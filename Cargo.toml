@@ -65,6 +65,11 @@ opt-level = 3
 [profile.dev]
 opt-level = 1
 
+[profile.test]
+# The combined Burn, CubeCL, and Bevy graph otherwise produces a very large
+# debug-info link on hosted CI runners. Tests do not require debug symbols.
+debug = 0
+
 [profile.release]
 strip = "symbols"
 lto = "thin"

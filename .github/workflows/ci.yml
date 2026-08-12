@@ -101,7 +101,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Unit and integration tests
-        run: cargo test --workspace --all-features --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep package feature graphs isolated. A workspace-wide all-feature
+          # invocation unifies burn_boogu's diagnostic CUDA backend into the
+          # Bevy cdylib and can exhaust the hosted runner's linker resources.
+          cargo test -p burn_image --all-features --locked
+          cargo test -p burn_qwen3_vl --all-features --locked
+          cargo test -p burn_flux_vae --all-features --locked
+          cargo test -p burn_boogu --all-features --lib --tests --locked
+          cargo test -p burn_boogu --features runtime,import,wgpu,ndarray --bins --locked
+          cargo test -p bevy_burn_image --all-features --lib --locked
       - name: Documentation
         run: cargo doc --workspace --all-features --no-deps --locked
       - name: Check converter feature contract
