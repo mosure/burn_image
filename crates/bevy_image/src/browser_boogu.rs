@@ -50,7 +50,8 @@ use crate::{
     ImageRunnerEvent, WgpuExecutionKind,
     artifact_stream::{
         ArtifactStreamConfig, BrowserArtifactControl, BrowserArtifactEvent,
-        BrowserStageShardReader, MAX_BROWSER_MANIFEST_BYTES, fetch_browser_bounded_file,
+        BrowserStageShardReader, MAX_BROWSER_MANIFEST_BYTES, artifact_progress_position,
+        fetch_browser_bounded_file,
     },
 };
 
@@ -70,7 +71,101 @@ type BrowserDenoiserSource = BrowserAsyncStageSource<BrowserVerifiedDenoiserSour
 
 const MAX_RUNTIME_EVENTS: usize = 256;
 const MAX_EVENTS_PER_POLL: usize = 64;
+const BROWSER_PROGRESS_EVENT_NAME: &str = "burn-image-progress";
+const BROWSER_RUNTIME_EVENT_NAME: &str = "burn-image-runtime";
 type BrowserBuildSlot = Arc<Mutex<Option<Result<BrowserBooguEngine, RuntimeError>>>>;
+
+#[derive(serde::Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum BrowserRuntimeEvent {
+    Preparing {
+        message: String,
+    },
+    ManifestVerified {
+        bundle: String,
+        weight_objects: u32,
+        weight_bytes: u64,
+    },
+    Ready {
+        model: String,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+pub(crate) fn report_browser_runtime_preparing(message: impl Into<String>) {
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::Preparing {
+            message: message.into(),
+        },
+    );
+}
+
+fn report_browser_manifest_verified(manifest: &ArtifactManifest) {
+    let weight_objects = manifest
+        .files
+        .iter()
+        .filter(|file| matches!(file.role, burn_image::ArtifactFileRole::Weights))
+        .count();
+    let weight_bytes = manifest
+        .files
+        .iter()
+        .filter(|file| matches!(file.role, burn_image::ArtifactFileRole::Weights))
+        .fold(0_u64, |total, file| total.saturating_add(file.size));
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::ManifestVerified {
+            bundle: manifest.bundle.to_string(),
+            weight_objects: u32::try_from(weight_objects).unwrap_or(u32::MAX),
+            weight_bytes,
+        },
+    );
+}
+
+fn report_browser_runtime_ready(variant: BooguVariant) {
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::Ready {
+            model: boogu_model_descriptor(variant).id.to_string(),
+        },
+    );
+}
+
+pub(crate) fn report_browser_runtime_failure(message: impl Into<String>) {
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::Failed {
+            message: message.into(),
+        },
+    );
+}
+
+fn dispatch_browser_progress(event: &ProgressEvent) {
+    dispatch_browser_event(BROWSER_PROGRESS_EVENT_NAME, event);
+}
+
+fn dispatch_browser_event<T: serde::Serialize>(name: &str, value: &T) {
+    let result = (|| {
+        let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
+        let detail = js_sys::JSON::parse(&json).map_err(|error| format!("{error:?}"))?;
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(&detail);
+        let event = web_sys::CustomEvent::new_with_event_init_dict(name, &init)
+            .map_err(|error| format!("{error:?}"))?;
+        let window = web_sys::window().ok_or_else(|| "Window is unavailable".to_owned())?;
+        window
+            .dispatch_event(event.as_ref())
+            .map_err(|error| format!("{error:?}"))?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        web_sys::console::warn_1(
+            &format!("failed to dispatch browser event {name}: {error}").into(),
+        );
+    }
+}
 
 struct BrowserBuildInputs {
     identity: BooguReleaseIdentity,
@@ -754,6 +849,9 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
             ));
         }
         let inputs = Self::validate_context(self.variant, context)?;
+        report_browser_runtime_preparing(
+            "Shared WebGPU device ready; verifying the sealed model manifest",
+        );
 
         let slot = Arc::new(Mutex::new(None));
         let result_slot = slot.clone();
@@ -767,6 +865,10 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
                 inputs.device,
             )
             .await;
+            match &result {
+                Ok(engine) => report_browser_runtime_ready(engine.identity.variant),
+                Err(error) => report_browser_runtime_failure(error.to_string()),
+            }
             *result_slot
                 .lock()
                 .expect("browser factory result mutex poisoned") = Some(result);
@@ -906,8 +1008,14 @@ impl BrowserBooguEngine {
             )
             .map_err(|error| execution_error(variant, error))?;
         }
+        report_browser_manifest_verified(&manifest);
 
         let mut reader = BrowserStageShardReader::new(base_url, stream_config);
+        let bootstrap_control = reader.control();
+        bootstrap_control.set_observer(Some(Arc::new(|event| {
+            let progress = browser_artifact_progress(RunId(0), event);
+            dispatch_browser_progress(&progress);
+        })));
         let qwen_config_bytes = read_manifest_file(
             &mut reader,
             &manifest,
@@ -1011,6 +1119,7 @@ impl BrowserBooguEngine {
         )
         .map_err(|error| execution_error(variant, error))?;
         let artifact_control = reader.control();
+        artifact_control.set_observer(None);
         artifact_control.clear_events();
 
         Ok(Self {
@@ -1535,31 +1644,36 @@ fn install_artifact_observer(
 ) {
     let observer_shared = Arc::clone(shared);
     control.set_observer(Some(Arc::new(move |event| {
-        let progress = match event {
-            BrowserArtifactEvent::Started(file) => ProgressEvent::ArtifactStarted {
+        let progress = browser_artifact_progress(run_id, event);
+        queue_progress(&observer_shared, id, progress);
+    })));
+}
+
+fn browser_artifact_progress(run_id: RunId, event: BrowserArtifactEvent) -> ProgressEvent {
+    match event {
+        BrowserArtifactEvent::Started(file) => {
+            let (file_index, file_count) = artifact_progress_position(&file);
+            ProgressEvent::ArtifactStarted {
                 run_id,
                 path: file.path,
                 component: file.component,
-                file_index: 1,
-                file_count: 1,
+                file_index,
+                file_count,
                 total_bytes: file.size,
-            },
-            BrowserArtifactEvent::Progress {
-                path,
-                loaded_bytes,
-                total_bytes,
-            } => ProgressEvent::ArtifactProgress {
-                run_id,
-                path,
-                loaded_bytes,
-                total_bytes,
-            },
-            BrowserArtifactEvent::Verified(path) => {
-                ProgressEvent::ArtifactVerified { run_id, path }
             }
-        };
-        queue_progress(&observer_shared, id, progress);
-    })));
+        }
+        BrowserArtifactEvent::Progress {
+            path,
+            loaded_bytes,
+            total_bytes,
+        } => ProgressEvent::ArtifactProgress {
+            run_id,
+            path,
+            loaded_bytes,
+            total_bytes,
+        },
+        BrowserArtifactEvent::Verified(path) => ProgressEvent::ArtifactVerified { run_id, path },
+    }
 }
 
 async fn read_manifest_file(
@@ -1714,6 +1828,7 @@ fn finish_stage(
 }
 
 fn queue_progress(shared: &Arc<Mutex<BrowserRuntimeShared>>, id: ImageJobId, event: ProgressEvent) {
+    dispatch_browser_progress(&event);
     let mut state = shared.lock().expect("browser runtime mutex poisoned");
     let diagnostic = if state.diagnostic_console_progress {
         let current_memory = wasm_linear_memory_bytes().unwrap_or(0);

@@ -113,6 +113,8 @@ web-sys = { workspace = true, features = [
   "Blob",
   "BlobPropertyBag",
   "console",
+  "CustomEvent",
+  "CustomEventInit",
   "Document",
   "Element",
   "Headers",

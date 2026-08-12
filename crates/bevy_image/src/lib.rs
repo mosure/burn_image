@@ -179,6 +179,9 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         RemoteBaseUrl::new(artifacts).map_err(|error| JsValue::from_str(&error.to_string()))?;
     let mut settings = BooguAdapterSettings::verified_default(ArtifactSource::Remote { base_url });
     settings.storage_profile = profile;
+    browser_boogu::report_browser_runtime_preparing(
+        "Initializing WebGPU and the verified streamed-model runtime",
+    );
     if matches!(headless.as_deref(), Some("bootstrap" | "f16-probe")) {
         let preserve_f16 = headless.as_deref() == Some("f16-probe");
         let status = window
@@ -261,4 +264,28 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
     }
     app::build_boogu_app(settings, BrowserBooguFactory::new(variant)).run();
     Ok(())
+}
+
+#[cfg(test)]
+mod web_shell_tests {
+    #[test]
+    fn web_shell_exposes_streaming_progress_contract_correctness() {
+        let html = include_str!("../www/index.html");
+        for required in [
+            "id=\"model-loader\"",
+            "id=\"artifact-progress\"",
+            "aria-live=\"polite\"",
+            "burn-image-runtime",
+            "burn-image-progress",
+            "verifiedObjects",
+            "transferredBytes",
+            "Reload runtime",
+        ] {
+            assert!(html.contains(required), "web shell omits {required}");
+        }
+        assert!(
+            html.contains("streamed on demand"),
+            "bundle inventory must not be presented as an eager full download"
+        );
+    }
 }

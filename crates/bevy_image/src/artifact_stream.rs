@@ -72,6 +72,19 @@ pub struct BrowserRangeRequest {
     pub range_header: String,
 }
 
+/// Return the zero-based shard position used by `ProgressEvent::ArtifactStarted`.
+///
+/// Unsharded semantic objects are represented as the sole object in a one-object group. Keeping
+/// this conversion beside the transport contract prevents browser adapters from accidentally
+/// reporting one-based indices that UI formatters increment a second time.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+pub(crate) fn artifact_progress_position(file: &ArtifactFile) -> (u32, u32) {
+    file.shard
+        .as_ref()
+        .map(|shard| (shard.index, shard.count))
+        .unwrap_or((0, 1))
+}
+
 impl BrowserRangeRequest {
     pub fn new(
         base_url: &RemoteBaseUrl,
@@ -727,7 +740,7 @@ impl<S: TransactionalArtifactSink> Drop for StreamingArtifactLoader<S> {
 
 #[cfg(test)]
 mod tests {
-    use burn_image::{ArtifactFileRole, Sha256Digest};
+    use burn_image::{ArtifactFileRole, ArtifactShard, Sha256Digest};
 
     use super::*;
 
@@ -857,5 +870,18 @@ mod tests {
                 Err(ArtifactStreamError::BrowserContentRange { .. })
             ));
         }
+    }
+
+    #[test]
+    fn artifact_progress_uses_zero_based_manifest_shards_correctness() {
+        let mut artifact = file(b"shard");
+        assert_eq!(artifact_progress_position(&artifact), (0, 1));
+
+        artifact.shard = Some(ArtifactShard {
+            index: 2,
+            count: 4,
+            chain_sha256: None,
+        });
+        assert_eq!(artifact_progress_position(&artifact), (2, 4));
     }
 }

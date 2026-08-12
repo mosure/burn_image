@@ -1,0 +1,180 @@
+name: deploy github pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - name: report deployment readiness
+        shell: bash
+        env:
+          AUTOMATIC_DEPLOYMENT_ENABLED: ${{ vars.BURN_IMAGE_PAGES_READY }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            echo "Manual deployment requested; the deploy job will verify every external prerequisite."
+          elif [[ "$AUTOMATIC_DEPLOYMENT_ENABLED" == true ]]; then
+            echo "Automatic Pages deployment is enabled."
+          else
+            echo "Pages deployment is gated until BURN_IMAGE_PAGES_READY=true."
+            echo "Publish the canonical CDN bundle and enable Pages with GitHub Actions first."
+          fi
+
+  deploy:
+    needs: readiness
+    if: github.event_name == 'workflow_dispatch' || vars.BURN_IMAGE_PAGES_READY == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: checkout repository
+        uses: actions/checkout@v5
+
+      - name: verify canonical browser CDN contract
+        shell: bash
+        env:
+          MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-turbo-f16-qwen-vision-f32
+          MODEL_CONTENT_DIGEST: 4f94cf68c00af12d5de486db4d316ce889d6d21e78913a1c74edab4bd0119ce3
+        run: |
+          set -euo pipefail
+          manifest_file="$(mktemp)"
+          manifest_headers="$(mktemp)"
+          range_headers="$(mktemp)"
+          trap 'rm -f -- "$manifest_file" "$manifest_headers" "$range_headers"' EXIT
+
+          curl --fail --silent --show-error \
+            --output "$manifest_file" \
+            --dump-header "$manifest_headers" \
+            --header 'Origin: https://mosure.github.io' \
+            "$MODEL_BASE_URL/manifest.json"
+          tr -d '\r' < "$manifest_headers" > "$manifest_headers.normalized"
+          mv "$manifest_headers.normalized" "$manifest_headers"
+          grep -Eqi '^access-control-allow-origin: (https://mosure\.github\.io|\*)$' \
+            "$manifest_headers"
+          jq -e \
+            --arg bundle 'boogu-image-0.1-turbo-f16-qwen-vision-f32' \
+            --arg digest "$MODEL_CONTENT_DIGEST" \
+            '.schema_version == 1 and
+             .bundle == $bundle and
+             .profile == "f16-qwen-vision-f32" and
+             .model == "Boogu/Boogu-Image-0.1-Turbo" and
+             .content_digest == $digest' \
+            "$manifest_file" >/dev/null
+          weight_path="$(
+            jq -er 'first(.files[] | select(.role == "weights") | .path)' "$manifest_file"
+          )"
+
+          verify_range_contract() {
+            local url="$1"
+            local status
+            status="$(
+              curl --silent --show-error \
+                --output /dev/null \
+                --dump-header "$range_headers" \
+                --write-out '%{http_code}' \
+                --header 'Origin: https://mosure.github.io' \
+                --header 'Range: bytes=0-0' \
+                "$url"
+            )"
+            test "$status" = 206
+            tr -d '\r' < "$range_headers" > "$range_headers.normalized"
+            mv "$range_headers.normalized" "$range_headers"
+            grep -Eqi '^access-control-allow-origin: (https://mosure\.github\.io|\*)$' \
+              "$range_headers"
+            grep -Eqi '^access-control-expose-headers:.*(content-range|\*)' "$range_headers"
+            grep -Eqi '^content-range: bytes 0-0/[1-9][0-9]*$' "$range_headers"
+            grep -Eqi '^cache-control:.*immutable' "$range_headers"
+          }
+
+          verify_range_contract "$MODEL_BASE_URL/manifest.json"
+          verify_range_contract "$MODEL_BASE_URL/$weight_path"
+
+      - name: setup frontend MSRV
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: install Cargo.lock-matched wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+
+      - name: build browser frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p bevy_burn_image \
+            --target wasm32-unknown-unknown \
+            --profile wasm-release \
+            --no-default-features \
+            --features boogu-web \
+            --locked \
+            --lib
+
+          wasm_input="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/wasm32-unknown-unknown/wasm-release/bevy_burn_image.wasm"
+          mkdir -p crates/bevy_image/www/out
+          wasm-bindgen \
+            --target web \
+            --out-dir crates/bevy_image/www/out \
+            --out-name bevy_burn_image \
+            "$wasm_input"
+
+      - name: inspect pages artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          touch crates/bevy_image/www/.nojekyll
+
+          test -s crates/bevy_image/www/index.html
+          test -s crates/bevy_image/www/out/bevy_burn_image.js
+          test -s crates/bevy_image/www/out/bevy_burn_image_bg.wasm
+          grep -Eq '^export function start_boogu_web\(\)' \
+            crates/bevy_image/www/out/bevy_burn_image.js
+          grep -Eq '^export function provide_reference_image\(bytes\)' \
+            crates/bevy_image/www/out/bevy_burn_image.js
+          grep -Fq 'wasm.__wbindgen_start()' crates/bevy_image/www/out/bevy_burn_image.js
+          grep -Fq 'burn-image-runtime' crates/bevy_image/www/index.html
+          grep -Fq 'burn-image-progress' crates/bevy_image/www/index.html
+          grep -Fq 'id="artifact-progress"' crates/bevy_image/www/index.html
+
+          sed -n '/<script type="module">/,/<\/script>/p' crates/bevy_image/www/index.html \
+            | sed '1d;$d' > "$RUNNER_TEMP/burn-image-index-module.mjs"
+          node --check "$RUNNER_TEMP/burn-image-index-module.mjs"
+
+          if find crates/bevy_image/www -type f \
+            \( -name '*.bpk' -o -name '*.bpk.parts.json' -o -name '*.bpk.part-*' \
+               -o -name '*.safetensors' -o -name '*.bin' -o -name '*.onnx' \
+               -o -name '*.npy' -o -name '*.npz' -o -name '*.pt' -o -name '*.pth' \) \
+            -print -quit | grep -q .; then
+            echo "model artifacts must remain on the Aberration CDN" >&2
+            exit 1
+          fi
+
+      - name: configure github pages
+        uses: actions/configure-pages@v6
+
+      - name: upload pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: crates/bevy_image/www
+
+      - name: deploy github pages
+        id: deployment
+        uses: actions/deploy-pages@v5

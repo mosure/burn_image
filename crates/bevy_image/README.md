@@ -197,6 +197,12 @@ one digest-verified semantic object at a time. Select the bundle with `variant`,
 notes](https://github.com/mosure/burn_image/blob/main/docs/web.md). Native file helpers remain
 excluded from Wasm builds.
 
+The repository's GitHub Pages workflow packages the tracked `www/` shell and ignored generated
+`www/out/` bindgen output only; model objects stay on the Aberration CDN. During runtime build and
+inference, Wasm dispatches structured `burn-image-runtime` and `burn-image-progress` DOM events.
+The shell turns them into exact current-object bytes/shard progress, transfer rate and ETA,
+verified-object totals, stage/step state, terminal errors, and a manual full-runtime reload action.
+
 The Wasm feature sets compile and package. On the externally attested headful X11/Vulkan hardware
 path, `headless=infer` completed one real 256×256 Turbo request with the
 `f16-qwen-vision-f32` bundle through streamed Qwen, all four DMD steps, and VAE decode; it encoded

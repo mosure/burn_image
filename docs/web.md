@@ -23,6 +23,26 @@ Open a URL with the remote sealed bundle and release selection:
 http://localhost:8080/?variant=turbo&profile=f16-qwen-vision-f32
 ```
 
+The tracked static host lives in `crates/bevy_image/www/`; generated bindgen JavaScript and Wasm
+remain under the ignored `www/out/` directory. `.github/workflows/deploy-pages.yml` mirrors the
+repository's local package command and never copies model objects into the Pages artifact. Manual
+dispatch runs the complete deployment; `main` pushes deploy automatically only after the
+repository variable `BURN_IMAGE_PAGES_READY=true` is set. Before setting it, publish the canonical
+CDN bundle and enable Pages with **GitHub Actions** as its source. The deploy job probes both the
+manifest and one weight object for the exact `206`, CORS, exposed `Content-Range`, and immutable
+cache headers required by the bounded Range reader. A missing/private bundle or incomplete CDN
+header policy therefore blocks deployment instead of publishing a page that cannot load its
+model. The expected project URL is `https://mosure.github.io/burn_image/`.
+
+The HTML shell listens for the Wasm-emitted `burn-image-runtime` and `burn-image-progress` custom
+events. Its accessible loading panel distinguishes runtime/manifest preparation, current semantic
+object transfer and SHA-256 verification, and GPU inference stages. It displays exact current
+bytes, actual zero-based manifest shard position rendered as one-based UI text, rolling transfer
+rate/current-object ETA, cumulative request bytes, verified-object count, and DMD steps. The panel
+does not invent a whole-run percentage: a task may skip or revisit objects as Qwen, VAE, and the
+four denoiser passes stream independently. `aria-live` announcements occur at lifecycle boundaries,
+while high-frequency 4 MiB range updates are coalesced to animation frames.
+
 With `artifacts` omitted, that selection resolves exactly to
 `https://aberration.technology/model/boogu-image-0.1-turbo-f16-qwen-vision-f32`.
 An explicit URL override remains available for local or pre-publication testing, for example
@@ -58,7 +78,8 @@ request header through CORS, return `206`, and expose `Content-Range` to browser
 - `BrowserStageShardReader` aggregates at most one sealed semantic object (hard cap 256 MiB),
   verifies its exact size and SHA-256, and releases its host bytes after upload/apply.
 - Async Qwen and four-step DMD execution suspend at network boundaries, report artifact/stage/step
-  progress, and check cancellation before every range and semantic boundary.
+  progress to both Bevy and the DOM loading panel, and check cancellation before every range and
+  semantic boundary.
 - VAE encode and decode are independently loaded with the released F32 force-upcast policy.
 - Q8 profiles dequantize Qwen Col-layout stages through F16 before transpose and widen them to the
   browser's F32 execution policy; denoiser Row-layout Q8 stays device-quantized with F32

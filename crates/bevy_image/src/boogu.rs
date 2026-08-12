@@ -434,6 +434,8 @@ fn fail_adapter(
     runner_status: &mut ImageRunnerStatus,
     error: FrontendError,
 ) {
+    #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
+    crate::browser_boogu::report_browser_runtime_failure(error.to_string());
     host.runtime = None;
     host.factory = None;
     host.phase = FactoryPhase::Failed;
