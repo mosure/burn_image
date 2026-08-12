@@ -1,0 +1,355 @@
+name: Real checkpoint release parity
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Artifact profile
+        required: true
+        default: f16-qwen-vision-f32
+        type: choice
+        options:
+          - f16-qwen-vision-f32
+      turbo_snapshot:
+        description: Absolute path to the pinned Turbo Hugging Face snapshot on the runner
+        required: true
+        type: string
+      edit_snapshot:
+        description: Absolute path to the pinned Edit-Turbo Hugging Face snapshot on the runner
+        required: true
+        type: string
+      turbo_artifacts:
+        description: Absolute path to the converted Turbo bundle for the selected profile
+        required: true
+        type: string
+      edit_artifacts:
+        description: Absolute path to the converted Edit-Turbo bundle for the selected profile
+        required: true
+        type: string
+      edit_1k5_snapshot:
+        description: Absolute path to the pinned Edit-Turbo 1.5K snapshot on the runner
+        required: true
+        type: string
+      edit_1k5_artifacts:
+        description: Absolute path to the exact qualified Edit-Turbo 1.5K mixed-F16 bundle
+        required: true
+        type: string
+      edit_1k5_fixture:
+        description: Absolute path to the exhaustive Edit-Turbo 1.5K schema-2 fixture directory
+        required: true
+        type: string
+      reference_fixtures:
+        description: Absolute path containing external Turbo and 1K Edit fixture directories
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: [self-hosted, gpu, burn-image]
+    timeout-minutes: 720
+    env:
+      CARGO_TERM_COLOR: always
+      PROFILE: ${{ inputs.profile }}
+      BURN_IMAGE_TURBO_SNAPSHOT: ${{ inputs.turbo_snapshot }}
+      BURN_IMAGE_EDIT_SNAPSHOT: ${{ inputs.edit_snapshot }}
+      BURN_IMAGE_TURBO_ARTIFACTS: ${{ inputs.turbo_artifacts }}
+      BURN_IMAGE_EDIT_ARTIFACTS: ${{ inputs.edit_artifacts }}
+      BURN_IMAGE_EDIT_1K5_SNAPSHOT: ${{ inputs.edit_1k5_snapshot }}
+      BURN_IMAGE_EDIT_1K5_ARTIFACTS: ${{ inputs.edit_1k5_artifacts }}
+      BURN_IMAGE_EDIT_1K5_FIXTURE: ${{ inputs.edit_1k5_fixture }}
+      BURN_IMAGE_REFERENCE_FIXTURES: ${{ inputs.reference_fixtures }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Authenticate pinned snapshots, bundles, and external oracles
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PROFILE" != "f16-qwen-vision-f32" ]]; then
+            echo "release parity requires f16-qwen-vision-f32, got: $PROFILE" >&2
+            exit 2
+          fi
+
+          for variable in \
+            BURN_IMAGE_TURBO_SNAPSHOT \
+            BURN_IMAGE_EDIT_SNAPSHOT \
+            BURN_IMAGE_TURBO_ARTIFACTS \
+            BURN_IMAGE_EDIT_ARTIFACTS \
+            BURN_IMAGE_EDIT_1K5_SNAPSHOT \
+            BURN_IMAGE_EDIT_1K5_ARTIFACTS \
+            BURN_IMAGE_EDIT_1K5_FIXTURE \
+            BURN_IMAGE_REFERENCE_FIXTURES; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "required input is empty: $variable" >&2
+              exit 2
+            fi
+          done
+
+          for directory in \
+            "$BURN_IMAGE_TURBO_SNAPSHOT" \
+            "$BURN_IMAGE_EDIT_SNAPSHOT" \
+            "$BURN_IMAGE_TURBO_ARTIFACTS" \
+            "$BURN_IMAGE_EDIT_ARTIFACTS" \
+            "$BURN_IMAGE_EDIT_1K5_SNAPSHOT" \
+            "$BURN_IMAGE_EDIT_1K5_ARTIFACTS" \
+            "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
+            "$BURN_IMAGE_REFERENCE_FIXTURES"; do
+            if [[ ! -d "$directory" ]]; then
+              echo "required external directory is missing: $directory" >&2
+              exit 2
+            fi
+          done
+
+          if [[ "$(realpath -e "$BURN_IMAGE_EDIT_SNAPSHOT")" == \
+                "$(realpath -e "$BURN_IMAGE_EDIT_1K5_SNAPSHOT")" ]]; then
+            echo "Edit-Turbo 1K and 1.5K must use distinct pinned snapshots" >&2
+            exit 2
+          fi
+          if [[ "$(realpath -e "$BURN_IMAGE_EDIT_ARTIFACTS")" == \
+                "$(realpath -e "$BURN_IMAGE_EDIT_1K5_ARTIFACTS")" ]]; then
+            echo "Edit-Turbo 1K and 1.5K must use distinct sealed bundles" >&2
+            exit 2
+          fi
+
+          verify_exact_file() {
+            local expected="$1"
+            local actual="$2"
+            if [[ ! -f "$actual" ]]; then
+              echo "required parity oracle is missing: $actual" >&2
+              exit 2
+            fi
+            printf '%s  %s\n' "$expected" "$actual" | sha256sum --check --status - || {
+              echo "real parity oracle hash mismatch: $actual" >&2
+              exit 2
+            }
+          }
+
+          turbo_fixture="$BURN_IMAGE_REFERENCE_FIXTURES/turbo"
+          edit_fixture="$BURN_IMAGE_REFERENCE_FIXTURES/edit"
+
+          verify_exact_file \
+            b85f757d18c5dfdb94b3366692d0b3ceb6f73d699e98820ba5177d90d36d838d \
+            "$turbo_fixture/metadata.json"
+          verify_exact_file \
+            d26178de365bea3a7e4fef6c9a292e8220af5481dfe398e74491817adc1fcd75 \
+            "$turbo_fixture/tensors.safetensors"
+          verify_exact_file \
+            80beb2ebd1f15ead37b48bab2741beb0e06befe1530730eba304596b5a1d5554 \
+            "$turbo_fixture/output.png"
+
+          verify_exact_file \
+            6891260a32639e65338558d4d2898ffd2f9aef10f479c62de953150ae37b9221 \
+            "$edit_fixture/metadata.json"
+          verify_exact_file \
+            831ca9e288de13ed682f8e260170957161ad5b338b028717f89e9d540b6317ee \
+            "$edit_fixture/tensors.safetensors"
+          verify_exact_file \
+            96534b93904478caf92c1d0e1b431396f81e7b62f09bb5505443378f245d9647 \
+            "$edit_fixture/source.png"
+          verify_exact_file \
+            1bb10a67af8e56f40f3aefec07f99a37990c539f3b66126bc861d5231dcf6201 \
+            "$edit_fixture/output.png"
+
+          # Only this exhaustive 372-tensor oracle qualifies Edit-Turbo 1.5K.
+          verify_exact_file \
+            1e78233c703ed32ee351c25d54ca4b05e3efeb898ee2836d1cc96c522e2abcae \
+            "$BURN_IMAGE_EDIT_1K5_FIXTURE/metadata.json"
+          verify_exact_file \
+            2585ddf2337e41f884218a4abeceb8a10baa7553e43d37f33016be68edc3eeb9 \
+            "$BURN_IMAGE_EDIT_1K5_FIXTURE/tensors.safetensors"
+          verify_exact_file \
+            96534b93904478caf92c1d0e1b431396f81e7b62f09bb5505443378f245d9647 \
+            "$BURN_IMAGE_EDIT_1K5_FIXTURE/source.png"
+          verify_exact_file \
+            8e88d6c3580593da723049ef4027a60c5d730b6006ef766d49971a23c6446a70 \
+            "$BURN_IMAGE_EDIT_1K5_FIXTURE/output.png"
+
+      - name: Verify sealed published artifact contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p burn_boogu --release --locked --features import \
+            --bin boogu-verify-artifacts -- \
+            --artifacts "$BURN_IMAGE_TURBO_ARTIFACTS" \
+            --require-published-release
+          cargo run -p burn_boogu --release --locked --features import \
+            --bin boogu-verify-artifacts -- \
+            --artifacts "$BURN_IMAGE_EDIT_ARTIFACTS" \
+            --require-published-release
+          cargo run -p burn_boogu --release --locked --features import \
+            --bin boogu-verify-artifacts -- \
+            --artifacts "$BURN_IMAGE_EDIT_1K5_ARTIFACTS" \
+            --require-published-release \
+            --require-edit-turbo-1k5-release
+
+      - name: Processor reference parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          BOOGU_PROCESSOR_MODEL_DIR="$BURN_IMAGE_TURBO_SNAPSHOT" \
+          BOOGU_PROCESSOR_FIXTURE_DIR="$BURN_IMAGE_REFERENCE_FIXTURES/turbo" \
+            cargo test -p burn_boogu --release --locked --features runtime,import \
+              real_boogu_processor_reference -- --nocapture
+          BOOGU_PROCESSOR_MODEL_DIR="$BURN_IMAGE_EDIT_SNAPSHOT" \
+          BOOGU_PROCESSOR_FIXTURE_DIR="$BURN_IMAGE_REFERENCE_FIXTURES/edit" \
+            cargo test -p burn_boogu --release --locked --features runtime,import \
+              real_boogu_processor_reference -- --nocapture
+          BOOGU_PROCESSOR_MODEL_DIR="$BURN_IMAGE_EDIT_1K5_SNAPSHOT" \
+          BOOGU_PROCESSOR_FIXTURE_DIR="$BURN_IMAGE_EDIT_1K5_FIXTURE" \
+            cargo test -p burn_boogu --release --locked --features runtime,import \
+              real_boogu_processor_reference -- --nocapture
+
+      - name: Qwen WGPU reference parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p burn_boogu --release --locked --features import,wgpu \
+            --bin boogu-qwen-parity -- \
+            --artifacts "$BURN_IMAGE_TURBO_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/turbo" \
+            --profile "$PROFILE" \
+            --query-chunk-size 128 \
+            --capture-stages true \
+            --minimum-cosine 0.997 \
+            --maximum-relative-rmse 0.10 \
+            --require
+          cargo run -p burn_boogu --release --locked --features import,wgpu \
+            --bin boogu-qwen-parity -- \
+            --artifacts "$BURN_IMAGE_EDIT_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/edit" \
+            --profile "$PROFILE" \
+            --query-chunk-size 128 \
+            --capture-stages true \
+            --minimum-cosine 0.994 \
+            --maximum-relative-rmse 0.11 \
+            --require
+          cargo run -p burn_boogu --release --locked --features import,wgpu \
+            --bin boogu-qwen-parity -- \
+            --artifacts "$BURN_IMAGE_EDIT_1K5_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
+            --profile "$PROFILE" \
+            --query-chunk-size 128 \
+            --capture-stages true \
+            --minimum-cosine 0.994 \
+            --maximum-relative-rmse 0.11 \
+            --require
+
+      - name: VAE and DMD WGPU reference parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p burn_boogu --release --locked --features import,ndarray,wgpu \
+            --bin boogu-parity -- \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/turbo" \
+            --artifacts "$BURN_IMAGE_TURBO_ARTIFACTS" \
+            --profile "$PROFILE" --backend wgpu --require
+          cargo run -p burn_boogu --release --locked --features import,ndarray,wgpu \
+            --bin boogu-parity -- \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/edit" \
+            --artifacts "$BURN_IMAGE_EDIT_ARTIFACTS" \
+            --profile "$PROFILE" --backend wgpu --require
+          cargo run -p burn_boogu --release --locked --features import,ndarray,wgpu \
+            --bin boogu-parity -- \
+            --fixture "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
+            --artifacts "$BURN_IMAGE_EDIT_1K5_ARTIFACTS" \
+            --profile "$PROFILE" --backend wgpu --require
+
+      - name: Denoiser WGPU boundary parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p burn_boogu --release --locked --features import,ndarray,wgpu \
+            --bin boogu-denoiser-parity -- \
+            --artifacts "$BURN_IMAGE_TURBO_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/turbo" \
+            --backend wgpu --profile "$PROFILE" --steps 4 \
+            --input-mode isolated --capture-boundaries true --require
+          cargo run -p burn_boogu --release --locked --features import,ndarray,wgpu \
+            --bin boogu-denoiser-parity -- \
+            --artifacts "$BURN_IMAGE_EDIT_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/edit" \
+            --backend wgpu --profile "$PROFILE" --steps 4 \
+            --input-mode isolated --capture-boundaries true --require
+          cargo run -p burn_boogu --release --locked --features import,ndarray,wgpu \
+            --bin boogu-denoiser-parity -- \
+            --artifacts "$BURN_IMAGE_EDIT_1K5_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
+            --backend wgpu --profile "$PROFILE" --steps 4 \
+            --input-mode isolated --capture-boundaries true --require
+
+      - name: Turbo production full-chain WGPU parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu \
+            --bin boogu-full-parity -- \
+            --artifacts "$BURN_IMAGE_TURBO_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/turbo" \
+            --profile "$PROFILE" \
+            --qwen-residency retained \
+            --qwen-synchronization-policy deferred \
+            --vae-float-policy preserve-f16 \
+            --vae-group-norm-policy f16-storage-f32-accum \
+            --vae-attention-query-chunk-size 4096 \
+            --qwen-query-chunk-size 128 \
+            --denoiser-query-chunk-size 8192 \
+            --denoiser-attention-policy padded-blackbox \
+            --denoiser-rms-norm-policy strict-f32 \
+            --denoiser-qk-preparation-policy balanced-strict-qk-norm-rope \
+            --blackbox-num-planes 4 \
+            --blackbox-seq-kv-tiles 1 \
+            --blackbox-seq-q-tiles 1 \
+            --require
+
+      - name: Edit-Turbo 1K production full-chain WGPU parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu \
+            --bin boogu-full-parity -- \
+            --artifacts "$BURN_IMAGE_EDIT_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/edit" \
+            --profile "$PROFILE" \
+            --qwen-residency retained \
+            --qwen-synchronization-policy deferred \
+            --vae-float-policy preserve-f16 \
+            --vae-group-norm-policy f16-storage-f32-accum \
+            --vae-attention-query-chunk-size 4096 \
+            --qwen-query-chunk-size 128 \
+            --denoiser-query-chunk-size 8192 \
+            --denoiser-attention-policy padded-blackbox \
+            --denoiser-rms-norm-policy strict-f32 \
+            --denoiser-qk-preparation-policy balanced-strict-qk-norm-rope \
+            --blackbox-num-planes 4 \
+            --blackbox-seq-kv-tiles 1 \
+            --blackbox-seq-q-tiles 1 \
+            --require
+
+      - name: Edit-Turbo 1.5K production full-chain WGPU parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu \
+            --bin boogu-full-parity -- \
+            --artifacts "$BURN_IMAGE_EDIT_1K5_ARTIFACTS" \
+            --fixture "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
+            --profile "$PROFILE" \
+            --qwen-residency retained \
+            --qwen-synchronization-policy deferred \
+            --vae-float-policy preserve-f16 \
+            --vae-group-norm-policy f16-storage-f32-accum \
+            --vae-attention-query-chunk-size 4096 \
+            --qwen-query-chunk-size 128 \
+            --denoiser-query-chunk-size 16384 \
+            --denoiser-attention-policy padded-blackbox \
+            --denoiser-rms-norm-policy strict-f32 \
+            --denoiser-qk-preparation-policy composed \
+            --blackbox-num-planes 4 \
+            --blackbox-seq-kv-tiles 1 \
+            --blackbox-seq-q-tiles 1 \
+            --require

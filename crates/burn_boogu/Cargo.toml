@@ -1,0 +1,167 @@
+[package]
+name = "burn_boogu"
+description = "Boogu-Image Turbo generation and editing pipelines implemented in Burn."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["burn", "boogu", "diffusion", "image-generation"]
+categories.workspace = true
+
+[features]
+default = ["std"]
+std = []
+runtime = ["std", "burn_qwen3_vl/tokenizers"]
+ndarray = ["burn/ndarray", "dep:burn-ndarray"]
+flex = ["burn/flex"]
+cuda-experimental = [
+  "burn/cuda",
+  "burn/fusion",
+  "burn/autotune",
+  "dep:burn-cubecl",
+  "dep:burn-cuda",
+  "dep:burn-fusion",
+  "dep:burn-ir",
+  "dep:cubek",
+]
+wgpu = [
+  "burn/wgpu",
+  "dep:burn-cubecl",
+  "dep:burn-fusion",
+  "dep:burn-ir",
+  "dep:burn-wgpu",
+  "dep:cubek",
+  "dep:wgpu",
+]
+webgpu = ["wgpu", "burn/webgpu"]
+burnpack = ["dep:burn-store"]
+import = [
+  "burnpack",
+  "burn_flux_vae/import",
+  "burn_qwen3_vl/import",
+  "dep:safetensors",
+  "dep:clap",
+]
+quantized = []
+reference-hooks = []
+
+[dependencies]
+burn.workspace = true
+burn_image = { version = "0.1.1", path = "../burn_image", default-features = false }
+burn_qwen3_vl = { version = "0.1.1", path = "../burn_qwen3_vl", default-features = false }
+burn_flux_vae = { version = "0.1.1", path = "../burn_flux_vae", default-features = false }
+burn-ndarray = { workspace = true, optional = true }
+burn-store = { workspace = true, optional = true }
+bytemuck.workspace = true
+clap = { workspace = true, optional = true }
+half.workspace = true
+hex.workspace = true
+image.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rand_distr.workspace = true
+safetensors = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+wgpu = { workspace = true, optional = true }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
+workspace = true
+features = ["autotune", "fusion", "std", "vulkan"]
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-cubecl]
+workspace = true
+features = ["fusion", "std"]
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-cuda]
+workspace = true
+features = ["autotune", "fusion", "std"]
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-fusion]
+workspace = true
+features = ["std"]
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-ir]
+workspace = true
+features = ["std"]
+optional = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.cubek]
+workspace = true
+features = ["attention", "std"]
+optional = true
+
+[target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
+workspace = true
+features = ["autotune", "fusion", "std", "metal"]
+optional = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
+workspace = true
+features = ["std", "webgpu"]
+optional = true
+
+[dev-dependencies]
+burn-ndarray.workspace = true
+futures.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "boogu-import"
+path = "src/bin/boogu_import.rs"
+required-features = ["import"]
+
+[[bin]]
+name = "boogu-run"
+path = "src/bin/boogu_run.rs"
+required-features = ["runtime", "import", "wgpu"]
+
+[[bin]]
+name = "boogu-run-cuda"
+path = "src/bin/boogu_run_cuda.rs"
+required-features = ["runtime", "import", "cuda-experimental"]
+
+[[bin]]
+name = "boogu-run-wgpu-blackbox"
+path = "src/bin/boogu_run_wgpu_blackbox.rs"
+required-features = ["runtime", "import", "wgpu"]
+
+[[bin]]
+name = "boogu-parity"
+path = "src/bin/boogu_parity.rs"
+required-features = ["import", "ndarray"]
+
+[[bin]]
+name = "boogu-denoiser-parity"
+path = "src/bin/boogu_denoiser_parity.rs"
+required-features = ["import", "ndarray"]
+
+[[bin]]
+name = "boogu-qwen-parity"
+path = "src/bin/boogu_qwen_parity.rs"
+required-features = ["import", "wgpu"]
+
+[[bin]]
+name = "boogu-full-parity"
+path = "src/bin/boogu_full_parity.rs"
+required-features = ["runtime", "import", "wgpu"]
+
+[[bin]]
+name = "boogu-verify-artifacts"
+path = "src/bin/boogu_verify_artifacts.rs"
+required-features = ["import"]
+
+[[bench]]
+name = "dmd_update"
+harness = false
+required-features = ["ndarray"]

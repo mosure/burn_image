@@ -1,0 +1,41 @@
+[package]
+name = "burn_qwen3_vl"
+description = "Reusable Qwen3-VL text and vision model components for Burn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+exclude = ["fixtures/**"]
+keywords = ["burn", "qwen", "vision-language", "webgpu"]
+categories.workspace = true
+
+[features]
+default = ["std"]
+std = []
+tokenizers = ["dep:tokenizers"]
+import = ["dep:burn-store", "dep:safetensors"]
+
+[dependencies]
+burn.workspace = true
+burn-store = { workspace = true, optional = true }
+image.workspace = true
+safetensors = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokenizers = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Burn's RNG dependency requires an explicit entropy backend on wasm32-unknown-unknown.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+burn-ndarray.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+burn-wgpu = { workspace = true, features = ["autotune", "fusion", "std", "vulkan"] }

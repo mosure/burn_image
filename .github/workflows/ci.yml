@@ -1,0 +1,306 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Enforce source-only repository contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' path; do
+            lower_path="${path,,}"
+            reason=""
+            case "/$lower_path/" in
+              */target/*|*/.artifacts/*|*/www/out/*)
+                reason="generated output directory"
+                ;;
+            esac
+            case "$lower_path" in
+              *.sh|*.py)
+                reason="checked-in script"
+                ;;
+              *.bpk|*.safetensors|*.bin|*.ckpt|*.npy|*.npz|*.onnx|*.pt|*.pth|*.gguf|*.h5|*.hdf5|*.pb|*.tflite)
+                reason="model weight, tensor fixture, or shard payload"
+                ;;
+              *.crate|*.tar|*.tar.gz|*.tgz|*.zip|*.wasm|*.rlib|*.rmeta|*.so|*.dylib|*.dll|*.o|*.a|*.exe|*.pyc)
+                reason="generated archive or build output"
+                ;;
+              */__pycache__/*|*.ds_store)
+                reason="generated cache file"
+                ;;
+            esac
+
+            blob_bytes="$(git cat-file -s "HEAD:$path")"
+            if ((blob_bytes > 1024 * 1024)) && [[ "$path" != "Cargo.lock" ]]; then
+              reason="file exceeds the 1 MiB source-only limit ($blob_bytes bytes)"
+            fi
+            if [[ -n "$reason" ]]; then
+              echo "$path: $reason" >&2
+              status=1
+            fi
+          done < <(git ls-files -z)
+          exit "$status"
+
+      - name: Enforce test naming contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r file; do
+            pending=0
+            line_number=0
+            while IFS= read -r line; do
+              line_number=$((line_number + 1))
+              if [[ "$line" =~ ^[[:space:]]*#\[test\] ]]; then
+                pending=1
+                continue
+              fi
+              if ((pending == 0)); then
+                continue
+              fi
+              if [[ "$line" =~ ^[[:space:]]*#\[ ]]; then
+                continue
+              fi
+              if [[ "$line" =~ ^[[:space:]]*fn[[:space:]]+([a-zA-Z0-9_]+) ]]; then
+                name="${BASH_REMATCH[1]}"
+                case "$name" in
+                  *_smoke|*_correctness|*_parity|*_reference) ;;
+                  *)
+                    echo "$file:$line_number: test '$name' must use a contract suffix" >&2
+                    status=1
+                    ;;
+                esac
+              fi
+              pending=0
+            done < "$file"
+          done < <(find crates -type f -name '*.rs' -print | sort)
+          exit "$status"
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Unit and integration tests
+        run: cargo test --workspace --all-features --locked
+      - name: Documentation
+        run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Check converter feature contract
+        run: cargo check -p burn_boogu --no-default-features --features import,ndarray --bins --locked
+      - name: Check Bevy native feature contracts
+        run: |
+          set -euo pipefail
+          cargo check -p bevy_burn_image --all-targets --locked
+          cargo check -p bevy_burn_image --no-default-features --lib --locked
+          cargo check -p bevy_burn_image --no-default-features --features boogu --lib --locked
+          cargo check -p bevy_burn_image --no-default-features --features boogu-native --all-targets --locked
+
+      - name: Build and inspect publishable crate archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly max_archive_bytes=$((5 * 1024 * 1024))
+          readonly package_crates=(burn_image burn_qwen3_vl burn_flux_vae burn_boogu)
+          target_directory="$(
+            cargo metadata --format-version 1 --no-deps |
+              python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+          )"
+
+          cargo package --workspace --exclude bevy_burn_image --locked
+
+          is_allowed_package_path() {
+            local crate="$1"
+            local path="$2"
+            case "$path" in
+              .cargo_vcs_info.json|Cargo.lock|Cargo.toml|Cargo.toml.orig|LICENSE-APACHE|LICENSE-MIT|README.md)
+                return 0
+                ;;
+            esac
+            case "$crate:$path" in
+              burn_image:src/*|burn_image:tests/*|burn_image:benches/*|\
+              burn_qwen3_vl:src/*|burn_qwen3_vl:tests/*|\
+              burn_flux_vae:src/*|burn_flux_vae:tests/*|\
+              burn_boogu:src/*|burn_boogu:tests/*|burn_boogu:benches/*)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          is_forbidden_payload() {
+            local crate="$1"
+            local path="$2"
+            case "$path" in
+              target/*|*/target/*|.artifacts/*|*/.artifacts/*|www/out/*|*/www/out/*|\
+              *.bpk|*.bin|*.ckpt|*.npy|*.npz|*.onnx|*.pt|*.pth|*.safetensors|*.sh|*.py)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          for crate in "${package_crates[@]}"; do
+            package_id="$(cargo pkgid -p "$crate")"
+            version="${package_id##*#}"
+            version="${version##*@}"
+            archive="$target_directory/package/${crate}-${version}.crate"
+            archive_prefix="${crate}-${version}/"
+            test -f "$archive"
+
+            archive_bytes="$(stat -c %s "$archive")"
+            if ((archive_bytes > max_archive_bytes)); then
+              echo "package archive exceeds $max_archive_bytes bytes: $archive ($archive_bytes bytes)" >&2
+              exit 1
+            fi
+
+            mapfile -t entries < <(tar -tzf "$archive")
+            ((${#entries[@]} > 0))
+            for entry in "${entries[@]}"; do
+              if [[ "$entry" != "$archive_prefix"* ]]; then
+                echo "unexpected archive root: $crate: $entry" >&2
+                exit 1
+              fi
+              relative_path="${entry#"$archive_prefix"}"
+              if [[ -z "$relative_path" || "$relative_path" == /* || "/$relative_path/" == *"/../"* ]]; then
+                echo "unsafe package path: $crate: $entry" >&2
+                exit 1
+              fi
+              if is_forbidden_payload "$crate" "$relative_path"; then
+                echo "forbidden artifact payload: $crate: $relative_path" >&2
+                exit 1
+              fi
+              if ! is_allowed_package_path "$crate" "$relative_path"; then
+                echo "package entry is not allowlisted: $crate: $relative_path" >&2
+                exit 1
+              fi
+            done
+
+            for required_path in Cargo.toml LICENSE-APACHE LICENSE-MIT README.md src/lib.rs; do
+              required_entry="${archive_prefix}${required_path}"
+              found=0
+              for entry in "${entries[@]}"; do
+                if [[ "$entry" == "$required_entry" ]]; then
+                  found=1
+                  break
+                fi
+              done
+              if ((found == 0)); then
+                echo "package archive is missing $required_path: $crate" >&2
+                exit 1
+              fi
+            done
+            echo "verified package $archive ($archive_bytes bytes, ${#entries[@]} files)"
+          done
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - name: Check model crates for Wasm
+        run: |
+          set -euo pipefail
+          cargo check -p burn_image --target wasm32-unknown-unknown --no-default-features --locked
+          cargo check -p burn_qwen3_vl --target wasm32-unknown-unknown --all-features --locked
+          cargo check -p burn_flux_vae --target wasm32-unknown-unknown --all-features --locked
+          cargo check -p burn_boogu --target wasm32-unknown-unknown --no-default-features --features webgpu,burnpack,runtime --locked
+      - name: Check browser frontend feature contracts
+        run: |
+          set -euo pipefail
+          cargo check -p bevy_burn_image --target wasm32-unknown-unknown --no-default-features --features web --lib --locked
+          cargo check -p bevy_burn_image --target wasm32-unknown-unknown --no-default-features --features boogu-web --locked
+      - name: Build and inspect browser package
+        shell: bash
+        run: |
+          set -euo pipefail
+          output_dir="$(mktemp -d /tmp/burn-image-wasm-package.XXXXXX)"
+          trap 'rm -rf -- "$output_dir"' EXIT
+
+          cargo build -p bevy_burn_image \
+            --target wasm32-unknown-unknown \
+            --profile wasm-release \
+            --no-default-features \
+            --features boogu-web \
+            --locked \
+            --lib
+
+          wasm_input="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/wasm32-unknown-unknown/wasm-release/bevy_burn_image.wasm"
+          wasm-bindgen --target web \
+            --out-dir "$output_dir" \
+            --out-name bevy_burn_image \
+            "$wasm_input"
+
+          js_output="$output_dir/bevy_burn_image.js"
+          wasm_output="$output_dir/bevy_burn_image_bg.wasm"
+          test -s "$js_output"
+          test -s "$wasm_output"
+          grep -Eq '^export function start_boogu_web\(\)' "$js_output"
+          grep -Eq '^export function provide_reference_image\(bytes\)' "$js_output"
+          grep -Fq 'wasm.__wbindgen_start()' "$js_output"
+          wc -c "$js_output" "$wasm_output"
+
+  model-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check model crates at MSRV
+        run: >-
+          cargo check
+          -p burn_image
+          -p burn_qwen3_vl
+          -p burn_flux_vae
+          -p burn_boogu
+          --all-targets --all-features --locked
+      - name: Check model Wasm contracts at MSRV
+        run: |
+          set -euo pipefail
+          cargo check -p burn_image --target wasm32-unknown-unknown --no-default-features --locked
+          cargo check -p burn_qwen3_vl --target wasm32-unknown-unknown --all-features --locked
+          cargo check -p burn_flux_vae --target wasm32-unknown-unknown --all-features --locked
+          cargo check -p burn_boogu --target wasm32-unknown-unknown --no-default-features --features webgpu,burnpack,runtime --locked
+
+  frontend-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Check native frontend at MSRV
+        run: cargo check -p bevy_burn_image --all-targets --all-features --locked
+      - name: Check browser frontend at MSRV
+        run: |
+          set -euo pipefail
+          cargo check -p bevy_burn_image --target wasm32-unknown-unknown --no-default-features --features web --lib --locked
+          cargo check -p bevy_burn_image --target wasm32-unknown-unknown --no-default-features --features boogu-web --locked

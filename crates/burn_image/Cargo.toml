@@ -1,0 +1,25 @@
+[package]
+name = "burn_image"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Model-neutral image generation and editing contracts for Burn runtimes"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["burn", "image-generation", "image-editing", "webgpu"]
+categories = ["computer-vision", "multimedia::images"]
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[[bench]]
+name = "artifact_verification"
+harness = false

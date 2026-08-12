@@ -1,0 +1,138 @@
+[package]
+name = "bevy_burn_image"
+description = "Native and WebGPU Bevy frontend for Burn image generation and editing."
+version.workspace = true
+edition.workspace = true
+# Bevy 0.19's public dependency graph requires Rust 1.95. The four publishable model/runtime
+# crates retain the workspace MSRV of 1.92 and are checked separately in CI.
+rust-version = "1.95"
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = false
+
+[features]
+default = ["app", "gpu-interop", "native-io"]
+app = [
+  "bevy/async_executor",
+  "bevy/bevy_camera",
+  "bevy/bevy_core_pipeline",
+  "bevy/bevy_log",
+  "bevy/bevy_picking",
+  "bevy/bevy_sprite",
+  "bevy/bevy_text",
+  "bevy/bevy_ui",
+  "bevy/bevy_ui_render",
+  "bevy/bevy_ui_widgets",
+  "bevy/bevy_window",
+  "bevy/bevy_winit",
+  "bevy/default_app",
+  "bevy/default_font",
+  "bevy/png",
+  "bevy/reflect_auto_register",
+  "bevy/webgpu",
+  "bevy/x11",
+]
+gpu-interop = ["dep:bevy_burn", "dep:burn-wgpu", "dep:wgpu"]
+native-io = []
+# Exact Boogu model routing plus the device-aware runtime factory boundary.
+# Concrete native/browser implementations are selected by boogu-native/boogu-web;
+# the injection seam remains available to embedders.
+boogu = ["gpu-interop", "dep:burn_boogu", "burn_boogu/burnpack"]
+# Concrete native, stage-streamed loader/worker for sealed local bundles. The
+# asynchronous range-streamed browser runtime remains a separate injected factory.
+boogu-native = [
+  "app",
+  "boogu",
+  "native-io",
+  "burn_boogu/import",
+  "burn_boogu/runtime",
+  "burn_boogu/wgpu",
+  "dep:burn_flux_vae",
+  "dep:burn_qwen3_vl",
+  "burn_qwen3_vl/tokenizers",
+  "dep:clap",
+  "dep:serde_json",
+  "dep:ureq",
+]
+# Concrete browser-local runtime over bounded HTTP Range readers and asynchronous
+# semantic Qwen/VAE/denoiser sources. No model weights are retained between stages.
+boogu-web = [
+  "web",
+  "boogu",
+  "burn_boogu/runtime",
+  "dep:burn_flux_vae",
+  "dep:burn_qwen3_vl",
+  "burn_qwen3_vl/tokenizers",
+  "dep:rand",
+  "dep:rand_chacha",
+  "dep:rand_distr",
+  "dep:serde_json",
+]
+# Marker for browser builds. Use with `--no-default-features --features web`.
+web = ["app", "gpu-interop"]
+
+[dependencies]
+bevy = { workspace = true, features = [
+  "bevy_asset",
+  "bevy_image",
+  "bevy_render",
+  "std",
+] }
+burn.workspace = true
+bevy_burn = { workspace = true, optional = true }
+burn-wgpu = { workspace = true, optional = true, features = ["fusion"] }
+burn_boogu = { path = "../burn_boogu", default-features = false, features = ["std"], optional = true }
+burn_flux_vae = { path = "../burn_flux_vae", default-features = false, optional = true }
+burn_image = { path = "../burn_image" }
+burn_qwen3_vl = { path = "../burn_qwen3_vl", default-features = false, optional = true }
+clap = { workspace = true, optional = true }
+half.workspace = true
+image.workspace = true
+rand = { workspace = true, optional = true }
+rand_chacha = { workspace = true, optional = true }
+rand_distr = { workspace = true, optional = true }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+ureq = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+cubecl = { version = "=0.10.0", default-features = false, features = ["wgpu"] }
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys = { workspace = true, features = [
+  "Blob",
+  "BlobPropertyBag",
+  "console",
+  "Document",
+  "Element",
+  "Headers",
+  "HtmlAnchorElement",
+  "HtmlElement",
+  "HtmlInputElement",
+  "Location",
+  "Node",
+  "Request",
+  "RequestInit",
+  "Response",
+  "Url",
+  "UrlSearchParams",
+  "Window",
+] }
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "burn-image-viewer"
+path = "src/main.rs"
+required-features = ["app", "gpu-interop"]

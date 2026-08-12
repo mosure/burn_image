@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>burn image</title>
+    <style>
+      html,
+      body,
+      #burn-image {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        overflow: hidden;
+        background: #101216;
+      }
+      #status {
+        position: absolute;
+        z-index: 2;
+        color: white;
+      }
+      #burn-image-reference-input {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status" aria-live="polite">loading wasm</div>
+    <input
+      id="burn-image-reference-input"
+      type="file"
+      accept="image/png,image/jpeg,image/webp"
+      aria-label="Choose an edit reference image"
+    />
+    <canvas id="burn-image"></canvas>
+    <script type="module">
+      import init, { provide_reference_image } from "./out/bevy_burn_image.js";
+
+      const status = document.querySelector("#status");
+      try {
+        await init();
+        document
+          .querySelector("#burn-image-reference-input")
+          .addEventListener("change", async (event) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            try {
+              provide_reference_image(new Uint8Array(await file.arrayBuffer()));
+              event.target.value = "";
+            } catch (error) {
+              status.textContent = `Reference load failed: ${error}`;
+            }
+          });
+        status.textContent = new URLSearchParams(location.search).has("headless")
+          ? "No-surface WebGPU task started"
+          : "Bevy WebGPU frontend started";
+      } catch (error) {
+        status.textContent = `WebGPU frontend failed: ${error}`;
+        console.error(error);
+      }
+    </script>
+  </body>
+</html>
