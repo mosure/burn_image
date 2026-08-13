@@ -1247,6 +1247,296 @@ pub trait AsyncQwen3VlCausalLmStageSource<B: Backend>: AsyncQwen3VlStageSource<B
     ) -> core::result::Result<OutputProjectionRowChunk<B>, Self::Error>;
 }
 
+/// Synchronization behavior for retained asynchronous Qwen stages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AsyncRetainingSynchronizationPolicy {
+    /// Forward every semantic-stage barrier to the wrapped source.
+    #[default]
+    PerStage,
+    /// Record semantic-stage barriers until the caller explicitly flushes them.
+    Deferred,
+}
+
+/// Opt-in GPU-resident cache for an asynchronous verified Qwen3-VL stage source.
+///
+/// A cache miss delegates to the wrapped source and retains only a clone of the initialized Burn
+/// module or embedding-row tensor. WGPU/WebGPU clones share device-buffer handles, so this cache
+/// does not retain Burnpack payloads or decoded host tensors. Cache hits still forward every
+/// [`AsyncQwen3VlStageSource::synchronize`] request to preserve executor ordering.
+///
+/// [`Self::new`] enables retention. [`Self::passthrough`] keeps the same concrete wrapper type but
+/// deliberately reloads every stage; callers must expose that behavior as a diagnostic mode.
+pub struct RetainingAsyncQwen3VlStageSource<B: Backend, S> {
+    source: S,
+    retention_enabled: bool,
+    synchronization_policy: AsyncRetainingSynchronizationPolicy,
+    synchronization_pending: bool,
+    embedding_rows: Vec<EmbeddingRowChunk<B>>,
+    vision_prelude: Option<Qwen3VlVisionPrelude<B>>,
+    vision_blocks: Vec<(usize, Qwen3VlVisionBlock<B>)>,
+    vision_deepstack_mergers: Vec<(usize, Qwen3VlVisionPatchMerger<B>)>,
+    vision_final_merger: Option<Qwen3VlVisionPatchMerger<B>>,
+    text_blocks: Vec<(usize, Qwen3VlDecoderLayer<B>)>,
+    text_final_norm: Option<RmsNorm<B>>,
+    lm_head_rows: Vec<OutputProjectionRowChunk<B>>,
+}
+
+impl<B: Backend, S> RetainingAsyncQwen3VlStageSource<B, S> {
+    /// Create an initially empty cache that retains verified device stages after first load.
+    pub fn new(source: S) -> Self {
+        Self::with_retention(source, true)
+    }
+
+    /// Wrap a source without retaining stages.
+    pub fn passthrough(source: S) -> Self {
+        Self::with_retention(source, false)
+    }
+
+    fn with_retention(source: S, retention_enabled: bool) -> Self {
+        Self {
+            source,
+            retention_enabled,
+            synchronization_policy: AsyncRetainingSynchronizationPolicy::PerStage,
+            synchronization_pending: false,
+            embedding_rows: Vec::new(),
+            vision_prelude: None,
+            vision_blocks: Vec::new(),
+            vision_deepstack_mergers: Vec::new(),
+            vision_final_merger: None,
+            text_blocks: Vec::new(),
+            text_final_norm: None,
+            lm_head_rows: Vec::new(),
+        }
+    }
+
+    /// Whether successfully loaded stages are retained for later forwards.
+    pub const fn retention_enabled(&self) -> bool {
+        self.retention_enabled
+    }
+
+    /// Select per-stage or explicitly deferred device synchronization.
+    pub const fn with_synchronization_policy(
+        mut self,
+        synchronization_policy: AsyncRetainingSynchronizationPolicy,
+    ) -> Self {
+        self.synchronization_policy = synchronization_policy;
+        self
+    }
+
+    /// Return the selected synchronization behavior.
+    pub const fn synchronization_policy(&self) -> AsyncRetainingSynchronizationPolicy {
+        self.synchronization_policy
+    }
+
+    /// Whether deferred work requires a caller-visible terminal barrier.
+    pub const fn has_pending_synchronization(&self) -> bool {
+        self.synchronization_pending
+    }
+
+    /// Number of independently loadable stages currently retained.
+    pub fn cached_stage_count(&self) -> usize {
+        self.embedding_rows.len()
+            + usize::from(self.vision_prelude.is_some())
+            + self.vision_blocks.len()
+            + self.vision_deepstack_mergers.len()
+            + usize::from(self.vision_final_merger.is_some())
+            + self.text_blocks.len()
+            + usize::from(self.text_final_norm.is_some())
+            + self.lm_head_rows.len()
+    }
+
+    /// Drop every retained device handle while preserving the wrapped verified source.
+    ///
+    /// Callers must await the final submitted synchronization before clearing a live GPU cache.
+    pub fn clear(&mut self) {
+        self.embedding_rows.clear();
+        self.vision_prelude = None;
+        self.vision_blocks.clear();
+        self.vision_deepstack_mergers.clear();
+        self.vision_final_merger = None;
+        self.text_blocks.clear();
+        self.text_final_norm = None;
+        self.lm_head_rows.clear();
+    }
+
+    /// Borrow the wrapped verified source.
+    pub const fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// Mutably borrow the wrapped verified source.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Consume the wrapper, dropping retained handles and returning the source.
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+impl<B, S> RetainingAsyncQwen3VlStageSource<B, S>
+where
+    B: Backend,
+    S: AsyncQwen3VlStageSource<B>,
+{
+    /// Forward one pending deferred barrier to the wrapped source.
+    pub async fn synchronize_pending(&mut self) -> core::result::Result<(), S::Error> {
+        if !self.synchronization_pending {
+            return Ok(());
+        }
+        self.source.synchronize().await?;
+        self.synchronization_pending = false;
+        Ok(())
+    }
+}
+
+impl<B, S> AsyncQwen3VlStageSource<B> for RetainingAsyncQwen3VlStageSource<B, S>
+where
+    B: Backend,
+    S: AsyncQwen3VlStageSource<B>,
+{
+    type Error = S::Error;
+
+    async fn load_embedding_rows(
+        &mut self,
+        spec: &RowChunkSpec,
+    ) -> core::result::Result<EmbeddingRowChunk<B>, Self::Error> {
+        if let Some(chunk) = self.embedding_rows.iter().find(|chunk| chunk.spec == *spec) {
+            return Ok(chunk.clone());
+        }
+        let chunk = self.source.load_embedding_rows(spec).await?;
+        if self.retention_enabled {
+            self.embedding_rows.push(chunk.clone());
+        }
+        Ok(chunk)
+    }
+
+    async fn load_vision_prelude(
+        &mut self,
+    ) -> core::result::Result<Qwen3VlVisionPrelude<B>, Self::Error> {
+        if let Some(prelude) = &self.vision_prelude {
+            return Ok(prelude.clone());
+        }
+        let prelude = self.source.load_vision_prelude().await?;
+        if self.retention_enabled {
+            self.vision_prelude = Some(prelude.clone());
+        }
+        Ok(prelude)
+    }
+
+    async fn load_vision_block(
+        &mut self,
+        index: usize,
+    ) -> core::result::Result<Qwen3VlVisionBlock<B>, Self::Error> {
+        if let Some(block) = self
+            .vision_blocks
+            .iter()
+            .find(|(cached, _)| *cached == index)
+            .map(|(_, block)| block.clone())
+        {
+            return Ok(block);
+        }
+        let block = self.source.load_vision_block(index).await?;
+        if self.retention_enabled {
+            self.vision_blocks.push((index, block.clone()));
+        }
+        Ok(block)
+    }
+
+    async fn load_vision_deepstack_merger(
+        &mut self,
+        index: usize,
+    ) -> core::result::Result<Qwen3VlVisionPatchMerger<B>, Self::Error> {
+        if let Some(merger) = self
+            .vision_deepstack_mergers
+            .iter()
+            .find(|(cached, _)| *cached == index)
+            .map(|(_, merger)| merger.clone())
+        {
+            return Ok(merger);
+        }
+        let merger = self.source.load_vision_deepstack_merger(index).await?;
+        if self.retention_enabled {
+            self.vision_deepstack_mergers.push((index, merger.clone()));
+        }
+        Ok(merger)
+    }
+
+    async fn load_vision_final_merger(
+        &mut self,
+    ) -> core::result::Result<Qwen3VlVisionPatchMerger<B>, Self::Error> {
+        if let Some(merger) = &self.vision_final_merger {
+            return Ok(merger.clone());
+        }
+        let merger = self.source.load_vision_final_merger().await?;
+        if self.retention_enabled {
+            self.vision_final_merger = Some(merger.clone());
+        }
+        Ok(merger)
+    }
+
+    async fn load_text_block(
+        &mut self,
+        index: usize,
+    ) -> core::result::Result<Qwen3VlDecoderLayer<B>, Self::Error> {
+        if let Some(block) = self
+            .text_blocks
+            .iter()
+            .find(|(cached, _)| *cached == index)
+            .map(|(_, block)| block.clone())
+        {
+            return Ok(block);
+        }
+        let block = self.source.load_text_block(index).await?;
+        if self.retention_enabled {
+            self.text_blocks.push((index, block.clone()));
+        }
+        Ok(block)
+    }
+
+    async fn load_text_final_norm(&mut self) -> core::result::Result<RmsNorm<B>, Self::Error> {
+        if let Some(norm) = &self.text_final_norm {
+            return Ok(norm.clone());
+        }
+        let norm = self.source.load_text_final_norm().await?;
+        if self.retention_enabled {
+            self.text_final_norm = Some(norm.clone());
+        }
+        Ok(norm)
+    }
+
+    async fn synchronize(&mut self) -> core::result::Result<(), Self::Error> {
+        match self.synchronization_policy {
+            AsyncRetainingSynchronizationPolicy::PerStage => self.source.synchronize().await,
+            AsyncRetainingSynchronizationPolicy::Deferred => {
+                self.synchronization_pending = true;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<B, S> AsyncQwen3VlCausalLmStageSource<B> for RetainingAsyncQwen3VlStageSource<B, S>
+where
+    B: Backend,
+    S: AsyncQwen3VlCausalLmStageSource<B>,
+{
+    async fn load_lm_head_rows(
+        &mut self,
+        spec: &RowChunkSpec,
+    ) -> core::result::Result<OutputProjectionRowChunk<B>, Self::Error> {
+        if let Some(chunk) = self.lm_head_rows.iter().find(|chunk| chunk.spec == *spec) {
+            return Ok(chunk.clone());
+        }
+        let chunk = self.source.load_lm_head_rows(spec).await?;
+        if self.retention_enabled {
+            self.lm_head_rows.push(chunk.clone());
+        }
+        Ok(chunk)
+    }
+}
+
 /// Typed holder for a source and its validated plan; orchestration can borrow the source while
 /// retaining all activation states outside it.
 pub struct StreamingQwen3Vl<B: Backend, S> {
@@ -2449,6 +2739,54 @@ mod tests {
             2 * expected_loads.len(),
             "cache hits must preserve per-stage synchronization"
         );
+    }
+
+    #[test]
+    fn async_retained_source_reuses_stages_and_defers_to_one_forward_barrier_correctness() {
+        type B = NdArray<f32>;
+        let config = tiny_config();
+        let device = Default::default();
+        B::seed(&device, 57);
+        let resident = Qwen3VlModel::<B>::new(config.clone(), &device).unwrap();
+        let embedding_rows = RowChunkPlan::even(
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+            3,
+            size_of::<f32>(),
+        )
+        .unwrap();
+        let plan = Qwen3VlStreamingPlan::new(&config, embedding_rows, None).unwrap();
+        let expected_loads =
+            plan.embedding_rows.chunks.len() + config.text_config.num_hidden_layers + 1;
+        let input = Qwen3VlModelInput {
+            input_ids: Tensor::<B, 2, Int>::from_data([[1_i64, 2, 3]], &device),
+            attention_mask: None,
+            position_ids: Some(MropePositionIds::text_only(1, 3)),
+            images: None,
+            videos: None,
+            output_hidden_states: false,
+        };
+        resident.forward(input.clone()).unwrap();
+        let source = ResidentStageSource {
+            model: resident,
+            synchronizations: 0,
+            loads: Vec::new(),
+        };
+        let source = RetainingAsyncQwen3VlStageSource::new(source)
+            .with_synchronization_policy(AsyncRetainingSynchronizationPolicy::Deferred);
+        let mut streamed = StreamingQwen3Vl::<B, _>::new(plan, source);
+
+        for forward in 1..=2 {
+            block_on_immediate(streamed.forward_base_async(&config, input.clone(), &mut ()))
+                .unwrap();
+            assert!(streamed.source.has_pending_synchronization());
+            block_on_immediate(streamed.source.synchronize_pending()).unwrap();
+            assert_eq!(streamed.source.source().synchronizations, forward);
+        }
+        assert_eq!(streamed.source.source().loads.len(), expected_loads);
+        assert_eq!(streamed.source.cached_stage_count(), expected_loads);
+        streamed.source.clear();
+        assert_eq!(streamed.source.cached_stage_count(), 0);
     }
 
     #[test]

@@ -14,19 +14,24 @@ use std::{
 };
 
 use burn_boogu::artifacts::{
-    canonical_published_bundle, validate_canonical_release_artifact_digest,
+    artifact_bundle_id_is_compatible, canonical_published_bundle,
+    validate_canonical_release_artifact_digest,
 };
 use burn_boogu::{BooguVariant, artifacts::BooguStorageProfile, boogu_model_descriptor};
 use burn_image::{
-    ArtifactFile, ArtifactManifest, ArtifactPath, ArtifactSource, ArtifactVerifier,
+    ArtifactBundleFetcher, ArtifactBundleId, ArtifactDependency, ArtifactFile, ArtifactManifest,
+    ArtifactPath, ArtifactReadError, ArtifactSource, ArtifactVerifier, FilesystemArtifactCache,
     IntegrityPolicy, NumericFormat, RemoteBaseUrl,
 };
 use thiserror::Error;
 
 use crate::{
-    BOOGU_CDN_ROOT, MAX_BROWSER_MANIFEST_BYTES, boogu_bundle_id, boogu_cdn_base_url,
-    boogu_profile_slug,
+    BOOGU_CDN_ROOT, MAX_BROWSER_MANIFEST_BYTES, boogu_bundle_id, boogu_legacy_bundle_id,
+    boogu_profile_slug, sibling_bundle_base_url,
 };
+
+const QWEN_DEPENDENCY_ROLE: &str = "qwen";
+const VAE_DEPENDENCY_ROLE: &str = "vae";
 
 /// Root containing immutable model-name prefixes on the Aberration CDN.
 pub const DEFAULT_BURN_IMAGE_MODEL_ROOT_URL: &str = BOOGU_CDN_ROOT;
@@ -54,6 +59,44 @@ impl NativeArtifactCacheError {
     }
 }
 
+/// Exact local roots used to assemble one Boogu runtime.
+///
+/// Legacy monolithic schema-v1 bundles point all three roots at the same
+/// directory. Schema-v2 compositions keep independently sealed Qwen and VAE
+/// bundles in digest-isolated cache directories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedNativeBooguArtifactDirectories {
+    pipeline_root: PathBuf,
+    qwen_root: PathBuf,
+    vae_root: PathBuf,
+}
+
+impl ResolvedNativeBooguArtifactDirectories {
+    pub fn pipeline_root(&self) -> &Path {
+        &self.pipeline_root
+    }
+
+    pub fn qwen_root(&self) -> &Path {
+        &self.qwen_root
+    }
+
+    pub fn vae_root(&self) -> &Path {
+        &self.vae_root
+    }
+
+    pub fn is_legacy_monolith(&self) -> bool {
+        self.pipeline_root == self.qwen_root && self.pipeline_root == self.vae_root
+    }
+
+    fn legacy(root: PathBuf) -> Self {
+        Self {
+            pipeline_root: root.clone(),
+            qwen_root: root.clone(),
+            vae_root: root,
+        }
+    }
+}
+
 /// Default immutable CDN prefix for one exact manifest bundle identity.
 pub fn default_native_boogu_model_base_url(
     variant: BooguVariant,
@@ -77,18 +120,29 @@ fn canonical_native_boogu_model_base_url(
             "{variant:?}/{profile:?} has no canonical published Aberration CDN bundle; pass --artifacts or set BURN_IMAGE_MODEL_BASE_URL for an explicit diagnostic source"
         ))
     })?;
-    let value = boogu_cdn_base_url(variant, profile);
-    debug_assert!(value.ends_with(published.bundle_id));
-    Ok(value)
+    Ok(format!(
+        "{DEFAULT_BURN_IMAGE_MODEL_ROOT_URL}/{}",
+        published.bundle_id
+    ))
 }
 
-/// Default exact cache directory for one bundle.
+/// Default exact cache directory for one canonical bundle.
 ///
 /// `BURN_IMAGE_CACHE_DIR` replaces the broad `~/.burn_image` root;
 /// `BURN_IMAGE_MODEL_CACHE_DIR` replaces the final bundle directory.
+/// A custom remote source is isolated under the legacy tuple identity unless the exact-directory
+/// override is set, so it cannot reuse or populate the canonical production cache by accident.
 pub fn default_native_boogu_model_cache_root(
     variant: BooguVariant,
     profile: BooguStorageProfile,
+) -> Result<PathBuf, NativeArtifactCacheError> {
+    configured_native_boogu_model_cache_root(variant, profile, true)
+}
+
+fn configured_native_boogu_model_cache_root(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+    canonical_source: bool,
 ) -> Result<PathBuf, NativeArtifactCacheError> {
     if let Some(exact) = std::env::var_os("BURN_IMAGE_MODEL_CACHE_DIR") {
         return Ok(expand_home_path(PathBuf::from(exact)));
@@ -103,9 +157,28 @@ pub fn default_native_boogu_model_cache_root(
             })?
             .join(DEFAULT_BURN_IMAGE_CACHE_ROOT_DIR),
     };
-    Ok(broad_root
+    Ok(native_boogu_model_cache_root_under(
+        &broad_root,
+        variant,
+        profile,
+        canonical_source,
+    ))
+}
+
+fn native_boogu_model_cache_root_under(
+    broad_root: &Path,
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+    canonical_source: bool,
+) -> PathBuf {
+    let cache_key = if canonical_source {
+        boogu_bundle_id(variant, profile)
+    } else {
+        boogu_legacy_bundle_id(variant, profile)
+    };
+    broad_root
         .join(DEFAULT_BURN_IMAGE_MODEL_CACHE_SUBDIR)
-        .join(boogu_bundle_id(variant, profile)))
+        .join(cache_key)
 }
 
 /// Resolve a local override or materialize a remote sealed bundle in the verified native cache.
@@ -114,15 +187,16 @@ pub fn resolve_native_boogu_artifact_directory<F>(
     profile: BooguStorageProfile,
     source: &ArtifactSource,
     progress: F,
-) -> Result<PathBuf, NativeArtifactCacheError>
+) -> Result<ResolvedNativeBooguArtifactDirectories, NativeArtifactCacheError>
 where
     F: Fn(&str),
 {
     let ArtifactSource::Remote { base_url } = source else {
-        return source
+        let root = source
             .local_root()
             .map(Path::to_path_buf)
-            .ok_or_else(|| NativeArtifactCacheError::message("invalid local artifact source"));
+            .ok_or_else(|| NativeArtifactCacheError::message("invalid local artifact source"))?;
+        return resolve_local_composition(variant, profile, root, &progress);
     };
     let base_url = match std::env::var("BURN_IMAGE_MODEL_BASE_URL") {
         Ok(value) => RemoteBaseUrl::new(value).map_err(|error| {
@@ -137,8 +211,9 @@ where
             base_url: base_url.clone(),
         },
     )?;
-    let cache_root = default_native_boogu_model_cache_root(variant, profile)?;
-    cache_remote_bundle(
+    let cache_root =
+        configured_native_boogu_model_cache_root(variant, profile, require_canonical_digest)?;
+    let manifest = cache_remote_bundle(
         variant,
         profile,
         &base_url,
@@ -146,7 +221,7 @@ where
         require_canonical_digest,
         &progress,
     )?;
-    Ok(cache_root)
+    resolve_remote_composition(&base_url, &cache_root, &manifest, &progress)
 }
 
 /// Whether an effective remote source names the pinned canonical CDN prefix.
@@ -185,7 +260,7 @@ fn cache_remote_bundle<F>(
     cache_root: &Path,
     require_canonical_digest: bool,
     progress: &F,
-) -> Result<(), NativeArtifactCacheError>
+) -> Result<ArtifactManifest, NativeArtifactCacheError>
 where
     F: Fn(&str),
 {
@@ -196,7 +271,7 @@ where
         ))
     })?;
     progress(&format!(
-        "resolving native model cache under {}",
+        "resolving pipeline bundle cache under {}",
         cache_root.display()
     ));
 
@@ -204,7 +279,7 @@ where
     let (manifest, manifest_bytes, mut manifest_needs_commit) =
         match read_expected_manifest(&manifest_path, variant, profile, require_canonical_digest) {
             Ok((manifest, bytes)) => {
-                progress("using cached sealed model manifest");
+                progress(&format!("using cached sealed {} manifest", manifest.bundle));
                 (manifest, bytes, false)
             }
             Err(cached_error) => {
@@ -263,7 +338,8 @@ where
             manifest_needs_commit = true;
         }
         progress(&format!(
-            "downloading model artifact {}/{}: {} ({} bytes)",
+            "downloading {} artifact {}/{}: {} ({} bytes)",
+            manifest.bundle,
             cached_files + 1,
             total_files,
             file.path,
@@ -275,12 +351,311 @@ where
     }
     if manifest_needs_commit {
         install_bytes_atomically(&manifest_path, &manifest_bytes)?;
-        progress("installed sealed model manifest as the cache commit point");
+        progress(&format!(
+            "installed sealed {} manifest as the cache commit point",
+            manifest.bundle
+        ));
     }
     progress(&format!(
-        "native model cache complete: {cached_files}/{total_files} files"
+        "native {} cache complete: {cached_files}/{total_files} files",
+        manifest.bundle
     ));
+    Ok(manifest)
+}
+
+fn resolve_local_composition<F>(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+    pipeline_root: PathBuf,
+    progress: &F,
+) -> Result<ResolvedNativeBooguArtifactDirectories, NativeArtifactCacheError>
+where
+    F: Fn(&str),
+{
+    let manifest_path = pipeline_root.join("manifest.json");
+    let (manifest, _) = read_expected_manifest(&manifest_path, variant, profile, false)?;
+    let Some((qwen, vae)) = required_component_dependencies(&manifest)? else {
+        progress(&format!(
+            "using legacy monolithic artifact directory {}",
+            pipeline_root.display()
+        ));
+        return Ok(ResolvedNativeBooguArtifactDirectories::legacy(
+            pipeline_root,
+        ));
+    };
+    let parent = pipeline_root.parent().ok_or_else(|| {
+        NativeArtifactCacheError::message(format!(
+            "composed local artifact directory has no sibling parent: {}",
+            pipeline_root.display()
+        ))
+    })?;
+    let qwen_root = validate_local_dependency(parent, qwen, progress)?;
+    let vae_root = validate_local_dependency(parent, vae, progress)?;
+    Ok(ResolvedNativeBooguArtifactDirectories {
+        pipeline_root,
+        qwen_root,
+        vae_root,
+    })
+}
+
+fn resolve_remote_composition<F>(
+    pipeline_base_url: &RemoteBaseUrl,
+    pipeline_cache_root: &Path,
+    manifest: &ArtifactManifest,
+    progress: &F,
+) -> Result<ResolvedNativeBooguArtifactDirectories, NativeArtifactCacheError>
+where
+    F: Fn(&str),
+{
+    let Some((qwen, vae)) = required_component_dependencies(manifest)? else {
+        progress("resolved legacy monolithic remote bundle");
+        return Ok(ResolvedNativeBooguArtifactDirectories::legacy(
+            pipeline_cache_root.to_owned(),
+        ));
+    };
+    let cache_parent = pipeline_cache_root.parent().ok_or_else(|| {
+        NativeArtifactCacheError::message(format!(
+            "pipeline cache has no dependency parent: {}",
+            pipeline_cache_root.display()
+        ))
+    })?;
+    let qwen_root = cache_remote_dependency(pipeline_base_url, cache_parent, qwen, progress)?;
+    let vae_root = cache_remote_dependency(pipeline_base_url, cache_parent, vae, progress)?;
+    Ok(ResolvedNativeBooguArtifactDirectories {
+        pipeline_root: pipeline_cache_root.to_owned(),
+        qwen_root,
+        vae_root,
+    })
+}
+
+fn required_component_dependencies(
+    manifest: &ArtifactManifest,
+) -> Result<Option<(&ArtifactDependency, &ArtifactDependency)>, NativeArtifactCacheError> {
+    if manifest.dependencies.is_empty() {
+        return if manifest.schema_version == burn_image::ARTIFACT_MANIFEST_SCHEMA_V1 {
+            Ok(None)
+        } else {
+            Err(NativeArtifactCacheError::message(format!(
+                "schema-v2 composed Boogu manifest {} omits qwen and vae dependencies",
+                manifest.bundle
+            )))
+        };
+    }
+    if manifest.dependencies.len() != 2 {
+        return Err(NativeArtifactCacheError::message(format!(
+            "composed Boogu manifest {} must contain exactly qwen and vae dependencies; found {}",
+            manifest.bundle,
+            manifest.dependencies.len()
+        )));
+    }
+    if manifest
+        .metadata
+        .get("component_dependency_count")
+        .map(String::as_str)
+        != Some("2")
+    {
+        return Err(NativeArtifactCacheError::message(format!(
+            "composed Boogu manifest {} does not declare component_dependency_count=2",
+            manifest.bundle
+        )));
+    }
+    let dependency = |role: &str| {
+        manifest
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.role.as_str() == role)
+            .ok_or_else(|| {
+                NativeArtifactCacheError::message(format!(
+                    "composed Boogu manifest {} omits required {role} dependency",
+                    manifest.bundle
+                ))
+            })
+    };
+    Ok(Some((
+        dependency(QWEN_DEPENDENCY_ROLE)?,
+        dependency(VAE_DEPENDENCY_ROLE)?,
+    )))
+}
+
+fn validate_local_dependency<F>(
+    sibling_parent: &Path,
+    dependency: &ArtifactDependency,
+    progress: &F,
+) -> Result<PathBuf, NativeArtifactCacheError>
+where
+    F: Fn(&str),
+{
+    let root = sibling_parent.join(dependency.bundle.as_str());
+    let manifest_path = root.join("manifest.json");
+    let bytes = read_bounded_local_manifest(&manifest_path)?;
+    parse_dependency_manifest(&bytes, dependency)?;
+    progress(&format!(
+        "validated local {} component bundle {} under {}",
+        dependency.role,
+        dependency.bundle,
+        root.display()
+    ));
+    Ok(root)
+}
+
+fn cache_remote_dependency<F>(
+    pipeline_base_url: &RemoteBaseUrl,
+    cache_parent: &Path,
+    dependency: &ArtifactDependency,
+    progress: &F,
+) -> Result<PathBuf, NativeArtifactCacheError>
+where
+    F: Fn(&str),
+{
+    let cache = FilesystemArtifactCache::new(cache_parent, MAX_BROWSER_MANIFEST_BYTES)
+        .map_err(|error| NativeArtifactCacheError::message(error.to_string()))?;
+    let mut fetcher = UreqSiblingBundleFetcher::new(pipeline_base_url.clone());
+    progress(&format!(
+        "resolving {} component bundle {} ({})",
+        dependency.role, dependency.bundle, dependency.content_digest
+    ));
+    let directory = cache
+        .ensure_dependency(dependency, &mut fetcher)
+        .map_err(|error| NativeArtifactCacheError::message(error.to_string()))?;
+    progress(&format!(
+        "native {} component {} cache complete: {} files",
+        dependency.role,
+        dependency.bundle,
+        directory.manifest().files.len()
+    ));
+    Ok(directory.root().to_owned())
+}
+
+struct UreqSiblingBundleFetcher {
+    pipeline_base_url: RemoteBaseUrl,
+}
+
+impl UreqSiblingBundleFetcher {
+    fn new(pipeline_base_url: RemoteBaseUrl) -> Self {
+        Self { pipeline_base_url }
+    }
+
+    fn bundle_base_url(
+        &self,
+        bundle: &ArtifactBundleId,
+    ) -> Result<RemoteBaseUrl, ArtifactReadError> {
+        sibling_bundle_base_url(&self.pipeline_base_url, bundle)
+            .map_err(|error| ArtifactReadError::transport(error.to_string()))
+    }
+}
+
+impl ArtifactBundleFetcher for UreqSiblingBundleFetcher {
+    fn fetch_manifest(
+        &mut self,
+        bundle: &ArtifactBundleId,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        let base = self.bundle_base_url(bundle)?;
+        let url = base.resolve(
+            &ArtifactPath::new("manifest.json").expect("canonical manifest path is valid"),
+        );
+        fetch_bounded_with_retries(&url, maximum_bytes, "dependency manifest")
+            .map_err(|error| ArtifactReadError::transport(error.to_string()))
+    }
+
+    fn fetch_file(
+        &mut self,
+        bundle: &ArtifactBundleId,
+        file: &ArtifactFile,
+        destination: &mut dyn Write,
+    ) -> Result<(), ArtifactReadError> {
+        let base = self.bundle_base_url(bundle)?;
+        let url = base.resolve(&file.path);
+        let response =
+            http_get(&url).map_err(|error| ArtifactReadError::transport(error.to_string()))?;
+        if let Some(expected) = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            && expected != file.size
+        {
+            return Err(ArtifactReadError::transport(format!(
+                "HTTP Content-Length for `{url}` is {expected}, manifest requires {}",
+                file.size
+            )));
+        }
+        let mut input = response.into_reader();
+        io_copy_bounded(&mut input, destination, file.size, &url)
+    }
+}
+
+fn io_copy_bounded(
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    exact_bytes: u64,
+    url: &str,
+) -> Result<(), ArtifactReadError> {
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| ArtifactReadError::transport(format!("read `{url}`: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        copied = copied.saturating_add(read as u64);
+        if copied > exact_bytes {
+            return Err(ArtifactReadError::transport(format!(
+                "response `{url}` exceeded sealed size {exact_bytes}"
+            )));
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| ArtifactReadError::transport(format!("cache `{url}`: {error}")))?;
+    }
+    if copied != exact_bytes {
+        return Err(ArtifactReadError::transport(format!(
+            "response `{url}` delivered {copied} bytes; expected {exact_bytes}"
+        )));
+    }
     Ok(())
+}
+
+fn read_bounded_local_manifest(path: &Path) -> Result<Vec<u8>, NativeArtifactCacheError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        NativeArtifactCacheError::message(format!("inspect manifest {}: {error}", path.display()))
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_BROWSER_MANIFEST_BYTES {
+        return Err(NativeArtifactCacheError::message(format!(
+            "manifest {} is not a regular file within 1..={MAX_BROWSER_MANIFEST_BYTES} bytes",
+            path.display()
+        )));
+    }
+    fs::read(path).map_err(|error| {
+        NativeArtifactCacheError::message(format!("read manifest {}: {error}", path.display()))
+    })
+}
+
+fn parse_dependency_manifest(
+    bytes: &[u8],
+    dependency: &ArtifactDependency,
+) -> Result<ArtifactManifest, NativeArtifactCacheError> {
+    let manifest: ArtifactManifest = serde_json::from_slice(bytes).map_err(|error| {
+        NativeArtifactCacheError::message(format!(
+            "parse {} dependency manifest: {error}",
+            dependency.role
+        ))
+    })?;
+    dependency
+        .validate_resolved_manifest(&manifest)
+        .map_err(|error| {
+            NativeArtifactCacheError::message(format!(
+                "validate sealed {} dependency {}: {error}",
+                dependency.role, dependency.bundle
+            ))
+        })?;
+    if !manifest.dependencies.is_empty() {
+        return Err(NativeArtifactCacheError::message(format!(
+            "model component bundle {} must be a dependency leaf",
+            manifest.bundle
+        )));
+    }
+    Ok(manifest)
 }
 
 fn read_expected_manifest(
@@ -325,17 +700,23 @@ fn parse_expected_manifest(
     })?;
 
     let expected_bundle = boogu_bundle_id(variant, profile);
+    let legacy_bundle = boogu_legacy_bundle_id(variant, profile);
     let expected_profile = boogu_profile_slug(profile);
     let descriptor = boogu_model_descriptor(variant);
     let expected_numeric = numeric_format(profile);
-    if manifest.bundle.as_str() != expected_bundle
+    let bundle_matches = if require_canonical_digest {
+        manifest.bundle.as_str() == expected_bundle
+    } else {
+        artifact_bundle_id_is_compatible(variant, profile, manifest.bundle.as_str())
+    };
+    if !bundle_matches
         || manifest.profile.as_str() != expected_profile
         || manifest.model != descriptor.id
         || manifest.model_revision != descriptor.revision
         || manifest.numeric_format != expected_numeric
     {
         return Err(NativeArtifactCacheError::message(format!(
-            "model manifest identity mismatch: expected bundle={expected_bundle}, profile={expected_profile}, model={}, revision={}, numeric={expected_numeric:?}; found bundle={}, profile={}, model={}, revision={}, numeric={:?}",
+            "model manifest identity mismatch: expected bundle={expected_bundle} (explicit sources may also use legacy {legacy_bundle}), profile={expected_profile}, model={}, revision={}, numeric={expected_numeric:?}; found bundle={}, profile={}, model={}, revision={}, numeric={:?}",
             descriptor.id,
             descriptor.revision,
             manifest.bundle,
@@ -723,21 +1104,31 @@ mod tests {
     };
 
     use burn_image::{
-        ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactBundleId, ArtifactFileRole, ArtifactProfileId,
-        ModelId, Sha256Digest,
+        ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_MANIFEST_SCHEMA_V2, ArtifactBundleId,
+        ArtifactComponentId, ArtifactDependency, ArtifactFileRole, ArtifactProfileId, ModelId,
+        Sha256Digest,
     };
 
     use super::*;
 
     fn write_tiny_remote(root: &Path, variant: BooguVariant, profile: BooguStorageProfile) {
+        write_tiny_remote_with_bundle(root, variant, profile, boogu_bundle_id(variant, profile));
+    }
+
+    fn write_tiny_remote_with_bundle(
+        root: &Path,
+        variant: BooguVariant,
+        profile: BooguStorageProfile,
+        bundle: String,
+    ) {
         let payload = b"small verified payload";
         let payload_path = ArtifactPath::new("objects/tiny.bpk").unwrap();
         fs::create_dir_all(root.join("objects")).unwrap();
         fs::write(root.join(payload_path.as_str()), payload).unwrap();
         let descriptor = boogu_model_descriptor(variant);
         let mut manifest = ArtifactManifest {
-            schema_version: ARTIFACT_MANIFEST_SCHEMA_VERSION,
-            bundle: ArtifactBundleId::new(boogu_bundle_id(variant, profile)).unwrap(),
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
+            bundle: ArtifactBundleId::new(bundle).unwrap(),
             profile: ArtifactProfileId::new(boogu_profile_slug(profile)).unwrap(),
             model: ModelId::new(descriptor.id.as_str()).unwrap(),
             model_revision: descriptor.revision,
@@ -751,6 +1142,7 @@ mod tests {
                 component: None,
                 shard: None,
             }],
+            dependencies: Vec::new(),
             metadata: BTreeMap::new(),
             content_digest: None,
         };
@@ -762,6 +1154,81 @@ mod tests {
         .unwrap();
     }
 
+    fn tiny_dependency(role: &str, manifest: &ArtifactManifest) -> ArtifactDependency {
+        ArtifactDependency {
+            role: ArtifactComponentId::new(role).unwrap(),
+            bundle: manifest.bundle.clone(),
+            profile: manifest.profile.clone(),
+            model: manifest.model.clone(),
+            model_revision: manifest.model_revision.clone(),
+            content_digest: manifest.content_digest.unwrap(),
+        }
+    }
+
+    fn write_tiny_dependency(root: &Path, bundle: &str, payload: &[u8]) -> ArtifactManifest {
+        let path = ArtifactPath::new("objects/tiny.bpk").unwrap();
+        fs::create_dir_all(root.join("objects")).unwrap();
+        fs::write(root.join(path.as_str()), payload).unwrap();
+        let mut manifest = ArtifactManifest {
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
+            bundle: ArtifactBundleId::new(bundle).unwrap(),
+            profile: ArtifactProfileId::new("tiny-component").unwrap(),
+            model: ModelId::new(format!("test/{bundle}")).unwrap(),
+            model_revision: "exact-revision".into(),
+            numeric_format: NumericFormat::F16,
+            components: Vec::new(),
+            files: vec![ArtifactFile {
+                path,
+                size: payload.len() as u64,
+                sha256: Sha256Digest::calculate(payload),
+                role: ArtifactFileRole::Metadata,
+                component: None,
+                shard: None,
+            }],
+            dependencies: Vec::new(),
+            metadata: BTreeMap::new(),
+            content_digest: None,
+        };
+        manifest.seal().unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest
+    }
+
+    #[test]
+    fn explicit_source_accepts_legacy_descriptive_bundle_identity_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+        write_tiny_remote_with_bundle(
+            temp.path(),
+            variant,
+            profile,
+            boogu_legacy_bundle_id(variant, profile),
+        );
+        let bytes = fs::read(temp.path().join("manifest.json")).unwrap();
+
+        let manifest = parse_expected_manifest(&bytes, variant, profile, false).unwrap();
+        assert_eq!(
+            manifest.bundle.as_str(),
+            "boogu-image-0.1-turbo-f16-qwen-vision-f32"
+        );
+        let error = parse_expected_manifest(&bytes, variant, profile, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("model manifest identity mismatch"),
+            "{error}"
+        );
+        assert!(
+            error.contains("expected bundle=boogu-image-0.1-turbo (explicit sources"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn canonical_cdn_and_cache_names_are_bundle_specific_correctness() {
         assert_eq!(
@@ -769,7 +1236,7 @@ mod tests {
                 BooguVariant::Image01Turbo,
                 BooguStorageProfile::F16QwenVisionF32
             ),
-            "boogu-image-0.1-turbo-f16-qwen-vision-f32"
+            "boogu-image-0.1-turbo"
         );
         let base = RemoteBaseUrl::new(format!(
             "{}/{}",
@@ -782,7 +1249,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             base.as_str(),
-            "https://aberration.technology/model/boogu-image-0.1-edit-turbo-1k5-f16-qwen-vision-f32"
+            "https://aberration.technology/model/boogu-image-0.1-edit-turbo-1k5"
         );
         assert!(
             canonical_native_boogu_model_base_url(
@@ -792,6 +1259,30 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no canonical published Aberration CDN bundle")
+        );
+    }
+
+    #[test]
+    fn canonical_and_custom_remote_default_cache_directories_do_not_alias_correctness() {
+        let broad_root = Path::new("/test-user-cache");
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+
+        let canonical = native_boogu_model_cache_root_under(broad_root, variant, profile, true);
+        let custom = native_boogu_model_cache_root_under(broad_root, variant, profile, false);
+
+        assert_ne!(canonical, custom);
+        assert_eq!(
+            canonical,
+            broad_root
+                .join(DEFAULT_BURN_IMAGE_MODEL_CACHE_SUBDIR)
+                .join("boogu-image-0.1-turbo")
+        );
+        assert_eq!(
+            custom,
+            broad_root
+                .join(DEFAULT_BURN_IMAGE_MODEL_CACHE_SUBDIR)
+                .join("boogu-image-0.1-turbo-f16-qwen-vision-f32")
         );
     }
 
@@ -865,7 +1356,7 @@ mod tests {
         fs::write(cache.join("objects/tiny.bpk"), b"corrupt").unwrap();
         let observed_repair_without_commit = Cell::new(false);
         cache_remote_bundle(variant, profile, &base, &cache, false, &|message| {
-            if message.starts_with("downloading model artifact") {
+            if message.starts_with("downloading boogu-image") {
                 assert!(!cache.join("manifest.json").exists());
                 observed_repair_without_commit.set(true);
             }
@@ -877,6 +1368,191 @@ mod tests {
         assert_eq!(
             fs::read(cache.join("objects/tiny.bpk")).unwrap(),
             b"small verified payload"
+        );
+    }
+
+    #[test]
+    fn local_schema_v2_composition_resolves_exact_siblings_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("models");
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+        let pipeline_root = parent.join(boogu_bundle_id(variant, profile));
+        fs::create_dir_all(&pipeline_root).unwrap();
+        write_tiny_remote(&pipeline_root, variant, profile);
+        let qwen =
+            write_tiny_dependency(&parent.join("shared-qwen"), "shared-qwen", b"qwen payload");
+        let vae = write_tiny_dependency(&parent.join("shared-vae"), "shared-vae", b"vae payload");
+        let mut pipeline: ArtifactManifest =
+            serde_json::from_slice(&fs::read(pipeline_root.join("manifest.json")).unwrap())
+                .unwrap();
+        pipeline.schema_version = ARTIFACT_MANIFEST_SCHEMA_V2;
+        pipeline.dependencies = vec![tiny_dependency("qwen", &qwen), tiny_dependency("vae", &vae)];
+        pipeline
+            .metadata
+            .insert("component_dependency_count".into(), "2".into());
+        pipeline.content_digest = None;
+        pipeline.seal().unwrap();
+        fs::write(
+            pipeline_root.join("manifest.json"),
+            serde_json::to_vec_pretty(&pipeline).unwrap(),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_local_composition(variant, profile, pipeline_root.clone(), &|_| {}).unwrap();
+        assert_eq!(resolved.pipeline_root(), pipeline_root);
+        assert_eq!(resolved.qwen_root(), parent.join("shared-qwen"));
+        assert_eq!(resolved.vae_root(), parent.join("shared-vae"));
+        assert!(!resolved.is_legacy_monolith());
+    }
+
+    #[test]
+    fn local_composition_fails_closed_for_missing_or_tampered_dependency_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("models");
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+        let pipeline_root = parent.join(boogu_bundle_id(variant, profile));
+        fs::create_dir_all(&pipeline_root).unwrap();
+        write_tiny_remote(&pipeline_root, variant, profile);
+        let qwen =
+            write_tiny_dependency(&parent.join("shared-qwen"), "shared-qwen", b"qwen payload");
+        let vae = write_tiny_dependency(&parent.join("shared-vae"), "shared-vae", b"vae payload");
+        let mut pipeline: ArtifactManifest =
+            serde_json::from_slice(&fs::read(pipeline_root.join("manifest.json")).unwrap())
+                .unwrap();
+        pipeline.schema_version = ARTIFACT_MANIFEST_SCHEMA_V2;
+        pipeline.dependencies = vec![tiny_dependency("qwen", &qwen), tiny_dependency("vae", &vae)];
+        pipeline
+            .metadata
+            .insert("component_dependency_count".into(), "2".into());
+        pipeline.content_digest = None;
+        pipeline.seal().unwrap();
+        fs::write(
+            pipeline_root.join("manifest.json"),
+            serde_json::to_vec_pretty(&pipeline).unwrap(),
+        )
+        .unwrap();
+
+        fs::remove_file(parent.join("shared-vae/manifest.json")).unwrap();
+        let missing = resolve_local_composition(variant, profile, pipeline_root.clone(), &|_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("shared-vae/manifest.json"), "{missing}");
+
+        fs::write(
+            parent.join("shared-vae/manifest.json"),
+            serde_json::to_vec_pretty(&vae).unwrap(),
+        )
+        .unwrap();
+        let mut tampered = vae;
+        tampered.model_revision = "wrong-revision".into();
+        tampered.content_digest = None;
+        tampered.seal().unwrap();
+        fs::write(
+            parent.join("shared-vae/manifest.json"),
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        let error = resolve_local_composition(variant, profile, pipeline_root, &|_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dependency"), "{error}");
+    }
+
+    #[test]
+    fn local_schema_v1_monolith_preserves_legacy_roots_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+        write_tiny_remote(temp.path(), variant, profile);
+        let resolved =
+            resolve_local_composition(variant, profile, temp.path().to_owned(), &|_| {}).unwrap();
+        assert!(resolved.is_legacy_monolith());
+        assert_eq!(resolved.pipeline_root(), temp.path());
+        assert_eq!(resolved.qwen_root(), temp.path());
+        assert_eq!(resolved.vae_root(), temp.path());
+    }
+
+    #[test]
+    fn local_schema_v2_without_dependencies_fails_closed_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+        write_tiny_remote(temp.path(), variant, profile);
+        let path = temp.path().join("manifest.json");
+        let mut manifest: ArtifactManifest =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest.schema_version = ARTIFACT_MANIFEST_SCHEMA_V2;
+        manifest.content_digest = None;
+        manifest.seal().unwrap();
+        fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+
+        let error = resolve_local_composition(variant, profile, temp.path().to_owned(), &|_| {})
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("omits qwen and vae dependencies"), "{error}");
+    }
+
+    #[test]
+    fn remote_component_cache_is_bundle_and_digest_isolated_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote");
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+        let pipeline_bundle = boogu_bundle_id(variant, profile);
+        let pipeline_remote = remote.join(&pipeline_bundle);
+        fs::create_dir_all(&pipeline_remote).unwrap();
+        write_tiny_remote(&pipeline_remote, variant, profile);
+        let qwen =
+            write_tiny_dependency(&remote.join("shared-qwen"), "shared-qwen", b"qwen payload");
+        let vae = write_tiny_dependency(&remote.join("shared-vae"), "shared-vae", b"vae payload");
+        let mut pipeline: ArtifactManifest =
+            serde_json::from_slice(&fs::read(pipeline_remote.join("manifest.json")).unwrap())
+                .unwrap();
+        pipeline.schema_version = ARTIFACT_MANIFEST_SCHEMA_V2;
+        pipeline.dependencies = vec![tiny_dependency("qwen", &qwen), tiny_dependency("vae", &vae)];
+        pipeline
+            .metadata
+            .insert("component_dependency_count".into(), "2".into());
+        pipeline.content_digest = None;
+        pipeline.seal().unwrap();
+        fs::write(
+            pipeline_remote.join("manifest.json"),
+            serde_json::to_vec_pretty(&pipeline).unwrap(),
+        )
+        .unwrap();
+
+        let server = TestServer::serve(remote);
+        let base = RemoteBaseUrl::new(format!("{}/{}", server.base_url, pipeline_bundle)).unwrap();
+        let cache_parent = temp.path().join("cache/models");
+        let pipeline_cache = cache_parent.join(&pipeline_bundle);
+        let fetched =
+            cache_remote_bundle(variant, profile, &base, &pipeline_cache, false, &|_| {}).unwrap();
+        let resolved =
+            resolve_remote_composition(&base, &pipeline_cache, &fetched, &|_| {}).unwrap();
+        assert_eq!(resolved.pipeline_root(), pipeline_cache);
+        assert_eq!(
+            resolved.qwen_root(),
+            cache_parent
+                .join("shared-qwen")
+                .join(qwen.content_digest.unwrap().to_string())
+        );
+        assert_eq!(
+            resolved.vae_root(),
+            cache_parent
+                .join("shared-vae")
+                .join(vae.content_digest.unwrap().to_string())
+        );
+        assert_ne!(resolved.qwen_root(), resolved.vae_root());
+        assert_eq!(
+            fs::read(resolved.qwen_root().join("objects/tiny.bpk")).unwrap(),
+            b"qwen payload"
+        );
+        assert_eq!(
+            fs::read(resolved.vae_root().join("objects/tiny.bpk")).unwrap(),
+            b"vae payload"
         );
     }
 

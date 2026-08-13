@@ -186,8 +186,9 @@ impl From<RemoteBaseUrl> for String {
     }
 }
 
-/// Transport-neutral artifact origin. Fetching and caching are implemented by
-/// native or browser adapters outside this crate.
+/// Transport-neutral artifact origin. Protocol-specific fetching stays in
+/// native or browser adapters; the optional filesystem cache composes with
+/// those adapters through [`crate::ArtifactBundleFetcher`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ArtifactSource {

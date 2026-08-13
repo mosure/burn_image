@@ -8,7 +8,12 @@ use crate::{
     NumericFormat, Sha256Digest, ValidationError,
 };
 
-pub const ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// Original, dependency-free artifact manifest schema.
+pub const ARTIFACT_MANIFEST_SCHEMA_V1: u32 = 1;
+/// Artifact manifest schema with immutable sibling-bundle dependencies.
+pub const ARTIFACT_MANIFEST_SCHEMA_V2: u32 = 2;
+/// Schema version used when constructing new artifact manifests.
+pub const ARTIFACT_MANIFEST_SCHEMA_VERSION: u32 = ARTIFACT_MANIFEST_SCHEMA_V2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +41,108 @@ impl ArtifactFileRole {
 pub struct ArtifactComponent {
     pub id: ArtifactComponentId,
     pub required: bool,
+}
+
+/// Immutable identity of a component bundle required by a composed manifest.
+///
+/// Dependency bundles are resolved as sibling bundle prefixes by transport and
+/// cache adapters. Keeping locations out of the sealed contract makes the same
+/// manifest mirrorable across CDN roots and local cache parents.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactDependency {
+    /// Role this bundle fills in the composition, for example `qwen` or `vae`.
+    pub role: ArtifactComponentId,
+    pub bundle: ArtifactBundleId,
+    pub profile: ArtifactProfileId,
+    pub model: ModelId,
+    pub model_revision: String,
+    pub content_digest: Sha256Digest,
+}
+
+impl ArtifactDependency {
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        if self.model_revision.trim().is_empty() {
+            return Err(ValidationError::Empty {
+                field: "artifact.dependency.model_revision",
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Validate a resolved sibling manifest against every sealed identity
+    /// field pinned by this dependency.
+    pub fn validate_resolved_manifest(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<(), ManifestError> {
+        self.validate()?;
+        manifest.validate_sealed()?;
+        validate_dependency_field(
+            &self.role,
+            "bundle",
+            self.bundle.as_str(),
+            manifest.bundle.as_str(),
+        )?;
+        validate_dependency_field(
+            &self.role,
+            "profile",
+            self.profile.as_str(),
+            manifest.profile.as_str(),
+        )?;
+        validate_dependency_field(
+            &self.role,
+            "model",
+            self.model.as_str(),
+            manifest.model.as_str(),
+        )?;
+        validate_dependency_field(
+            &self.role,
+            "model_revision",
+            &self.model_revision,
+            &manifest.model_revision,
+        )?;
+        let actual = manifest
+            .content_digest
+            .expect("validate_sealed requires a content digest");
+        if actual != self.content_digest {
+            return Err(ManifestError::DependencyContentDigestMismatch {
+                role: self.role.to_string(),
+                expected: self.content_digest,
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A dependency/manifest pair whose complete sealed identity has been checked.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolvedArtifactDependency<'a> {
+    dependency: &'a ArtifactDependency,
+    manifest: &'a ArtifactManifest,
+}
+
+impl<'a> ResolvedArtifactDependency<'a> {
+    pub fn new(
+        dependency: &'a ArtifactDependency,
+        manifest: &'a ArtifactManifest,
+    ) -> Result<Self, ManifestError> {
+        dependency.validate_resolved_manifest(manifest)?;
+        Ok(Self {
+            dependency,
+            manifest,
+        })
+    }
+
+    pub fn dependency(self) -> &'a ArtifactDependency {
+        self.dependency
+    }
+
+    pub fn manifest(self) -> &'a ArtifactManifest {
+        self.manifest
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +174,9 @@ pub struct ArtifactManifest {
     pub numeric_format: NumericFormat,
     pub components: Vec<ArtifactComponent>,
     pub files: Vec<ArtifactFile>,
+    /// Immutable sibling bundles used by a composed schema-v2 manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<ArtifactDependency>,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     pub content_digest: Option<Sha256Digest>,
@@ -74,11 +184,17 @@ pub struct ArtifactManifest {
 
 impl ArtifactManifest {
     pub fn validate(&self) -> Result<(), ManifestError> {
-        if self.schema_version != ARTIFACT_MANIFEST_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            ARTIFACT_MANIFEST_SCHEMA_V1 | ARTIFACT_MANIFEST_SCHEMA_V2
+        ) {
             return Err(ManifestError::UnsupportedSchema {
                 expected: ARTIFACT_MANIFEST_SCHEMA_VERSION,
                 actual: self.schema_version,
             });
+        }
+        if self.schema_version == ARTIFACT_MANIFEST_SCHEMA_V1 && !self.dependencies.is_empty() {
+            return Err(ManifestError::DependenciesRequireSchemaV2);
         }
         if self.model_revision.trim().is_empty() {
             return Err(ValidationError::Empty {
@@ -89,6 +205,27 @@ impl ArtifactManifest {
         self.numeric_format.validate()?;
         if self.files.is_empty() {
             return Err(ManifestError::EmptyFiles);
+        }
+
+        let mut dependency_roles = BTreeSet::new();
+        let mut dependency_bundles = BTreeSet::new();
+        for dependency in &self.dependencies {
+            dependency.validate()?;
+            if dependency.bundle == self.bundle {
+                return Err(ManifestError::SelfDependency {
+                    bundle: self.bundle.to_string(),
+                });
+            }
+            if !dependency_roles.insert(dependency.role.clone()) {
+                return Err(ManifestError::DuplicateDependencyRole {
+                    role: dependency.role.to_string(),
+                });
+            }
+            if !dependency_bundles.insert(dependency.bundle.clone()) {
+                return Err(ManifestError::DuplicateDependencyBundle {
+                    bundle: dependency.bundle.to_string(),
+                });
+            }
         }
 
         let mut component_ids = BTreeSet::new();
@@ -194,11 +331,32 @@ impl ArtifactManifest {
         self.validate_hash_chains(true)
     }
 
+    /// Validate this sealed manifest and its complete transitive dependency
+    /// closure. The resolver supplies sibling manifests by immutable bundle id.
+    /// Missing nodes, identity drift, and dependency cycles are rejected.
+    pub fn validate_dependency_closure<'a, F>(&'a self, mut resolve: F) -> Result<(), ManifestError>
+    where
+        F: FnMut(&ArtifactBundleId) -> Option<&'a ArtifactManifest>,
+    {
+        let mut visiting = Vec::new();
+        let mut validated = BTreeMap::new();
+        validate_dependency_node(self, &mut resolve, &mut visiting, &mut validated)
+    }
+
     /// Deterministic digest over artifact identity, components, file metadata,
     /// and user metadata. File declaration order does not affect the result.
     pub fn calculate_content_digest(&self) -> Sha256Digest {
         let mut hasher = Sha256::new();
-        hasher.update(b"burn_image.artifact_manifest.v1\0");
+        match self.schema_version {
+            ARTIFACT_MANIFEST_SCHEMA_V1 => {
+                hasher.update(b"burn_image.artifact_manifest.v1\0");
+            }
+            _ => {
+                // Unknown schemas cannot be sealed, but still receive a
+                // domain-separated digest for diagnostic callers.
+                hasher.update(b"burn_image.artifact_manifest.v2\0");
+            }
+        }
         update_u32(&mut hasher, self.schema_version);
         update_str(&mut hasher, self.bundle.as_str());
         update_str(&mut hasher, self.profile.as_str());
@@ -215,6 +373,28 @@ impl ArtifactManifest {
         for component in components {
             update_str(&mut hasher, component.id.as_str());
             hasher.update([u8::from(component.required)]);
+        }
+
+        if self.schema_version >= ARTIFACT_MANIFEST_SCHEMA_V2 {
+            let mut dependencies = self.dependencies.iter().collect::<Vec<_>>();
+            dependencies.sort_by(|left, right| {
+                left.role
+                    .cmp(&right.role)
+                    .then_with(|| left.bundle.cmp(&right.bundle))
+                    .then_with(|| left.profile.cmp(&right.profile))
+                    .then_with(|| left.model.cmp(&right.model))
+                    .then_with(|| left.model_revision.cmp(&right.model_revision))
+                    .then_with(|| left.content_digest.cmp(&right.content_digest))
+            });
+            update_u64(&mut hasher, dependencies.len() as u64);
+            for dependency in dependencies {
+                update_str(&mut hasher, dependency.role.as_str());
+                update_str(&mut hasher, dependency.bundle.as_str());
+                update_str(&mut hasher, dependency.profile.as_str());
+                update_str(&mut hasher, dependency.model.as_str());
+                update_str(&mut hasher, &dependency.model_revision);
+                hasher.update(dependency.content_digest.as_bytes());
+            }
         }
 
         let mut files = self.files.iter().collect::<Vec<_>>();
@@ -343,6 +523,86 @@ impl ArtifactManifest {
     }
 }
 
+fn validate_dependency_field(
+    role: &ArtifactComponentId,
+    field: &'static str,
+    expected: &str,
+    actual: &str,
+) -> Result<(), ManifestError> {
+    if expected != actual {
+        return Err(ManifestError::DependencyIdentityMismatch {
+            role: role.to_string(),
+            field,
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_dependency_node<'a, F>(
+    manifest: &'a ArtifactManifest,
+    resolve: &mut F,
+    visiting: &mut Vec<ArtifactBundleId>,
+    validated: &mut BTreeMap<ArtifactBundleId, Sha256Digest>,
+) -> Result<(), ManifestError>
+where
+    F: FnMut(&ArtifactBundleId) -> Option<&'a ArtifactManifest>,
+{
+    manifest.validate_sealed()?;
+    let manifest_digest = manifest
+        .content_digest
+        .expect("validate_sealed requires a content digest");
+    if let Some(expected) = validated.get(&manifest.bundle) {
+        if *expected != manifest_digest {
+            return Err(ManifestError::DependencyBundleConflict {
+                bundle: manifest.bundle.to_string(),
+                expected: *expected,
+                actual: manifest_digest,
+            });
+        }
+        return Ok(());
+    }
+
+    visiting.push(manifest.bundle.clone());
+    for dependency in &manifest.dependencies {
+        let resolved = resolve(&dependency.bundle).ok_or_else(|| {
+            ManifestError::MissingResolvedDependency {
+                role: dependency.role.to_string(),
+                bundle: dependency.bundle.to_string(),
+            }
+        })?;
+        // Establish the graph edge before validating its cryptographic pin so
+        // a topological cycle is reported as a cycle even though circular
+        // content-digest fixed points cannot practically be constructed.
+        validate_dependency_field(
+            &dependency.role,
+            "bundle",
+            dependency.bundle.as_str(),
+            resolved.bundle.as_str(),
+        )?;
+
+        if let Some(cycle_start) = visiting
+            .iter()
+            .position(|bundle| bundle == &resolved.bundle)
+        {
+            let mut cycle = visiting[cycle_start..]
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            cycle.push(resolved.bundle.to_string());
+            return Err(ManifestError::DependencyCycle { cycle });
+        }
+        dependency.validate_resolved_manifest(resolved)?;
+        validate_dependency_node(resolved, resolve, visiting, validated)?;
+    }
+    let completed = visiting
+        .pop()
+        .expect("dependency traversal always has a current node");
+    validated.insert(completed, manifest_digest);
+    Ok(())
+}
+
 #[derive(Default)]
 struct ComponentLayout {
     unsharded: usize,
@@ -432,12 +692,13 @@ fn serde_numeric_format_name(format: &NumericFormat) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{cell::Cell, collections::BTreeMap};
 
     use crate::{
-        ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactBundleId, ArtifactComponent, ArtifactComponentId,
-        ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath, ArtifactProfileId,
-        ArtifactShard, ModelId, NumericFormat, Sha256Digest,
+        ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactBundleId,
+        ArtifactComponent, ArtifactComponentId, ArtifactDependency, ArtifactFile, ArtifactFileRole,
+        ArtifactManifest, ArtifactPath, ArtifactProfileId, ArtifactShard, ManifestError, ModelId,
+        NumericFormat, ResolvedArtifactDependency, Sha256Digest,
     };
 
     fn manifest() -> ArtifactManifest {
@@ -468,8 +729,28 @@ mod tests {
                 required: true,
             }],
             files,
+            dependencies: Vec::new(),
             metadata: BTreeMap::new(),
             content_digest: None,
+        }
+    }
+
+    fn sealed_manifest(bundle: &str) -> ArtifactManifest {
+        let mut manifest = manifest();
+        manifest.bundle = ArtifactBundleId::new(bundle).unwrap();
+        manifest.model = ModelId::new(format!("owner/{bundle}")).unwrap();
+        manifest.seal().unwrap();
+        manifest
+    }
+
+    fn dependency(role: &str, manifest: &ArtifactManifest) -> ArtifactDependency {
+        ArtifactDependency {
+            role: ArtifactComponentId::new(role).unwrap(),
+            bundle: manifest.bundle.clone(),
+            profile: manifest.profile.clone(),
+            model: manifest.model.clone(),
+            model_revision: manifest.model_revision.clone(),
+            content_digest: manifest.content_digest.unwrap(),
         }
     }
 
@@ -507,5 +788,219 @@ mod tests {
         let mut manifest = manifest();
         manifest.files.pop();
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn manifest_v1_digest_and_legacy_json_remain_stable_correctness() {
+        let mut manifest = manifest();
+        manifest.schema_version = ARTIFACT_MANIFEST_SCHEMA_V1;
+        let digest = manifest.seal().unwrap();
+        assert_eq!(
+            digest.to_string(),
+            "aaaaecdde41723f2203b30a40fb2ba6ee46b8c390b834e1d32c5746a8259abff"
+        );
+
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert!(json.get("dependencies").is_none());
+        let decoded: ArtifactManifest = serde_json::from_value(json).unwrap();
+        assert!(decoded.dependencies.is_empty());
+        decoded.validate_sealed().unwrap();
+        assert_eq!(decoded.calculate_content_digest(), digest);
+    }
+
+    #[test]
+    fn manifest_v2_dependency_digest_is_order_independent_and_bound_correctness() {
+        let qwen = sealed_manifest("qwen-bundle");
+        let vae = sealed_manifest("vae-bundle");
+        let mut root = manifest();
+        root.dependencies = vec![dependency("qwen", &qwen), dependency("vae", &vae)];
+        let digest = root.seal().unwrap();
+
+        root.dependencies.reverse();
+        assert_eq!(root.calculate_content_digest(), digest);
+        root.dependencies[0].model_revision.push_str("-tampered");
+        assert_ne!(root.calculate_content_digest(), digest);
+        assert!(matches!(
+            root.validate(),
+            Err(ManifestError::ContentDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_dependencies_fail_closed_on_invalid_declarations_correctness() {
+        let qwen = sealed_manifest("qwen-bundle");
+        let vae = sealed_manifest("vae-bundle");
+
+        let mut root = manifest();
+        root.schema_version = ARTIFACT_MANIFEST_SCHEMA_V1;
+        root.dependencies = vec![dependency("qwen", &qwen)];
+        assert_eq!(
+            root.validate(),
+            Err(ManifestError::DependenciesRequireSchemaV2)
+        );
+
+        root.schema_version = ARTIFACT_MANIFEST_SCHEMA_VERSION;
+        root.dependencies = vec![dependency("qwen", &qwen), dependency("qwen", &vae)];
+        assert!(matches!(
+            root.validate(),
+            Err(ManifestError::DuplicateDependencyRole { .. })
+        ));
+
+        let mut second_qwen = dependency("vision", &qwen);
+        second_qwen.role = ArtifactComponentId::new("vision").unwrap();
+        root.dependencies = vec![dependency("qwen", &qwen), second_qwen];
+        assert!(matches!(
+            root.validate(),
+            Err(ManifestError::DuplicateDependencyBundle { .. })
+        ));
+
+        let mut self_dependency = dependency("pipeline", &qwen);
+        self_dependency.bundle = root.bundle.clone();
+        root.dependencies = vec![self_dependency];
+        assert!(matches!(
+            root.validate(),
+            Err(ManifestError::SelfDependency { .. })
+        ));
+
+        let mut empty_revision = dependency("qwen", &qwen);
+        empty_revision.model_revision = "  ".to_string();
+        root.dependencies = vec![empty_revision];
+        assert!(root.validate().is_err());
+    }
+
+    #[test]
+    fn dependency_serde_rejects_missing_invalid_and_unknown_fields_correctness() {
+        let qwen = sealed_manifest("qwen-bundle");
+        let dependency = dependency("qwen", &qwen);
+
+        let mut missing = serde_json::to_value(&dependency).unwrap();
+        missing.as_object_mut().unwrap().remove("profile");
+        assert!(serde_json::from_value::<ArtifactDependency>(missing).is_err());
+
+        let mut invalid = serde_json::to_value(&dependency).unwrap();
+        invalid["role"] = serde_json::Value::String("bad role".to_string());
+        assert!(serde_json::from_value::<ArtifactDependency>(invalid).is_err());
+
+        let mut unknown = serde_json::to_value(&dependency).unwrap();
+        unknown["base_url"] = serde_json::Value::String("https://mutable.example".to_string());
+        assert!(serde_json::from_value::<ArtifactDependency>(unknown).is_err());
+    }
+
+    #[test]
+    fn resolved_dependency_requires_exact_sealed_identity_correctness() {
+        let qwen = sealed_manifest("qwen-bundle");
+        let dependency = dependency("qwen", &qwen);
+        let resolved = ResolvedArtifactDependency::new(&dependency, &qwen).unwrap();
+        assert_eq!(resolved.dependency(), &dependency);
+        assert_eq!(resolved.manifest(), &qwen);
+
+        let mut wrong_profile = qwen.clone();
+        wrong_profile.profile = ArtifactProfileId::new("bf16").unwrap();
+        wrong_profile.content_digest = None;
+        wrong_profile.seal().unwrap();
+        assert!(matches!(
+            dependency.validate_resolved_manifest(&wrong_profile),
+            Err(ManifestError::DependencyIdentityMismatch {
+                field: "profile",
+                ..
+            })
+        ));
+
+        let mut wrong_content = qwen.clone();
+        wrong_content.files[0].sha256 = Sha256Digest::calculate(b"different payload");
+        wrong_content.content_digest = None;
+        wrong_content.seal().unwrap();
+        assert!(matches!(
+            dependency.validate_resolved_manifest(&wrong_content),
+            Err(ManifestError::DependencyContentDigestMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn dependency_closure_validates_transitive_nodes_and_missing_nodes_correctness() {
+        let qwen = sealed_manifest("qwen-bundle");
+        let vae = sealed_manifest("vae-bundle");
+        let mut codec = sealed_manifest("codec-bundle");
+        codec.dependencies = vec![dependency("vae", &vae)];
+        codec.content_digest = None;
+        codec.seal().unwrap();
+        let mut root = sealed_manifest("pipeline-bundle");
+        root.dependencies = vec![dependency("qwen", &qwen), dependency("codec", &codec)];
+        root.content_digest = None;
+        root.seal().unwrap();
+
+        let closure = BTreeMap::from([
+            (qwen.bundle.clone(), &qwen),
+            (codec.bundle.clone(), &codec),
+            (vae.bundle.clone(), &vae),
+        ]);
+        root.validate_dependency_closure(|bundle| closure.get(bundle).copied())
+            .unwrap();
+
+        let incomplete = BTreeMap::from([(qwen.bundle.clone(), &qwen)]);
+        assert!(matches!(
+            root.validate_dependency_closure(|bundle| incomplete.get(bundle).copied()),
+            Err(ManifestError::MissingResolvedDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn dependency_closure_rejects_cycles_before_stale_cycle_pins_correctness() {
+        let mut first = sealed_manifest("first-bundle");
+        let mut second = sealed_manifest("second-bundle");
+
+        second.dependencies = vec![dependency("first", &first)];
+        second.content_digest = None;
+        second.seal().unwrap();
+        first.dependencies = vec![dependency("second", &second)];
+        first.content_digest = None;
+        first.seal().unwrap();
+
+        let closure = BTreeMap::from([
+            (first.bundle.clone(), &first),
+            (second.bundle.clone(), &second),
+        ]);
+        assert!(matches!(
+            first.validate_dependency_closure(|bundle| closure.get(bundle).copied()),
+            Err(ManifestError::DependencyCycle { .. })
+        ));
+    }
+
+    #[test]
+    fn dependency_closure_rejects_equivocating_bundle_resolver_correctness() {
+        let shared_a = sealed_manifest("shared-bundle");
+        let mut shared_b = shared_a.clone();
+        shared_b.files[0].sha256 = Sha256Digest::calculate(b"different shared payload");
+        shared_b.content_digest = None;
+        shared_b.seal().unwrap();
+
+        let mut left = sealed_manifest("left-bundle");
+        left.dependencies = vec![dependency("shared", &shared_a)];
+        left.content_digest = None;
+        left.seal().unwrap();
+        let mut right = sealed_manifest("right-bundle");
+        right.dependencies = vec![dependency("shared", &shared_b)];
+        right.content_digest = None;
+        right.seal().unwrap();
+        let mut root = sealed_manifest("root-bundle");
+        root.dependencies = vec![dependency("left", &left), dependency("right", &right)];
+        root.content_digest = None;
+        root.seal().unwrap();
+
+        let shared_resolutions = Cell::new(0);
+        let result = root.validate_dependency_closure(|bundle| match bundle.as_str() {
+            "left-bundle" => Some(&left),
+            "right-bundle" => Some(&right),
+            "shared-bundle" => {
+                let index = shared_resolutions.get();
+                shared_resolutions.set(index + 1);
+                Some(if index == 0 { &shared_a } else { &shared_b })
+            }
+            _ => None,
+        });
+        assert!(matches!(
+            result,
+            Err(ManifestError::DependencyBundleConflict { .. })
+        ));
     }
 }

@@ -476,6 +476,7 @@ mod tests {
                     }),
                 },
             ],
+            dependencies: Vec::new(),
             metadata: BTreeMap::new(),
             content_digest: None,
         };

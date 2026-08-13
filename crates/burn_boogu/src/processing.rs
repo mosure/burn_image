@@ -465,15 +465,35 @@ pub fn prepare_instruction<B: Backend, T: Qwen3VlTokenizer>(
 /// Decoder values are mapped directly from `[-1, 1]` to rounded bytes and labeled sRGB to match
 /// upstream `output.rgb_u8`; no linear-to-sRGB transfer function is applied.
 pub fn decoder_output_to_host<B: Backend>(output: Tensor<B, 4>) -> Result<HostImage, BooguError> {
-    let [batch, channels, height, width] = output.dims();
-    if batch != 1 || channels != 3 {
+    decoder_output_data_to_host(output.into_data())
+}
+
+/// Convert already-materialized decoder output into validated interleaved RGB8 host pixels.
+///
+/// This is the asynchronous-runtime counterpart to [`decoder_output_to_host`]: browser callers
+/// can await one device readback, use the same [`TensorData`] for numerical comparison, and then
+/// pass it here without reading the full decoded tensor from the device a second time.
+pub fn decoder_output_data_to_host(data: TensorData) -> Result<HostImage, BooguError> {
+    let shape = data.shape.clone();
+    let [batch, channels, height, width] = shape.as_slice() else {
+        return Err(BooguError::InvalidShape(format!(
+            "decoder output must be rank 4 [1,3,H,W], got {shape:?}"
+        )));
+    };
+    if *batch != 1 || *channels != 3 {
         return Err(BooguError::InvalidShape(format!(
             "decoder output must be [1,3,H,W], got [{batch},{channels},{height},{width}]"
         )));
     }
-    let plane = height * width;
-    let bytes = decoder_data_to_rgb8(output.into_data(), plane)?;
-    let dimensions = Dimensions::new(width as u32, height as u32)
+    let plane = height.checked_mul(*width).ok_or_else(|| {
+        BooguError::InvalidShape("decoder output dimensions overflow host indexing".into())
+    })?;
+    let bytes = decoder_data_to_rgb8(data, plane)?;
+    let width = u32::try_from(*width)
+        .map_err(|_| BooguError::InvalidShape("decoder output width exceeds u32".into()))?;
+    let height = u32::try_from(*height)
+        .map_err(|_| BooguError::InvalidShape("decoder output height exceeds u32".into()))?;
+    let dimensions = Dimensions::new(width, height)
         .map_err(|error| BooguError::InvalidShape(error.to_string()))?;
     let pixels = PixelBuffer::new(dimensions, PixelFormat::Rgb8, ColorSpace::Srgb, bytes)
         .map_err(|error| BooguError::InvalidShape(error.to_string()))?;
@@ -862,6 +882,23 @@ mod tests {
             panic!("expected pixels")
         };
         assert_eq!(output.bytes(), &[0, 128, 255]);
+    }
+
+    #[test]
+    fn materialized_decoder_output_conversion_matches_tensor_path_correctness() {
+        let values = vec![-1.0_f32, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let data = TensorData::new(values.clone(), [1, 3, 1, 2]);
+        let HostImage::Pixels(materialized) = decoder_output_data_to_host(data).unwrap() else {
+            panic!("expected pixels")
+        };
+        let tensor =
+            Tensor::<B, 4>::from_data(TensorData::new(values, [1, 3, 1, 2]), &Default::default());
+        let HostImage::Pixels(from_tensor) = decoder_output_to_host(tensor).unwrap() else {
+            panic!("expected pixels")
+        };
+
+        assert_eq!(materialized, from_tensor);
+        assert_eq!(materialized.bytes(), [0, 128, 255, 64, 191, 255]);
     }
 
     #[test]

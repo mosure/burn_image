@@ -112,6 +112,28 @@ impl<B: Backend> AutoencoderKl<B> {
         self.decoder.forward_with_group_norm_policy(latents, policy)
     }
 
+    /// Decode with the exact strict-F32 two-slab final-tail policy.
+    ///
+    /// See [`Decoder::forward_striped_tail_strict_f32`] for the bounded-buffer execution plan.
+    pub fn decode_striped_tail_strict_f32(
+        &self,
+        latents: Tensor<B, 4>,
+        split_width: usize,
+    ) -> Tensor<B, 4> {
+        assert_eq!(
+            latents.dims()[1],
+            self.latent_channels,
+            "AutoencoderKL latent channel mismatch"
+        );
+        let latents = self
+            .post_quant_conv
+            .as_ref()
+            .map(|conv| conv.forward(latents.clone()))
+            .unwrap_or(latents);
+        self.decoder
+            .forward_striped_tail_strict_f32(latents, split_width)
+    }
+
     /// Apply FLUX pipeline latent normalization: `(latents - shift_factor) * scaling_factor`.
     pub fn scale_latents(&self, latents: Tensor<B, 4>) -> Tensor<B, 4> {
         (latents - self.shift_factor) * self.scaling_factor
@@ -282,5 +304,29 @@ mod tests {
         let established = values(established);
         assert_eq!(established, values(strict));
         assert_eq!(established, values(mixed));
+    }
+
+    fn assert_striped_tail_matches_full(latent_shape: [usize; 4], split_width: usize) {
+        let device = Default::default();
+        let model = AutoencoderKlConfig::tiny().init::<TestBackend>(&device);
+        let latents = Tensor::random(latent_shape, Distribution::Default, &device);
+        let full = model.decode(latents.clone());
+        let striped = model.decode_striped_tail_strict_f32(latents, split_width);
+        assert_eq!(full.dims(), striped.dims());
+        let max_abs = (full - striped).abs().max().into_scalar();
+        assert!(
+            max_abs <= 1.0e-5,
+            "strict-F32 striped decoder max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn striped_tail_matches_full_decoder_square_parity() {
+        assert_striped_tail_matches_full([1, 4, 4, 4], 4);
+    }
+
+    #[test]
+    fn striped_tail_matches_full_decoder_ragged_parity() {
+        assert_striped_tail_matches_full([1, 4, 3, 5], 4);
     }
 }

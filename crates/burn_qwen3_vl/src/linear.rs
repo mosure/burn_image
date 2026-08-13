@@ -105,6 +105,7 @@ impl<B: Backend> QwenLinear<B> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    #[cfg(feature = "import")]
     use burn::{
         module::ParamId,
         tensor::{Tensor, TensorData},

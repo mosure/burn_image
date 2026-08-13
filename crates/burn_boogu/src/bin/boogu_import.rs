@@ -25,7 +25,7 @@ use burn_boogu::{
 };
 use burn_flux_vae::AutoencoderKlConfig;
 use burn_image::{
-    ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactBundleId, ArtifactComponent, ArtifactComponentId,
+    ARTIFACT_MANIFEST_SCHEMA_V1, ArtifactBundleId, ArtifactComponent, ArtifactComponentId,
     ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath, ArtifactProfileId,
     ArtifactShard, ModelId, NumericFormat, Sha256Digest,
 };
@@ -503,7 +503,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .to_owned(),
     );
     let mut manifest = ArtifactManifest {
-        schema_version: ARTIFACT_MANIFEST_SCHEMA_VERSION,
+        // Direct imports remain dependency-free legacy candidates. The release preparation tool
+        // extracts and seals schema-v1 components, then emits the schema-v2 composition lock.
+        schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
+        // Conversion candidates keep a descriptive identity. Only the promotion tool assigns the
+        // clean canonical id after authenticating an exact legacy production bundle.
         bundle: ArtifactBundleId::new(format!("{}-{}", args.variant.slug(), args.profile.slug()))?,
         profile: ArtifactProfileId::new(args.profile.slug())?,
         model: ModelId::new(args.variant.model_id())?,
@@ -511,6 +515,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         numeric_format: args.profile.numeric_format(),
         components,
         files: artifact_files,
+        dependencies: Vec::new(),
         metadata,
         content_digest: None,
     };

@@ -118,14 +118,26 @@ the rows needed from each short-lived chunk into a retained activation; the full
 table is never resident. The untied LM head uses the same optional row-slice mechanism, and is
 absent from the ordinary base-model conditioning stream.
 
-`Qwen3VlStageSource` deliberately does not prescribe URLs, caches, signatures, or async policy.
-An artifact runtime verifies and prefetches bytes, strips the canonical stage prefix, applies them
-to a fresh lazy module, advances `Qwen3VlVisionState` or `Qwen3VlTextState`, synchronizes the
+`Qwen3VlStageSource` deliberately does not prescribe URLs or cache locations. With the optional
+`artifacts` feature, `Qwen3VlComponentContract` validates a sealed standalone component manifest,
+and `VerifiedBurnpackQwen3VlStageSource` / `VerifiedAsyncBurnpackQwen3VlStageSource` verify and
+apply bounded Burnpack objects through the transport-neutral readers in `burn_image`. The Qwen
+crate owns shard semantics, stage loading, and device-resident retaining wrappers; `burn_image`
+owns the generic filesystem/browser transport and cache seam. The loaders strip the canonical
+stage prefix and apply tensors to a fresh lazy module, advance `Qwen3VlVisionState` or
+`Qwen3VlTextState`, synchronize the
 backend, and then drops the module. Column-layout linear shards stay in checkpoint `[out, in]`
 shape and use an identity adapter; the Qwen parameter load mapper performs the runtime transpose.
 On wasm32 that mapper submits the transpose without a blocking sync, leaving the async source's
 stage barrier responsible for completion. Never collect or forward a stage module before applying
 its shard, because doing so initializes the parameter and changes its validation shape.
+
+The released component is `qwen3-vl-8b-base-boogu-image-0.1` with profile
+`f16-text-f32-vision-base`. Its model revision is derived from the four sorted upstream source-file
+declarations, and its exact manifest digest is pinned by the crate. `qwen_component_dependency()`
+returns the complete role/bundle/profile/model/revision/digest edge for a composed manifest. A
+Qwen-only consumer can use the same model-neutral verified cache and readers without depending on
+`burn_boogu`.
 
 `StreamingQwen3Vl::forward_base` performs that complete orchestration for the ordinary base model,
 including concurrent image/video state progression, visual replacement, DeepStack additions,
@@ -144,11 +156,12 @@ bounded row/module fetch, computes the stage, awaits source synchronization, dro
 only then requests the next one. The asynchronous and synchronous paths share exact observer
 boundaries and are tested against the same resident multimodal model.
 
-Native runtimes with sufficient VRAM can opt into `RetainingQwen3VlStageSource`. It wraps any
-synchronous verified source, keeps the first successfully loaded copy of each embedding/LM-head
-row and semantic module, and serves shared-handle clones on later forwards while preserving every
-backend synchronization. `clear` releases all retained weights. The wrapper deliberately does not
-implement the asynchronous browser trait, so the browser execution contract remains bounded.
+Runtimes with sufficient VRAM can opt into `RetainingQwen3VlStageSource` or
+`RetainingAsyncQwen3VlStageSource`. Each wraps a verified source, keeps the first successfully
+loaded copy of each embedding/LM-head row and semantic module, and serves shared device-handle
+clones on later forwards while preserving the selected synchronization policy. `clear` releases
+all retained weights. The asynchronous path still fetches and verifies only one bounded artifact
+object at a time; GPU residency does not imply retaining Burnpack bytes in Wasm memory.
 
 ## Correctness surface
 
@@ -186,6 +199,8 @@ must not be interpreted as vision/deep-stack parity.
 - `std` (default): ordinary Rust standard-library build.
 - `tokenizers`: Hugging Face tokenizer adapter (`HfTokenizer`).
 - `import`: strict native Hugging Face SafeTensors index/shard loading through `burn-store`.
+- `artifacts`: sealed component-manifest validation plus synchronous and asynchronous bounded
+  Burnpack stage sources; transport and persistent cache policy remain in `burn_image` adapters.
 
 The core model does not select a Burn backend. Consumers can use NdArray, WGPU/WebGPU, or another
 Burn 0.21 backend without changing this crate's model API.

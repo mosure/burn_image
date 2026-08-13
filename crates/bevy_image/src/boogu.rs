@@ -16,6 +16,7 @@ use burn_boogu::{
     BooguTask, BooguVariant, ResolvedBooguRequest,
     artifacts::{
         BooguFloatLoadPolicy, BooguQuantizedLoadPolicy, BooguReleaseIdentity, BooguStorageProfile,
+        canonical_published_bundle, legacy_artifact_bundle_id, preferred_artifact_bundle_id,
     },
     boogu_model_descriptor,
     conditioning::InstructionPolicy,
@@ -38,13 +39,40 @@ use crate::{
 
 /// Largest current browser tensor after verified F16 Qwen row storage is adapted to F32.
 pub const BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES: u64 = 414_892_032;
-/// Power-of-two WebGPU device limit requested by the concrete Boogu app for that tensor.
+/// F32 `[1, 256, 1536, 1536]` feature buffer the ordinary untiled VAE would require.
+pub const BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES: u64 = 2_415_919_104;
+/// Conservative largest buffer in the exact two-slab VAE tail.
+///
+/// This covers one F32 `[1, 256, 1538, 772]` explicitly padded convolution input. The actual
+/// 1536-square core slab is `[1, 256, 1536, 768]`; the extra rows/columns cover its 3x3 halo and
+/// Burn's current explicit padding materialization.
+pub const BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES: u64 = 1_215_832_064;
+/// F32 denoiser feed-forward buffer required by the exact 1.5K browser parity fixture.
+pub const BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES: u64 = 522_042_368;
+/// Largest single runtime buffer required by the exact 1.5K browser parity fixture.
+pub const BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES: u64 =
+    BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES;
+/// Device-buffer limit requested by the ordinary 256-square Boogu browser runtime.
+///
+/// Exact 1.5K parity uses a separate limit contract so an unsupported qualification route cannot
+/// raise the device request for the released interactive browser surface.
 pub const BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+/// Minimum applied device-buffer limit required by the exact 1.5K parity route.
+///
+/// The exact two-slab decoder tail keeps this below Chrome's observed 2,147,483,644-byte WebGPU
+/// ceiling without changing the global middle attention or GroupNorm semantics.
+pub const BOOGU_BROWSER_1K5_MIN_REQUIRED_BUFFER_LIMIT_BYTES: u64 =
+    BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES;
 /// Released browser execution is intentionally limited to the validated 256-square request.
 pub const BOOGU_BROWSER_OUTPUT_EDGE: u32 = 256;
 /// Pixel ceiling corresponding to [`BOOGU_BROWSER_OUTPUT_EDGE`] squared.
 pub const BOOGU_BROWSER_MAX_OUTPUT_PIXELS: u64 =
     BOOGU_BROWSER_OUTPUT_EDGE as u64 * BOOGU_BROWSER_OUTPUT_EDGE as u64;
+/// Exact output edge replayed by the dedicated 1.5K browser parity route.
+pub const BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE: u32 = 1536;
+/// Exact output pixel count replayed by the dedicated 1.5K browser parity route.
+pub const BOOGU_BROWSER_1K5_PARITY_OUTPUT_PIXELS: u64 =
+    BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64 * BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64;
 /// Canonical public origin for immutable Boogu artifact bundles.
 pub const BOOGU_CDN_ROOT: &str = "https://aberration.technology/model";
 
@@ -843,7 +871,7 @@ pub fn variant_for_model(model: &ModelId) -> Option<BooguVariant> {
     .find(|variant| boogu_model_descriptor(*variant).id == *model)
 }
 
-/// Stable local/CDN directory stem for one logical Boogu release.
+/// Stable directory stem for one logical Boogu release.
 pub const fn boogu_bundle_slug(variant: BooguVariant) -> &'static str {
     match variant {
         BooguVariant::Image01Turbo => "boogu-image-0.1-turbo",
@@ -852,7 +880,11 @@ pub const fn boogu_bundle_slug(variant: BooguVariant) -> &'static str {
     }
 }
 
-/// Stable storage-profile suffix shared by manifests, caches, and CDN bundle names.
+/// Stable internal storage-profile identity used by manifests and runtime provenance.
+///
+/// The production CDN uses concise model-name bundle ids. This precise profile name remains
+/// unchanged so existing local bundles, CLI arguments, and sealed Burnpack metadata stay
+/// compatible.
 pub const fn boogu_profile_slug(profile: BooguStorageProfile) -> &'static str {
     match profile {
         BooguStorageProfile::F16 => "f16",
@@ -862,22 +894,106 @@ pub const fn boogu_profile_slug(profile: BooguStorageProfile) -> &'static str {
     }
 }
 
-/// Exact manifest bundle id used as the single `{model_name}` CDN path segment.
-pub fn boogu_bundle_id(variant: BooguVariant, profile: BooguStorageProfile) -> String {
-    format!(
-        "{}-{}",
-        boogu_bundle_slug(variant),
-        boogu_profile_slug(profile)
-    )
+/// Legacy descriptive manifest identity used by explicit-source bundles and diagnostic conversions.
+pub fn boogu_legacy_bundle_id(variant: BooguVariant, profile: BooguStorageProfile) -> String {
+    legacy_artifact_bundle_id(variant, profile)
 }
 
-/// Canonical immutable CDN base URL for one exact variant/profile bundle.
-pub fn boogu_cdn_base_url(variant: BooguVariant, profile: BooguStorageProfile) -> String {
-    format!("{BOOGU_CDN_ROOT}/{}", boogu_bundle_id(variant, profile))
+/// Preferred manifest bundle id used as the single `{model_name}` CDN path segment.
+///
+/// Published tuples take their immutable id from `burn_boogu`'s release registry. Unpublished
+/// diagnostic tuples retain the legacy variant/profile identity and require an explicit source.
+pub fn boogu_bundle_id(variant: BooguVariant, profile: BooguStorageProfile) -> String {
+    preferred_artifact_bundle_id(variant, profile)
+}
+
+/// Canonical immutable CDN base URL for one published variant/profile bundle.
+///
+/// Diagnostic tuples deliberately return `None`; callers must provide an explicit source rather
+/// than accidentally synthesizing an apparently canonical Aberration URL.
+pub fn boogu_cdn_base_url(variant: BooguVariant, profile: BooguStorageProfile) -> Option<String> {
+    canonical_published_bundle(variant, profile)
+        .map(|bundle| format!("{BOOGU_CDN_ROOT}/{}", bundle.bundle_id))
 }
 
 pub fn boogu_descriptor(variant: BooguVariant, profile: BooguStorageProfile) -> ModelDescriptor {
     boogu_descriptor_for_execution(variant, profile, current_execution_kind())
+}
+
+/// Exact descriptor used only by the surface-free 1.5K browser parity replay.
+///
+/// Ordinary browser capabilities intentionally remain fixed at 256 square and reject the 1.5K
+/// release. This separate seam prevents an unfinished qualification path from being advertised by
+/// the interactive UI or accepted by normal request dispatch.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) fn boogu_browser_1k5_parity_descriptor(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+) -> Result<ModelDescriptor, RuntimeError> {
+    if variant != BooguVariant::Image01EditTurbo1k5 {
+        return Err(model_execution(
+            &boogu_model_id(variant),
+            "headless=parity requires variant=edit-turbo-1k5",
+        ));
+    }
+    validate_variant_profile(variant, profile)?;
+    if profile != BooguStorageProfile::F16QwenVisionF32 {
+        return Err(model_execution(
+            &boogu_model_id(variant),
+            "1.5K browser parity requires the production mixed-F16 artifact profile",
+        ));
+    }
+
+    let mut descriptor =
+        boogu_descriptor_for_execution(variant, profile, WgpuExecutionKind::NativeWgpu);
+    let exact = Dimensions::new(
+        BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE,
+        BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE,
+    )
+    .expect("fixed 1.5K parity dimensions are valid");
+    let dimensions = &mut descriptor.capabilities.dimensions;
+    dimensions.min_width = exact.width();
+    dimensions.max_width = exact.width();
+    dimensions.min_height = exact.height();
+    dimensions.max_height = exact.height();
+    dimensions.max_pixels = Some(BOOGU_BROWSER_1K5_PARITY_OUTPUT_PIXELS);
+    dimensions.allowed_dimensions = Some([exact].into_iter().collect());
+    descriptor
+        .validate()
+        .map_err(|error| model_execution(&descriptor.id, error.to_string()))?;
+    Ok(descriptor)
+}
+
+/// Validate the applied device limits for the exact 1.5K F32 striped-tail browser execution plan.
+///
+/// Both limits are checked because WebGPU implementations can independently cap a buffer's total
+/// allocation size and the portion visible through one storage binding.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) fn validate_browser_1k5_buffer_limits(
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
+) -> Result<(), RuntimeError> {
+    let model = boogu_model_id(BooguVariant::Image01EditTurbo1k5);
+    for (name, actual) in [
+        (
+            "max_storage_buffer_binding_size",
+            max_storage_buffer_binding_size,
+        ),
+        ("max_buffer_size", max_buffer_size),
+    ] {
+        if actual < BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES {
+            return Err(model_execution(
+                &model,
+                format!(
+                    "browser {name} is {actual} bytes; exact 1536-square parity requires at least {} bytes for the F32 two-slab VAE tail (an untiled [1,256,1536,1536] feature would require {} bytes; the F32 denoiser FFN requires {} bytes)",
+                    BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES,
+                    BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES,
+                    BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES,
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn boogu_descriptor_for_execution(
@@ -948,6 +1064,7 @@ mod tests {
     use bevy::prelude::*;
     use burn_boogu::artifacts::{
         BooguStorageProfile, EDIT_TURBO_1K5_REVISION, EDIT_TURBO_REVISION, TURBO_REVISION,
+        artifact_bundle_id_is_compatible,
     };
     use burn_image::{
         ArtifactSource, ColorSpace, EditRequest, GenerateRequest, GenerationOptions, ImageRequest,
@@ -1034,6 +1151,13 @@ mod tests {
                 BooguVariant::Image01EditTurbo1k5,
                 BooguStorageProfile::F16QwenVisionF32,
             ),
+            "boogu-image-0.1-edit-turbo-1k5"
+        );
+        assert_eq!(
+            boogu_legacy_bundle_id(
+                BooguVariant::Image01EditTurbo1k5,
+                BooguStorageProfile::F16QwenVisionF32,
+            ),
             "boogu-image-0.1-edit-turbo-1k5-f16-qwen-vision-f32"
         );
         assert_eq!(
@@ -1041,8 +1165,22 @@ mod tests {
                 BooguVariant::Image01Turbo,
                 BooguStorageProfile::F16QwenVisionF32,
             ),
-            "https://aberration.technology/model/boogu-image-0.1-turbo-f16-qwen-vision-f32"
+            Some("https://aberration.technology/model/boogu-image-0.1-turbo".into())
         );
+        assert_eq!(
+            boogu_cdn_base_url(BooguVariant::Image01Turbo, BooguStorageProfile::F16),
+            None
+        );
+        assert!(artifact_bundle_id_is_compatible(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+            "boogu-image-0.1-turbo-f16-qwen-vision-f32",
+        ));
+        assert!(artifact_bundle_id_is_compatible(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+            "boogu-image-0.1-turbo",
+        ));
         assert_eq!(
             variant_for_model(&edit_1k5.id),
             Some(BooguVariant::Image01EditTurbo1k5)
@@ -1266,10 +1404,119 @@ mod tests {
             25_323_u64 * 4_096 * std::mem::size_of::<f32>() as u64
         );
         assert_eq!(
+            BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES,
+            512 * 1024 * 1024
+        );
+        assert_eq!(
             BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES
                 .saturating_sub(BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES),
             121_978_880
         );
+        assert_eq!(
+            BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES,
+            256_u64
+                * BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64
+                * BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64
+                * std::mem::size_of::<f32>() as u64
+        );
+        assert_eq!(
+            BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES,
+            BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES
+        );
+        assert_eq!(
+            BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES,
+            256_u64 * 1_538 * 772 * std::mem::size_of::<f32>() as u64
+        );
+        assert_eq!(
+            BOOGU_BROWSER_1K5_MIN_REQUIRED_BUFFER_LIMIT_BYTES,
+            BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES
+        );
+        assert_eq!(BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES % 256, 0);
+        assert_eq!(BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES, 522_042_368);
+    }
+
+    #[test]
+    fn browser_1k5_parity_surface_is_exact_and_fail_closed_correctness() {
+        let descriptor = boogu_browser_1k5_parity_descriptor(
+            BooguVariant::Image01EditTurbo1k5,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        let dimensions = &descriptor.capabilities.dimensions;
+        let exact = Dimensions::new(1536, 1536).unwrap();
+        assert_eq!(dimensions.min_width, 1536);
+        assert_eq!(dimensions.max_width, 1536);
+        assert_eq!(dimensions.min_height, 1536);
+        assert_eq!(dimensions.max_height, 1536);
+        assert_eq!(dimensions.max_pixels, Some(1536_u64 * 1536));
+        assert_eq!(
+            dimensions.allowed_dimensions,
+            Some([exact].into_iter().collect())
+        );
+        assert!(dimensions.supports(exact).is_ok());
+        assert!(
+            dimensions
+                .supports(Dimensions::new(1536, 1520).unwrap())
+                .is_err()
+        );
+
+        for variant in [BooguVariant::Image01Turbo, BooguVariant::Image01EditTurbo] {
+            let error =
+                boogu_browser_1k5_parity_descriptor(variant, BooguStorageProfile::F16QwenVisionF32)
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("headless=parity requires variant=edit-turbo-1k5")
+            );
+        }
+        assert!(
+            boogu_browser_1k5_parity_descriptor(
+                BooguVariant::Image01EditTurbo1k5,
+                BooguStorageProfile::F16,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_1k5_parity_limits_cover_each_measured_buffer_correctness() {
+        validate_browser_1k5_buffer_limits(
+            BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES,
+            BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES,
+        )
+        .unwrap();
+
+        for (storage, buffer, missing) in [
+            (
+                BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES - 1,
+                BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES,
+                "max_storage_buffer_binding_size",
+            ),
+            (
+                BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES,
+                BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES - 1,
+                "max_buffer_size",
+            ),
+        ] {
+            let error = validate_browser_1k5_buffer_limits(storage, buffer).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(missing), "{message}");
+            assert!(message.contains("1215832064"), "{message}");
+            assert!(message.contains("2415919104"), "{message}");
+            assert!(message.contains("two-slab"), "{message}");
+            assert!(message.contains("522042368"), "{message}");
+        }
+
+        // Chrome's qualification limit cannot cover the untiled feature but does cover the exact
+        // striped-tail plan.
+        let chrome_max_buffer_size = 2_147_483_644;
+        validate_browser_1k5_buffer_limits(
+            BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES,
+            chrome_max_buffer_size,
+        )
+        .unwrap();
+        assert!(BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES > chrome_max_buffer_size);
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! generation policy. It models the ordinary Qwen3-VL language and vision towers and exposes
 //! deterministic preprocessing contracts suitable for native and WebGPU Burn backends.
 
+#[cfg(feature = "artifacts")]
+pub mod artifacts;
 pub mod builder;
 pub mod chat;
 #[cfg(feature = "import")]
@@ -23,6 +25,14 @@ pub mod tokenizer;
 pub mod vision;
 pub mod weights;
 
+#[cfg(feature = "artifacts")]
+pub use artifacts::{
+    QWEN_BASE_CONDITIONING_PROFILE, QWEN_COMPONENT_BUNDLE_ID, QWEN_COMPONENT_CONTENT_DIGEST,
+    QWEN_COMPONENT_MODEL_ID, QWEN_COMPONENT_MODEL_REVISION, QWEN_COMPONENT_ROLE,
+    Qwen3VlArtifactError, Qwen3VlArtifactFloatPolicy, Qwen3VlComponentContract,
+    VerifiedAsyncBurnpackQwen3VlStageSource, VerifiedBurnpackQwen3VlStageSource,
+    qwen_component_dependency, qwen_row_slice_target, qwen_streaming_stage_name,
+};
 pub use builder::Qwen3VlBuilder;
 pub use chat::{ChatContent, ChatMessage, ChatRole, ChatTemplate, ChatTemplateConfig, ToolCall};
 #[cfg(feature = "import")]
@@ -49,13 +59,13 @@ pub use processor::{
 };
 pub use rope::{MropePositionIds, PositionDelta};
 pub use streaming::{
-    AsyncQwen3VlCausalLmStageSource, AsyncQwen3VlStageSource, ChunkedEmbeddingState,
-    DEFAULT_VOCABULARY_CHUNKS, EmbeddingRowChunk, OutputProjectionRowChunk,
+    AsyncQwen3VlCausalLmStageSource, AsyncQwen3VlStageSource, AsyncRetainingSynchronizationPolicy,
+    ChunkedEmbeddingState, DEFAULT_VOCABULARY_CHUNKS, EmbeddingRowChunk, OutputProjectionRowChunk,
     Qwen3VlCausalLmStageSource, Qwen3VlStage, Qwen3VlStageDType, Qwen3VlStageDTypePolicy,
     Qwen3VlStageDescriptor, Qwen3VlStageObserver, Qwen3VlStageSource, Qwen3VlStreamingPlan,
-    Qwen3VlTextState, Qwen3VlVisionPrelude, Qwen3VlVisionState, RetainingQwen3VlStageSource,
-    RetainingSynchronizationPolicy, RowChunkPlan, RowChunkSpec, RowSliceWeightSpec,
-    StreamingForwardError, StreamingQwen3Vl,
+    Qwen3VlTextState, Qwen3VlVisionPrelude, Qwen3VlVisionState, RetainingAsyncQwen3VlStageSource,
+    RetainingQwen3VlStageSource, RetainingSynchronizationPolicy, RowChunkPlan, RowChunkSpec,
+    RowSliceWeightSpec, StreamingForwardError, StreamingQwen3Vl,
 };
 pub use text::{DeepstackEmbeddings, Qwen3VlDecoderLayer};
 pub use vision::{Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger};

@@ -18,7 +18,7 @@ pub const TURBO_REVISION: &str = "53ad54522023f64d049f7f38e4d679359ef3fb92";
 pub const EDIT_TURBO_REVISION: &str = "132a0ab9051b42c1d9be4919a68873d1f132c0c8";
 /// Immutable Edit-Turbo 1.5K Hugging Face revision.
 pub const EDIT_TURBO_1K5_REVISION: &str = "60981c49e48cffadf2c169532a4ba3f6108afd5e";
-/// Converter version that produced the five immutable published bundles.
+/// Converter version that produced the immutable payloads reused by the canonical bundles.
 ///
 /// Artifact compatibility follows the sealed converter contract, not this runtime crate's version.
 pub const PUBLISHED_BUNDLE_CONVERTER_VERSION: &str = "0.1.0";
@@ -40,20 +40,43 @@ pub fn validate_supported_bundle_converter_version(actual: &str) -> Result<(), B
         )))
     }
 }
-/// Exact sealed mixed-F16 Turbo bundle qualified for the published release.
+/// Exact sealed mixed-F16 Turbo bundle qualified for the canonical production release.
 pub const TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
-    "4f94cf68c00af12d5de486db4d316ce889d6d21e78913a1c74edab4bd0119ce3";
-/// Exact sealed hybrid-Q8 Turbo bundle qualified for the published release.
+    "555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36";
+/// Exact sealed hybrid-Q8 Turbo legacy bundle retained as evidence.
 pub const TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "8685559e73cf836e98e1ebdf80815e3d66765f7d620624408148d5f98c87c0dd";
-/// Exact sealed mixed-F16 Edit-Turbo 1K bundle qualified for the published release.
+/// Exact sealed mixed-F16 Edit-Turbo 1K bundle qualified for the canonical production release.
 pub const EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
-    "14acbafd13dc9b79757e7d554b504396bee30ea7ed231f533919c6c82a6e6a32";
-/// Exact sealed hybrid-Q8 Edit-Turbo 1K bundle qualified for the published release.
+    "28b1b51f2fb152557b11a9f0ef8e872ae7d163bcab7abd42f9eaf4bfef10e7aa";
+/// Exact sealed hybrid-Q8 Edit-Turbo 1K legacy bundle retained as evidence.
 pub const EDIT_TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "ffde989bb66df3a541d44957422f996790633dab46ca3547a59dfdfb871f0b7a";
-/// Exact sealed mixed-F16 Edit-Turbo 1.5K bundle qualified for the published release.
+/// Exact sealed mixed-F16 Edit-Turbo 1.5K bundle qualified for the canonical production release.
 pub const EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
+    "4eb95001708becebeab5bb7417b02003e9dbe704775bb49557b681a5b617fd5a";
+/// Storage-policy marker for the opt-in 1.5K VAE encoder F32 A/B artifact.
+///
+/// This is deliberately metadata rather than a production storage profile: callers must
+/// select the ordinary mixed-F16 profile and an explicit custom artifact URL, then separately
+/// authenticate this diagnostic overlay contract.
+pub const EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_PROFILE: &str =
+    "f16-qwen-vision-f32+vae-encoder-f32";
+/// Exact number of ordinary FLUX VAE encoder tensors replaced by the diagnostic F32 overlay.
+pub const EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_TENSORS: usize = 106;
+/// SHA-256 of the pinned upstream F32 FLUX VAE SafeTensors object used by the diagnostic.
+pub const EDIT_TURBO_1K5_VAE_SOURCE_SHA256: &str =
+    "8c717328c8ad41faab2ccfd52ae17332505c6833cf176aad56e7b58f2c4d4c94";
+/// Exact byte length of the pinned upstream F32 FLUX VAE SafeTensors object.
+pub const EDIT_TURBO_1K5_VAE_SOURCE_BYTES: u64 = 335_306_212;
+/// Legacy descriptive mixed-F16 Turbo digest accepted only for explicit/local migration.
+pub const LEGACY_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
+    "4f94cf68c00af12d5de486db4d316ce889d6d21e78913a1c74edab4bd0119ce3";
+/// Legacy descriptive mixed-F16 Edit-Turbo 1K digest accepted only for explicit/local migration.
+pub const LEGACY_EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
+    "14acbafd13dc9b79757e7d554b504396bee30ea7ed231f533919c6c82a6e6a32";
+/// Legacy descriptive mixed-F16 Edit-Turbo 1.5K digest accepted only for explicit/local migration.
+pub const LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "4e8b12ac5ca95272f9009080a23baf1bc52d1b0e7aebf2e9e5f394a492369213";
 /// Largest physical Burnpack object accepted for browser-deployable releases.
 pub const BOOGU_RELEASE_MAX_SHARD_BYTES: u64 = 256 * 1024 * 1024;
@@ -968,16 +991,19 @@ mod loading {
         prelude::Backend,
         tensor::{Bytes, DType, Tensor, TensorData, quantization::QuantizedBytes},
     };
-    use burn_flux_vae::AutoencoderKl;
+    use burn_flux_vae::{
+        AutoencoderKl, AutoencoderKlConfig, FLUX_VAE_COMPONENT_ROLE, FluxVaeComponentContract,
+    };
     use burn_image::{
         ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactVerifier, IntegrityPolicy,
-        NumericFormat, Sha256Digest,
+        NumericFormat, Sha256Digest, VerificationStatus, VerifiedArtifact,
     };
     use burn_qwen3_vl::{
         AsyncQwen3VlCausalLmStageSource, AsyncQwen3VlStageSource, EmbeddingRowChunk,
-        OutputProjectionRowChunk, Qwen3VlCausalLmStageSource, Qwen3VlForConditionalGeneration,
-        Qwen3VlImageProcessorConfig, Qwen3VlModel, Qwen3VlStage, Qwen3VlStageSource,
-        Qwen3VlStreamingPlan, Qwen3VlVisionPrelude, RowChunkPlan, RowChunkSpec,
+        OutputProjectionRowChunk, QWEN_COMPONENT_ROLE, Qwen3VlCausalLmStageSource,
+        Qwen3VlComponentContract, Qwen3VlForConditionalGeneration, Qwen3VlImageProcessorConfig,
+        Qwen3VlModel, Qwen3VlStage, Qwen3VlStageSource, Qwen3VlStreamingPlan, Qwen3VlVisionPrelude,
+        RowChunkPlan, RowChunkSpec,
         text::Qwen3VlDecoderLayer,
         vision::{Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger},
     };
@@ -1014,6 +1040,180 @@ mod loading {
         Q8sBlock32F32QwenVisionF32,
     }
 
+    /// Authenticated identity evidence for the opt-in 1.5K VAE encoder F32 A/B overlay.
+    ///
+    /// This does not make the overlay a published bundle or a production storage profile. The
+    /// browser must receive it through an explicit custom URL and label its result diagnostic.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct BooguVaeEncoderF32DiagnosticManifest {
+        /// Sealed content digest of the complete diagnostic overlay manifest.
+        pub content_digest: Sha256Digest,
+        /// Legacy flat mixed-F16 digest from which all non-encoder payloads are reused.
+        pub base_content_digest: Sha256Digest,
+        /// Number of tensors whose storage changes from F16 to F32.
+        pub replaced_tensors: usize,
+        /// Number of bounded Burnpack files holding the replacement encoder.
+        pub encoder_weight_files: usize,
+        /// Total bytes in the replacement encoder Burnpack files.
+        pub encoder_weight_bytes: u64,
+    }
+
+    const VAE_ENCODER_F32_DIAGNOSTIC_METADATA: [(&str, &str); 12] = [
+        ("diagnostic_manifest_schema", "1"),
+        ("diagnostic_kind", "vae-encoder-f32-overlay"),
+        (
+            "diagnostic_storage_profile",
+            super::EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_PROFILE,
+        ),
+        ("diagnostic_base_bundle", "boogu-image-0.1-edit-turbo-1k5"),
+        (
+            "diagnostic_base_content_digest",
+            super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
+        ),
+        ("diagnostic_replaced_stage", "flux-vae-encoder"),
+        ("diagnostic_replaced_tensor_count", "106"),
+        ("diagnostic_replaced_stored_dtype", "f32"),
+        (
+            "diagnostic_upstream_vae_repository",
+            "Boogu/Boogu-Image-0.1-Edit-Turbo",
+        ),
+        (
+            "diagnostic_upstream_vae_revision",
+            super::EDIT_TURBO_REVISION,
+        ),
+        (
+            "diagnostic_upstream_vae_sha256",
+            super::EDIT_TURBO_1K5_VAE_SOURCE_SHA256,
+        ),
+        ("diagnostic_intended_mode", "browser-vae-reference"),
+    ];
+
+    /// Stamp the exact diagnostic metadata used by the F32 VAE encoder A/B overlay.
+    ///
+    /// The caller is still responsible for replacing exactly the encoder object and inventory
+    /// entries before sealing. Existing diagnostic metadata is rejected rather than overwritten.
+    pub fn stamp_edit_turbo_1k5_vae_encoder_f32_diagnostic_metadata(
+        manifest: &mut ArtifactManifest,
+    ) -> Result<(), BooguError> {
+        if manifest
+            .metadata
+            .keys()
+            .any(|key| key.starts_with("diagnostic_"))
+        {
+            return Err(BooguError::Artifact(
+                "base manifest already contains diagnostic metadata".into(),
+            ));
+        }
+        for (key, value) in VAE_ENCODER_F32_DIAGNOSTIC_METADATA {
+            manifest.metadata.insert(key.into(), value.into());
+        }
+        manifest.metadata.insert(
+            "diagnostic_upstream_vae_bytes".into(),
+            super::EDIT_TURBO_1K5_VAE_SOURCE_BYTES.to_string(),
+        );
+        manifest
+            .metadata
+            .insert("production_qualified".into(), "false".into());
+        Ok(())
+    }
+
+    /// Authenticate the sealed manifest-level identity of an explicit 1.5K VAE encoder F32 A/B.
+    ///
+    /// Exact tensor ownership and the rule that only the 106 encoder tensors use F32 are checked
+    /// by the normal sealed tensor-inventory verifier. This helper is the narrow selection gate a
+    /// browser diagnostic can use instead of accepting an arbitrary non-canonical digest.
+    pub fn validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest(
+        manifest: &ArtifactManifest,
+    ) -> Result<BooguVaeEncoderF32DiagnosticManifest, BooguError> {
+        manifest
+            .validate_sealed()
+            .map_err(|error| BooguError::Artifact(error.to_string()))?;
+        let expected_profile = "f16-qwen-vision-f32";
+        if manifest.bundle.as_str() != "boogu-image-0.1-edit-turbo-1k5-f16-qwen-vision-f32"
+            || manifest.profile.as_str() != expected_profile
+            || manifest.model.as_str() != "Boogu/Boogu-Image-0.1-Edit-Turbo-1K5"
+            || manifest.model_revision != super::EDIT_TURBO_1K5_REVISION
+            || manifest.numeric_format != NumericFormat::Other(expected_profile.into())
+            || manifest.metadata.get("profile").map(String::as_str) != Some(expected_profile)
+        {
+            return Err(BooguError::Artifact(
+                "VAE encoder F32 diagnostic manifest has the wrong bundle, release, or base profile"
+                    .into(),
+            ));
+        }
+        let expected_keys = VAE_ENCODER_F32_DIAGNOSTIC_METADATA
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(["diagnostic_upstream_vae_bytes"])
+            .collect::<BTreeSet<_>>();
+        let actual_keys = manifest
+            .metadata
+            .keys()
+            .filter(|key| key.starts_with("diagnostic_"))
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if actual_keys != expected_keys
+            || VAE_ENCODER_F32_DIAGNOSTIC_METADATA
+                .iter()
+                .any(|(key, value)| manifest.metadata.get(*key).map(String::as_str) != Some(*value))
+            || manifest
+                .metadata
+                .get("diagnostic_upstream_vae_bytes")
+                .map(String::as_str)
+                != Some("335306212")
+            || manifest
+                .metadata
+                .get("production_qualified")
+                .map(String::as_str)
+                != Some("false")
+        {
+            return Err(BooguError::Artifact(
+                "VAE encoder F32 diagnostic metadata is incomplete or not exact".into(),
+            ));
+        }
+        let encoder_files = manifest
+            .files
+            .iter()
+            .filter(|file| {
+                file.role == ArtifactFileRole::Weights
+                    && file.component.as_ref().map(|value| value.as_str())
+                        == Some("flux-vae-encoder")
+            })
+            .collect::<Vec<_>>();
+        if encoder_files.len() != 1 || encoder_files[0].shard.is_some() {
+            return Err(BooguError::Artifact(format!(
+                "VAE encoder F32 diagnostic requires one bounded unsharded encoder object, found {}",
+                encoder_files.len()
+            )));
+        }
+        let encoder_weight_bytes = encoder_files[0].size;
+        if encoder_weight_bytes == 0 || encoder_weight_bytes > super::BOOGU_RELEASE_MAX_SHARD_BYTES
+        {
+            return Err(BooguError::Artifact(format!(
+                "VAE encoder F32 diagnostic object is {encoder_weight_bytes} bytes; limit is {}",
+                super::BOOGU_RELEASE_MAX_SHARD_BYTES
+            )));
+        }
+        let content_digest = manifest
+            .content_digest
+            .ok_or_else(|| BooguError::Artifact("diagnostic manifest is not sealed".into()))?;
+        let base_content_digest =
+            Sha256Digest::from_hex(super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+                .map_err(|error| BooguError::Artifact(error.to_string()))?;
+        if content_digest == base_content_digest {
+            return Err(BooguError::Artifact(
+                "diagnostic overlay aliases the canonical production digest".into(),
+            ));
+        }
+        Ok(BooguVaeEncoderF32DiagnosticManifest {
+            content_digest,
+            base_content_digest,
+            replaced_tensors: super::EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_TENSORS,
+            encoder_weight_files: encoder_files.len(),
+            encoder_weight_bytes,
+        })
+    }
+
     /// One immutable bundle published beneath the canonical CDN root.
     ///
     /// Absence from [`PUBLISHED_ARTIFACT_BUNDLES`] means callers must require an explicit local or
@@ -1032,40 +1232,29 @@ mod loading {
         pub converter_version: &'static str,
     }
 
-    /// All immutable Boogu bundles published by the initial release.
-    pub const PUBLISHED_ARTIFACT_BUNDLES: [CanonicalBooguArtifactBundle; 5] = [
+    /// The three immutable production bundles published beneath the canonical CDN root.
+    ///
+    /// Hybrid-Q8 and all-F16 bundles remain available as explicitly selected diagnostics, but are
+    /// intentionally absent from this canonical publication set.
+    pub const PUBLISHED_ARTIFACT_BUNDLES: [CanonicalBooguArtifactBundle; 3] = [
         CanonicalBooguArtifactBundle {
             variant: BooguVariant::Image01Turbo,
             profile: BooguStorageProfile::F16QwenVisionF32,
-            bundle_id: "boogu-image-0.1-turbo-f16-qwen-vision-f32",
+            bundle_id: "boogu-image-0.1-turbo",
             content_digest: super::TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST,
             converter_version: super::PUBLISHED_BUNDLE_CONVERTER_VERSION,
         },
         CanonicalBooguArtifactBundle {
-            variant: BooguVariant::Image01Turbo,
-            profile: BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
-            bundle_id: "boogu-image-0.1-turbo-q8s-block32-f32-qwen-vision-f32",
-            content_digest: super::TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST,
-            converter_version: super::PUBLISHED_BUNDLE_CONVERTER_VERSION,
-        },
-        CanonicalBooguArtifactBundle {
             variant: BooguVariant::Image01EditTurbo,
             profile: BooguStorageProfile::F16QwenVisionF32,
-            bundle_id: "boogu-image-0.1-edit-turbo-f16-qwen-vision-f32",
+            bundle_id: "boogu-image-0.1-edit-turbo",
             content_digest: super::EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST,
-            converter_version: super::PUBLISHED_BUNDLE_CONVERTER_VERSION,
-        },
-        CanonicalBooguArtifactBundle {
-            variant: BooguVariant::Image01EditTurbo,
-            profile: BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
-            bundle_id: "boogu-image-0.1-edit-turbo-q8s-block32-f32-qwen-vision-f32",
-            content_digest: super::EDIT_TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST,
             converter_version: super::PUBLISHED_BUNDLE_CONVERTER_VERSION,
         },
         CanonicalBooguArtifactBundle {
             variant: BooguVariant::Image01EditTurbo1k5,
             profile: BooguStorageProfile::F16QwenVisionF32,
-            bundle_id: "boogu-image-0.1-edit-turbo-1k5-f16-qwen-vision-f32",
+            bundle_id: "boogu-image-0.1-edit-turbo-1k5",
             content_digest: super::EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
             converter_version: super::PUBLISHED_BUNDLE_CONVERTER_VERSION,
         },
@@ -1080,6 +1269,65 @@ mod loading {
             .iter()
             .copied()
             .find(|bundle| bundle.variant == variant && bundle.profile == profile)
+    }
+
+    /// Return the legacy descriptive bundle id for a variant and exact storage profile.
+    ///
+    /// These identities remain valid for explicit local/custom artifacts and as the source of a
+    /// canonical promotion. They are never used to construct a canonical CDN URL.
+    pub fn legacy_artifact_bundle_id(
+        variant: BooguVariant,
+        profile: BooguStorageProfile,
+    ) -> String {
+        format!(
+            "{}-{}",
+            release_variant_name(variant),
+            release_profile_name(profile)
+        )
+    }
+
+    /// Return the exact legacy digest eligible for promotion to a canonical production bundle.
+    pub const fn promotable_legacy_artifact_digest(
+        variant: BooguVariant,
+        profile: BooguStorageProfile,
+    ) -> Option<&'static str> {
+        match (variant, profile) {
+            (BooguVariant::Image01Turbo, BooguStorageProfile::F16QwenVisionF32) => {
+                Some(super::LEGACY_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            }
+            (BooguVariant::Image01EditTurbo, BooguStorageProfile::F16QwenVisionF32) => {
+                Some(super::LEGACY_EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            }
+            (BooguVariant::Image01EditTurbo1k5, BooguStorageProfile::F16QwenVisionF32) => {
+                Some(super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            }
+            _ => None,
+        }
+    }
+
+    /// Select the preferred bundle id for a variant/profile tuple.
+    ///
+    /// The three published mixed-F16 tuples use their clean canonical identities. Diagnostics
+    /// retain the explicit legacy-derived dtype suffix and require an explicit source. Importers
+    /// must use [`legacy_artifact_bundle_id`] until a candidate is promoted separately.
+    pub fn preferred_artifact_bundle_id(
+        variant: BooguVariant,
+        profile: BooguStorageProfile,
+    ) -> String {
+        canonical_published_bundle(variant, profile)
+            .map(|bundle| bundle.bundle_id.to_owned())
+            .unwrap_or_else(|| legacy_artifact_bundle_id(variant, profile))
+    }
+
+    /// Whether an explicit/local manifest uses the canonical id or its compatible legacy id.
+    pub fn artifact_bundle_id_is_compatible(
+        variant: BooguVariant,
+        profile: BooguStorageProfile,
+        actual: &str,
+    ) -> bool {
+        actual == legacy_artifact_bundle_id(variant, profile)
+            || canonical_published_bundle(variant, profile)
+                .is_some_and(|bundle| actual == bundle.bundle_id)
     }
 
     /// Require the exact content digest pinned for a published variant/profile tuple.
@@ -1107,17 +1355,28 @@ mod loading {
         Ok(())
     }
 
-    /// Require the exact artifact bundle qualified by the native Edit-Turbo 1.5K release gates.
+    /// Require an exact artifact manifest qualified by the native Edit-Turbo 1.5K release gates.
     ///
-    /// Kept as a focused compatibility helper for existing 1.5K release gates.
+    /// This accepts either the dependency-composed canonical CDN release or the exact legacy flat
+    /// monolith used by explicit/local compatibility and diagnostic tooling. Canonical CDN callers
+    /// should use [`validate_canonical_release_artifact_digest`] to require canonical identity.
     pub fn validate_edit_turbo_1k5_release_artifact_digest(
         actual: Sha256Digest,
     ) -> Result<(), BooguError> {
-        validate_canonical_release_artifact_digest(
-            BooguVariant::Image01EditTurbo1k5,
-            BooguStorageProfile::F16QwenVisionF32,
-            actual,
-        )
+        let actual = actual.to_string();
+        if matches!(
+            actual.as_str(),
+            super::EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST
+                | super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST
+        ) {
+            Ok(())
+        } else {
+            Err(BooguError::Artifact(format!(
+                "Edit-Turbo 1.5K requires canonical composition digest {} or compatible legacy flat digest {}, found {actual}",
+                super::EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
+                super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
+            )))
+        }
     }
 
     /// Policy for floating-point snapshots after their release dtype has been verified.
@@ -1272,6 +1531,58 @@ mod loading {
         pub max_shard_bytes: u64,
     }
 
+    /// Bounded semantic verification statistics for one reusable dependency bundle.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct BooguComponentVerification {
+        /// Exact sealed bundle id.
+        pub bundle: String,
+        /// Exact sealed manifest digest.
+        pub content_digest: Sha256Digest,
+        /// Manifest-declared payloads whose complete bytes were authenticated.
+        pub verified_files: usize,
+        /// Sum of authenticated payload sizes.
+        pub verified_bytes: u64,
+        /// Physical Burnpack objects parsed and checked.
+        pub verified_weight_objects: usize,
+        /// Stored tensor entries checked through the exact model-owned inventory.
+        pub verified_tensors: usize,
+        /// Largest physical object read during verification.
+        pub largest_object_bytes: u64,
+        /// Exact declared physical-object ceiling.
+        pub max_shard_bytes: u64,
+    }
+
+    /// Complete semantic proof for a schema-v2 Boogu composition and both sealed dependencies.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct BooguModularReleaseVerification {
+        /// Canonical released model variant proven by the parent manifest.
+        pub variant: BooguVariant,
+        /// Exact composed storage profile.
+        pub profile: BooguStorageProfile,
+        /// Parent denoiser/composition verification statistics.
+        pub parent: BooguReleaseVerification,
+        /// Qwen3-VL base-conditioning component verification statistics.
+        pub qwen: BooguComponentVerification,
+        /// FLUX VAE component verification statistics.
+        pub vae: BooguComponentVerification,
+        /// Both dependency edges matched their complete sealed component identities.
+        pub dependency_closure_verified: bool,
+        /// Both reusable crates accepted their exact component manifests and configs.
+        pub component_contracts_verified: bool,
+        /// The three owner inventories exactly reconstructed the compiled pipeline inventory.
+        pub reconstructed_inventory_verified: bool,
+        /// Total authenticated payload declarations across all three bundle prefixes.
+        pub verified_files: usize,
+        /// Total logical payload bytes across the composed release.
+        pub verified_bytes: u64,
+        /// Total parsed Burnpack objects across the composed release.
+        pub verified_weight_objects: usize,
+        /// Total stored tensor entries authenticated across the composed release.
+        pub verified_tensors: usize,
+        /// Largest bounded object read across the composed release.
+        pub largest_object_bytes: u64,
+    }
+
     /// Strict staged artifact loading error.
     #[derive(Debug, Error)]
     pub enum BooguArtifactLoadError {
@@ -1321,13 +1632,112 @@ mod loading {
         fn read_shard(&mut self, file: &ArtifactFile) -> Result<Vec<u8>, BooguError>;
     }
 
+    /// Bytes returned by an asynchronous shard reader, optionally carrying unforgeable SHA-256
+    /// evidence produced from those same bytes.
+    ///
+    /// Generic readers can use [`Self::unverified`]; the verified source will hash that payload
+    /// before parsing it. Readers that already authenticate a response can use
+    /// [`Self::verify_sha256`] and pass the resulting evidence through without making the source
+    /// hash the object a second time. The payload and evidence fields remain private so callers
+    /// cannot replace authenticated bytes while retaining their proof.
+    pub struct AsyncStageShardRead {
+        bytes: Vec<u8>,
+        verification: Option<VerifiedArtifact>,
+    }
+
+    impl AsyncStageShardRead {
+        /// Wrap bytes from a generic reader. The verified source remains responsible for hashing
+        /// them before any payload is parsed.
+        pub fn unverified(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                verification: None,
+            }
+        }
+
+        /// Verify exact size and SHA-256 once and bind the resulting evidence to these bytes.
+        pub fn verify_sha256(file: &ArtifactFile, bytes: Vec<u8>) -> Result<Self, BooguError> {
+            let verification = verify_async_stage_bytes(file, &bytes).map_err(|error| {
+                BooguError::Artifact(format!(
+                    "integrity verification failed for {}: {error}",
+                    file.path
+                ))
+            })?;
+            Ok(Self {
+                bytes,
+                verification: Some(verification),
+            })
+        }
+
+        /// Consume the wrapper and return its payload bytes, discarding verification evidence.
+        ///
+        /// Verified model sources do not use this escape hatch; it exists so direct reader users
+        /// can preserve the original `read_shard` behavior.
+        pub fn into_bytes(self) -> Vec<u8> {
+            self.bytes
+        }
+
+        fn into_verified_bytes(
+            self,
+            file: &ArtifactFile,
+            max_bytes: u64,
+        ) -> Result<Vec<u8>, BooguError> {
+            let received = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
+            if received > max_bytes {
+                return Err(BooguError::Artifact(format!(
+                    "reader returned {received} bytes for {}, exceeding the per-read cap of {max_bytes}",
+                    file.path
+                )));
+            }
+            match self.verification {
+                Some(verification)
+                    if verification.path() == &file.path
+                        && verification.size() == file.size
+                        && verification.size() == received
+                        && verification.digest() == file.sha256
+                        && verification.status() == VerificationStatus::Sha256Verified =>
+                {
+                    Ok(self.bytes)
+                }
+                Some(_) => Err(BooguError::Artifact(format!(
+                    "reader SHA-256 evidence does not match sealed file {}",
+                    file.path
+                ))),
+                None => {
+                    verify_async_stage_bytes(file, &self.bytes).map_err(|error| {
+                        BooguError::Artifact(format!(
+                            "integrity verification failed for {}: {error}",
+                            file.path
+                        ))
+                    })?;
+                    Ok(self.bytes)
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    std::thread_local! {
+        static ASYNC_STAGE_SHA256_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn verify_async_stage_bytes(
+        file: &ArtifactFile,
+        bytes: &[u8],
+    ) -> Result<VerifiedArtifact, burn_image::IntegrityError> {
+        #[cfg(test)]
+        ASYNC_STAGE_SHA256_PASSES.with(|passes| passes.set(passes.get() + 1));
+        ArtifactVerifier::verify_bytes(file, bytes, IntegrityPolicy::RequireSha256)
+    }
+
     /// Wasm-friendly source of one bounded manifest-declared shard at a time.
     ///
     /// Futures intentionally do not require [`Send`]: browser fetch/cache handles and WebGPU
     /// resources commonly remain on one JavaScript event loop. `max_bytes` is supplied before
     /// the read starts so an HTTP/range implementation can abort a response before it exceeds the
-    /// release's sealed physical-shard bound. Verified sources independently recheck the response
-    /// length, declared file size, and SHA-256 digest before parsing any payload.
+    /// release's sealed physical-shard bound. Verified sources independently check the response
+    /// cap and either validate typed SHA-256 evidence or hash an unverified response before parsing
+    /// any payload.
     #[allow(async_fn_in_trait)]
     pub trait AsyncStageShardReader {
         /// Read exactly the supplied sealed file without exceeding `max_bytes`.
@@ -1336,6 +1746,107 @@ mod loading {
             file: &ArtifactFile,
             max_bytes: u64,
         ) -> Result<Vec<u8>, BooguError>;
+
+        /// Read one shard with optional integrity evidence.
+        ///
+        /// The default preserves generic reader behavior: [`Self::read_shard`] returns ordinary
+        /// bytes and the verified source hashes them. Browser transports that already perform
+        /// exact SHA-256 verification should override this method and return
+        /// [`AsyncStageShardRead::verify_sha256`] so the source validates the evidence instead of
+        /// hashing the object again.
+        async fn read_stage_shard(
+            &mut self,
+            file: &ArtifactFile,
+            max_bytes: u64,
+        ) -> Result<AsyncStageShardRead, BooguError> {
+            self.read_shard(file, max_bytes)
+                .await
+                .map(AsyncStageShardRead::unverified)
+        }
+    }
+
+    #[cfg(test)]
+    mod async_stage_shard_read_tests {
+        use burn_image::{ArtifactFileRole, ArtifactPath};
+
+        use super::*;
+
+        fn sealed_file(path: &str, bytes: &[u8]) -> ArtifactFile {
+            ArtifactFile {
+                path: ArtifactPath::new(path).unwrap(),
+                size: bytes.len() as u64,
+                sha256: Sha256Digest::calculate(bytes),
+                role: ArtifactFileRole::Weights,
+                component: None,
+                shard: None,
+            }
+        }
+
+        #[test]
+        fn typed_async_shard_evidence_hashes_exactly_once_correctness() {
+            let bytes = b"sealed browser object";
+            let file = sealed_file("objects/sealed.bpk", bytes);
+            ASYNC_STAGE_SHA256_PASSES.with(|passes| passes.set(0));
+
+            let read = AsyncStageShardRead::verify_sha256(&file, bytes.to_vec()).unwrap();
+            ASYNC_STAGE_SHA256_PASSES.with(|passes| assert_eq!(passes.get(), 1));
+            assert_eq!(
+                read.into_verified_bytes(&file, bytes.len() as u64).unwrap(),
+                bytes
+            );
+            ASYNC_STAGE_SHA256_PASSES.with(|passes| assert_eq!(passes.get(), 1));
+        }
+
+        #[test]
+        fn generic_async_shard_is_hashed_once_by_source_correctness() {
+            let bytes = b"generic reader object";
+            let file = sealed_file("objects/generic.bpk", bytes);
+            ASYNC_STAGE_SHA256_PASSES.with(|passes| passes.set(0));
+
+            let read = AsyncStageShardRead::unverified(bytes.to_vec());
+            assert_eq!(
+                read.into_verified_bytes(&file, bytes.len() as u64).unwrap(),
+                bytes
+            );
+            ASYNC_STAGE_SHA256_PASSES.with(|passes| assert_eq!(passes.get(), 1));
+        }
+
+        #[test]
+        fn typed_async_shard_rejects_corrupt_size_and_wrong_identity_correctness() {
+            let bytes = b"authenticated object";
+            let file = sealed_file("objects/authenticated.bpk", bytes);
+            let corrupt =
+                match AsyncStageShardRead::verify_sha256(&file, b"corrupted object".to_vec()) {
+                    Ok(_) => panic!("corrupt payload must fail SHA-256 verification"),
+                    Err(error) => error,
+                };
+            assert!(
+                corrupt
+                    .to_string()
+                    .contains("integrity verification failed")
+            );
+
+            let short = match AsyncStageShardRead::verify_sha256(&file, bytes[..8].to_vec()) {
+                Ok(_) => panic!("short payload must fail exact-size verification"),
+                Err(error) => error,
+            };
+            assert!(short.to_string().contains("integrity verification failed"));
+
+            let read = AsyncStageShardRead::verify_sha256(&file, bytes.to_vec()).unwrap();
+            let other = sealed_file("objects/other.bpk", bytes);
+            let wrong_identity = read
+                .into_verified_bytes(&other, bytes.len() as u64)
+                .unwrap_err();
+            assert!(
+                wrong_identity
+                    .to_string()
+                    .contains("evidence does not match sealed file")
+            );
+
+            let read = AsyncStageShardRead::verify_sha256(&file, bytes.to_vec()).unwrap();
+            let over_cap = read.into_verified_bytes(&file, (bytes.len() - 1) as u64);
+            assert!(over_cap.unwrap_err().to_string().contains("per-read cap"));
+        }
     }
 
     /// Native filesystem reader for sealed artifact bundle directories.
@@ -1466,7 +1977,7 @@ mod loading {
             "metadata/source/transformer/config.json",
             ArtifactFileRole::Config,
         )?)?;
-        validate_release_processor_metadata(&directory, variant)?;
+        validate_release_processor_metadata(&directory, &directory, variant)?;
 
         let inventory = BooguArtifactInventory::new(&qwen_config, &denoiser_config, &vae_config)
             .map_err(|error| {
@@ -1510,7 +2021,240 @@ mod loading {
         })
     }
 
-    /// Authenticate one of the five exact bundles published beneath the canonical CDN root.
+    /// Authenticate a modular Boogu release and both reusable component bundles.
+    ///
+    /// The parent must be a schema-v2 composition containing only Boogu denoiser weights and two
+    /// exact sibling dependencies. Qwen and VAE identities are validated by their owning crates.
+    /// Every compact file is SHA-256 checked, and every Burnpack is parsed one bounded object at a
+    /// time against the complete config-derived three-model inventory.
+    pub fn verify_modular_release_artifact_directories(
+        parent_root: impl AsRef<Path>,
+        qwen_root: impl AsRef<Path>,
+        vae_root: impl AsRef<Path>,
+    ) -> Result<BooguModularReleaseVerification, BooguArtifactLoadError> {
+        let parent = VerifiedArtifactDirectory::open(parent_root.as_ref())?;
+        let qwen = VerifiedArtifactDirectory::open(qwen_root.as_ref())?;
+        let vae = VerifiedArtifactDirectory::open(vae_root.as_ref())?;
+        let parent_manifest = parent.manifest();
+        let qwen_manifest = qwen.manifest();
+        let vae_manifest = vae.manifest();
+
+        let variant = release_variant(parent_manifest)?;
+        let profile = release_profile(parent_manifest)?;
+        validate_modular_parent_contract(parent_manifest, qwen_manifest, vae_manifest)?;
+        validate_release_deployment_bounds(parent_manifest, variant, profile)?;
+
+        let qwen_config = burn_qwen3_vl::Qwen3VlConfig::from_json(&required_release_text(
+            &qwen,
+            "metadata/source/mllm/config.json",
+            ArtifactFileRole::Config,
+        )?)
+        .map_err(|error| contract("qwen-source-config", error.to_string()))?;
+        let vae_config = AutoencoderKlConfig::from_diffusers_json(&required_release_text(
+            &vae,
+            "metadata/source/vae/config.json",
+            ArtifactFileRole::Config,
+        )?)
+        .map_err(|error| contract("vae-source-config", error.to_string()))?;
+        let denoiser_config = validate_release_denoiser_config(&required_release_text(
+            &parent,
+            "metadata/source/transformer/config.json",
+            ArtifactFileRole::Config,
+        )?)?;
+
+        Qwen3VlComponentContract::released_base(qwen_manifest.clone(), qwen_config.clone())
+            .map_err(|error| contract("qwen-component", error.to_string()))?;
+        FluxVaeComponentContract::new(vae_manifest.clone(), vae_config.clone())
+            .map_err(|error| contract("vae-component", error.to_string()))?;
+        validate_release_processor_metadata(&qwen, &parent, variant)?;
+
+        let inventory = BooguArtifactInventory::new(&qwen_config, &denoiser_config, &vae_config)
+            .map_err(|error| contract("tensor-inventory", error.to_string()))?;
+        let identity = BooguReleaseIdentity::canonical(variant);
+        validate_release_manifest(&identity, parent_manifest, &inventory, profile)?;
+
+        let parent_verification =
+            verify_one_modular_owner(&parent, &inventory, profile, Some((variant, profile)))?;
+        let qwen_verification = verify_one_modular_owner(&qwen, &inventory, profile, None)?;
+        let vae_verification = verify_one_modular_owner(&vae, &inventory, profile, None)?;
+
+        let verified_tensors = parent_verification
+            .verified_tensors
+            .checked_add(qwen_verification.verified_tensors)
+            .and_then(|count| count.checked_add(vae_verification.verified_tensors))
+            .ok_or_else(|| contract("verification", "tensor count overflow"))?;
+        let expected_stored = inventory
+            .tensors()
+            .len()
+            .checked_sub(1)
+            // The one embedding tensor is represented by six row slices (+5 physical entries),
+            // while the LM head remains one present-but-omitted inventory entry.
+            .and_then(|count| count.checked_add(5))
+            .ok_or_else(|| contract("verification", "inventory count overflow"))?;
+        if verified_tensors != expected_stored {
+            return Err(contract(
+                "verification",
+                format!(
+                    "component tensor closure has {verified_tensors} stored entries, expected {expected_stored}"
+                ),
+            ));
+        }
+
+        let verified_files = parent_verification
+            .verified_files
+            .checked_add(qwen_verification.verified_files)
+            .and_then(|count| count.checked_add(vae_verification.verified_files))
+            .ok_or_else(|| contract("verification", "file count overflow"))?;
+        let verified_bytes = parent_verification
+            .verified_bytes
+            .checked_add(qwen_verification.verified_bytes)
+            .and_then(|count| count.checked_add(vae_verification.verified_bytes))
+            .ok_or_else(|| contract("verification", "byte count overflow"))?;
+        let verified_weight_objects = parent_verification
+            .verified_weight_objects
+            .checked_add(qwen_verification.verified_weight_objects)
+            .and_then(|count| count.checked_add(vae_verification.verified_weight_objects))
+            .ok_or_else(|| contract("verification", "object count overflow"))?;
+        let largest_object_bytes = parent_verification
+            .largest_object_bytes
+            .max(qwen_verification.largest_object_bytes)
+            .max(vae_verification.largest_object_bytes);
+        Ok(BooguModularReleaseVerification {
+            variant,
+            profile,
+            parent: BooguReleaseVerification {
+                variant,
+                profile,
+                verified_files: parent_verification.verified_files,
+                verified_bytes: parent_verification.verified_bytes,
+                verified_weight_objects: parent_verification.verified_weight_objects,
+                verified_tensors: parent_verification.verified_tensors,
+                largest_object_bytes: parent_verification.largest_object_bytes,
+                max_shard_bytes: parent_verification.max_shard_bytes,
+            },
+            qwen: qwen_verification,
+            vae: vae_verification,
+            dependency_closure_verified: true,
+            component_contracts_verified: true,
+            reconstructed_inventory_verified: true,
+            verified_files,
+            verified_bytes,
+            verified_weight_objects,
+            verified_tensors,
+            largest_object_bytes,
+        })
+    }
+
+    fn validate_modular_parent_contract(
+        parent: &ArtifactManifest,
+        qwen: &ArtifactManifest,
+        vae: &ArtifactManifest,
+    ) -> Result<(), BooguArtifactLoadError> {
+        if parent.schema_version != burn_image::ARTIFACT_MANIFEST_SCHEMA_V2
+            || parent.dependencies.len() != 2
+            || parent.metadata.get("artifact_layout").map(String::as_str)
+                != Some("semantic-burnpack-composition-v2")
+            || parent
+                .metadata
+                .get("component_dependency_count")
+                .map(String::as_str)
+                != Some("2")
+        {
+            return Err(contract(
+                "composition",
+                "parent is not the exact two-dependency schema-v2 layout",
+            ));
+        }
+        if parent
+            .components
+            .iter()
+            .any(|component| !component.required || !component.id.as_str().starts_with("boogu-"))
+            || parent.files.iter().any(|file| {
+                file.role == ArtifactFileRole::Weights
+                    && file
+                        .component
+                        .as_ref()
+                        .is_none_or(|component| !component.as_str().starts_with("boogu-"))
+            })
+        {
+            return Err(contract(
+                "composition",
+                "parent contains a non-denoiser component or weight object",
+            ));
+        }
+        let qwen_dependency = parent
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.role.as_str() == QWEN_COMPONENT_ROLE)
+            .ok_or_else(|| contract("composition", "parent omits the qwen dependency"))?;
+        let vae_dependency = parent
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.role.as_str() == FLUX_VAE_COMPONENT_ROLE)
+            .ok_or_else(|| contract("composition", "parent omits the vae dependency"))?;
+        qwen_dependency
+            .validate_resolved_manifest(qwen)
+            .map_err(|error| contract("qwen-dependency", error.to_string()))?;
+        vae_dependency
+            .validate_resolved_manifest(vae)
+            .map_err(|error| contract("vae-dependency", error.to_string()))?;
+        parent
+            .validate_dependency_closure(|bundle| {
+                if bundle == &qwen.bundle {
+                    Some(qwen)
+                } else if bundle == &vae.bundle {
+                    Some(vae)
+                } else {
+                    None
+                }
+            })
+            .map_err(|error| contract("dependency-closure", error.to_string()))?;
+        Ok(())
+    }
+
+    fn verify_one_modular_owner(
+        directory: &VerifiedArtifactDirectory,
+        inventory: &BooguArtifactInventory,
+        profile: BooguStorageProfile,
+        parent_identity: Option<(BooguVariant, BooguStorageProfile)>,
+    ) -> Result<BooguComponentVerification, BooguArtifactLoadError> {
+        let manifest = directory.manifest();
+        if let Some((variant, profile)) = parent_identity {
+            validate_release_deployment_bounds(manifest, variant, profile)?;
+        }
+        let mut reader = DirectoryStageShardReader::new(directory.root());
+        let entries = verify_inventory_contract(manifest, inventory, profile, &mut reader)?;
+        let (verified_weight_objects, verified_tensors, largest_weight_bytes) =
+            verify_release_burnpacks(manifest, &entries, &mut reader)?;
+        let mut largest_object_bytes = largest_weight_bytes;
+        for file in manifest
+            .files
+            .iter()
+            .filter(|file| file.role != ArtifactFileRole::Weights)
+        {
+            let bytes = directory.read_file(file.path.as_str())?;
+            largest_object_bytes = largest_object_bytes.max(bytes.len() as u64);
+        }
+        let verified_bytes = manifest.files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.size)
+                .ok_or_else(|| contract("verification", "payload byte count overflow"))
+        })?;
+        Ok(BooguComponentVerification {
+            bundle: manifest.bundle.to_string(),
+            content_digest: manifest
+                .content_digest
+                .expect("verified sealed manifest has a content digest"),
+            verified_files: manifest.files.len(),
+            verified_bytes,
+            verified_weight_objects,
+            verified_tensors,
+            largest_object_bytes,
+            max_shard_bytes: declared_target_max_shard_bytes(manifest)?,
+        })
+    }
+
+    /// Authenticate one of the three exact bundles published beneath the canonical CDN root.
     ///
     /// This performs the complete bounded semantic verification and additionally pins the tuple's
     /// manifest bundle id, converter version, and sealed content digest. Use
@@ -1582,6 +2326,14 @@ mod loading {
         }
     }
 
+    fn release_variant_name(variant: BooguVariant) -> &'static str {
+        match variant {
+            BooguVariant::Image01Turbo => "boogu-image-0.1-turbo",
+            BooguVariant::Image01EditTurbo => "boogu-image-0.1-edit-turbo",
+            BooguVariant::Image01EditTurbo1k5 => "boogu-image-0.1-edit-turbo-1k5",
+        }
+    }
+
     fn release_profile_name(profile: BooguStorageProfile) -> &'static str {
         match profile {
             BooguStorageProfile::F16 => "f16",
@@ -1613,16 +2365,16 @@ mod loading {
         variant: BooguVariant,
         profile: BooguStorageProfile,
     ) -> Result<(), BooguArtifactLoadError> {
-        let variant_name = match variant {
-            BooguVariant::Image01Turbo => "boogu-image-0.1-turbo",
-            BooguVariant::Image01EditTurbo => "boogu-image-0.1-edit-turbo",
-            BooguVariant::Image01EditTurbo1k5 => "boogu-image-0.1-edit-turbo-1k5",
-        };
-        let expected_bundle = format!("{variant_name}-{}", release_profile_name(profile));
-        if manifest.bundle.as_str() != expected_bundle {
+        let legacy_bundle = legacy_artifact_bundle_id(variant, profile);
+        let published_bundle =
+            canonical_published_bundle(variant, profile).map(|bundle| bundle.bundle_id);
+        if !artifact_bundle_id_is_compatible(variant, profile, manifest.bundle.as_str()) {
+            let accepted = published_bundle
+                .map(|bundle| format!("{legacy_bundle} or {bundle}"))
+                .unwrap_or(legacy_bundle);
             return Err(BooguArtifactLoadError::Identity(format!(
-                "bundle {} is not canonical {expected_bundle}",
-                manifest.bundle
+                "bundle {} is not an accepted explicit/canonical release identity; expected {accepted}",
+                manifest.bundle,
             )));
         }
         let converter = manifest
@@ -1776,11 +2528,12 @@ mod loading {
     }
 
     fn validate_release_processor_metadata(
-        directory: &VerifiedArtifactDirectory,
+        qwen_directory: &VerifiedArtifactDirectory,
+        pipeline_directory: &VerifiedArtifactDirectory,
         variant: BooguVariant,
     ) -> Result<(), BooguArtifactLoadError> {
         let processor = required_release_text(
-            directory,
+            qwen_directory,
             "metadata/source/mllm/preprocessor_config.json",
             ArtifactFileRole::Config,
         )?;
@@ -1791,7 +2544,7 @@ mod loading {
             )
         })?;
         let tokenizer = required_release_text(
-            directory,
+            qwen_directory,
             "metadata/source/mllm/tokenizer.json",
             ArtifactFileRole::Tokenizer,
         )?;
@@ -1805,7 +2558,7 @@ mod loading {
             ));
         }
         let template = required_release_text(
-            directory,
+            qwen_directory,
             "metadata/source/mllm/chat_template.json",
             ArtifactFileRole::Tokenizer,
         )?;
@@ -1820,7 +2573,7 @@ mod loading {
         }
 
         let model_index = required_release_text(
-            directory,
+            pipeline_directory,
             "metadata/source/model_index.json",
             ArtifactFileRole::Config,
         )?;
@@ -2012,23 +2765,10 @@ mod loading {
                 file.path, file.size
             )));
         }
-        let bytes = reader.read_shard(file, max_bytes).await?;
-        let received = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        if received > max_bytes {
-            return Err(BooguError::Artifact(format!(
-                "reader returned {received} bytes for {}, exceeding the per-read cap of {max_bytes}",
-                file.path
-            )));
-        }
-        ArtifactVerifier::verify_bytes(file, &bytes, IntegrityPolicy::RequireSha256).map_err(
-            |error| {
-                BooguError::Artifact(format!(
-                    "integrity verification failed for {}: {error}",
-                    file.path
-                ))
-            },
-        )?;
-        Ok(bytes)
+        reader
+            .read_stage_shard(file, max_bytes)
+            .await?
+            .into_verified_bytes(file, max_bytes)
     }
 
     #[derive(Default)]
@@ -5008,6 +5748,14 @@ mod loading {
                 stage: "tensor-inventory".into(),
                 message: format!("invalid exact tensor inventory JSON: {error}"),
             })?;
+        let vae_encoder_f32_diagnostic = manifest
+            .metadata
+            .keys()
+            .any(|key| key.starts_with("diagnostic_"));
+        if vae_encoder_f32_diagnostic {
+            validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest(manifest)
+                .map_err(|error| contract("tensor-inventory", error.to_string()))?;
+        }
         verify_source_file_contract(manifest, &entries, reader)?;
         let weight_files = manifest
             .files
@@ -5015,6 +5763,7 @@ mod loading {
             .filter(|file| file.role == ArtifactFileRole::Weights)
             .map(|file| (file.path.as_str(), file))
             .collect::<BTreeMap<_, _>>();
+        let expected_specs = manifest_inventory_specs(manifest, inventory);
         let mut targets = BTreeSet::new();
         let mut sources = BTreeMap::<String, Vec<&SerializedTensorInventory>>::new();
         let mut referenced_objects = BTreeSet::new();
@@ -5098,7 +5847,7 @@ mod loading {
                 }
             } else if entry.included {
                 let (expected_stored_dtype, expected_quantized) =
-                    expected_spec_storage(profile, spec);
+                    expected_spec_storage(profile, spec, vae_encoder_f32_diagnostic);
                 let expected_stage = if schema == 1 && spec.owner == TensorOwner::Qwen3Vl {
                     legacy_qwen_stage(&spec.source_name)
                 } else {
@@ -5178,8 +5927,7 @@ mod loading {
             sources.entry(qualified_source).or_default().push(entry);
         }
 
-        let expected_sources = inventory
-            .tensors()
+        let expected_sources = expected_specs
             .iter()
             .map(|spec| spec.qualified_source_name())
             .collect::<BTreeSet<_>>();
@@ -5195,7 +5943,7 @@ mod loading {
                 "sealed weight object set contains an unreferenced or missing Burnpack",
             ));
         }
-        for spec in inventory.tensors() {
+        for spec in &expected_specs {
             let qualified = spec.qualified_source_name();
             let group = sources
                 .get(&qualified)
@@ -5300,7 +6048,7 @@ mod loading {
                     "omitted Qwen LM head lacks explicit manifest policy",
                 ));
             }
-        } else if entries.len() != inventory.tensors().len() || omitted_count != 0 {
+        } else if entries.len() != expected_specs.len() || omitted_count != 0 {
             return Err(contract(
                 "tensor-inventory",
                 "legacy schema must contain exactly one stored entry per source tensor",
@@ -5439,7 +6187,17 @@ mod loading {
             .map_err(|error| BooguArtifactLoadError::Identity(error.to_string()))?;
         validate_manifest_identity(identity, manifest, profile)?;
         let metadata = &manifest.metadata;
-        if metadata.get("artifact_layout").map(String::as_str) != Some("semantic-burnpack-v1")
+        let expected_layout = match (manifest.schema_version, manifest.dependencies.is_empty()) {
+            (burn_image::ARTIFACT_MANIFEST_SCHEMA_V1, true) => "semantic-burnpack-v1",
+            (burn_image::ARTIFACT_MANIFEST_SCHEMA_V2, false) => "semantic-burnpack-composition-v2",
+            (schema, empty) => {
+                return Err(BooguArtifactLoadError::Identity(format!(
+                    "manifest schema {schema} and dependency state ({}) do not form a supported release layout",
+                    if empty { "empty" } else { "non-empty" }
+                )));
+            }
+        };
+        if metadata.get("artifact_layout").map(String::as_str) != Some(expected_layout)
             || metadata.get("layout_contract").map(String::as_str)
                 != Some("metadata/tensor-inventory.json")
             || metadata
@@ -5461,10 +6219,11 @@ mod loading {
                     "manifest tensor_count is invalid: {error}"
                 ))
             })?;
-        if tensor_count != inventory.tensors().len() {
+        let expected_tensor_count = manifest_inventory_specs(manifest, inventory).len();
+        if tensor_count != expected_tensor_count {
             return Err(BooguArtifactLoadError::Identity(format!(
                 "manifest declares {tensor_count} tensors, local exact inventory requires {}",
-                inventory.tensors().len()
+                expected_tensor_count
             )));
         }
         let inventory_path = metadata
@@ -5502,6 +6261,26 @@ mod loading {
             )));
         }
         Ok(())
+    }
+
+    /// Schema-v2 Boogu composition manifests own only the variant-specific denoiser inventory;
+    /// their sealed Qwen/VAE dependencies are validated and loaded by the reusable model crates.
+    /// Legacy schema-v1 monoliths continue to bind the complete three-model inventory.
+    fn manifest_inventory_specs<'a>(
+        manifest: &ArtifactManifest,
+        inventory: &'a BooguArtifactInventory,
+    ) -> Vec<&'a super::ArtifactTensorSpec> {
+        let owner = match manifest.metadata.get("component_kind").map(String::as_str) {
+            Some("qwen3-vl-base-conditioning") => Some(TensorOwner::Qwen3Vl),
+            Some("flux1-vae") => Some(TensorOwner::FluxVae),
+            _ if !manifest.dependencies.is_empty() => Some(TensorOwner::BooguDenoiser),
+            _ => None,
+        };
+        inventory
+            .tensors()
+            .iter()
+            .filter(|spec| owner.is_none_or(|owner| spec.owner == owner))
+            .collect()
     }
 
     fn declared_target_max_shard_bytes(
@@ -5657,7 +6436,14 @@ mod loading {
     fn expected_spec_storage(
         profile: BooguStorageProfile,
         spec: &super::ArtifactTensorSpec,
+        vae_encoder_f32_diagnostic: bool,
     ) -> (&'static str, bool) {
+        if vae_encoder_f32_diagnostic
+            && spec.owner == TensorOwner::FluxVae
+            && spec.stage == "flux-vae-encoder"
+        {
+            return ("f32", false);
+        }
         let qwen_vision =
             spec.owner == TensorOwner::Qwen3Vl && spec.stage.starts_with("qwen-vision-");
         let mixed_vision = matches!(
@@ -5685,7 +6471,7 @@ mod loading {
         spec: &super::ArtifactTensorSpec,
         actual: DType,
     ) -> Result<(), String> {
-        let (stored_dtype, quantized) = expected_spec_storage(profile, spec);
+        let (stored_dtype, quantized) = expected_spec_storage(profile, spec, false);
         validate_stored_dtype(stored_dtype, quantized, actual)
     }
 
@@ -5855,18 +6641,24 @@ mod loading {
 
 #[cfg(feature = "burnpack")]
 pub use loading::{
-    AsyncStageShardReader, BooguArtifactLoadError, BooguBurnpackLoader, BooguFloatLoadPolicy,
-    BooguLoadReport, BooguModels, BooguQuantizedLoadPolicy, BooguReleaseVerification,
-    BooguStorageProfile, CanonicalBooguArtifactBundle, DirectoryStageShardReader,
-    PUBLISHED_ARTIFACT_BUNDLES, StageShardReader, VerifiedArtifactDirectory,
-    VerifiedAsyncBurnpackDenoiserStageSource, VerifiedAsyncBurnpackQwenStageSource,
-    VerifiedAsyncBurnpackVaeStageSource, VerifiedBurnpackQwenStageSource,
-    VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource, canonical_published_bundle,
+    AsyncStageShardRead, AsyncStageShardReader, BooguArtifactLoadError, BooguBurnpackLoader,
+    BooguComponentVerification, BooguFloatLoadPolicy, BooguLoadReport, BooguModels,
+    BooguModularReleaseVerification, BooguQuantizedLoadPolicy, BooguReleaseVerification,
+    BooguStorageProfile, BooguVaeEncoderF32DiagnosticManifest, CanonicalBooguArtifactBundle,
+    DirectoryStageShardReader, PUBLISHED_ARTIFACT_BUNDLES, StageShardReader,
+    VerifiedArtifactDirectory, VerifiedAsyncBurnpackDenoiserStageSource,
+    VerifiedAsyncBurnpackQwenStageSource, VerifiedAsyncBurnpackVaeStageSource,
+    VerifiedBurnpackQwenStageSource, VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource,
+    artifact_bundle_id_is_compatible, canonical_published_bundle, legacy_artifact_bundle_id,
     load_resident_denoiser_from_directory, load_resident_denoiser_from_directory_with_policies,
     load_resident_qwen_base_from_directory, load_resident_vae_from_directory, load_vae_decoder,
     load_vae_decoder_from_directory, load_vae_encoder, load_vae_encoder_from_directory,
+    preferred_artifact_bundle_id, promotable_legacy_artifact_digest,
+    stamp_edit_turbo_1k5_vae_encoder_f32_diagnostic_metadata,
     validate_canonical_release_artifact_digest, validate_edit_turbo_1k5_release_artifact_digest,
-    verify_published_release_artifact_directory, verify_release_artifact_directory,
+    validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest,
+    verify_modular_release_artifact_directories, verify_published_release_artifact_directory,
+    verify_release_artifact_directory,
 };
 
 #[cfg(test)]
@@ -5899,6 +6691,11 @@ mod tests {
         let expected =
             Sha256Digest::from_hex(EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST).unwrap();
         validate_edit_turbo_1k5_release_artifact_digest(expected).unwrap();
+        validate_edit_turbo_1k5_release_artifact_digest(
+            Sha256Digest::from_hex(LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+                .unwrap(),
+        )
+        .unwrap();
         assert!(
             validate_edit_turbo_1k5_release_artifact_digest(Sha256Digest::calculate(b"other"))
                 .is_err()
@@ -5910,7 +6707,7 @@ mod tests {
     fn canonical_published_bundle_matrix_is_exact_correctness() {
         use std::collections::BTreeSet;
 
-        assert_eq!(PUBLISHED_ARTIFACT_BUNDLES.len(), 5);
+        assert_eq!(PUBLISHED_ARTIFACT_BUNDLES.len(), 3);
         let bundle_ids = PUBLISHED_ARTIFACT_BUNDLES
             .iter()
             .map(|bundle| bundle.bundle_id)
@@ -5921,6 +6718,14 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(bundle_ids.len(), PUBLISHED_ARTIFACT_BUNDLES.len());
         assert_eq!(digests.len(), PUBLISHED_ARTIFACT_BUNDLES.len());
+        assert_eq!(
+            bundle_ids,
+            BTreeSet::from([
+                "boogu-image-0.1-turbo",
+                "boogu-image-0.1-edit-turbo",
+                "boogu-image-0.1-edit-turbo-1k5",
+            ])
+        );
 
         for bundle in PUBLISHED_ARTIFACT_BUNDLES {
             assert_eq!(bundle.converter_version, PUBLISHED_BUNDLE_CONVERTER_VERSION);
@@ -5933,7 +6738,11 @@ mod tests {
                 .unwrap();
         }
 
-        for diagnostic in [BooguStorageProfile::F16, BooguStorageProfile::Q8sBlock32F32] {
+        for diagnostic in [
+            BooguStorageProfile::F16,
+            BooguStorageProfile::Q8sBlock32F32,
+            BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
+        ] {
             assert!(canonical_published_bundle(BooguVariant::Image01Turbo, diagnostic).is_none());
             let error = validate_canonical_release_artifact_digest(
                 BooguVariant::Image01Turbo,
@@ -5947,6 +6756,55 @@ mod tests {
                     .contains("explicit local or custom remote source")
             );
         }
+
+        assert_eq!(
+            preferred_artifact_bundle_id(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            ),
+            "boogu-image-0.1-turbo"
+        );
+        assert_eq!(
+            preferred_artifact_bundle_id(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
+            ),
+            "boogu-image-0.1-turbo-q8s-block32-f32-qwen-vision-f32"
+        );
+        assert_eq!(
+            promotable_legacy_artifact_digest(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            ),
+            Some(LEGACY_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+        );
+        assert_eq!(
+            promotable_legacy_artifact_digest(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
+            ),
+            None
+        );
+        assert!(artifact_bundle_id_is_compatible(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+            "boogu-image-0.1-turbo",
+        ));
+        assert!(artifact_bundle_id_is_compatible(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+            "boogu-image-0.1-turbo-f16-qwen-vision-f32",
+        ));
+        assert!(!artifact_bundle_id_is_compatible(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+            "boogu-image-0.1-turbo-arbitrary",
+        ));
+        assert!(!artifact_bundle_id_is_compatible(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
+            "boogu-image-0.1-turbo",
+        ));
     }
 
     #[cfg(feature = "burnpack")]
@@ -6041,6 +6899,7 @@ mod tests {
                 component: None,
                 shard: None,
             }],
+            dependencies: Vec::new(),
             metadata: BTreeMap::new(),
             content_digest: None,
         };
@@ -6172,9 +7031,9 @@ mod tests {
     ) -> (tempfile::TempDir, burn_image::ArtifactManifest) {
         use burn::{module::ParamId, tensor::DType};
         use burn_image::{
-            ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactBundleId, ArtifactComponent,
-            ArtifactComponentId, ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath,
-            ArtifactProfileId, ModelId, NumericFormat, Sha256Digest,
+            ARTIFACT_MANIFEST_SCHEMA_V1, ArtifactBundleId, ArtifactComponent, ArtifactComponentId,
+            ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath, ArtifactProfileId,
+            ModelId, NumericFormat, Sha256Digest,
         };
         use burn_store::{BurnpackWriter, TensorSnapshot};
 
@@ -6343,7 +7202,7 @@ mod tests {
         );
         metadata.insert("physical_shards_bounded".into(), "true".into());
         let mut manifest = ArtifactManifest {
-            schema_version: ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
             bundle: ArtifactBundleId::new("tiny-component-test").unwrap(),
             profile: ArtifactProfileId::new(profile_name).unwrap(),
             model: ModelId::new("Boogu/Boogu-Image-0.1-Turbo").unwrap(),
@@ -6351,6 +7210,7 @@ mod tests {
             numeric_format,
             components,
             files,
+            dependencies: Vec::new(),
             metadata,
             content_digest: None,
         };
@@ -7511,9 +8371,9 @@ mod tests {
         use crate::StreamingStageSource;
         use burn::{backend::NdArray, module::ParamId, tensor::DType};
         use burn_image::{
-            ARTIFACT_MANIFEST_SCHEMA_VERSION, ArtifactBundleId, ArtifactComponent,
-            ArtifactComponentId, ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath,
-            ArtifactProfileId, ModelId, NumericFormat, Sha256Digest,
+            ARTIFACT_MANIFEST_SCHEMA_V1, ArtifactBundleId, ArtifactComponent, ArtifactComponentId,
+            ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath, ArtifactProfileId,
+            ModelId, NumericFormat, Sha256Digest,
         };
         use burn_store::{BurnpackWriter, ModuleSnapshot, TensorSnapshot};
 
@@ -7686,7 +8546,7 @@ mod tests {
         metadata.insert("target_max_shard_bytes".into(), (1024 * 1024).to_string());
         metadata.insert("physical_shards_bounded".into(), "true".into());
         let mut manifest = ArtifactManifest {
-            schema_version: ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
             bundle: ArtifactBundleId::new("tiny-stream-test").unwrap(),
             profile: ArtifactProfileId::new("f16").unwrap(),
             model: ModelId::new("Boogu/Boogu-Image-0.1-Turbo").unwrap(),
@@ -7694,6 +8554,7 @@ mod tests {
             numeric_format: NumericFormat::F16,
             components,
             files,
+            dependencies: Vec::new(),
             metadata,
             content_digest: None,
         };

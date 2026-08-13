@@ -8,7 +8,7 @@
 Burn-native image generation and editing with
 [Boogu-Image 0.1](https://github.com/boogu-project/Boogu-Image). Use it through the Bevy desktop
 viewer or embed the model-neutral Rust API. Native WGPU is the primary runtime; browser WebGPU is
-available as an experimental streamed path.
+available as an experimental, GPU-resident path.
 
 ## Support
 
@@ -16,13 +16,13 @@ available as an experimental streamed path.
 | --- | --- |
 | Turbo 1K generation | Native production path; numerical gates pass and performance is at the 2× target boundary |
 | Edit-Turbo 1K | Native production path; numerical and 2× performance gates pass |
-| Edit-Turbo 1.5K | Native only; numerical gates pass, while the 2× performance goal remains unmet |
-| Turbo in the browser | Experimental at 256×256; real inference works, but rendered-window numerical parity is not yet claimed |
+| Edit-Turbo 1.5K | Native numerical gates pass; historical flat-bundle 1536 browser parity passed on the attested RTX/Chrome stack, while the modular bundle, browser UI, and browser performance remain unqualified |
+| Turbo in the browser | Resident mechanism is experimental; a historical streamed request ran on real WebGPU, but resident UI/numerical/performance qualification is still open |
 
 > [!IMPORTANT]
 > These are large models. Expect tens of gigabytes of artifacts and a workstation-class GPU for
-> the validated resident path. The browser streams bounded shards instead of loading the complete
-> bundle into Wasm memory.
+> resident execution. Native and browser production modes finish verified GPU preloading before
+> becoming ready; the browser never loads the complete bundle into Wasm memory.
 
 ## Quick start
 
@@ -32,13 +32,15 @@ The full viewer requires Rust 1.95 or newer:
 cargo run --release --locked -p bevy_burn_image \
   --features boogu-native --bin burn-image-viewer -- \
   --variant turbo \
-  --profile f16-qwen-vision-f32 \
+  --profile production \
   --residency native-high-vram
 ```
 
-Once the canonical CDN bundle is published, the viewer resolves it, verifies it, and caches it
-under `~/.burn_image/models/`. Until then, add `--artifacts /path/to/converted-bundle` to use a
-local conversion. Enter a prompt, select **Run**, then save the generated PNG from the viewer.
+`production` selects the parity-qualified, F16-first storage policy. Once the canonical CDN bundle
+is published, the viewer resolves it, verifies it, and caches it under
+`~/.burn_image/models/`. Until then, add `--artifacts /path/to/production-bundle` to use a local
+bundle.
+Enter a prompt, select **Run**, then save the generated PNG from the viewer.
 
 For image editing, use `--variant edit-turbo` and select or drop a reference image. The native
 1.5K checkpoint is selected with `--variant edit-turbo-1k5` and its matching artifact bundle.
@@ -52,9 +54,9 @@ model load does not look frozen.
 | Crate | Responsibility |
 | --- | --- |
 | [`burn_image`](crates/burn_image) | Model-neutral requests, jobs, manifests, integrity, transport, and provenance |
-| [`burn_qwen3_vl`](crates/burn_qwen3_vl) | Qwen3-VL text/vision model, processor, MRoPE, and weight inventory |
-| [`burn_flux_vae`](crates/burn_flux_vae) | Diffusers-compatible FLUX `AutoencoderKL` |
-| [`burn_boogu`](crates/burn_boogu) | Boogu conditioning, denoiser, DMD pipeline, artifacts, and native runners |
+| [`burn_qwen3_vl`](crates/burn_qwen3_vl) | Qwen3-VL model/processor plus its sealed component, semantic shard loader, and device cache |
+| [`burn_flux_vae`](crates/burn_flux_vae) | FLUX `AutoencoderKL` plus its sealed component, encoder/decoder shard loader, and device cache |
+| [`burn_boogu`](crates/burn_boogu) | Boogu conditioning, variant-specific denoiser, DMD composition, and native runners |
 | [`bevy_burn_image`](crates/bevy_image) | Native/web Bevy UI and shared WGPU integration |
 
 The frontend package is named `bevy_burn_image` because Bevy already publishes a crate named
@@ -64,12 +66,13 @@ The frontend package is named `bevy_burn_image` because Bevy already publishes a
 
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test -p burn_image --all-targets --locked
+cargo clippy -p burn_image --all-targets --locked -- -D warnings
 ```
 
-The [CI workflow](.github/workflows/ci.yml) contains the authoritative package-isolated test and
-WebAssembly build matrix.
+The [CI workflow](.github/workflows/ci.yml) contains the authoritative package-isolated test,
+feature-contract, and WebAssembly build matrix. Use it instead of combining every model and
+frontend feature into one linker-heavy workspace test.
 
 ## Documentation
 

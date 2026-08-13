@@ -3,8 +3,10 @@
 ## Ownership
 
 - `burn_image` owns model-neutral requests, outputs, jobs, artifacts, and provenance.
-- `burn_qwen3_vl` owns ordinary Qwen3-VL architecture and processing only.
-- `burn_flux_vae` owns ordinary FLUX-compatible `AutoencoderKL` math only.
+- `burn_qwen3_vl` owns ordinary Qwen3-VL architecture, processing, semantic artifact stages,
+  verified shard loading, and device-resident stage retention.
+- `burn_flux_vae` owns ordinary FLUX-compatible `AutoencoderKL` math, semantic artifact stages,
+  verified shard loading, and device-resident stage retention.
 - `burn_boogu` owns Boogu conditioning, denoiser, DMD sampling, and composition.
 - `bevy_burn_image` owns ECS, UI, device sharing, display, and platform I/O only.
 

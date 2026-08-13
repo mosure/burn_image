@@ -42,9 +42,11 @@ pub use config::{
 pub use dmd::{DmdSchedule, dmd_prediction, dmd_renoise};
 pub use error::BooguError;
 pub use model::{
-    AsyncBooguDenoiserStageSource, BooguDenoiser, BooguDenoiserInput, BooguDenoiserPrelude,
-    BooguDenoiserTail, BooguStreamState, DenoiserRmsNormPolicy, DenoiserStageObserver,
-    DoubleStreamBlock, SingleStreamBlock, StreamingBooguDenoiser, StreamingStageSource,
+    AsyncBooguDenoiserStageSource, AsyncRetainingDenoiserSynchronizationPolicy, BooguDenoiser,
+    BooguDenoiserInput, BooguDenoiserPrelude, BooguDenoiserTail, BooguStreamState,
+    DenoiserRmsNormPolicy, DenoiserStageObserver, DoubleStreamBlock,
+    RetainingAsyncBooguDenoiserStageSource, SingleStreamBlock, StreamingBooguDenoiser,
+    StreamingStageSource,
 };
 #[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
 pub use model::{
@@ -60,23 +62,26 @@ pub use model::{
 };
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub use pipeline::NativeFlashUnitDenoiser;
-#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-pub use pipeline::NativePaddedBlackboxDenoiser;
 pub use pipeline::{
     AsyncBooguVaeStageSource, BooguDmdInput, BooguExecution, BooguPipelineOutput,
     BooguVaeStageSource, DmdDenoiser, ResidentBooguInput, ResidentBooguPipeline,
-    RetainingBooguVaeStageSource, StreamingBooguPipeline, encode_instruction, encode_reference,
-    run_dmd, run_dmd_with_observer, trim_instruction_features,
+    RetainingAsyncBooguVaeStageSource, RetainingBooguVaeStageSource, StreamingBooguPipeline,
+    encode_instruction, encode_reference, run_dmd, run_dmd_with_observer,
+    trim_instruction_features,
 };
+#[cfg(feature = "burnpack")]
+pub use pipeline::{AsyncFluxVaeStageSourceAdapter, FluxVaeStageSourceAdapter};
 #[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
 pub use pipeline::{NativeCudaFlashUnitDenoiser, NativeCudaPaddedBlackboxDenoiser};
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub use pipeline::{NativePaddedBlackboxDenoiser, NativePortableDenoiser};
 pub use processing::{
     BOOGU_1K5_DEFAULT_EDGE, BOOGU_1K5_MAX_OUTPUT_PIXELS, BOOGU_1K5_MAX_OUTPUT_SIDE,
     BOOGU_1K5_OUTPUT_PRESETS, BOOGU_DEFAULT_EDGE, BOOGU_MAX_OUTPUT_PIXELS, BOOGU_MAX_OUTPUT_SIDE,
     BOOGU_MAX_REFERENCE_PIXELS, BOOGU_MAX_REFERENCE_SIDE, BOOGU_MAX_VLM_PIXELS, BOOGU_MAX_VLM_SIDE,
     PreparedInstruction, ResolvedBooguRequest, boogu_model_descriptor, boogu_processor_config,
-    decode_input_image, decoder_output_to_host, prepare_instruction, prepare_vae_reference,
-    resize_reference, resolve_request,
+    decode_input_image, decoder_output_data_to_host, decoder_output_to_host, prepare_instruction,
+    prepare_vae_reference, resize_reference, resolve_request,
 };
 #[cfg(feature = "runtime")]
 pub use runtime::{BooguImageModel, BooguRuntimeDTypes, BooguRuntimeMetadata};

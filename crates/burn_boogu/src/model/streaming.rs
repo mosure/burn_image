@@ -4,12 +4,11 @@ use crate::{
     BooguConfig, BooguDenoiserInput, BooguError,
     latent::{patchify, unpatchify},
     pipeline::DmdDenoiser,
-    rope::{LatentSize, position_ids},
 };
 
 use super::{
     CombinedTimestepCaptionEmbedding, DoubleStreamBlock, FinalProjection, SingleStreamBlock,
-    denoiser::rope_tensors,
+    denoiser::BooguRoPeGeometry,
 };
 
 /// Optional observer for numerical checks at streamed denoiser boundaries.
@@ -85,6 +84,19 @@ impl<B: Backend> BooguDenoiserPrelude<B> {
         input: BooguDenoiserInput<B>,
         observer: &mut O,
     ) -> Result<BooguStreamState<B>, BooguError> {
+        let geometry = self.prepare_rope_geometry(&input)?;
+        self.begin_with_prepared_rope_and_observer(input, &geometry, observer)
+    }
+
+    fn prepare_rope_geometry(
+        &self,
+        input: &BooguDenoiserInput<B>,
+    ) -> Result<BooguRoPeGeometry<B>, BooguError> {
+        self.validate_input(input)?;
+        BooguRoPeGeometry::prepare(&self.config, input)
+    }
+
+    fn validate_input(&self, input: &BooguDenoiserInput<B>) -> Result<(), BooguError> {
         let [batch, channels, height, width] = input.latent.dims();
         if batch != 1 || channels != self.config.in_channels {
             return Err(BooguError::InvalidShape(format!(
@@ -102,45 +114,44 @@ impl<B: Backend> BooguDenoiserPrelude<B> {
                 self.config.instruction_feature_dim
             )));
         }
-        let device = input.latent.device();
+        let _ = (height, width);
+        Ok(())
+    }
+
+    fn begin_with_prepared_rope_and_observer<O: DenoiserStageObserver<B>>(
+        &self,
+        input: BooguDenoiserInput<B>,
+        geometry: &BooguRoPeGeometry<B>,
+        observer: &mut O,
+    ) -> Result<BooguStreamState<B>, BooguError> {
+        self.validate_input(&input)?;
+        if !geometry.matches(&input) {
+            return Err(BooguError::InvalidShape(
+                "cached denoiser RoPE geometry does not match the input shape, dtype, or device"
+                    .into(),
+            ));
+        }
+        let [_batch, _channels, height, width] = input.latent.dims();
         let (time, instruction) = self
             .time_caption_embed
             .forward(input.timestep, input.instruction);
         observer.rank2("time_caption_embed.0", time.clone())?;
         observer.rank3("time_caption_embed.1", instruction.clone())?;
         let text_len = instruction.dims()[1];
-        let reference_size = input.reference.as_ref().map(|reference| {
-            let dims = reference.dims();
-            LatentSize {
-                height: dims[2],
-                width: dims[3],
-            }
-        });
-        let ids = position_ids(
-            text_len,
-            reference_size.as_slice(),
-            LatentSize { height, width },
-            self.config.patch_size,
-        )?;
-        let (joint_cos, joint_sin) = rope_tensors::<B>(
-            &ids.values,
-            self.config.axes_dim_rope,
-            10_000.0,
-            input.latent.dtype(),
-            &device,
-        );
+        let joint_cos = geometry.joint_cos.clone();
+        let joint_sin = geometry.joint_sin.clone();
         let text_rope = (
             joint_cos.clone().narrow(1, 0, text_len),
             joint_sin.clone().narrow(1, 0, text_len),
         );
-        let generated_start = text_len + ids.reference_len;
+        let generated_start = text_len + geometry.reference_len;
         let generated_rope = (
             joint_cos
                 .clone()
-                .narrow(1, generated_start, ids.generated_len),
+                .narrow(1, generated_start, geometry.generated_len),
             joint_sin
                 .clone()
-                .narrow(1, generated_start, ids.generated_len),
+                .narrow(1, generated_start, geometry.generated_len),
         );
         let generated = self
             .x_embedder
@@ -161,8 +172,12 @@ impl<B: Backend> BooguDenoiserPrelude<B> {
             (
                 Some(reference),
                 Some((
-                    joint_cos.clone().narrow(1, text_len, ids.reference_len),
-                    joint_sin.clone().narrow(1, text_len, ids.reference_len),
+                    joint_cos
+                        .clone()
+                        .narrow(1, text_len, geometry.reference_len),
+                    joint_sin
+                        .clone()
+                        .narrow(1, text_len, geometry.reference_len),
                 )),
             )
         } else {
@@ -171,10 +186,10 @@ impl<B: Backend> BooguDenoiserPrelude<B> {
         let image_rope = (
             joint_cos
                 .clone()
-                .narrow(1, text_len, ids.reference_len + ids.generated_len),
+                .narrow(1, text_len, geometry.reference_len + geometry.generated_len),
             joint_sin
                 .clone()
-                .narrow(1, text_len, ids.reference_len + ids.generated_len),
+                .narrow(1, text_len, geometry.reference_len + geometry.generated_len),
         );
         Ok(BooguStreamState {
             instruction: Some(instruction),
@@ -190,7 +205,7 @@ impl<B: Backend> BooguDenoiserPrelude<B> {
             joint_rope: (joint_cos, joint_sin),
             config: self.config.clone(),
             generated_start,
-            generated_len: ids.generated_len,
+            generated_len: geometry.generated_len,
             latent_height: height,
             latent_width: width,
             context_refiners: 0,
@@ -521,10 +536,272 @@ pub trait AsyncBooguDenoiserStageSource<B: Backend> {
     async fn synchronize(&mut self) -> Result<(), BooguError>;
 }
 
+/// Synchronization behavior for retained asynchronous denoiser stages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AsyncRetainingDenoiserSynchronizationPolicy {
+    /// Forward every semantic-stage barrier to the wrapped source.
+    #[default]
+    PerStage,
+    /// Record barriers until the caller explicitly flushes at the DMD-step boundary.
+    Deferred,
+}
+
+/// Opt-in GPU-resident cache for an asynchronous verified denoiser stage source.
+///
+/// A cache miss delegates to the wrapped source and stores only a clone of the successfully
+/// loaded Burn module. On WGPU/WebGPU, those clones share initialized device-buffer handles; no
+/// Burnpack bytes, decoded host tensors, or other artifact payloads are retained here. Cache hits
+/// still delegate every [`AsyncBooguDenoiserStageSource::synchronize`] call, preserving the
+/// executor's exact stage ordering and observer/readback boundaries.
+///
+/// [`Self::new`] enables retention. [`Self::passthrough`] provides the same concrete wrapper type
+/// without retaining modules, allowing a runtime to keep ordinary bounded streaming as its
+/// default and opt into residency only after an explicit resource gate.
+pub struct RetainingAsyncBooguDenoiserStageSource<B: Backend, S> {
+    source: S,
+    retention_enabled: bool,
+    synchronization_policy: AsyncRetainingDenoiserSynchronizationPolicy,
+    synchronization_pending: bool,
+    prelude: Option<BooguDenoiserPrelude<B>>,
+    context_refiners: Vec<(usize, SingleStreamBlock<B>)>,
+    noise_refiners: Vec<(usize, SingleStreamBlock<B>)>,
+    reference_refiners: Vec<(usize, SingleStreamBlock<B>)>,
+    double_stream: Vec<(usize, DoubleStreamBlock<B>)>,
+    single_stream: Vec<(usize, SingleStreamBlock<B>)>,
+    tail: Option<BooguDenoiserTail<B>>,
+}
+
+impl<B: Backend, S> RetainingAsyncBooguDenoiserStageSource<B, S> {
+    /// Create an initially empty cache that retains verified device modules after first load.
+    pub fn new(source: S) -> Self {
+        Self::with_retention(source, true)
+    }
+
+    /// Wrap a source without retaining any module, preserving one-stage-at-a-time residency.
+    pub fn passthrough(source: S) -> Self {
+        Self::with_retention(source, false)
+    }
+
+    fn with_retention(source: S, retention_enabled: bool) -> Self {
+        Self {
+            source,
+            retention_enabled,
+            synchronization_policy: AsyncRetainingDenoiserSynchronizationPolicy::PerStage,
+            synchronization_pending: false,
+            prelude: None,
+            context_refiners: Vec::new(),
+            noise_refiners: Vec::new(),
+            reference_refiners: Vec::new(),
+            double_stream: Vec::new(),
+            single_stream: Vec::new(),
+            tail: None,
+        }
+    }
+
+    /// Whether successfully loaded modules are retained for later requests.
+    pub const fn retention_enabled(&self) -> bool {
+        self.retention_enabled
+    }
+
+    /// Select per-stage or explicitly deferred device synchronization.
+    pub const fn with_synchronization_policy(
+        mut self,
+        synchronization_policy: AsyncRetainingDenoiserSynchronizationPolicy,
+    ) -> Self {
+        self.synchronization_policy = synchronization_policy;
+        self
+    }
+
+    /// Return the selected synchronization behavior.
+    pub const fn synchronization_policy(&self) -> AsyncRetainingDenoiserSynchronizationPolicy {
+        self.synchronization_policy
+    }
+
+    /// Whether deferred work requires a terminal DMD-step barrier.
+    pub const fn has_pending_synchronization(&self) -> bool {
+        self.synchronization_pending
+    }
+
+    /// Number of independently loadable semantic stages currently retained.
+    pub fn cached_stage_count(&self) -> usize {
+        usize::from(self.prelude.is_some())
+            + self.context_refiners.len()
+            + self.noise_refiners.len()
+            + self.reference_refiners.len()
+            + self.double_stream.len()
+            + self.single_stream.len()
+            + usize::from(self.tail.is_some())
+    }
+
+    /// Drop every retained module handle while preserving the wrapped verified source.
+    ///
+    /// Callers must first await the last submitted stage synchronization. Dropping this cache does
+    /// not retain or materialize any host-side artifact bytes.
+    pub fn clear(&mut self) {
+        self.prelude = None;
+        self.context_refiners.clear();
+        self.noise_refiners.clear();
+        self.reference_refiners.clear();
+        self.double_stream.clear();
+        self.single_stream.clear();
+        self.tail = None;
+    }
+
+    /// Borrow the wrapped verified source.
+    pub const fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// Mutably borrow the wrapped verified source.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Consume the wrapper, drop retained modules, and return the verified source.
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+impl<B, S> RetainingAsyncBooguDenoiserStageSource<B, S>
+where
+    B: Backend,
+    S: AsyncBooguDenoiserStageSource<B>,
+{
+    /// Forward one pending deferred barrier to the wrapped source.
+    pub async fn synchronize_pending(&mut self) -> Result<(), BooguError> {
+        if !self.synchronization_pending {
+            return Ok(());
+        }
+        self.source.synchronize().await?;
+        self.synchronization_pending = false;
+        Ok(())
+    }
+}
+
+fn cached_indexed<T: Clone>(cache: &[(usize, T)], index: usize) -> Option<T> {
+    cache
+        .iter()
+        .find(|(cached_index, _)| *cached_index == index)
+        .map(|(_, value)| value.clone())
+}
+
+impl<B, S> AsyncBooguDenoiserStageSource<B> for RetainingAsyncBooguDenoiserStageSource<B, S>
+where
+    B: Backend,
+    S: AsyncBooguDenoiserStageSource<B>,
+{
+    async fn load_prelude(&mut self) -> Result<BooguDenoiserPrelude<B>, BooguError> {
+        if let Some(prelude) = &self.prelude {
+            return Ok(prelude.clone());
+        }
+        let prelude = self.source.load_prelude().await?;
+        if self.retention_enabled {
+            self.prelude = Some(prelude.clone());
+        }
+        Ok(prelude)
+    }
+
+    async fn load_context_refiner(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<B>, BooguError> {
+        if let Some(block) = cached_indexed(&self.context_refiners, index) {
+            return Ok(block);
+        }
+        let block = self.source.load_context_refiner(index).await?;
+        if self.retention_enabled {
+            self.context_refiners.push((index, block.clone()));
+        }
+        Ok(block)
+    }
+
+    async fn load_noise_refiner(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<B>, BooguError> {
+        if let Some(block) = cached_indexed(&self.noise_refiners, index) {
+            return Ok(block);
+        }
+        let block = self.source.load_noise_refiner(index).await?;
+        if self.retention_enabled {
+            self.noise_refiners.push((index, block.clone()));
+        }
+        Ok(block)
+    }
+
+    async fn load_reference_refiner(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<B>, BooguError> {
+        if let Some(block) = cached_indexed(&self.reference_refiners, index) {
+            return Ok(block);
+        }
+        let block = self.source.load_reference_refiner(index).await?;
+        if self.retention_enabled {
+            self.reference_refiners.push((index, block.clone()));
+        }
+        Ok(block)
+    }
+
+    async fn load_double_stream(
+        &mut self,
+        index: usize,
+    ) -> Result<DoubleStreamBlock<B>, BooguError> {
+        if let Some(block) = cached_indexed(&self.double_stream, index) {
+            return Ok(block);
+        }
+        let block = self.source.load_double_stream(index).await?;
+        if self.retention_enabled {
+            self.double_stream.push((index, block.clone()));
+        }
+        Ok(block)
+    }
+
+    async fn load_single_stream(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<B>, BooguError> {
+        if let Some(block) = cached_indexed(&self.single_stream, index) {
+            return Ok(block);
+        }
+        let block = self.source.load_single_stream(index).await?;
+        if self.retention_enabled {
+            self.single_stream.push((index, block.clone()));
+        }
+        Ok(block)
+    }
+
+    async fn load_tail(&mut self) -> Result<BooguDenoiserTail<B>, BooguError> {
+        if let Some(tail) = &self.tail {
+            return Ok(tail.clone());
+        }
+        let tail = self.source.load_tail().await?;
+        if self.retention_enabled {
+            self.tail = Some(tail.clone());
+        }
+        Ok(tail)
+    }
+
+    async fn synchronize(&mut self) -> Result<(), BooguError> {
+        match self.synchronization_policy {
+            AsyncRetainingDenoiserSynchronizationPolicy::PerStage => {
+                self.source.synchronize().await
+            }
+            AsyncRetainingDenoiserSynchronizationPolicy::Deferred => {
+                self.synchronization_pending = true;
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Concrete one-block-at-a-time denoiser executor for constrained WGPU/WebGPU devices.
 pub struct StreamingBooguDenoiser<B: Backend, S> {
     config: BooguConfig,
     source: S,
+    rope_geometry: Option<BooguRoPeGeometry<B>>,
+    rope_cache_misses: usize,
     _backend: core::marker::PhantomData<B>,
 }
 
@@ -535,6 +812,8 @@ impl<B: Backend, S> StreamingBooguDenoiser<B, S> {
         Ok(Self {
             config,
             source,
+            rope_geometry: None,
+            rope_cache_misses: 0,
             _backend: core::marker::PhantomData,
         })
     }
@@ -547,6 +826,16 @@ impl<B: Backend, S> StreamingBooguDenoiser<B, S> {
     /// Mutably access the stage source.
     pub fn source_mut(&mut self) -> &mut S {
         &mut self.source
+    }
+
+    /// Number of exact denoiser input geometries built and uploaded since construction.
+    pub const fn rope_cache_misses(&self) -> usize {
+        self.rope_cache_misses
+    }
+
+    /// Drop the device-resident RoPE tensors while preserving weights and the stage source.
+    pub fn clear_rope_cache(&mut self) {
+        self.rope_geometry = None;
     }
 }
 
@@ -563,7 +852,21 @@ where
     ) -> Result<Tensor<B, 4>, BooguError> {
         let has_reference = input.reference.is_some();
         let prelude = self.source.load_prelude()?;
-        let mut state = prelude.begin_with_observer(input, observer)?;
+        if !self
+            .rope_geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.matches(&input))
+        {
+            self.rope_geometry = Some(prelude.prepare_rope_geometry(&input)?);
+            self.rope_cache_misses += 1;
+        }
+        let mut state = prelude.begin_with_prepared_rope_and_observer(
+            input,
+            self.rope_geometry
+                .as_ref()
+                .expect("streamed RoPE geometry was populated above"),
+            observer,
+        )?;
         self.source.synchronize()?;
         drop(prelude);
 
@@ -673,7 +976,21 @@ where
     ) -> Result<Tensor<B, 4>, BooguError> {
         let has_reference = input.reference.is_some();
         let prelude = self.source.load_prelude().await?;
-        let mut state = prelude.begin_with_observer(input, observer)?;
+        if !self
+            .rope_geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.matches(&input))
+        {
+            self.rope_geometry = Some(prelude.prepare_rope_geometry(&input)?);
+            self.rope_cache_misses += 1;
+        }
+        let mut state = prelude.begin_with_prepared_rope_and_observer(
+            input,
+            self.rope_geometry
+                .as_ref()
+                .expect("streamed RoPE geometry was populated above"),
+            observer,
+        )?;
         self.source.synchronize().await?;
         drop(prelude);
 
@@ -913,6 +1230,106 @@ mod tests {
         }
     }
 
+    struct CountingAsyncStageSource {
+        inner: MemoryStageSource,
+        loads: Vec<String>,
+    }
+
+    impl CountingAsyncStageSource {
+        fn new(model: super::super::BooguDenoiser<B>) -> Self {
+            Self {
+                inner: MemoryStageSource {
+                    model,
+                    synchronizations: 0,
+                },
+                loads: Vec::new(),
+            }
+        }
+
+        fn load_count(&self, stage: &str) -> usize {
+            self.loads.iter().filter(|loaded| *loaded == stage).count()
+        }
+    }
+
+    impl AsyncBooguDenoiserStageSource<B> for CountingAsyncStageSource {
+        async fn load_prelude(&mut self) -> Result<BooguDenoiserPrelude<B>, BooguError> {
+            self.loads.push("prelude".into());
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_prelude(&mut self.inner)
+                .await
+        }
+
+        async fn load_context_refiner(
+            &mut self,
+            index: usize,
+        ) -> Result<SingleStreamBlock<B>, BooguError> {
+            self.loads.push(format!("context.{index}"));
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_context_refiner(
+                &mut self.inner,
+                index,
+            )
+            .await
+        }
+
+        async fn load_noise_refiner(
+            &mut self,
+            index: usize,
+        ) -> Result<SingleStreamBlock<B>, BooguError> {
+            self.loads.push(format!("noise.{index}"));
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_noise_refiner(
+                &mut self.inner,
+                index,
+            )
+            .await
+        }
+
+        async fn load_reference_refiner(
+            &mut self,
+            index: usize,
+        ) -> Result<SingleStreamBlock<B>, BooguError> {
+            self.loads.push(format!("reference.{index}"));
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_reference_refiner(
+                &mut self.inner,
+                index,
+            )
+            .await
+        }
+
+        async fn load_double_stream(
+            &mut self,
+            index: usize,
+        ) -> Result<DoubleStreamBlock<B>, BooguError> {
+            self.loads.push(format!("double.{index}"));
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_double_stream(
+                &mut self.inner,
+                index,
+            )
+            .await
+        }
+
+        async fn load_single_stream(
+            &mut self,
+            index: usize,
+        ) -> Result<SingleStreamBlock<B>, BooguError> {
+            self.loads.push(format!("single.{index}"));
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_single_stream(
+                &mut self.inner,
+                index,
+            )
+            .await
+        }
+
+        async fn load_tail(&mut self) -> Result<BooguDenoiserTail<B>, BooguError> {
+            self.loads.push("tail".into());
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_tail(&mut self.inner)
+                .await
+        }
+
+        async fn synchronize(&mut self) -> Result<(), BooguError> {
+            <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::synchronize(&mut self.inner)
+                .await
+        }
+    }
+
     #[derive(Debug, PartialEq)]
     struct Boundary {
         name: String,
@@ -1093,5 +1510,139 @@ mod tests {
             unobserved.source().synchronizations,
             expected_synchronizations
         );
+    }
+
+    #[test]
+    fn async_retaining_source_loads_once_and_preserves_boundaries_correctness() {
+        let config = tiny_config();
+        let device = Default::default();
+        B::seed(&device, 79);
+        let resident = super::super::BooguDenoiser::<B>::new(config.clone(), &device).unwrap();
+        let expected = resident
+            .forward(tiny_input(&device))
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let source = CountingAsyncStageSource::new(resident);
+        let source = RetainingAsyncBooguDenoiserStageSource::new(source);
+        let mut streamed = StreamingBooguDenoiser::new(config, source).unwrap();
+        let mut observer = RecordingObserver::default();
+
+        for _ in 0..4 {
+            let output = block_on_immediate(
+                streamed.predict_with_observer_async(tiny_input(&device), &mut observer),
+            )
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+            assert!(max_delta(&output, &expected) < 1.0e-5);
+        }
+
+        let source = streamed.source();
+        assert!(source.retention_enabled());
+        assert_eq!(source.cached_stage_count(), 7);
+        assert_eq!(source.source().loads.len(), 7);
+        for stage in [
+            "prelude",
+            "context.0",
+            "noise.0",
+            "reference.0",
+            "double.0",
+            "single.0",
+            "tail",
+        ] {
+            assert_eq!(source.source().load_count(stage), 1, "stage {stage}");
+        }
+        assert_eq!(source.source().inner.synchronizations, 7 * 4);
+        assert_eq!(observer.boundaries.len(), 11 * 4);
+        for pass in observer.boundaries.chunks_exact(11).skip(1) {
+            for (actual, first) in pass.iter().zip(&observer.boundaries[..11]) {
+                assert_eq!(actual.name, first.name);
+                assert_eq!(actual.shape, first.shape);
+                assert!(max_delta(&actual.values, &first.values) < 1.0e-6);
+            }
+        }
+
+        streamed.source_mut().clear();
+        assert_eq!(streamed.source().cached_stage_count(), 0);
+    }
+
+    #[test]
+    fn async_retained_dense_forward_defers_to_one_step_barrier_and_reuses_rope_correctness() {
+        let config = tiny_config();
+        let device = Default::default();
+        B::seed(&device, 81);
+        let resident = super::super::BooguDenoiser::<B>::new(config.clone(), &device).unwrap();
+        let expected = resident
+            .forward(tiny_input(&device))
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let source = CountingAsyncStageSource::new(resident);
+        let source = RetainingAsyncBooguDenoiserStageSource::new(source)
+            .with_synchronization_policy(AsyncRetainingDenoiserSynchronizationPolicy::Deferred);
+        let mut streamed = StreamingBooguDenoiser::new(config, source).unwrap();
+
+        for step in 0..4 {
+            let output = block_on_immediate(streamed.predict_async(tiny_input(&device)))
+                .unwrap()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert!(max_delta(&output, &expected) < 1.0e-5);
+            assert!(streamed.source().has_pending_synchronization());
+            block_on_immediate(streamed.source_mut().synchronize_pending()).unwrap();
+            assert_eq!(streamed.source().source().inner.synchronizations, step + 1);
+        }
+
+        assert_eq!(streamed.source().source().loads.len(), 7);
+        assert_eq!(streamed.source().cached_stage_count(), 7);
+        assert_eq!(streamed.rope_cache_misses(), 1);
+    }
+
+    #[test]
+    fn async_retaining_source_passthrough_reloads_every_stage_correctness() {
+        let config = tiny_config();
+        let device = Default::default();
+        B::seed(&device, 83);
+        let resident = super::super::BooguDenoiser::<B>::new(config.clone(), &device).unwrap();
+        let expected = resident
+            .forward(tiny_input(&device))
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let source = CountingAsyncStageSource::new(resident);
+        let source = RetainingAsyncBooguDenoiserStageSource::passthrough(source);
+        let mut streamed = StreamingBooguDenoiser::new(config, source).unwrap();
+
+        for _ in 0..2 {
+            let output = block_on_immediate(streamed.predict_async(tiny_input(&device)))
+                .unwrap()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert!(max_delta(&output, &expected) < 1.0e-5);
+        }
+
+        let source = streamed.source();
+        assert!(!source.retention_enabled());
+        assert_eq!(source.cached_stage_count(), 0);
+        assert_eq!(source.source().loads.len(), 7 * 2);
+        for stage in [
+            "prelude",
+            "context.0",
+            "noise.0",
+            "reference.0",
+            "double.0",
+            "single.0",
+            "tail",
+        ] {
+            assert_eq!(source.source().load_count(stage), 2, "stage {stage}");
+        }
+        assert_eq!(source.source().inner.synchronizations, 7 * 2);
     }
 }

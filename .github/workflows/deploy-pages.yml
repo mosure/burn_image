@@ -49,40 +49,64 @@ jobs:
       - name: verify canonical browser CDN contract
         shell: bash
         env:
-          MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-turbo-f16-qwen-vision-f32
-          MODEL_CONTENT_DIGEST: 4f94cf68c00af12d5de486db4d316ce889d6d21e78913a1c74edab4bd0119ce3
+          MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-turbo
+          MODEL_CONTENT_DIGEST: 555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36
+          EDIT_MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-edit-turbo
+          EDIT_MODEL_CONTENT_DIGEST: 28b1b51f2fb152557b11a9f0ef8e872ae7d163bcab7abd42f9eaf4bfef10e7aa
         run: |
           set -euo pipefail
-          manifest_file="$(mktemp)"
-          manifest_headers="$(mktemp)"
-          range_headers="$(mktemp)"
-          trap 'rm -f -- "$manifest_file" "$manifest_headers" "$range_headers"' EXIT
+          scratch="$(mktemp -d)"
+          trap 'rm -rf -- "$scratch"' EXIT
+          manifest_file="$scratch/parent.json"
+          model_root_url="${MODEL_BASE_URL%/*}"
 
-          curl --fail --silent --show-error \
-            --output "$manifest_file" \
-            --dump-header "$manifest_headers" \
-            --header 'Origin: https://mosure.github.io' \
-            "$MODEL_BASE_URL/manifest.json"
-          tr -d '\r' < "$manifest_headers" > "$manifest_headers.normalized"
-          mv "$manifest_headers.normalized" "$manifest_headers"
-          grep -Eqi '^access-control-allow-origin: (https://mosure\.github\.io|\*)$' \
-            "$manifest_headers"
+          fetch_manifest() {
+            local url="$1"
+            local output="$2"
+            local headers="$3"
+
+            curl --fail --silent --show-error \
+              --output "$output" \
+              --dump-header "$headers" \
+              --header 'Origin: https://mosure.github.io' \
+              "$url"
+            tr -d '\r' < "$headers" > "$headers.normalized"
+            mv "$headers.normalized" "$headers"
+            grep -Eqi '^access-control-allow-origin: (https://mosure\.github\.io|\*)$' \
+              "$headers"
+          }
+
+          fetch_manifest \
+            "$MODEL_BASE_URL/manifest.json" \
+            "$manifest_file" \
+            "$scratch/parent.headers"
           jq -e \
-            --arg bundle 'boogu-image-0.1-turbo-f16-qwen-vision-f32' \
+            --arg bundle 'boogu-image-0.1-turbo' \
             --arg digest "$MODEL_CONTENT_DIGEST" \
-            '.schema_version == 1 and
+            --arg qwen_bundle 'qwen3-vl-8b-base-boogu-image-0.1' \
+            --arg vae_bundle 'flux1-vae-boogu-image-0.1' \
+            '.schema_version == 2 and
              .bundle == $bundle and
              .profile == "f16-qwen-vision-f32" and
              .model == "Boogu/Boogu-Image-0.1-Turbo" and
-             .content_digest == $digest' \
+             .model_revision == "53ad54522023f64d049f7f38e4d679359ef3fb92" and
+             .content_digest == $digest and
+             .metadata.artifact_layout == "semantic-burnpack-composition-v2" and
+             .metadata.composition_manifest == "true" and
+             .metadata.component_dependency_count == "2" and
+             (.dependencies | type == "array" and length == 2) and
+             ([.dependencies[].role] | sort) == ["qwen", "vae"] and
+             any(.dependencies[]; .role == "qwen" and .bundle == $qwen_bundle) and
+             any(.dependencies[]; .role == "vae" and .bundle == $vae_bundle) and
+             any(.files[]; .role == "weights") and
+             all(.files[]; .role != "weights" or ((.component // "") | startswith("boogu-")))' \
             "$manifest_file" >/dev/null
-          weight_path="$(
-            jq -er 'first(.files[] | select(.role == "weights") | .path)' "$manifest_file"
-          )"
 
           verify_range_contract() {
             local url="$1"
+            local cache_policy="$2"
             local status
+            local range_headers="$scratch/range.headers"
             status="$(
               curl --silent --show-error \
                 --output /dev/null \
@@ -99,11 +123,85 @@ jobs:
               "$range_headers"
             grep -Eqi '^access-control-expose-headers:.*(content-range|\*)' "$range_headers"
             grep -Eqi '^content-range: bytes 0-0/[1-9][0-9]*$' "$range_headers"
-            grep -Eqi '^cache-control:.*immutable' "$range_headers"
+            if [[ "$cache_policy" == immutable ]]; then
+              grep -Eqi '^cache-control:.*immutable' "$range_headers"
+            else
+              grep -Eqi '^cache-control:.*no-cache' "$range_headers"
+            fi
           }
 
-          verify_range_contract "$MODEL_BASE_URL/manifest.json"
-          verify_range_contract "$MODEL_BASE_URL/$weight_path"
+          verify_range_contract "$MODEL_BASE_URL/manifest.json" no-cache
+          parent_weight_path="$(
+            jq -er 'first(.files[] | select(.role == "weights") | .path)' "$manifest_file"
+          )"
+          verify_range_contract "$MODEL_BASE_URL/$parent_weight_path" immutable
+
+          for role in qwen vae; do
+            dependency_file="$scratch/$role-dependency.json"
+            jq -e --arg role "$role" \
+              '.dependencies[] | select(.role == $role)' \
+              "$manifest_file" > "$dependency_file"
+            dependency_bundle="$(jq -er '.bundle' "$dependency_file")"
+            dependency_base_url="$model_root_url/$dependency_bundle"
+            child_manifest="$scratch/$role.json"
+
+            fetch_manifest \
+              "$dependency_base_url/manifest.json" \
+              "$child_manifest" \
+              "$scratch/$role.headers"
+            jq -e \
+              --slurpfile dependency "$dependency_file" \
+              --arg role "$role" \
+              '.schema_version == 1 and
+               .bundle == $dependency[0].bundle and
+               .profile == $dependency[0].profile and
+               .model == $dependency[0].model and
+               .model_revision == $dependency[0].model_revision and
+               .content_digest == $dependency[0].content_digest and
+               .metadata.artifact_layout == "semantic-burnpack-v1" and
+               .metadata.component_bundle == "true" and
+               ((.dependencies // []) | length == 0) and
+               any(.files[]; .role == "weights") and
+               (if $role == "qwen" then
+                  all(.files[]; .role != "weights" or ((.component // "") | startswith("qwen-")))
+                else
+                  all(.files[]; .role != "weights" or ((.component // "") | startswith("flux-vae-")))
+                end)' \
+              "$child_manifest" >/dev/null
+
+            verify_range_contract "$dependency_base_url/manifest.json" no-cache
+            child_weight_path="$(
+              jq -er 'first(.files[] | select(.role == "weights") | .path)' "$child_manifest"
+            )"
+            verify_range_contract "$dependency_base_url/$child_weight_path" immutable
+          done
+
+          edit_manifest="$scratch/edit-parent.json"
+          fetch_manifest \
+            "$EDIT_MODEL_BASE_URL/manifest.json" \
+            "$edit_manifest" \
+            "$scratch/edit-parent.headers"
+          jq -e \
+            --slurpfile turbo "$manifest_file" \
+            --arg digest "$EDIT_MODEL_CONTENT_DIGEST" \
+            '.schema_version == 2 and
+             .bundle == "boogu-image-0.1-edit-turbo" and
+             .profile == "f16-qwen-vision-f32" and
+             .model == "Boogu/Boogu-Image-0.1-Edit-Turbo" and
+             .model_revision == "132a0ab9051b42c1d9be4919a68873d1f132c0c8" and
+             .content_digest == $digest and
+             .metadata.artifact_layout == "semantic-burnpack-composition-v2" and
+             .metadata.composition_manifest == "true" and
+             .metadata.component_dependency_count == "2" and
+             (.dependencies | sort_by(.role)) == ($turbo[0].dependencies | sort_by(.role)) and
+             any(.files[]; .role == "weights") and
+             all(.files[]; .role != "weights" or ((.component // "") | startswith("boogu-")))' \
+            "$edit_manifest" >/dev/null
+          verify_range_contract "$EDIT_MODEL_BASE_URL/manifest.json" no-cache
+          edit_weight_path="$(
+            jq -er 'first(.files[] | select(.role == "weights") | .path)' "$edit_manifest"
+          )"
+          verify_range_contract "$EDIT_MODEL_BASE_URL/$edit_weight_path" immutable
 
       - name: setup frontend MSRV
         uses: dtolnay/rust-toolchain@1.95.0

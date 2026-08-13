@@ -1,6 +1,10 @@
 use burn_image::{
-    ArtifactFile, ArtifactPath, ArtifactReadRequest, ArtifactSource, ArtifactVerifier, ByteRange,
-    IntegrityPolicy, RemoteBaseUrl, VerifiedArtifact,
+    ArtifactBundleId, ArtifactFile, ArtifactPath, ArtifactReadRequest, ArtifactSource,
+    ArtifactVerifier, ByteRange, IntegrityPolicy, RemoteBaseUrl, VerifiedArtifact,
+};
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+use burn_image::{
+    ArtifactComponentId, ArtifactReadError, AsyncArtifactShardReader, VerifiedArtifactBytes,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,7 +16,10 @@ use std::{
 };
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-use burn_boogu::{BooguError, artifacts::AsyncStageShardReader};
+use burn_boogu::{
+    BooguError,
+    artifacts::{AsyncStageShardRead, AsyncStageShardReader},
+};
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
 use burn_image::CancellationToken;
 
@@ -24,6 +31,37 @@ pub const DEFAULT_BROWSER_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 pub const MAX_BROWSER_STAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Bootstrap metadata must remain small enough to fetch before the sealed manifest is known.
 pub const MAX_BROWSER_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Resolve an immutable dependency bundle beside a composed bundle prefix.
+///
+/// A composed URL such as `https://cdn.example/model/pipeline` resolves the
+/// dependency `qwen` as `https://cdn.example/model/qwen`. The dependency id is
+/// already a validated artifact identifier, so it cannot inject URL path
+/// traversal or a second origin.
+pub fn sibling_bundle_base_url(
+    composed_base: &RemoteBaseUrl,
+    dependency_bundle: &ArtifactBundleId,
+) -> Result<RemoteBaseUrl, ArtifactStreamError> {
+    let value = composed_base.as_str();
+    let scheme_end = value
+        .find("://")
+        .expect("RemoteBaseUrl always contains a validated HTTP(S) scheme")
+        + 3;
+    let slash = value[scheme_end..]
+        .rfind('/')
+        .map(|index| scheme_end + index)
+        .ok_or_else(|| ArtifactStreamError::DependencySiblingBase {
+            base_url: value.to_owned(),
+        })?;
+    RemoteBaseUrl::new(format!(
+        "{}/{}",
+        &value[..slash],
+        dependency_bundle.as_str()
+    ))
+    .map_err(|_| ArtifactStreamError::DependencySiblingBase {
+        base_url: value.to_owned(),
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactStreamConfig {
@@ -138,6 +176,8 @@ pub enum ArtifactStreamError {
     UnboundedBrowserRequest,
     #[error("a browser range request requires a remote artifact source")]
     LocalBrowserSource,
+    #[error("artifact base URL {base_url} has no sibling bundle prefix")]
+    DependencySiblingBase { base_url: String },
     #[error("browser fetch is unavailable because Window is missing")]
     BrowserWindowUnavailable,
     #[error("browser fetch request failed: {0}")]
@@ -496,14 +536,16 @@ impl BrowserArtifactControl {
 /// HTTP Range reader for one sealed semantic Burnpack at a time.
 ///
 /// Each response is capped by [`ArtifactStreamConfig`]; the aggregate is capped by
-/// [`MAX_BROWSER_STAGE_BYTES`], verified against the manifest file SHA-256, and returned to the
-/// model source for an independent verification before parsing.
+/// [`MAX_BROWSER_STAGE_BYTES`] and verified exactly once against the manifest file SHA-256. Typed
+/// evidence is returned with the bytes so the model source can validate the proof without hashing
+/// the complete object again.
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
 #[derive(Clone)]
 pub struct BrowserStageShardReader {
     source: ArtifactSource,
     config: ArtifactStreamConfig,
     control: BrowserArtifactControl,
+    progress_bundle: Option<ArtifactBundleId>,
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
@@ -513,6 +555,38 @@ impl BrowserStageShardReader {
             source: ArtifactSource::Remote { base_url },
             config,
             control: BrowserArtifactControl::default(),
+            progress_bundle: None,
+        }
+    }
+
+    /// Construct a reader whose progress events identify the independently
+    /// sealed bundle and share cancellation/event routing with sibling readers.
+    pub fn for_bundle(
+        base_url: RemoteBaseUrl,
+        bundle: ArtifactBundleId,
+        config: ArtifactStreamConfig,
+        control: BrowserArtifactControl,
+    ) -> Self {
+        Self {
+            source: ArtifactSource::Remote { base_url },
+            config,
+            control,
+            progress_bundle: Some(bundle),
+        }
+    }
+
+    /// Construct an unqualified legacy reader that shares progress and
+    /// cancellation routing with sibling reader wrappers.
+    pub fn with_control(
+        base_url: RemoteBaseUrl,
+        config: ArtifactStreamConfig,
+        control: BrowserArtifactControl,
+    ) -> Self {
+        Self {
+            source: ArtifactSource::Remote { base_url },
+            config,
+            control,
+            progress_bundle: None,
         }
     }
 
@@ -521,13 +595,34 @@ impl BrowserStageShardReader {
     }
 
     pub async fn read_verified(&mut self, file: &ArtifactFile) -> Result<Vec<u8>, BooguError> {
-        self.read_shard(file, MAX_BROWSER_STAGE_BYTES).await
+        <Self as AsyncStageShardReader>::read_shard(self, file, MAX_BROWSER_STAGE_BYTES).await
     }
-}
 
-#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-impl AsyncStageShardReader for BrowserStageShardReader {
-    async fn read_shard(
+    fn progress_file(&self, file: &ArtifactFile) -> ArtifactFile {
+        let Some(bundle) = &self.progress_bundle else {
+            return file.clone();
+        };
+        let mut progress = file.clone();
+        progress.path = ArtifactPath::new(format!("{bundle}/{}", file.path))
+            .expect("validated bundle and artifact path compose into a valid path");
+        progress.component = Some(
+            ArtifactComponentId::new(bundle.as_str())
+                .expect("an artifact bundle id is also a valid component id"),
+        );
+        progress
+    }
+
+    fn progress_path(&self, path: &ArtifactPath) -> ArtifactPath {
+        self.progress_bundle.as_ref().map_or_else(
+            || path.clone(),
+            |bundle| {
+                ArtifactPath::new(format!("{bundle}/{path}"))
+                    .expect("validated bundle and artifact path compose into a valid path")
+            },
+        )
+    }
+
+    async fn fetch_shard_bytes(
         &mut self,
         file: &ArtifactFile,
         max_bytes: u64,
@@ -547,7 +642,7 @@ impl AsyncStageShardReader for BrowserStageShardReader {
         })?;
         self.control.check_cancelled()?;
         self.control
-            .push(BrowserArtifactEvent::Started(file.clone()));
+            .push(BrowserArtifactEvent::Started(self.progress_file(file)));
         let mut bytes = Vec::with_capacity(capacity);
         let mut offset = 0_u64;
         while offset < file.size {
@@ -565,16 +660,68 @@ impl AsyncStageShardReader for BrowserStageShardReader {
             bytes.extend_from_slice(&chunk.bytes);
             offset = range.end_exclusive();
             self.control.push(BrowserArtifactEvent::Progress {
-                path: file.path.clone(),
+                path: self.progress_path(&file.path),
                 loaded_bytes: offset,
                 total_bytes: file.size,
             });
         }
-        ArtifactVerifier::verify_bytes(file, &bytes, IntegrityPolicy::RequireSha256)
-            .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        self.control
-            .push(BrowserArtifactEvent::Verified(file.path.clone()));
         Ok(bytes)
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+impl AsyncStageShardReader for BrowserStageShardReader {
+    async fn read_shard(
+        &mut self,
+        file: &ArtifactFile,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, BooguError> {
+        Ok(self.read_stage_shard(file, max_bytes).await?.into_bytes())
+    }
+
+    async fn read_stage_shard(
+        &mut self,
+        file: &ArtifactFile,
+        max_bytes: u64,
+    ) -> Result<AsyncStageShardRead, BooguError> {
+        let bytes = self.fetch_shard_bytes(file, max_bytes).await?;
+        let read = AsyncStageShardRead::verify_sha256(file, bytes)?;
+        self.control.push(BrowserArtifactEvent::Verified(
+            self.progress_path(&file.path),
+        ));
+        Ok(read)
+    }
+}
+
+/// Model crates consume the model-neutral reader contract. Keep the legacy Boogu reader
+/// implementation above only for the variant-specific denoiser during the compatibility window.
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+impl AsyncArtifactShardReader for BrowserStageShardReader {
+    async fn read_shard(
+        &mut self,
+        file: &ArtifactFile,
+        maximum_bytes: u64,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        Ok(self
+            .read_verified_shard(file, maximum_bytes)
+            .await?
+            .into_bytes())
+    }
+
+    async fn read_verified_shard(
+        &mut self,
+        file: &ArtifactFile,
+        maximum_bytes: u64,
+    ) -> Result<VerifiedArtifactBytes, ArtifactReadError> {
+        let bytes = self
+            .fetch_shard_bytes(file, maximum_bytes)
+            .await
+            .map_err(|error| ArtifactReadError::transport(error.to_string()))?;
+        let read = VerifiedArtifactBytes::verify_sha256(file, bytes)?;
+        self.control.push(BrowserArtifactEvent::Verified(
+            self.progress_path(&file.path),
+        ));
+        Ok(read)
     }
 }
 
@@ -852,6 +999,23 @@ mod tests {
         let browser = BrowserRangeRequest::from_source(&source, &request).unwrap();
         assert_eq!(browser.url, "https://cdn.example/models/weights/a.bpk");
         assert_eq!(browser.range_header, "bytes=8-11");
+    }
+
+    #[test]
+    fn dependency_bundle_resolves_as_a_same_origin_sibling_correctness() {
+        let pipeline =
+            RemoteBaseUrl::new("https://cdn.example/model/boogu-image-0.1-turbo").unwrap();
+        let qwen = ArtifactBundleId::new("qwen3-vl-shared").unwrap();
+        assert_eq!(
+            sibling_bundle_base_url(&pipeline, &qwen).unwrap().as_str(),
+            "https://cdn.example/model/qwen3-vl-shared"
+        );
+
+        let origin_only = RemoteBaseUrl::new("https://cdn.example").unwrap();
+        assert!(matches!(
+            sibling_bundle_base_url(&origin_only, &qwen),
+            Err(ArtifactStreamError::DependencySiblingBase { .. })
+        ));
     }
 
     #[test]

@@ -1,12 +1,16 @@
 //! Concrete native worker for a sealed Boogu Burnpack bundle.
 //!
-//! The default high-VRAM policy loads every verified Qwen and VAE stage once, retains their shared
-//! WGPU handles for later requests, and keeps one verified denoiser resident for all four DMD
-//! steps. An explicit layer-streamed
-//! diagnostic policy rereads Qwen and denoiser stages. This is deliberately separate from the
-//! browser adapter: the directory sources are synchronous filesystem readers,
-//! while a browser needs asynchronous range/CDN orchestration behind the same
-//! public [`crate::BooguRuntimeFactory`] seam.
+//! The default high-VRAM policy verifies, decodes, and uploads every required Qwen/VAE stage
+//! before the runtime becomes ready. It then retains their shared WGPU handles with one verified
+//! denoiser for every request and all four DMD steps. No model-weight filesystem read, host decode,
+//! or host-to-device upload occurs in that runtime's forward hot path.
+//!
+//! The explicit layer-streamed diagnostic policy is intentionally different: it rereads Qwen and
+//! VAE stages per request and denoiser stages per DMD step. It requires an explicit local artifact
+//! override and reports that traffic policy in provenance. This is deliberately separate from the
+//! browser adapter: the directory sources are synchronous filesystem readers, while a browser
+//! needs asynchronous range/CDN orchestration behind the same public
+//! [`crate::BooguRuntimeFactory`] seam.
 
 use std::{
     sync::{
@@ -17,50 +21,183 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+use burn::{nn::RmsNorm, prelude::Backend};
 use burn_boogu::{
-    BOOGU_1K_NATIVE_POLICY, BooguConfig, BooguExecution, BooguImageModel, BooguRuntimeDTypes,
-    BooguRuntimeMetadata, BooguVariant, DenoiserRmsNormPolicy, EDIT_TURBO_1K5_NATIVE_POLICY,
+    BOOGU_1K_NATIVE_POLICY, BooguConfig, BooguError, BooguExecution, BooguImageModel,
+    BooguRuntimeDTypes, BooguRuntimeMetadata, BooguVaeStageSource, BooguVariant,
+    DenoiserRmsNormPolicy, EDIT_TURBO_1K5_NATIVE_POLICY, FluxVaeStageSourceAdapter,
     NativeAutotunePolicy, NativeDenoiserAttentionPolicy, NativeDenoiserQkPreparationPolicy,
     NativeDenoiserRmsNormPolicy, NativeHighVramPolicy, NativePaddedBlackboxDenoiser,
-    NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy, RetainingBooguVaeStageSource,
-    StreamingBooguDenoiser, StreamingBooguPipeline,
+    NativePortableDenoiser, NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy,
+    RetainingBooguVaeStageSource, StreamingBooguDenoiser, StreamingBooguPipeline,
     artifacts::{
         BooguArtifactInventory, BooguReleaseIdentity, BooguStorageProfile,
         DirectoryStageShardReader, VerifiedArtifactDirectory, VerifiedBurnpackQwenStageSource,
         VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource,
-        load_resident_denoiser_from_directory_with_policies,
+        artifact_bundle_id_is_compatible, load_resident_denoiser_from_directory_with_policies,
         validate_canonical_release_artifact_digest,
     },
     boogu_model_descriptor, boogu_processor_config,
 };
-use burn_flux_vae::{AutoencoderKlConfig, DecoderGroupNormPolicy};
+use burn_flux_vae::{
+    AutoencoderKl, AutoencoderKlConfig, DecoderGroupNormPolicy, FluxVaeArtifactFloatPolicy,
+    VerifiedBurnpackFluxVaeStageSource,
+};
 use burn_image::{
-    CancellationToken, ImageModel, ImageOutput, ImageRuntime, IntegrityPolicy, ProgressEvent,
-    RuntimeConfig, RuntimeError,
+    ArtifactSource, CancellationToken, DirectoryArtifactShardReader, ImageModel, ImageOutput,
+    ImageRuntime, IntegrityPolicy, ProgressEvent, RuntimeConfig, RuntimeError,
 };
 use burn_qwen3_vl::{
-    Qwen3VlConfig, Qwen3VlImageProcessor, Qwen3VlImageProcessorConfig, Qwen3VlProcessor,
-    Qwen3VlTokenizer, RetainingQwen3VlStageSource, RetainingSynchronizationPolicy,
-    StreamingQwen3Vl, tokenizer::HfTokenizer,
+    EmbeddingRowChunk, Qwen3VlArtifactFloatPolicy, Qwen3VlConfig, Qwen3VlDecoderLayer,
+    Qwen3VlImageProcessor, Qwen3VlImageProcessorConfig, Qwen3VlProcessor, Qwen3VlStage,
+    Qwen3VlStageSource, Qwen3VlStreamingPlan, Qwen3VlTokenizer, Qwen3VlVisionBlock,
+    Qwen3VlVisionPatchMerger, Qwen3VlVisionPrelude, RetainingQwen3VlStageSource,
+    RetainingSynchronizationPolicy, RowChunkSpec, StreamingQwen3Vl,
+    VerifiedBurnpackQwen3VlStageSource, tokenizer::HfTokenizer,
 };
 
 use crate::{
     BooguFactoryContext, BooguRuntime, BooguRuntimeFactory, BooguRuntimeJob, ImageJobId,
-    ImageRunnerEvent, WgpuExecutionKind, boogu_bundle_id, boogu_profile_slug,
-    native_boogu_source_requires_canonical_digest, resolve_native_boogu_artifact_directory,
+    ImageRunnerEvent, WgpuExecutionKind, boogu_bundle_id, boogu_legacy_bundle_id,
+    boogu_profile_slug, native_boogu_source_requires_canonical_digest,
+    resolve_native_boogu_artifact_directory,
 };
 
 type NativeBackend = burn_wgpu::Wgpu<f32, i32, u32>;
+type LegacyNativeQwenSource =
+    VerifiedBurnpackQwenStageSource<NativeBackend, DirectoryStageShardReader>;
+type ComponentNativeQwenSource =
+    VerifiedBurnpackQwen3VlStageSource<NativeBackend, DirectoryArtifactShardReader>;
+type LegacyNativeVaeSource = VerifiedDirectoryVaeStageSource<NativeBackend>;
+type ComponentNativeVaeSource = FluxVaeStageSourceAdapter<
+    VerifiedBurnpackFluxVaeStageSource<NativeBackend, DirectoryArtifactShardReader>,
+>;
+
+enum NativeQwenSource {
+    Legacy(Box<LegacyNativeQwenSource>),
+    Component(Box<ComponentNativeQwenSource>),
+}
+
+impl Qwen3VlStageSource<NativeBackend> for NativeQwenSource {
+    type Error = BooguError;
+
+    fn load_embedding_rows(
+        &mut self,
+        spec: &RowChunkSpec,
+    ) -> Result<EmbeddingRowChunk<NativeBackend>, Self::Error> {
+        match self {
+            Self::Legacy(source) => source.load_embedding_rows(spec),
+            Self::Component(source) => source
+                .load_embedding_rows(spec)
+                .map_err(component_qwen_error),
+        }
+    }
+
+    fn load_vision_prelude(&mut self) -> Result<Qwen3VlVisionPrelude<NativeBackend>, Self::Error> {
+        match self {
+            Self::Legacy(source) => source.load_vision_prelude(),
+            Self::Component(source) => source.load_vision_prelude().map_err(component_qwen_error),
+        }
+    }
+
+    fn load_vision_block(
+        &mut self,
+        index: usize,
+    ) -> Result<Qwen3VlVisionBlock<NativeBackend>, Self::Error> {
+        match self {
+            Self::Legacy(source) => source.load_vision_block(index),
+            Self::Component(source) => source
+                .load_vision_block(index)
+                .map_err(component_qwen_error),
+        }
+    }
+
+    fn load_vision_deepstack_merger(
+        &mut self,
+        index: usize,
+    ) -> Result<Qwen3VlVisionPatchMerger<NativeBackend>, Self::Error> {
+        match self {
+            Self::Legacy(source) => source.load_vision_deepstack_merger(index),
+            Self::Component(source) => source
+                .load_vision_deepstack_merger(index)
+                .map_err(component_qwen_error),
+        }
+    }
+
+    fn load_vision_final_merger(
+        &mut self,
+    ) -> Result<Qwen3VlVisionPatchMerger<NativeBackend>, Self::Error> {
+        match self {
+            Self::Legacy(source) => source.load_vision_final_merger(),
+            Self::Component(source) => source
+                .load_vision_final_merger()
+                .map_err(component_qwen_error),
+        }
+    }
+
+    fn load_text_block(
+        &mut self,
+        index: usize,
+    ) -> Result<Qwen3VlDecoderLayer<NativeBackend>, Self::Error> {
+        match self {
+            Self::Legacy(source) => source.load_text_block(index),
+            Self::Component(source) => source.load_text_block(index).map_err(component_qwen_error),
+        }
+    }
+
+    fn load_text_final_norm(&mut self) -> Result<RmsNorm<NativeBackend>, Self::Error> {
+        match self {
+            Self::Legacy(source) => source.load_text_final_norm(),
+            Self::Component(source) => source.load_text_final_norm().map_err(component_qwen_error),
+        }
+    }
+
+    fn synchronize(&mut self) -> Result<(), Self::Error> {
+        match self {
+            Self::Legacy(source) => source.synchronize(),
+            Self::Component(source) => source.synchronize().map_err(component_qwen_error),
+        }
+    }
+}
+
+fn component_qwen_error(error: impl std::fmt::Display) -> BooguError {
+    BooguError::Artifact(error.to_string())
+}
+
+enum NativeVaeSource {
+    Legacy(Box<LegacyNativeVaeSource>),
+    Component(Box<ComponentNativeVaeSource>),
+}
+
+impl BooguVaeStageSource<NativeBackend> for NativeVaeSource {
+    fn load_encoder(&mut self) -> Result<AutoencoderKl<NativeBackend>, BooguError> {
+        match self {
+            Self::Legacy(source) => source.load_encoder(),
+            Self::Component(source) => source.load_encoder(),
+        }
+    }
+
+    fn load_decoder(&mut self) -> Result<AutoencoderKl<NativeBackend>, BooguError> {
+        match self {
+            Self::Legacy(source) => source.load_decoder(),
+            Self::Component(source) => source.load_decoder(),
+        }
+    }
+}
 
 const MAX_EVENTS_PER_POLL: usize = 64;
 
 /// Native weight-residency policy selected before model construction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NativeBooguResidencyPolicy {
-    /// Load each Qwen/VAE stage once and retain it with the denoiser for later requests.
+    /// Eagerly load every required Qwen/VAE stage and retain it with the denoiser on the GPU.
     #[default]
     HighVram,
-    /// Reload Qwen, VAE, and denoiser stages to minimize GPU residency.
+    /// Diagnostic-only host streaming that reloads weights inside model execution.
+    ///
+    /// This is not a supported production residency policy. The native factory accepts it only
+    /// with an explicit local artifact override, preventing accidental CDN/cache selection from
+    /// enabling repeated host weight traffic.
     LayerStreamed,
 }
 
@@ -68,8 +205,28 @@ impl NativeBooguResidencyPolicy {
     /// Stable label reported in logs and backend provenance.
     pub const fn label(self) -> &'static str {
         match self {
-            Self::HighVram => "native-high-vram-retained-qwen",
-            Self::LayerStreamed => "native-layer-streamed",
+            Self::HighVram => "native-high-vram-gpu-resident-dense",
+            Self::LayerStreamed => "native-diagnostic-layer-streamed",
+        }
+    }
+
+    /// Whether this policy is a supported no-hot-path-weight-transfer execution mode.
+    pub const fn is_gpu_resident(self) -> bool {
+        matches!(self, Self::HighVram)
+    }
+
+    /// Exact steady-state model-weight traffic contract attached to runtime provenance.
+    pub const fn weight_traffic_contract(self, production_profile: bool) -> &'static str {
+        match self {
+            Self::HighVram if production_profile => {
+                "gpu-resident-dense/zero-forward-host-weight-transfers"
+            }
+            Self::HighVram => {
+                "diagnostic-gpu-resident-unqualified/zero-forward-host-weight-transfers"
+            }
+            Self::LayerStreamed => {
+                "diagnostic-host-streamed/qwen+vae-per-request/denoiser-per-dmd-step"
+            }
         }
     }
 }
@@ -125,6 +282,17 @@ impl BooguRuntimeFactory for NativeBooguFactory {
             ));
         }
         crate::boogu::validate_variant_profile(self.variant, context.settings.storage_profile)?;
+        if self.residency == NativeBooguResidencyPolicy::LayerStreamed
+            && !matches!(
+                &context.settings.artifact_source,
+                ArtifactSource::LocalDirectory { .. }
+            )
+        {
+            return Err(execution_error(
+                self.variant,
+                "native diagnostic layer streaming requires an explicit local artifact directory; the verified CDN/cache path is GPU-resident-only",
+            ));
+        }
         if self.variant == BooguVariant::Image01EditTurbo1k5
             && self.residency != NativeBooguResidencyPolicy::HighVram
         {
@@ -157,6 +325,11 @@ impl BooguRuntimeFactory for NativeBooguFactory {
             .settings
             .validate_concrete_cache_policy()
             .map_err(|error| execution_error(self.variant, error))?;
+        if self.residency == NativeBooguResidencyPolicy::LayerStreamed {
+            bevy::log::warn!(
+                "starting opt-in diagnostic native host streaming: Qwen and VAE weights reload per request; denoiser weights reload for every DMD step; this mode is not production-supported"
+            );
+        }
         let mut loading = self
             .loading
             .lock()
@@ -440,13 +613,14 @@ fn load_native_runtime(
     );
     let native_policy =
         qualified_native_high_vram_policy(variant, residency, context.settings.storage_profile);
-    let root = resolve_native_boogu_artifact_directory(
+    let artifact_directories = resolve_native_boogu_artifact_directory(
         variant,
         context.settings.storage_profile,
         &context.settings.artifact_source,
         |message| bevy::log::info!("{message}"),
     )
     .map_err(|error| execution_error(variant, error))?;
+    let root = artifact_directories.pipeline_root().to_owned();
     if !root.is_dir() {
         return Err(execution_error(
             variant,
@@ -456,11 +630,31 @@ fn load_native_runtime(
 
     let directory =
         VerifiedArtifactDirectory::open(&root).map_err(|error| execution_error(variant, error))?;
+    let qwen_directory = VerifiedArtifactDirectory::open(artifact_directories.qwen_root())
+        .map_err(|error| execution_error(variant, error))?;
+    let vae_directory = VerifiedArtifactDirectory::open(artifact_directories.vae_root())
+        .map_err(|error| execution_error(variant, error))?;
     let manifest = directory.manifest();
     let descriptor = boogu_model_descriptor(variant);
     let expected_bundle = boogu_bundle_id(variant, context.settings.storage_profile);
+    let legacy_bundle = boogu_legacy_bundle_id(variant, context.settings.storage_profile);
     let expected_profile = boogu_profile_slug(context.settings.storage_profile);
-    if manifest.bundle.as_str() != expected_bundle
+    let require_canonical_digest = native_boogu_source_requires_canonical_digest(
+        variant,
+        context.settings.storage_profile,
+        &context.settings.artifact_source,
+    )
+    .map_err(|error| execution_error(variant, error))?;
+    let bundle_matches = if require_canonical_digest {
+        manifest.bundle.as_str() == expected_bundle
+    } else {
+        artifact_bundle_id_is_compatible(
+            variant,
+            context.settings.storage_profile,
+            manifest.bundle.as_str(),
+        )
+    };
+    if !bundle_matches
         || manifest.profile.as_str() != expected_profile
         || manifest.model != descriptor.id
         || manifest.model_revision != descriptor.revision
@@ -468,7 +662,7 @@ fn load_native_runtime(
         return Err(execution_error(
             variant,
             format!(
-                "sealed manifest identity does not match the selected Boogu release: expected bundle={expected_bundle}, profile={expected_profile}, model={}, revision={}; found bundle={}, profile={}, model={}, revision={}",
+                "sealed manifest identity does not match the selected Boogu release: expected bundle={expected_bundle} (explicit sources may also use legacy {legacy_bundle}), profile={expected_profile}, model={}, revision={}; found bundle={}, profile={}, model={}, revision={}",
                 descriptor.id,
                 descriptor.revision,
                 manifest.bundle,
@@ -481,13 +675,7 @@ fn load_native_runtime(
     let content_digest = manifest
         .content_digest
         .ok_or_else(|| execution_error(variant, "sealed manifest is missing its content digest"))?;
-    if native_boogu_source_requires_canonical_digest(
-        variant,
-        context.settings.storage_profile,
-        &context.settings.artifact_source,
-    )
-    .map_err(|error| execution_error(variant, error))?
-    {
+    if require_canonical_digest {
         validate_canonical_release_artifact_digest(
             variant,
             context.settings.storage_profile,
@@ -501,13 +689,13 @@ fn load_native_runtime(
         .map_err(|error| execution_error(variant, error))?;
 
     let qwen_config = Qwen3VlConfig::from_json(
-        &directory
+        &qwen_directory
             .read_text("metadata/source/mllm/config.json")
             .map_err(|error| execution_error(variant, error))?,
     )
     .map_err(|error| execution_error(variant, error))?;
     let mut vae_config = AutoencoderKlConfig::from_diffusers_json(
-        &directory
+        &vae_directory
             .read_text("metadata/source/vae/config.json")
             .map_err(|error| execution_error(variant, error))?,
     )
@@ -537,32 +725,72 @@ fn load_native_runtime(
     let execution_dtypes =
         BooguRuntimeDTypes::from_artifact_policies(profile, vae_policy, denoiser_policy);
 
-    let qwen_source = VerifiedBurnpackQwenStageSource::<
-        NativeBackend,
-        DirectoryStageShardReader,
-    >::from_directory_auto(
-        &identity,
-        &root,
-        inventory.clone(),
-        qwen_config.clone(),
-        profile,
-        device.clone(),
-    )
-    .map_err(|error| execution_error(variant, error))?
-    .with_quantized_load_policy(qwen_quantized_policy);
-    let qwen_plan = qwen_source.plan().clone();
-    let vae = VerifiedDirectoryVaeStageSource::<NativeBackend>::new(
-        &identity,
-        &root,
-        inventory.clone(),
-        vae_config,
-        profile,
-        vae_policy,
-        device.clone(),
-    )
-    .map_err(|error| execution_error(variant, error))?;
+    let (qwen_source, qwen_plan, vae) = if artifact_directories.is_legacy_monolith() {
+        let qwen_source = VerifiedBurnpackQwenStageSource::<
+            NativeBackend,
+            DirectoryStageShardReader,
+        >::from_directory_auto(
+            &identity,
+            &root,
+            inventory.clone(),
+            qwen_config.clone(),
+            profile,
+            device.clone(),
+        )
+        .map_err(|error| execution_error(variant, error))?
+        .with_quantized_load_policy(qwen_quantized_policy);
+        let qwen_plan = qwen_source.plan().clone();
+        let vae = VerifiedDirectoryVaeStageSource::<NativeBackend>::new(
+            &identity,
+            &root,
+            inventory.clone(),
+            vae_config,
+            profile,
+            vae_policy,
+            device.clone(),
+        )
+        .map_err(|error| execution_error(variant, error))?;
+        (
+            NativeQwenSource::Legacy(Box::new(qwen_source)),
+            qwen_plan,
+            NativeVaeSource::Legacy(Box::new(vae)),
+        )
+    } else {
+        let qwen_source = VerifiedBurnpackQwen3VlStageSource::<
+            NativeBackend,
+            DirectoryArtifactShardReader,
+        >::from_directory(
+            artifact_directories.qwen_root(),
+            qwen_config.clone(),
+            device.clone(),
+        )
+        .map_err(|error| execution_error(variant, error))?
+        .with_float_policy(Qwen3VlArtifactFloatPolicy::Preserve);
+        let qwen_plan = qwen_source.contract().plan().clone();
+        let component_vae_policy = match vae_policy {
+            burn_boogu::artifacts::BooguFloatLoadPolicy::Preserve => {
+                FluxVaeArtifactFloatPolicy::Preserve
+            }
+            burn_boogu::artifacts::BooguFloatLoadPolicy::AdaptToF32 => {
+                FluxVaeArtifactFloatPolicy::AdaptToF32
+            }
+        };
+        let vae = VerifiedBurnpackFluxVaeStageSource::<
+            NativeBackend,
+            DirectoryArtifactShardReader,
+        >::from_directory(
+            artifact_directories.vae_root(), vae_config, device.clone()
+        )
+        .map_err(|error| execution_error(variant, error))?
+        .with_float_policy(component_vae_policy);
+        (
+            NativeQwenSource::Component(Box::new(qwen_source)),
+            qwen_plan,
+            NativeVaeSource::Component(Box::new(FluxVaeStageSourceAdapter::new(vae))),
+        )
+    };
 
-    let tokenizer_bytes = directory
+    let tokenizer_bytes = qwen_directory
         .read_file("metadata/source/mllm/tokenizer.json")
         .map_err(|error| execution_error(variant, error))?;
     let tokenizer = HfTokenizer::from_bytes(&tokenizer_bytes)
@@ -577,7 +805,7 @@ fn load_native_runtime(
     .map_err(|error| execution_error(variant, error))?;
     let image_processor = Qwen3VlImageProcessor::new(
         Qwen3VlImageProcessorConfig::from_json(
-            &directory
+            &qwen_directory
                 .read_text("metadata/source/mllm/preprocessor_config.json")
                 .map_err(|error| execution_error(variant, error))?,
         )
@@ -585,14 +813,15 @@ fn load_native_runtime(
     )
     .map_err(|error| execution_error(variant, error))?;
     let runtime_config = context.settings.runtime_config(variant);
-    let backend_policy = if let Some(policy) = native_policy {
-        policy.provenance_label
-    } else {
-        residency.label()
-    };
+    let backend_policy = native_policy
+        .map(|policy| policy.provenance_label)
+        .unwrap_or_else(|| residency.label());
     let metadata = BooguRuntimeMetadata {
         numeric_format: numeric_format(profile),
-        backend: format!("burn-wgpu-native/shared-bevy-device/{backend_policy}"),
+        backend: format!(
+            "burn-wgpu-native/shared-bevy-device/{}/{backend_policy}",
+            residency.weight_traffic_contract(profile == BooguStorageProfile::F16QwenVisionF32)
+        ),
         artifact_content_digest: Some(content_digest),
         artifacts_verified: true,
         execution_dtypes,
@@ -602,7 +831,7 @@ fn load_native_runtime(
     match residency {
         NativeBooguResidencyPolicy::HighVram => {
             bevy::log::info!(
-                "retaining verified Qwen stages after their first load and loading one resident Boogu denoiser"
+                "eagerly loading required Qwen/VAE weights and one resident Boogu denoiser before native runtime readiness"
             );
             let (mut denoiser, report) =
                 load_resident_denoiser_from_directory_with_policies::<NativeBackend>(
@@ -621,22 +850,53 @@ fn load_native_runtime(
                 report.tensors,
                 report.shards
             );
-            let qwen_source = if let Some(policy) = native_policy {
-                let synchronization = match policy.qwen_synchronization {
+            // Retained stages never need a device barrier before a module handle is dropped.
+            // The eager preload below performs one explicit final barrier after all authenticated
+            // host uploads. Forward then submits the dense GPU graph without a CPU wait per layer;
+            // the normal component/output barriers remain the synchronization points.
+            let synchronization = native_policy
+                .map(|policy| match policy.qwen_synchronization {
                     NativeQwenSynchronizationPolicy::PerStage => {
                         RetainingSynchronizationPolicy::PerStage
                     }
                     NativeQwenSynchronizationPolicy::DeferredToStageBoundary => {
                         RetainingSynchronizationPolicy::Deferred
                     }
-                };
-                RetainingQwen3VlStageSource::new(qwen_source)
-                    .with_synchronization_policy(synchronization)
-            } else {
-                RetainingQwen3VlStageSource::new(qwen_source)
-            };
+                })
+                .unwrap_or(RetainingSynchronizationPolicy::Deferred);
+            let mut qwen_source = RetainingQwen3VlStageSource::new(qwen_source)
+                .with_synchronization_policy(synchronization);
+            let retained_qwen_stages = preload_retained_qwen(
+                &mut qwen_source,
+                &qwen_plan,
+                variant != BooguVariant::Image01Turbo,
+            )
+            .map_err(|error| execution_error(variant, error))?;
+            bevy::log::info!(
+                "native Qwen preload complete: {retained_qwen_stages} semantic stages resident on the shared WGPU device"
+            );
             let mut qwen = StreamingQwen3Vl::new(qwen_plan, qwen_source);
-            let vae = RetainingBooguVaeStageSource::new(vae);
+            let mut vae = RetainingBooguVaeStageSource::new(vae);
+            if variant != BooguVariant::Image01Turbo {
+                drop(
+                    vae.load_encoder()
+                        .map_err(|error| execution_error(variant, error))?,
+                );
+            }
+            drop(
+                vae.load_decoder()
+                    .map_err(|error| execution_error(variant, error))?,
+            );
+            <NativeBackend as Backend>::sync(&device).map_err(|error| {
+                execution_error(
+                    variant,
+                    format!("device sync after eager VAE residency load failed: {error}"),
+                )
+            })?;
+            bevy::log::info!(
+                "native VAE preload complete: {} required halves resident on the shared WGPU device",
+                vae.cached_stage_count()
+            );
             if let Some(policy) = native_policy {
                 qwen.set_query_chunk_size(policy.qwen_query_chunk_size);
                 denoiser.set_attention_query_chunk_size(policy.denoiser_query_chunk_size);
@@ -678,6 +938,7 @@ fn load_native_runtime(
                     metadata,
                 )
             } else {
+                let denoiser = NativePortableDenoiser::new(denoiser);
                 let pipeline =
                     StreamingBooguPipeline::new(variant, qwen_config, qwen, vae, denoiser);
                 spawn_native_runtime(
@@ -720,6 +981,93 @@ fn load_native_runtime(
                 metadata,
             )
         }
+    }
+}
+
+/// Populate every base-model stage cache before the runtime accepts its first request.
+///
+/// The retained wrapper keeps the underlying WGPU allocations alive. This function deliberately
+/// excludes the untied LM head because Boogu consumes Qwen's base hidden state and never computes
+/// vocabulary logits.
+fn preload_retained_qwen<S>(
+    source: &mut RetainingQwen3VlStageSource<NativeBackend, S>,
+    plan: &Qwen3VlStreamingPlan,
+    include_vision: bool,
+) -> Result<usize, burn_boogu::BooguError>
+where
+    S: Qwen3VlStageSource<NativeBackend, Error = burn_boogu::BooguError>,
+{
+    let expected = plan
+        .stages
+        .iter()
+        .filter(|descriptor| qwen_stage_is_required(&descriptor.stage, include_vision))
+        .count();
+    for descriptor in &plan.stages {
+        if !qwen_stage_is_required(&descriptor.stage, include_vision) {
+            continue;
+        }
+        let loaded = match &descriptor.stage {
+            Qwen3VlStage::EmbeddingRows { chunk } => {
+                let spec = plan.embedding_rows.chunks.get(*chunk).ok_or_else(|| {
+                    burn_boogu::BooguError::Artifact(format!(
+                        "Qwen preload plan references missing embedding chunk {chunk}"
+                    ))
+                })?;
+                drop(source.load_embedding_rows(spec)?);
+                true
+            }
+            Qwen3VlStage::VisionPrelude => {
+                drop(source.load_vision_prelude()?);
+                true
+            }
+            Qwen3VlStage::VisionBlock { index } => {
+                drop(source.load_vision_block(*index)?);
+                true
+            }
+            Qwen3VlStage::VisionDeepstackMerger { index, .. } => {
+                drop(source.load_vision_deepstack_merger(*index)?);
+                true
+            }
+            Qwen3VlStage::VisionFinalMerger => {
+                drop(source.load_vision_final_merger()?);
+                true
+            }
+            Qwen3VlStage::TextBlock { index } => {
+                drop(source.load_text_block(*index)?);
+                true
+            }
+            Qwen3VlStage::TextFinalNorm => {
+                drop(source.load_text_final_norm()?);
+                true
+            }
+            Qwen3VlStage::LmHeadRows { .. } => false,
+        };
+        if loaded {
+            // Bound host staging memory to one semantic stage. This initialization-only barrier is
+            // deliberately outside model forward; cache-hit forward calls remain deferred.
+            source.synchronize()?;
+            source.synchronize_pending()?;
+        }
+    }
+    let loaded = source.cached_stage_count();
+    if loaded != expected {
+        return Err(burn_boogu::BooguError::Artifact(format!(
+            "Qwen eager-residency contract loaded {loaded} stages, expected {expected}"
+        )));
+    }
+    Ok(loaded)
+}
+
+fn qwen_stage_is_required(stage: &Qwen3VlStage, include_vision: bool) -> bool {
+    match stage {
+        Qwen3VlStage::VisionPrelude
+        | Qwen3VlStage::VisionBlock { .. }
+        | Qwen3VlStage::VisionDeepstackMerger { .. }
+        | Qwen3VlStage::VisionFinalMerger => include_vision,
+        Qwen3VlStage::LmHeadRows { .. } => false,
+        Qwen3VlStage::EmbeddingRows { .. }
+        | Qwen3VlStage::TextBlock { .. }
+        | Qwen3VlStage::TextFinalNorm => true,
     }
 }
 
@@ -824,11 +1172,52 @@ mod tests {
     fn native_factory_defaults_to_retained_qwen_and_resident_denoiser_correctness() {
         let factory = NativeBooguFactory::new(BooguVariant::Image01Turbo);
         assert_eq!(factory.residency, NativeBooguResidencyPolicy::HighVram);
-        assert_eq!(factory.residency.label(), "native-high-vram-retained-qwen");
+        assert!(factory.residency.is_gpu_resident());
+        assert_eq!(
+            factory.residency.label(),
+            "native-high-vram-gpu-resident-dense"
+        );
         assert_eq!(
             NativeBooguResidencyPolicy::LayerStreamed.label(),
-            "native-layer-streamed"
+            "native-diagnostic-layer-streamed"
         );
+        assert_eq!(
+            factory.residency.weight_traffic_contract(true),
+            "gpu-resident-dense/zero-forward-host-weight-transfers"
+        );
+        assert_eq!(
+            factory.residency.weight_traffic_contract(false),
+            "diagnostic-gpu-resident-unqualified/zero-forward-host-weight-transfers"
+        );
+        assert_eq!(
+            NativeBooguResidencyPolicy::LayerStreamed.weight_traffic_contract(false),
+            "diagnostic-host-streamed/qwen+vae-per-request/denoiser-per-dmd-step"
+        );
+        assert!(!NativeBooguResidencyPolicy::LayerStreamed.is_gpu_resident());
+    }
+
+    #[test]
+    fn native_qwen_eager_residency_selects_only_request_graph_stages_correctness() {
+        assert!(qwen_stage_is_required(
+            &Qwen3VlStage::EmbeddingRows { chunk: 0 },
+            false
+        ));
+        assert!(qwen_stage_is_required(
+            &Qwen3VlStage::TextBlock { index: 0 },
+            false
+        ));
+        assert!(!qwen_stage_is_required(
+            &Qwen3VlStage::VisionBlock { index: 0 },
+            false
+        ));
+        assert!(qwen_stage_is_required(
+            &Qwen3VlStage::VisionBlock { index: 0 },
+            true
+        ));
+        assert!(!qwen_stage_is_required(
+            &Qwen3VlStage::LmHeadRows { chunk: 0 },
+            true
+        ));
     }
 
     #[test]
@@ -928,6 +1317,27 @@ mod tests {
                 .to_string()
                 .contains("UseCached")
         );
+    }
+
+    #[test]
+    fn native_diagnostic_streaming_requires_explicit_local_artifacts_correctness() {
+        let mut context = context(WgpuExecutionKind::NativeWgpu);
+        context.settings.artifact_source = ArtifactSource::Remote {
+            base_url: burn_image::RemoteBaseUrl::new(
+                "https://aberration.technology/model/diagnostic-test",
+            )
+            .unwrap(),
+        };
+        let mut factory = NativeBooguFactory::with_residency(
+            BooguVariant::Image01Turbo,
+            NativeBooguResidencyPolicy::LayerStreamed,
+        );
+        let error = factory.start(context).unwrap_err().to_string();
+        assert!(
+            error.contains("requires an explicit local artifact directory"),
+            "{error}"
+        );
+        assert!(error.contains("GPU-resident-only"), "{error}");
     }
 
     #[test]

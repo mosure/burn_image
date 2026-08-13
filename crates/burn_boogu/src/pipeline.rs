@@ -50,6 +50,82 @@ impl<B: Backend> DmdDenoiser<B> for BooguDenoiser<B> {
     }
 }
 
+/// Native resident denoiser using Burn's portable bounded-attention graph.
+///
+/// This adapter leaves the verified dense weights on the shared WGPU device and caches the exact
+/// step-invariant RoPE tensors across all four DMD predictions. It is used by native storage
+/// profiles that do not select the separately qualified padded-blackbox execution policy.
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub struct NativePortableDenoiser {
+    denoiser: BooguDenoiser<crate::model::NativeWgpuBackend>,
+    rope_geometry: Option<crate::model::BooguRoPeGeometry<crate::model::NativeWgpuBackend>>,
+    rope_cache_misses: usize,
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+impl NativePortableDenoiser {
+    /// Wrap an already verified, fully resident native WGPU denoiser.
+    pub const fn new(denoiser: BooguDenoiser<crate::model::NativeWgpuBackend>) -> Self {
+        Self {
+            denoiser,
+            rope_geometry: None,
+            rope_cache_misses: 0,
+        }
+    }
+
+    /// Access the resident denoiser.
+    pub const fn denoiser(&self) -> &BooguDenoiser<crate::model::NativeWgpuBackend> {
+        &self.denoiser
+    }
+
+    /// Mutably access the resident denoiser and invalidate shape-derived cached tensors.
+    pub fn denoiser_mut(&mut self) -> &mut BooguDenoiser<crate::model::NativeWgpuBackend> {
+        self.rope_geometry = None;
+        &mut self.denoiser
+    }
+
+    /// Number of exact input geometries built and uploaded since construction.
+    pub const fn rope_cache_misses(&self) -> usize {
+        self.rope_cache_misses
+    }
+
+    /// Consume the adapter and return its resident denoiser.
+    pub fn into_inner(self) -> BooguDenoiser<crate::model::NativeWgpuBackend> {
+        self.denoiser
+    }
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+impl DmdDenoiser<crate::model::NativeWgpuBackend> for NativePortableDenoiser {
+    fn execution_dtype(&self) -> Option<DType> {
+        self.denoiser
+            .x_embedder
+            .bias
+            .as_ref()
+            .map(|bias| bias.val().dtype())
+    }
+
+    fn predict(
+        &mut self,
+        input: BooguDenoiserInput<crate::model::NativeWgpuBackend>,
+    ) -> Result<Tensor<crate::model::NativeWgpuBackend, 4>, BooguError> {
+        if !self
+            .rope_geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.matches(&input))
+        {
+            self.rope_geometry = Some(self.denoiser.prepare_rope_geometry(&input)?);
+            self.rope_cache_misses += 1;
+        }
+        self.denoiser.forward_with_prepared_rope(
+            input,
+            self.rope_geometry
+                .as_ref()
+                .expect("native RoPE geometry was populated above"),
+        )
+    }
+}
+
 /// Native WGPU adapter that requires Cubek `FlashUnit` for every denoiser attention operation.
 ///
 /// Constructing this adapter is an explicit execution-policy choice. The wrapped model and its
@@ -115,6 +191,8 @@ impl DmdDenoiser<crate::model::NativeWgpuBackend> for NativeFlashUnitDenoiser {
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub struct NativePaddedBlackboxDenoiser {
     denoiser: BooguDenoiser<crate::model::NativeWgpuBackend>,
+    rope_geometry: Option<crate::model::BooguRoPeGeometry<crate::model::NativeWgpuBackend>>,
+    rope_cache_misses: usize,
     num_planes: u8,
     seq_kv_tiles: u8,
     seq_q_tiles: u8,
@@ -131,6 +209,8 @@ impl NativePaddedBlackboxDenoiser {
     pub fn new(denoiser: BooguDenoiser<crate::model::NativeWgpuBackend>) -> Self {
         Self {
             denoiser,
+            rope_geometry: None,
+            rope_cache_misses: 0,
             num_planes: 4,
             seq_kv_tiles: 1,
             seq_q_tiles: 1,
@@ -232,7 +312,17 @@ impl NativePaddedBlackboxDenoiser {
 
     /// Mutably access the wrapped denoiser.
     pub fn denoiser_mut(&mut self) -> &mut BooguDenoiser<crate::model::NativeWgpuBackend> {
+        self.rope_geometry = None;
         &mut self.denoiser
+    }
+
+    /// Number of exact input geometries built and uploaded since construction.
+    ///
+    /// A four-step DMD request with stable shape/dtype/device increments this once. A later request
+    /// with the same contract reuses the same device tensors; an exact geometry change increments
+    /// it again.
+    pub const fn rope_cache_misses(&self) -> usize {
+        self.rope_cache_misses
     }
 
     /// Return the configured accelerated stage plane count.
@@ -503,9 +593,22 @@ impl DmdDenoiser<crate::model::NativeWgpuBackend> for NativePaddedBlackboxDenois
         &mut self,
         input: BooguDenoiserInput<crate::model::NativeWgpuBackend>,
     ) -> Result<Tensor<crate::model::NativeWgpuBackend, 4>, BooguError> {
+        if !self
+            .rope_geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.matches(&input))
+        {
+            self.rope_geometry = Some(self.denoiser.prepare_rope_geometry(&input)?);
+            self.rope_cache_misses += 1;
+        }
+        let geometry = self
+            .rope_geometry
+            .as_ref()
+            .expect("native RoPE geometry was populated above");
         self.denoiser
-            .forward_native_padded_blackbox_partitioned_with_policies(
+            .forward_native_padded_blackbox_partitioned_with_prepared_rope_and_policies(
                 input,
+                geometry,
                 self.num_planes,
                 self.seq_kv_tiles,
                 self.seq_q_tiles,
@@ -772,6 +875,58 @@ pub trait BooguVaeStageSource<B: Backend> {
     fn load_decoder(&mut self) -> Result<AutoencoderKl<B>, BooguError>;
 }
 
+/// Thin compatibility adapter from the reusable FLUX VAE artifact source into Boogu composition.
+///
+/// Shard verification, loading, and device residency remain owned by `burn_flux_vae`; this type
+/// only translates its model-neutral error at the pipeline boundary.
+#[cfg(feature = "burnpack")]
+pub struct FluxVaeStageSourceAdapter<S> {
+    source: S,
+}
+
+#[cfg(feature = "burnpack")]
+impl<S> FluxVaeStageSourceAdapter<S> {
+    /// Wrap a reusable synchronous FLUX VAE artifact source.
+    pub const fn new(source: S) -> Self {
+        Self { source }
+    }
+
+    /// Borrow the underlying reusable source.
+    pub const fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// Mutably borrow the underlying reusable source.
+    pub const fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Unwrap and return the reusable source.
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+#[cfg(feature = "burnpack")]
+impl<B, S> BooguVaeStageSource<B> for FluxVaeStageSourceAdapter<S>
+where
+    B: Backend,
+    S: burn_flux_vae::FluxVaeStageSource<B>,
+    S::Error: std::fmt::Display,
+{
+    fn load_encoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+        self.source
+            .load_encoder()
+            .map_err(|error| BooguError::Artifact(error.to_string()))
+    }
+
+    fn load_decoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+        self.source
+            .load_decoder()
+            .map_err(|error| BooguError::Artifact(error.to_string()))
+    }
+}
+
 /// Native high-residency wrapper that retains each verified VAE half after its first load.
 ///
 /// Burn modules clone initialized backend tensor handles, so returning a clone does not reread
@@ -866,6 +1021,165 @@ pub trait AsyncBooguVaeStageSource<B: Backend> {
 
     /// Await submitted device work before the selected VAE half is dropped.
     async fn synchronize(&mut self) -> Result<(), BooguError>;
+}
+
+/// Wasm-local compatibility adapter for the reusable asynchronous FLUX VAE source.
+#[cfg(feature = "burnpack")]
+pub struct AsyncFluxVaeStageSourceAdapter<S> {
+    source: S,
+}
+
+#[cfg(feature = "burnpack")]
+impl<S> AsyncFluxVaeStageSourceAdapter<S> {
+    /// Wrap a reusable asynchronous FLUX VAE artifact source.
+    pub const fn new(source: S) -> Self {
+        Self { source }
+    }
+
+    /// Borrow the underlying reusable source.
+    pub const fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// Mutably borrow the underlying reusable source.
+    pub const fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Unwrap and return the reusable source.
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+#[cfg(feature = "burnpack")]
+impl<B, S> AsyncBooguVaeStageSource<B> for AsyncFluxVaeStageSourceAdapter<S>
+where
+    B: Backend,
+    S: burn_flux_vae::AsyncFluxVaeStageSource<B>,
+    S::Error: std::fmt::Display,
+{
+    async fn load_encoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+        self.source
+            .load_encoder()
+            .await
+            .map_err(|error| BooguError::Artifact(error.to_string()))
+    }
+
+    async fn load_decoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+        self.source
+            .load_decoder()
+            .await
+            .map_err(|error| BooguError::Artifact(error.to_string()))
+    }
+
+    async fn synchronize(&mut self) -> Result<(), BooguError> {
+        self.source
+            .synchronize()
+            .await
+            .map_err(|error| BooguError::Artifact(error.to_string()))
+    }
+}
+
+/// Opt-in GPU-resident cache for an asynchronous verified FLUX VAE source.
+///
+/// A cache miss delegates to the wrapped source and retains only a clone of the initialized Burn
+/// module. WGPU/WebGPU clones share device-buffer handles, so no Burnpack payload or decoded host
+/// tensor is retained. Synchronization always reaches the wrapped source, including cache hits.
+///
+/// [`Self::new`] enables retention. [`Self::passthrough`] provides an explicitly non-retaining
+/// wrapper for diagnostic low-memory runtimes that need the same concrete type.
+pub struct RetainingAsyncBooguVaeStageSource<B: Backend, S> {
+    source: S,
+    retention_enabled: bool,
+    encoder: Option<AutoencoderKl<B>>,
+    decoder: Option<AutoencoderKl<B>>,
+}
+
+impl<B: Backend, S> RetainingAsyncBooguVaeStageSource<B, S> {
+    /// Create an initially empty cache that retains each verified VAE half after first load.
+    pub fn new(source: S) -> Self {
+        Self::with_retention(source, true)
+    }
+
+    /// Wrap a source without retaining either VAE half.
+    pub fn passthrough(source: S) -> Self {
+        Self::with_retention(source, false)
+    }
+
+    fn with_retention(source: S, retention_enabled: bool) -> Self {
+        Self {
+            source,
+            retention_enabled,
+            encoder: None,
+            decoder: None,
+        }
+    }
+
+    /// Whether successfully loaded halves are retained for later requests.
+    pub const fn retention_enabled(&self) -> bool {
+        self.retention_enabled
+    }
+
+    /// Number of retained VAE halves (`0..=2`).
+    pub fn cached_stage_count(&self) -> usize {
+        usize::from(self.encoder.is_some()) + usize::from(self.decoder.is_some())
+    }
+
+    /// Drop both retained device handles while preserving the wrapped verified source.
+    ///
+    /// Callers must await the final submitted synchronization before clearing a live GPU cache.
+    pub fn clear(&mut self) {
+        self.encoder = None;
+        self.decoder = None;
+    }
+
+    /// Borrow the wrapped verified source.
+    pub const fn source(&self) -> &S {
+        &self.source
+    }
+
+    /// Mutably borrow the wrapped verified source.
+    pub fn source_mut(&mut self) -> &mut S {
+        &mut self.source
+    }
+
+    /// Consume the wrapper, dropping retained handles and returning the source.
+    pub fn into_source(self) -> S {
+        self.source
+    }
+}
+
+impl<B, S> AsyncBooguVaeStageSource<B> for RetainingAsyncBooguVaeStageSource<B, S>
+where
+    B: Backend,
+    S: AsyncBooguVaeStageSource<B>,
+{
+    async fn load_encoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+        if let Some(encoder) = &self.encoder {
+            return Ok(encoder.clone());
+        }
+        let encoder = self.source.load_encoder().await?;
+        if self.retention_enabled {
+            self.encoder = Some(encoder.clone());
+        }
+        Ok(encoder)
+    }
+
+    async fn load_decoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+        if let Some(decoder) = &self.decoder {
+            return Ok(decoder.clone());
+        }
+        let decoder = self.source.load_decoder().await?;
+        if self.retention_enabled {
+            self.decoder = Some(decoder.clone());
+        }
+        Ok(decoder)
+    }
+
+    async fn synchronize(&mut self) -> Result<(), BooguError> {
+        self.source.synchronize().await
+    }
 }
 
 /// Component execution boundary shared by the model-neutral host adapter.
@@ -1462,6 +1776,32 @@ mod tests {
         }
     }
 
+    impl AsyncBooguVaeStageSource<B> for CountingVaeSource {
+        async fn load_encoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+            BooguVaeStageSource::load_encoder(self)
+        }
+
+        async fn load_decoder(&mut self) -> Result<AutoencoderKl<B>, BooguError> {
+            BooguVaeStageSource::load_decoder(self)
+        }
+
+        async fn synchronize(&mut self) -> Result<(), BooguError> {
+            Ok(())
+        }
+    }
+
+    fn block_on_immediate<F: core::future::Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(output) => return output,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
     #[test]
     fn retaining_vae_source_loads_each_half_once_correctness() {
         let source = CountingVaeSource {
@@ -1483,6 +1823,40 @@ mod tests {
         assert_eq!(retaining.cached_stage_count(), 0);
         drop(retaining.load_decoder().unwrap());
         assert_eq!(retaining.source().decoder_loads, 2);
+    }
+
+    #[test]
+    fn async_retaining_vae_source_loads_each_half_once_and_clears_correctness() {
+        let source = CountingVaeSource {
+            encoder_loads: 0,
+            decoder_loads: 0,
+        };
+        let mut retaining = RetainingAsyncBooguVaeStageSource::new(source);
+
+        block_on_immediate(retaining.load_encoder()).unwrap();
+        block_on_immediate(retaining.load_encoder()).unwrap();
+        block_on_immediate(retaining.load_decoder()).unwrap();
+        block_on_immediate(retaining.load_decoder()).unwrap();
+
+        assert!(retaining.retention_enabled());
+        assert_eq!(retaining.cached_stage_count(), 2);
+        assert_eq!(retaining.source().encoder_loads, 1);
+        assert_eq!(retaining.source().decoder_loads, 1);
+        retaining.clear();
+        assert_eq!(retaining.cached_stage_count(), 0);
+        block_on_immediate(retaining.load_decoder()).unwrap();
+        assert_eq!(retaining.source().decoder_loads, 2);
+
+        let source = CountingVaeSource {
+            encoder_loads: 0,
+            decoder_loads: 0,
+        };
+        let mut passthrough = RetainingAsyncBooguVaeStageSource::passthrough(source);
+        block_on_immediate(passthrough.load_decoder()).unwrap();
+        block_on_immediate(passthrough.load_decoder()).unwrap();
+        assert!(!passthrough.retention_enabled());
+        assert_eq!(passthrough.cached_stage_count(), 0);
+        assert_eq!(passthrough.source().decoder_loads, 2);
     }
 
     #[test]

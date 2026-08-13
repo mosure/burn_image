@@ -91,6 +91,19 @@ be loaded or saved directly.
 `BurnpackShardLoader` additionally tracks duplicate, unexpected, and missing tensors across
 sequential partial Burnpack payloads.
 
+With the separate `artifacts` feature, `FluxVaeComponentContract` validates the sealed reusable
+VAE bundle and its exact config-derived inventory. This model crate owns the VAE shard semantics,
+stage loading, and device residency. The synchronous and asynchronous verified stage sources
+fetch, hash, apply, and release one bounded Burnpack object at a time. Encoder and decoder
+halves can be loaded independently; the opt-in retaining wrappers cache initialized device tensor
+handles, not Burnpack bytes. Filesystem, HTTP, and browser cache implementations are shared through
+the model-neutral `burn_image` reader traits, so a VAE-only downstream crate does not depend on
+Boogu or reimplement shard semantics.
+
+The released component is `flux1-vae-boogu-image-0.1` with profile `f16`. Its exact source-derived
+model revision and sealed manifest digest are pinned by this crate.
+`flux_vae_component_dependency()` returns the complete immutable edge for a composed manifest.
+
 `TensorInventory::from_config` returns both Burn and Diffusers names and shapes. This is intended for
 conversion manifests and preflight checks; artifact provenance, checksums, shard bounds, and CDN
 transport belong to the repository's model-neutral artifact layer.
@@ -104,6 +117,7 @@ transport belong to the repository's model-neutral artifact layer.
 | `wgpu` | native WGPU backend |
 | `webgpu` | browser WebGPU backend |
 | `import` | Safetensors and Burnpack loading/conversion surfaces |
+| `artifacts` | Standalone sealed VAE manifest, bounded shard sources, and device retention |
 
 The upstream FLUX configuration sets `force_upcast = true`. The flag is preserved and exposed, but
 mixed-dtype parameter mutation is intentionally not hidden inside `forward`; production callers

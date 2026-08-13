@@ -6,7 +6,8 @@ use std::{
 };
 
 use burn_boogu::artifacts::{
-    VerifiedArtifactDirectory, validate_edit_turbo_1k5_release_artifact_digest,
+    VerifiedArtifactDirectory, validate_canonical_release_artifact_digest,
+    validate_edit_turbo_1k5_release_artifact_digest, verify_modular_release_artifact_directories,
     verify_published_release_artifact_directory, verify_release_artifact_directory,
 };
 use clap::Parser;
@@ -23,7 +24,7 @@ struct Args {
     /// Require the exact mixed-F16 artifact digest qualified for Edit-Turbo 1.5K.
     #[arg(long, default_value_t = false)]
     require_edit_turbo_1k5_release: bool,
-    /// Require the exact pinned digest for one of the five canonical published bundles.
+    /// Require the exact pinned digest for one of the three canonical production bundles.
     #[arg(long, default_value_t = false)]
     require_published_release: bool,
 }
@@ -42,6 +43,10 @@ struct VerificationReport {
     verified_tensors: usize,
     largest_object_bytes: u64,
     max_shard_bytes: u64,
+    dependency_bundles: Vec<String>,
+    dependency_closure_verified: bool,
+    component_contracts_verified: bool,
+    reconstructed_inventory_verified: bool,
     published_release_verified: bool,
     semantic_contract_verified: bool,
     artifacts_verified: bool,
@@ -63,16 +68,86 @@ fn verify_artifact_directory(
     require_edit_turbo_1k5_release: bool,
     require_published_release: bool,
 ) -> Result<VerificationReport, Box<dyn Error>> {
-    let semantic = if require_published_release {
-        verify_published_release_artifact_directory(root)?
-    } else {
-        verify_release_artifact_directory(root)?
-    };
     let directory = VerifiedArtifactDirectory::open(root)?;
     let manifest = directory.manifest();
     let content_digest = manifest
         .content_digest
         .expect("a verified sealed manifest has a digest");
+    let modular = !manifest.dependencies.is_empty();
+    let (
+        verified_files,
+        verified_bytes,
+        verified_weight_objects,
+        verified_tensors,
+        largest_object_bytes,
+        max_shard_bytes,
+        dependency_bundles,
+        dependency_closure_verified,
+        component_contracts_verified,
+        reconstructed_inventory_verified,
+    ) = if modular {
+        let bundle_root = root
+            .parent()
+            .ok_or("modular artifact directory must have a sibling-bundle parent")?;
+        let dependency_path = |role: &str| -> Result<PathBuf, Box<dyn Error>> {
+            let dependency = manifest
+                .dependencies
+                .iter()
+                .find(|dependency| dependency.role.as_str() == role)
+                .ok_or_else(|| format!("composition omits dependency role {role}"))?;
+            Ok(bundle_root.join(dependency.bundle.as_str()))
+        };
+        let semantic = verify_modular_release_artifact_directories(
+            root,
+            dependency_path("qwen")?,
+            dependency_path("vae")?,
+        )?;
+        if require_published_release {
+            validate_canonical_release_artifact_digest(
+                semantic.variant,
+                semantic.profile,
+                content_digest,
+            )?;
+        }
+        (
+            semantic.verified_files,
+            semantic.verified_bytes,
+            semantic.verified_weight_objects,
+            semantic.verified_tensors,
+            semantic.largest_object_bytes,
+            semantic
+                .parent
+                .max_shard_bytes
+                .max(semantic.qwen.max_shard_bytes)
+                .max(semantic.vae.max_shard_bytes),
+            manifest
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.bundle.to_string())
+                .collect(),
+            semantic.dependency_closure_verified,
+            semantic.component_contracts_verified,
+            semantic.reconstructed_inventory_verified,
+        )
+    } else {
+        let semantic = if require_published_release {
+            verify_published_release_artifact_directory(root)?
+        } else {
+            verify_release_artifact_directory(root)?
+        };
+        (
+            semantic.verified_files,
+            semantic.verified_bytes,
+            semantic.verified_weight_objects,
+            semantic.verified_tensors,
+            semantic.largest_object_bytes,
+            semantic.max_shard_bytes,
+            Vec::new(),
+            true,
+            true,
+            true,
+        )
+    };
     if require_edit_turbo_1k5_release {
         validate_edit_turbo_1k5_release_artifact_digest(content_digest)?;
     }
@@ -83,12 +158,16 @@ fn verify_artifact_directory(
         model: manifest.model.to_string(),
         model_revision: manifest.model_revision.clone(),
         content_digest: content_digest.to_string(),
-        verified_files: semantic.verified_files,
-        verified_bytes: semantic.verified_bytes,
-        verified_weight_objects: semantic.verified_weight_objects,
-        verified_tensors: semantic.verified_tensors,
-        largest_object_bytes: semantic.largest_object_bytes,
-        max_shard_bytes: semantic.max_shard_bytes,
+        verified_files,
+        verified_bytes,
+        verified_weight_objects,
+        verified_tensors,
+        largest_object_bytes,
+        max_shard_bytes,
+        dependency_bundles,
+        dependency_closure_verified,
+        component_contracts_verified,
+        reconstructed_inventory_verified,
         published_release_verified: require_published_release,
         semantic_contract_verified: true,
         artifacts_verified: true,
@@ -132,6 +211,7 @@ mod tests {
                 component: None,
                 shard: None,
             }],
+            dependencies: Vec::new(),
             metadata: BTreeMap::new(),
             content_digest: None,
         };

@@ -48,6 +48,39 @@ pub enum ValidationError {
 pub enum ManifestError {
     #[error("unsupported artifact manifest schema {actual}; expected {expected}")]
     UnsupportedSchema { expected: u32, actual: u32 },
+    #[error("artifact dependencies require manifest schema 2")]
+    DependenciesRequireSchemaV2,
+    #[error("artifact manifest declares duplicate dependency role '{role}'")]
+    DuplicateDependencyRole { role: String },
+    #[error("artifact manifest declares dependency bundle '{bundle}' more than once")]
+    DuplicateDependencyBundle { bundle: String },
+    #[error("artifact bundle '{bundle}' depends on itself")]
+    SelfDependency { bundle: String },
+    #[error("dependency role '{role}' resolved {field} '{actual}', expected '{expected}'")]
+    DependencyIdentityMismatch {
+        role: String,
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    #[error("dependency role '{role}' content digest mismatch: expected {expected}, got {actual}")]
+    DependencyContentDigestMismatch {
+        role: String,
+        expected: Sha256Digest,
+        actual: Sha256Digest,
+    },
+    #[error("dependency role '{role}' could not resolve bundle '{bundle}'")]
+    MissingResolvedDependency { role: String, bundle: String },
+    #[error(
+        "dependency closure resolved bundle '{bundle}' to conflicting digests {expected} and {actual}"
+    )]
+    DependencyBundleConflict {
+        bundle: String,
+        expected: Sha256Digest,
+        actual: Sha256Digest,
+    },
+    #[error("artifact dependency cycle detected: {cycle:?}")]
+    DependencyCycle { cycle: Vec<String> },
     #[error("artifact manifest contains no files")]
     EmptyFiles,
     #[error("duplicate artifact path '{0}'")]

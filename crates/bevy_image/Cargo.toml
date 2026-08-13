@@ -41,8 +41,8 @@ native-io = []
 # Concrete native/browser implementations are selected by boogu-native/boogu-web;
 # the injection seam remains available to embedders.
 boogu = ["gpu-interop", "dep:burn_boogu", "burn_boogu/burnpack"]
-# Concrete native, stage-streamed loader/worker for sealed local bundles. The
-# asynchronous range-streamed browser runtime remains a separate injected factory.
+# Concrete native GPU-resident loader/worker for sealed bundles, with an explicit local-only
+# layer-streamed diagnostic. The asynchronous range-loaded browser runtime remains separate.
 boogu-native = [
   "app",
   "boogu",
@@ -57,8 +57,9 @@ boogu-native = [
   "dep:serde_json",
   "dep:ureq",
 ]
-# Concrete browser-local runtime over bounded HTTP Range readers and asynchronous
-# semantic Qwen/VAE/denoiser sources. No model weights are retained between stages.
+# Concrete browser-local runtime over bounded HTTP Range readers and asynchronous semantic
+# Qwen/VAE/denoiser sources. Production preloads and retains dense-F32 WebGPU stages; bounded host
+# payloads are released after upload. Layer streaming is an explicit diagnostic policy.
 boogu-web = [
   "web",
   "boogu",
@@ -107,6 +108,7 @@ tempfile.workspace = true
 console_error_panic_hook = "0.1.7"
 cubecl = { version = "=0.10.0", default-features = false, features = ["wgpu"] }
 js-sys.workspace = true
+sha2.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [

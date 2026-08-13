@@ -41,6 +41,7 @@ half = { version = "2.7", features = ["bytemuck", "serde"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["bmp", "jpeg", "png", "webp"] }
 js-sys = "0.3"
+memmap2 = "0.9"
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"

@@ -1,6 +1,11 @@
 //! Real-fixture DMD and FLUX VAE parity runner.
 
-use std::{error::Error, fs, path::PathBuf, time::Instant};
+use std::{
+    error::Error,
+    fs::{self, File},
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use burn::{
     prelude::Backend,
@@ -15,15 +20,34 @@ use burn_boogu::{
         VerifiedArtifactDirectory, load_vae_decoder_from_directory,
         load_vae_encoder_from_directory,
     },
-    reference::verify_reference_fixture,
+    reference::{verify_reference_fixture, verify_reference_fixture_file},
 };
 use burn_flux_vae::{AutoencoderKl, AutoencoderKlConfig, load_safetensors_file};
 use burn_image::HostImage;
 use burn_qwen3_vl::Qwen3VlConfig;
 use clap::{Parser, ValueEnum};
 use half::{bf16, f16};
+use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::{Deserialize, Serialize};
+
+const VAE_F32_SCALED_LATENT_MAX_ABS: f32 = 0.005;
+const VAE_F32_REFERENCE_NAMES: [&str; 6] = [
+    "vae.reference_f32_moments",
+    "vae.reference_f32_mean",
+    "vae.reference_f32_logvar",
+    "vae.reference_f32_std",
+    "vae.reference_f32_raw_latent",
+    "vae.reference_f32_scaled_latent",
+];
+const VAE_BF16_REFERENCE_NAMES: [&str; 6] = [
+    "vae.reference_moments",
+    "vae.reference_mean",
+    "vae.reference_logvar",
+    "vae.reference_std",
+    "vae.reference_raw_latent",
+    "vae.reference_scaled_latent",
+];
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum BackendChoice {
@@ -91,11 +115,22 @@ struct Args {
     /// the same pinned upstream BF16 fixture.
     #[arg(long, value_enum, default_value = "force-f32")]
     vae_float_policy: VaeFloatPolicyChoice,
+    /// Load only the sealed VAE encoder stage and report the six authenticated F32-oracle
+    /// encoder surfaces. This mode stream-authenticates and memory-maps the fixture without
+    /// materializing the decoder input, decoder output, or final pixels.
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "artifacts",
+        conflicts_with = "vae"
+    )]
+    encoder_only: bool,
     /// Fail when the measured metrics exceed the checked-in gates.
     #[arg(long, default_value_t = false)]
     require: bool,
-    /// Repeat decoder execution in one loaded process. The first sample includes first-use kernel
-    /// selection; later samples are retained warm-path measurements.
+    /// Repeat VAE execution in one loaded process. This repeats the decoder normally and the
+    /// encoder under `--encoder-only`. The first sample includes first-use kernel selection;
+    /// later samples are retained warm-path measurements.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     repeat: u16,
 }
@@ -135,6 +170,22 @@ struct VaeEncodeMetrics {
     raw_sample: Comparison,
     scaled_latent: Comparison,
     milliseconds: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct EncoderOnlyMetrics {
+    mode: &'static str,
+    variant: String,
+    model_revision: String,
+    width: usize,
+    height: usize,
+    backend: String,
+    vae_encode: VaeEncodeMetrics,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vae_encode_bf16_drift: Option<VaeEncodeMetrics>,
+    vae_load_milliseconds: f64,
+    vae_encode_milliseconds_by_run: Vec<f64>,
+    vae_loaded_tensors: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +232,21 @@ struct LoadedVae<B: Backend> {
     label: String,
 }
 
+struct LoadedVaeEncoder<B: Backend> {
+    encoder: AutoencoderKl<B>,
+    tensors: usize,
+    label: String,
+}
+
+struct VaeEncoderOutputs<B: Backend> {
+    moments: Tensor<B, 4>,
+    mean: Tensor<B, 4>,
+    logvar: Tensor<B, 4>,
+    std: Tensor<B, 4>,
+    raw_sample: Tensor<B, 4>,
+    scaled_latent: Tensor<B, 4>,
+}
+
 struct VaeRun<'a> {
     metadata: &'a FixtureMetadata,
     source: VaeSource<'a>,
@@ -190,15 +256,42 @@ struct VaeRun<'a> {
     dmd: (f32, f32),
 }
 
+struct VaeEncoderRun<'a> {
+    metadata: &'a FixtureMetadata,
+    source: VaeSource<'a>,
+    float_policy: BooguFloatLoadPolicy,
+    repeat: u16,
+    tensors: &'a SafeTensors<'a>,
+}
+
+enum FixtureBytes {
+    Owned(Vec<u8>),
+    Mapped(Mmap),
+}
+
+impl AsRef<[u8]> for FixtureBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(bytes) => bytes,
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let fixture_metadata_bytes = fs::read(args.fixture.join("metadata.json"))?;
     let metadata: FixtureMetadata = serde_json::from_slice(&fixture_metadata_bytes)?;
     let tensor_path = args.fixture.join("tensors.safetensors");
-    let bytes = fs::read(&tensor_path)?;
-    verify_reference_fixture(&fixture_metadata_bytes, &bytes)?;
-    let tensors = SafeTensors::deserialize(&bytes)?;
-    let dmd = dmd_metrics(&tensors)?;
+    let fixture_bytes = if args.encoder_only {
+        verify_reference_fixture_file(&fixture_metadata_bytes, &tensor_path)?;
+        FixtureBytes::Mapped(memory_map_read_only(&tensor_path)?)
+    } else {
+        let bytes = fs::read(&tensor_path)?;
+        verify_reference_fixture(&fixture_metadata_bytes, &bytes)?;
+        FixtureBytes::Owned(bytes)
+    };
+    let tensors = SafeTensors::deserialize(fixture_bytes.as_ref())?;
     let source = if let Some(path) = args.vae.as_deref() {
         VaeSource::Upstream(path)
     } else {
@@ -210,6 +303,41 @@ fn main() -> Result<(), Box<dyn Error>> {
             profile: args.profile.into(),
         }
     };
+
+    if args.encoder_only {
+        let metrics = match args.backend {
+            BackendChoice::Ndarray => {
+                if !matches!(args.vae_float_policy, VaeFloatPolicyChoice::ForceF32) {
+                    return Err("NdArray does not implement the native F16 VAE policy".into());
+                }
+                run_vae_encoder_only::<burn_ndarray::NdArray<f32>>(
+                    Default::default(),
+                    "ndarray-f32",
+                    VaeEncoderRun {
+                        metadata: &metadata,
+                        source,
+                        float_policy: args.vae_float_policy.load_policy(),
+                        repeat: args.repeat,
+                        tensors: &tensors,
+                    },
+                )?
+            }
+            BackendChoice::Wgpu => run_wgpu_encoder_only(
+                &metadata,
+                source,
+                args.vae_float_policy.load_policy(),
+                args.repeat,
+                &tensors,
+            )?,
+        };
+        println!("{}", serde_json::to_string_pretty(&metrics)?);
+        if args.require {
+            require_vae_encode_f32(&metrics.vae_encode)?;
+        }
+        return Ok(());
+    }
+
+    let dmd = dmd_metrics(&tensors)?;
 
     let metrics = match args.backend {
         BackendChoice::Ndarray => {
@@ -267,28 +395,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
-        if let Some(encode) = &metrics.vae_encode
-            && (encode.reference != "pytorch-f32-cpu"
-                || encode.moments.max_abs > 0.007
-                || encode.moments.rmse > 0.0002
-                || encode.moments.cosine < 0.999999
-                || encode.mean.max_abs > 0.007
-                || encode.logvar.max_abs > 0.004
-                || encode.std.max_abs > 0.0001
-                || encode.raw_sample.max_abs > 0.007
-                || encode.scaled_latent.max_abs > 0.003)
-        {
-            return Err(format!(
-                "VAE encode F32-oracle gate failed: reference={}, moments={:?}, mean={:?}, logvar={:?}, std={:?}, raw_sample={:?}, scaled={:?}",
-                encode.reference,
-                encode.moments,
-                encode.mean,
-                encode.logvar,
-                encode.std,
-                encode.raw_sample,
-                encode.scaled_latent
-            )
-            .into());
+        if let Some(encode) = &metrics.vae_encode {
+            require_vae_encode_f32(encode)?;
         }
         if metrics.output_rgb.max_abs_u8 > 4
             || metrics.output_rgb.mean_abs_u8 > 0.5
@@ -297,6 +405,40 @@ fn main() -> Result<(), Box<dyn Error>> {
         {
             return Err(format!("final RGB parity gate failed: {:?}", metrics.output_rgb).into());
         }
+    }
+    Ok(())
+}
+
+fn memory_map_read_only(path: &Path) -> Result<Mmap, Box<dyn Error>> {
+    let file = File::open(path)?;
+    // SAFETY: this process only holds a read-only fixture handle and never mutates the file. The
+    // parity contract requires callers not to replace or truncate an authenticated fixture while
+    // it is running. Keeping the mapping alive owns the resulting byte region after `file` drops.
+    Ok(unsafe { MmapOptions::new().map(&file)? })
+}
+
+fn require_vae_encode_f32(encode: &VaeEncodeMetrics) -> Result<(), Box<dyn Error>> {
+    if encode.reference != "pytorch-f32-cpu"
+        || encode.moments.max_abs > 0.007
+        || encode.moments.rmse > 0.0002
+        || encode.moments.cosine < 0.999999
+        || encode.mean.max_abs > 0.007
+        || encode.logvar.max_abs > 0.004
+        || encode.std.max_abs > 0.0001
+        || encode.raw_sample.max_abs > 0.007
+        || encode.scaled_latent.max_abs > VAE_F32_SCALED_LATENT_MAX_ABS
+    {
+        return Err(format!(
+            "VAE encode F32-oracle gate failed: reference={}, moments={:?}, mean={:?}, logvar={:?}, std={:?}, raw_sample={:?}, scaled={:?}",
+            encode.reference,
+            encode.moments,
+            encode.mean,
+            encode.logvar,
+            encode.std,
+            encode.raw_sample,
+            encode.scaled_latent
+        )
+        .into());
     }
     Ok(())
 }
@@ -324,6 +466,27 @@ fn run_wgpu(
     )
 }
 
+#[cfg(feature = "wgpu")]
+fn run_wgpu_encoder_only(
+    metadata: &FixtureMetadata,
+    source: VaeSource<'_>,
+    float_policy: BooguFloatLoadPolicy,
+    repeat: u16,
+    tensors: &SafeTensors<'_>,
+) -> Result<EncoderOnlyMetrics, Box<dyn Error>> {
+    run_vae_encoder_only::<burn_wgpu::Wgpu<f32, i32, u32>>(
+        require_native_wgpu_device()?,
+        "wgpu-f32",
+        VaeEncoderRun {
+            metadata,
+            source,
+            float_policy,
+            repeat,
+            tensors,
+        },
+    )
+}
+
 #[cfg(not(feature = "wgpu"))]
 fn run_wgpu(
     _metadata: &FixtureMetadata,
@@ -334,6 +497,180 @@ fn run_wgpu(
     _dmd: (f32, f32),
 ) -> Result<Metrics, Box<dyn Error>> {
     Err("the wgpu backend requires --features wgpu".into())
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn run_wgpu_encoder_only(
+    _metadata: &FixtureMetadata,
+    _source: VaeSource<'_>,
+    _float_policy: BooguFloatLoadPolicy,
+    _repeat: u16,
+    _tensors: &SafeTensors<'_>,
+) -> Result<EncoderOnlyMetrics, Box<dyn Error>> {
+    Err("the wgpu backend requires --features wgpu".into())
+}
+
+fn run_vae_encoder_only<B: Backend>(
+    device: B::Device,
+    backend: &str,
+    run: VaeEncoderRun<'_>,
+) -> Result<EncoderOnlyMetrics, Box<dyn Error>> {
+    let VaeEncoderRun {
+        metadata,
+        source,
+        float_policy,
+        repeat,
+        tensors,
+    } = run;
+    for name in [
+        "vae.reference_input",
+        "vae.reference_epsilon",
+        VAE_F32_REFERENCE_NAMES[0],
+        VAE_F32_REFERENCE_NAMES[1],
+        VAE_F32_REFERENCE_NAMES[2],
+        VAE_F32_REFERENCE_NAMES[3],
+        VAE_F32_REFERENCE_NAMES[4],
+        VAE_F32_REFERENCE_NAMES[5],
+    ] {
+        tensors.tensor(name).map_err(|error| {
+            format!("--encoder-only requires authenticated fixture tensor {name:?}: {error}")
+        })?;
+    }
+
+    let execution_dtype = match float_policy {
+        BooguFloatLoadPolicy::Preserve => burn::tensor::DType::F16,
+        BooguFloatLoadPolicy::AdaptToF32 => burn::tensor::DType::F32,
+    };
+    let input_view = tensors.tensor("vae.reference_input")?;
+    let input = Tensor::<B, 4>::from_data(
+        TensorData::new(decode_f32(&input_view)?, shape4(&input_view)?),
+        &device,
+    )
+    .cast(execution_dtype);
+    let epsilon_view = tensors.tensor("vae.reference_epsilon")?;
+    let epsilon = Tensor::<B, 4>::from_data(
+        TensorData::new(decode_f32(&epsilon_view)?, shape4(&epsilon_view)?),
+        &device,
+    )
+    .cast(execution_dtype);
+
+    let load_started = Instant::now();
+    let loaded = load_vae_encoder_model::<B>(&device, metadata, source, float_policy)?;
+    B::sync(&device)?;
+    let load_milliseconds = load_started.elapsed().as_secs_f64() * 1_000.0;
+
+    let mut milliseconds_by_run = Vec::with_capacity(usize::from(repeat));
+    let mut outputs = None;
+    for _ in 0..repeat {
+        let started = Instant::now();
+        let current = run_vae_encoder(&loaded.encoder, input.clone(), epsilon.clone());
+        B::sync(&device)?;
+        milliseconds_by_run.push(started.elapsed().as_secs_f64() * 1_000.0);
+        outputs = Some(current);
+    }
+    let outputs = outputs.expect("--repeat is constrained to at least one encode");
+    let milliseconds = *milliseconds_by_run
+        .last()
+        .expect("--repeat is constrained to at least one encode");
+    let vae_encode = compare_vae_encoder_outputs(
+        &outputs,
+        tensors,
+        "vae.reference_f32_",
+        "pytorch-f32-cpu",
+        milliseconds,
+    )?;
+    let vae_encode_bf16_drift = VAE_BF16_REFERENCE_NAMES
+        .iter()
+        .all(|name| tensors.tensor(name).is_ok())
+        .then(|| {
+            compare_vae_encoder_outputs(
+                &outputs,
+                tensors,
+                "vae.reference_",
+                "upstream-bf16-execution",
+                milliseconds,
+            )
+        })
+        .transpose()?;
+
+    Ok(EncoderOnlyMetrics {
+        mode: "encoder-only",
+        variant: metadata.variant.clone(),
+        model_revision: metadata.model_revision.clone(),
+        width: metadata.width,
+        height: metadata.height,
+        backend: format!("{backend}/{}", loaded.label),
+        vae_encode,
+        vae_encode_bf16_drift,
+        vae_load_milliseconds: load_milliseconds,
+        vae_encode_milliseconds_by_run: milliseconds_by_run,
+        vae_loaded_tensors: loaded.tensors,
+    })
+}
+
+fn run_vae_encoder<B: Backend>(
+    encoder: &AutoencoderKl<B>,
+    input: Tensor<B, 4>,
+    epsilon: Tensor<B, 4>,
+) -> VaeEncoderOutputs<B> {
+    let moments = encoder.encode_moments(input);
+    let posterior = burn_flux_vae::DiagonalGaussian::from_moments(moments.clone());
+    let mean = posterior.mean();
+    let logvar = posterior.logvar();
+    let std = posterior.std();
+    let raw_sample = posterior.sample_with_epsilon(epsilon);
+    let scaled_latent = encoder.scale_latents(raw_sample.clone());
+    VaeEncoderOutputs {
+        moments,
+        mean,
+        logvar,
+        std,
+        raw_sample,
+        scaled_latent,
+    }
+}
+
+fn compare_vae_encoder_outputs<B: Backend>(
+    outputs: &VaeEncoderOutputs<B>,
+    tensors: &SafeTensors<'_>,
+    prefix: &str,
+    reference: &str,
+    milliseconds: f64,
+) -> Result<VaeEncodeMetrics, Box<dyn Error>> {
+    Ok(VaeEncodeMetrics {
+        reference: reference.to_owned(),
+        moments: compare_tensor(
+            outputs.moments.clone(),
+            &tensors.tensor(&format!("{prefix}moments"))?,
+            "VAE moments",
+        )?,
+        mean: compare_tensor(
+            outputs.mean.clone(),
+            &tensors.tensor(&format!("{prefix}mean"))?,
+            "VAE posterior mean",
+        )?,
+        logvar: compare_tensor(
+            outputs.logvar.clone(),
+            &tensors.tensor(&format!("{prefix}logvar"))?,
+            "VAE posterior logvar",
+        )?,
+        std: compare_tensor(
+            outputs.std.clone(),
+            &tensors.tensor(&format!("{prefix}std"))?,
+            "VAE posterior std",
+        )?,
+        raw_sample: compare_tensor(
+            outputs.raw_sample.clone(),
+            &tensors.tensor(&format!("{prefix}raw_latent"))?,
+            "VAE raw sample",
+        )?,
+        scaled_latent: compare_tensor(
+            outputs.scaled_latent.clone(),
+            &tensors.tensor(&format!("{prefix}scaled_latent"))?,
+            "VAE scaled latent",
+        )?,
+        milliseconds,
+    })
 }
 
 fn run_vae<B: Backend>(
@@ -424,68 +761,38 @@ fn run_vae<B: Backend>(
             .cast(execution_dtype);
             let started = Instant::now();
             let encoder = loaded.encoder.as_ref().unwrap_or(&loaded.decoder);
-            let moments = encoder.encode_moments(input);
-            let posterior = burn_flux_vae::DiagonalGaussian::from_moments(moments.clone());
-            let mean = posterior.mean();
-            let logvar = posterior.logvar();
-            let std = posterior.std();
-            let raw_sample = posterior.sample_with_epsilon(epsilon);
-            let scaled_latent = encoder.scale_latents(raw_sample.clone());
+            let outputs = run_vae_encoder(encoder, input, epsilon);
             B::sync(&device)?;
             let milliseconds = started.elapsed().as_secs_f64() * 1_000.0;
-            let compare_set =
-                |prefix: &str, reference: &str| -> Result<VaeEncodeMetrics, Box<dyn Error>> {
-                    Ok(VaeEncodeMetrics {
-                        reference: reference.to_owned(),
-                        moments: compare_tensor(
-                            moments.clone(),
-                            &tensors.tensor(&format!("{prefix}moments"))?,
-                            "VAE moments",
-                        )?,
-                        mean: compare_tensor(
-                            mean.clone(),
-                            &tensors.tensor(&format!("{prefix}mean"))?,
-                            "VAE posterior mean",
-                        )?,
-                        logvar: compare_tensor(
-                            logvar.clone(),
-                            &tensors.tensor(&format!("{prefix}logvar"))?,
-                            "VAE posterior logvar",
-                        )?,
-                        std: compare_tensor(
-                            std.clone(),
-                            &tensors.tensor(&format!("{prefix}std"))?,
-                            "VAE posterior std",
-                        )?,
-                        raw_sample: compare_tensor(
-                            raw_sample.clone(),
-                            &tensors.tensor(&format!("{prefix}raw_latent"))?,
-                            "VAE raw sample",
-                        )?,
-                        scaled_latent: compare_tensor(
-                            scaled_latent.clone(),
-                            &tensors.tensor(&format!("{prefix}scaled_latent"))?,
-                            "VAE scaled latent",
-                        )?,
-                        milliseconds,
-                    })
-                };
-            let f32_names = [
-                "vae.reference_f32_moments",
-                "vae.reference_f32_mean",
-                "vae.reference_f32_logvar",
-                "vae.reference_f32_std",
-                "vae.reference_f32_raw_latent",
-                "vae.reference_f32_scaled_latent",
-            ];
-            if f32_names.iter().all(|name| tensors.tensor(name).is_ok()) {
+            if VAE_F32_REFERENCE_NAMES
+                .iter()
+                .all(|name| tensors.tensor(name).is_ok())
+            {
                 (
-                    Some(compare_set("vae.reference_f32_", "pytorch-f32-cpu")?),
-                    Some(compare_set("vae.reference_", "upstream-bf16-execution")?),
+                    Some(compare_vae_encoder_outputs(
+                        &outputs,
+                        tensors,
+                        "vae.reference_f32_",
+                        "pytorch-f32-cpu",
+                        milliseconds,
+                    )?),
+                    Some(compare_vae_encoder_outputs(
+                        &outputs,
+                        tensors,
+                        "vae.reference_",
+                        "upstream-bf16-execution",
+                        milliseconds,
+                    )?),
                 )
             } else {
                 (
-                    Some(compare_set("vae.reference_", "upstream-bf16-execution")?),
+                    Some(compare_vae_encoder_outputs(
+                        &outputs,
+                        tensors,
+                        "vae.reference_",
+                        "upstream-bf16-execution",
+                        milliseconds,
+                    )?),
                     None,
                 )
             }
@@ -568,6 +875,42 @@ fn load_vae_models<B: Backend>(
             })
         }
     }
+}
+
+fn load_vae_encoder_model<B: Backend>(
+    device: &B::Device,
+    metadata: &FixtureMetadata,
+    source: VaeSource<'_>,
+    float_policy: BooguFloatLoadPolicy,
+) -> Result<LoadedVaeEncoder<B>, Box<dyn Error>> {
+    let VaeSource::Artifacts { root, profile } = source else {
+        return Err(
+            "--encoder-only requires --artifacts so decoder weights are never loaded".into(),
+        );
+    };
+    let artifact_directory = VerifiedArtifactDirectory::open(root)?;
+    let qwen = Qwen3VlConfig::from_json(
+        &artifact_directory.read_text("metadata/source/mllm/config.json")?,
+    )?;
+    let config = AutoencoderKlConfig::from_diffusers_json(
+        &artifact_directory.read_text("metadata/source/vae/config.json")?,
+    )?;
+    let inventory = BooguArtifactInventory::new(&qwen, &BooguConfig::default(), &config)?;
+    let identity = BooguReleaseIdentity::canonical(metadata.variant()?);
+    let (encoder, report) = load_vae_encoder_from_directory::<B>(
+        &identity,
+        root,
+        inventory,
+        config,
+        profile,
+        float_policy,
+        device,
+    )?;
+    Ok(LoadedVaeEncoder {
+        encoder,
+        tensors: report.tensors,
+        label: format!("burnpack-{}", profile_label(profile)),
+    })
 }
 
 const fn profile_label(profile: BooguStorageProfile) -> &'static str {
@@ -829,6 +1172,50 @@ fn decode_f32(view: &TensorView<'_>) -> Result<Vec<f32>, Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_only_cli_requires_sealed_artifacts_correctness() {
+        let parsed = Args::try_parse_from([
+            "boogu-parity",
+            "--fixture",
+            "fixture",
+            "--artifacts",
+            "artifacts",
+            "--encoder-only",
+        ])
+        .unwrap();
+        assert!(parsed.encoder_only);
+        assert!(parsed.artifacts.is_some());
+        assert!(parsed.vae.is_none());
+
+        assert!(
+            Args::try_parse_from([
+                "boogu-parity",
+                "--fixture",
+                "fixture",
+                "--vae",
+                "upstream.safetensors",
+                "--encoder-only",
+            ])
+            .is_err(),
+            "encoder-only must reject the upstream loader because it allocates decoder weights"
+        );
+    }
+
+    #[test]
+    fn encoder_only_f32_oracle_surface_contract_correctness() {
+        assert_eq!(
+            VAE_F32_REFERENCE_NAMES,
+            [
+                "vae.reference_f32_moments",
+                "vae.reference_f32_mean",
+                "vae.reference_f32_logvar",
+                "vae.reference_f32_std",
+                "vae.reference_f32_raw_latent",
+                "vae.reference_f32_scaled_latent",
+            ]
+        );
+    }
 
     #[test]
     fn block_ssim_is_one_for_identical_non_multiple_dimensions_correctness() {

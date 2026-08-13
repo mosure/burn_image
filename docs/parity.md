@@ -401,7 +401,14 @@ exhaustive q128 Qwen, VAE/DMD, 240 portable-denoiser boundaries, and the exact a
 production full chain. The 1.5K invocation selects the F16 VAE q4096, retained Qwen q128 with
 deferred synchronization, denoiser q16384, and forced `p4/kv1/q1`
 padded-blackbox policy recorded above. Captured-sigma trajectory diagnostics remain
-separately reported. `boogu-full-parity` is the production execution-dtype propagated chain. The
-current release-evidence matrix is native only.
-The Wasm target is compiled in ordinary CI, but `edit-turbo-1k5` is rejected by the browser runtime
-and has no real-checkpoint Chromium parity result.
+separately reported. `boogu-full-parity` is the production execution-dtype propagated chain.
+
+The ordinary Wasm UI still rejects `edit-turbo-1k5`. The separate no-surface browser gate has a
+positive real-checkpoint result for the exact 1536×1536 fixture against the former schema-v1 flat
+closure. It authenticated all 372 fixture tensors, compared every published boundary, retained 48
+verified denoiser stages on WebGPU across DMD, cleared them before decode, and emitted
+`gates.passed=true` plus `numerical_parity_claimed=true`. That historical result is scoped to Chrome
+151.0.7922.108, the NVIDIA RTX PRO 6000 Blackwell device `0x2bb1`, driver 610.43.02, and the raw
+CubeCL F32 browser policy. The current schema-v2 modular closure has not been rerun and remains
+unqualified in the browser. Exact historical report and resource evidence are recorded in
+[the web guide](web.md#historical-flat-bundle-15k-exhaustive-browser-parity).

@@ -15,6 +15,8 @@ mod streaming;
 
 pub use attention::{DoubleStreamAttention, GqaAttention};
 pub use block::{DoubleStreamBlock, SingleStreamBlock};
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub(crate) use denoiser::BooguRoPeGeometry;
 pub use denoiser::{BooguDenoiser, BooguDenoiserInput};
 pub use embedding::{CombinedTimestepCaptionEmbedding, FinalProjection};
 pub use feed_forward::LuminaFeedForward;
@@ -39,6 +41,7 @@ pub(crate) use native_flash::{
 };
 pub use norm::{DenoiserRmsNormPolicy, RmsNormZero};
 pub use streaming::{
-    AsyncBooguDenoiserStageSource, BooguDenoiserPrelude, BooguDenoiserTail, BooguStreamState,
-    DenoiserStageObserver, StreamingBooguDenoiser, StreamingStageSource,
+    AsyncBooguDenoiserStageSource, AsyncRetainingDenoiserSynchronizationPolicy,
+    BooguDenoiserPrelude, BooguDenoiserTail, BooguStreamState, DenoiserStageObserver,
+    RetainingAsyncBooguDenoiserStageSource, StreamingBooguDenoiser, StreamingStageSource,
 };

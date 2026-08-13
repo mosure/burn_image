@@ -244,6 +244,13 @@ jobs:
           set -euo pipefail
           cargo check -p bevy_burn_image --target wasm32-unknown-unknown --no-default-features --features web --lib --locked
           cargo check -p bevy_burn_image --target wasm32-unknown-unknown --no-default-features --features boogu-web --locked
+      - name: Check browser qualification harness
+        run: |
+          set -euo pipefail
+          node --check crates/bevy_image/tests/wasm_browser_1k5_parity.mjs
+          node --check crates/bevy_image/tests/wasm_browser_1k5_scope.mjs
+          node --check crates/bevy_image/tests/wasm_browser_1k5_scope.test.mjs
+          node --test crates/bevy_image/tests/wasm_browser_1k5_scope.test.mjs
       - name: Build and inspect browser package
         shell: bash
         run: |

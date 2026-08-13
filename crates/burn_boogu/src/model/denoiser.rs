@@ -63,13 +63,41 @@ struct BooguRoPeKey {
 #[derive(Clone)]
 pub(crate) struct BooguRoPeGeometry<B: Backend> {
     key: BooguRoPeKey,
-    reference_len: usize,
-    generated_len: usize,
-    joint_cos: Tensor<B, 3>,
-    joint_sin: Tensor<B, 3>,
+    pub(crate) reference_len: usize,
+    pub(crate) generated_len: usize,
+    pub(crate) joint_cos: Tensor<B, 3>,
+    pub(crate) joint_sin: Tensor<B, 3>,
 }
 
 impl<B: Backend> BooguRoPeGeometry<B> {
+    pub(crate) fn prepare(
+        config: &BooguConfig,
+        input: &BooguDenoiserInput<B>,
+    ) -> Result<Self, BooguError> {
+        let key = BooguRoPeKey::from_input(input);
+        let ids = position_ids(
+            key.text_len,
+            key.reference_size.as_slice(),
+            key.generated_size,
+            config.patch_size,
+        )?;
+        let device = input.latent.device();
+        let (joint_cos, joint_sin) = rope_tensors::<B>(
+            &ids.values,
+            config.axes_dim_rope,
+            10_000.0,
+            key.dtype,
+            &device,
+        );
+        Ok(Self {
+            key,
+            reference_len: ids.reference_len,
+            generated_len: ids.generated_len,
+            joint_cos,
+            joint_sin,
+        })
+    }
+
     /// Whether these tensors exactly describe the supplied input on the same device.
     pub(crate) fn matches(&self, input: &BooguDenoiserInput<B>) -> bool {
         self.key == BooguRoPeKey::from_input(input)
@@ -243,28 +271,7 @@ impl<B: Backend> BooguDenoiser<B> {
         input: &BooguDenoiserInput<B>,
     ) -> Result<BooguRoPeGeometry<B>, BooguError> {
         self.validate_input(input)?;
-        let key = BooguRoPeKey::from_input(input);
-        let ids = position_ids(
-            key.text_len,
-            key.reference_size.as_slice(),
-            key.generated_size,
-            self.config.patch_size,
-        )?;
-        let device = input.latent.device();
-        let (joint_cos, joint_sin) = rope_tensors::<B>(
-            &ids.values,
-            self.config.axes_dim_rope,
-            10_000.0,
-            key.dtype,
-            &device,
-        );
-        Ok(BooguRoPeGeometry {
-            key,
-            reference_len: ids.reference_len,
-            generated_len: ids.generated_len,
-            joint_cos,
-            joint_sin,
-        })
+        BooguRoPeGeometry::prepare(&self.config, input)
     }
 
     /// Execute with a previously prepared, exact-match RoPE table.
@@ -278,6 +285,19 @@ impl<B: Backend> BooguDenoiser<B> {
             geometry,
             DenoiserRmsNormPolicy::StrictF32,
         )
+    }
+
+    /// Execute portable bounded attention with a caller-retained, exact-match RoPE table.
+    ///
+    /// Native DMD adapters use this seam to keep step-invariant trigonometric tables on device
+    /// across all four predictions instead of rebuilding and uploading them on every step.
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    pub(crate) fn forward_with_prepared_rope(
+        &self,
+        input: BooguDenoiserInput<B>,
+        geometry: &BooguRoPeGeometry<B>,
+    ) -> Result<Tensor<B, 4>, BooguError> {
+        self.forward_with_kernel_and_rope::<PortableChunkedAttention>(input, geometry)
     }
 
     pub(crate) fn forward_with_kernel_and_rope_and_rms_norm_policy<K: AttentionKernel<B>>(
@@ -529,6 +549,34 @@ impl BooguDenoiser<NativeWgpuBackend> {
         split_double_stream_shared_projection: bool,
     ) -> Result<Tensor<NativeWgpuBackend, 4>, BooguError> {
         let geometry = self.prepare_rope_geometry(&input)?;
+        self.forward_native_padded_blackbox_partitioned_with_prepared_rope_and_policies(
+            input,
+            &geometry,
+            num_planes,
+            seq_kv_tiles,
+            seq_q_tiles,
+            rms_norm_policy,
+            fused_strict_qk_norm_rope,
+            fused_rope_gqa_padding,
+            balanced_strict_qk_norm_rope,
+            split_double_stream_shared_projection,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_native_padded_blackbox_partitioned_with_prepared_rope_and_policies(
+        &self,
+        input: BooguDenoiserInput<NativeWgpuBackend>,
+        geometry: &BooguRoPeGeometry<NativeWgpuBackend>,
+        num_planes: u8,
+        seq_kv_tiles: u8,
+        seq_q_tiles: u8,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+        fused_strict_qk_norm_rope: bool,
+        fused_rope_gqa_padding: bool,
+        balanced_strict_qk_norm_rope: bool,
+        split_double_stream_shared_projection: bool,
+    ) -> Result<Tensor<NativeWgpuBackend, 4>, BooguError> {
         assert_supported_wgpu_blackbox_partition_configuration(
             num_planes,
             seq_kv_tiles,
@@ -556,7 +604,7 @@ impl BooguDenoiser<NativeWgpuBackend> {
                 NativePaddedBlackboxAttention<4, 1, 1, true, false>,
             >(
                 input,
-                &geometry,
+                geometry,
                 rms_norm_policy,
                 split_double_stream_shared_projection,
             );
@@ -576,7 +624,7 @@ impl BooguDenoiser<NativeWgpuBackend> {
                 NativePaddedBlackboxAttention<4, 1, 1, false, true>,
             >(
                 input,
-                &geometry,
+                geometry,
                 rms_norm_policy,
                 split_double_stream_shared_projection,
             );
@@ -596,7 +644,7 @@ impl BooguDenoiser<NativeWgpuBackend> {
                 NativePaddedBlackboxAttention<4, 1, 1, false, false, true>,
             >(
                 input,
-                &geometry,
+                geometry,
                 rms_norm_policy,
                 split_double_stream_shared_projection,
             );
@@ -605,21 +653,21 @@ impl BooguDenoiser<NativeWgpuBackend> {
             (2, 1, 1) => self
                 .forward_with_native_projection_policy::<NativePaddedBlackboxAttention<2, 1, 1>>(
                     input,
-                    &geometry,
+                    geometry,
                     rms_norm_policy,
                     split_double_stream_shared_projection,
                 ),
             (2, 2, 1) => self
                 .forward_with_native_projection_policy::<NativePaddedBlackboxAttention<2, 2, 1>>(
                     input,
-                    &geometry,
+                    geometry,
                     rms_norm_policy,
                     split_double_stream_shared_projection,
                 ),
             (4, 1, 1) => self
                 .forward_with_native_projection_policy::<NativePaddedBlackboxAttention<4, 1, 1>>(
                     input,
-                    &geometry,
+                    geometry,
                     rms_norm_policy,
                     split_double_stream_shared_projection,
                 ),

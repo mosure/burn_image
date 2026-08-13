@@ -693,6 +693,7 @@ dependencies = [
  "rand_distr 0.5.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "ureq",
@@ -2537,6 +2538,7 @@ dependencies = [
  "half",
  "hex",
  "image",
+ "memmap2",
  "rand 0.9.5",
  "rand_chacha 0.9.0",
  "rand_distr 0.5.1",
@@ -2555,6 +2557,7 @@ version = "0.1.1"
 dependencies = [
  "burn",
  "burn-store",
+ "burn_image",
  "getrandom 0.4.3",
  "serde",
  "serde_json",
@@ -2569,6 +2572,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -2580,6 +2584,7 @@ dependencies = [
  "burn-ndarray",
  "burn-store",
  "burn-wgpu",
+ "burn_image",
  "getrandom 0.4.3",
  "image",
  "safetensors 0.7.0",

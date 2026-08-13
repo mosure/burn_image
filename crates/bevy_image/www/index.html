@@ -324,8 +324,9 @@
       <p id="progress-secondary" class="progress-secondary"></p>
       <p id="inventory-note" class="inventory-note" hidden></p>
       <p class="model-note">
-        Large model objects are range-streamed and SHA-256 verified on demand. Keep this tab open;
-        browser HTTP-cache reuse depends on the browser and CDN.
+        Large model objects are range-streamed, SHA-256 verified, and preloaded to WebGPU during
+        preparation. Keep this tab open; after readiness, forward execution reuses resident GPU
+        weights instead of transferring them again.
       </p>
 
       <details>
@@ -529,8 +530,18 @@
             inventory.hidden = false;
             inventory.textContent = `${detail.weight_objects} model objects · ${formatBytes(
               detail.weight_bytes,
-            )} bundle inventory (streamed on demand)`;
+            )} bundle inventory (preloaded to WebGPU during preparation)`;
             logActivity(`Manifest ${detail.bundle} verified`);
+            break;
+          case "resident_resource_plan":
+            setSummary("GPU-resident model plan verified", "PLANNED");
+            primary.textContent = `${formatBytes(
+              detail.conservative_planned_device_bytes,
+            )} conservative WebGPU plan`;
+            secondary.textContent = `${formatBytes(
+              detail.conservative_f32_weight_bytes,
+            )} dense-F32 weights · ${formatBytes(detail.activation_reserve_bytes)} activation reserve`;
+            logActivity("Resident WebGPU resource plan accepted; preloading required model stages");
             break;
           case "ready":
             invalidateTransferRender();

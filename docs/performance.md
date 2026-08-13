@@ -17,7 +17,7 @@ Reports record:
 
 - adapter, driver, operating system, browser, Burn/WGPU and upstream revisions;
 - artifact profile and on-disk/downloaded byte counts;
-- native residency policy (`native-high-vram` or `native-layer-streamed`) and bytes reread per step;
+- native residency policy (`native-high-vram` or `diagnostic-layer-streamed`) and bytes reread per step;
 - cold manifest-to-first-pixel time and warm inference time;
 - tokenizer, Qwen, VAE encode, each denoiser/DMD step, VAE decode, readback, and encoding times;
 - peak host RSS, Wasm memory high-water mark, and peak/delta GPU memory;
@@ -207,11 +207,12 @@ was numerically invalid.
 
 ### Edit-Turbo 1.5K validation row
 
-The mixed-F16 1.5K conversion is sealed under bundle digest
+The historical schema-v1 flat mixed-F16 1.5K conversion is sealed under bundle digest
 `4e8b12ac5ca95272f9009080a23baf1bc52d1b0e7aebf2e9e5f394a492369213`. The strict verifier covered
 249 files, 38,224,723,721 bytes, 223 semantic objects, and 1,940 tensors; its report SHA-256 is
 `b702ef29e4a9e26afc67d2fdf8ad46582f561995d6041763439a6ed7ef3ee64f`. This establishes artifact
-identity and integrity, not numerical or performance parity.
+identity and integrity, not numerical or performance parity for the current schema-v2 modular
+closure; its browser replay remains pending.
 
 The 1536x1536 fixture-injected native WGPU full chain subsequently passed its production
 execution-dtype gate. Its JSON SHA-256 is
@@ -227,8 +228,9 @@ Both sides used the same prompt/source/seed, `align_res=false`, one unreported w
 five measured warm requests, synchronization, and uncached conditioning. The p95 comparison above
 uses nearest rank on both five-sample sets; the upstream JSON additionally records its linearly
 interpolated p95 as `6.002870 s`. The target is `<= 2x` at p50 and p95. Cached repeated-request
-timing cannot replace this comparison. Browser WebGPU rejects this variant and has no 1.5K
-performance row.
+timing cannot replace this comparison. The ordinary browser UI rejects this variant and there is
+no browser 1.5K performance row. A separate no-surface schema-v1 flat-bundle parity replay is
+numerical evidence only; the new modular composition still requires its own replay.
 
 The exact released policy used full autotune, retained Qwen q128 with synchronization deferred to
 the terminal Qwen-stage barrier, `p4/kv1/q1` denoiser q16384 with strict-F32 RMSNorm and composed
@@ -289,10 +291,14 @@ qualified only for 1K; splitting the double-stream shared projection was effecti
 - Q8 is retained only where measured end-to-end latency or peak residency improves and its parity
   gate passes. A smaller file alone is not enough.
 
-The native viewer defaults to `native-high-vram`: verified Qwen and VAE stages are retained after
-their first load and the denoiser is loaded once. `native-layer-streamed` is a deliberate
-lower-residency tradeoff whose benchmark must include repeated Qwen, VAE, and denoiser artifact
-reads and verification. Browser execution always remains non-retaining.
+The native viewer defaults to `native-high-vram`: every required Qwen/VAE stage and the denoiser
+are verified and resident before **Ready**, so measured forward execution contains no model-weight
+filesystem/decode/upload traffic. `diagnostic-layer-streamed` is an explicit local-only memory
+tradeoff whose benchmark must include repeated Qwen, VAE, and denoiser artifact reads and
+verification. Browser production now follows the same ready-state boundary with dense-F32 WebGPU
+modules; its explicit `layer-streamed-diagnostic` policy is the only ordinary browser mode that
+repeats model-weight traffic. Historical streamed-browser numbers do not qualify the resident
+default.
 
 The first reviewed native baseline is the
 [2026-08-11 RTX PRO 6000 report](reports/2026-08-11-rtx-pro-6000.md). It records a real performance

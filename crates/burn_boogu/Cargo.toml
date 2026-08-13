@@ -38,13 +38,20 @@ wgpu = [
   "dep:wgpu",
 ]
 webgpu = ["wgpu", "burn/webgpu"]
-burnpack = ["dep:burn-store"]
+burnpack = [
+  "dep:burn-store",
+  "burn_flux_vae/artifacts",
+  "burn_qwen3_vl/artifacts",
+]
 import = [
   "burnpack",
+  "burn_flux_vae/artifacts",
   "burn_flux_vae/import",
+  "burn_qwen3_vl/artifacts",
   "burn_qwen3_vl/import",
   "dep:safetensors",
   "dep:clap",
+  "dep:memmap2",
 ]
 quantized = []
 reference-hooks = []
@@ -61,6 +68,7 @@ clap = { workspace = true, optional = true }
 half.workspace = true
 hex.workspace = true
 image.workspace = true
+memmap2 = { workspace = true, optional = true }
 rand.workspace = true
 rand_chacha.workspace = true
 rand_distr.workspace = true
@@ -159,6 +167,16 @@ required-features = ["runtime", "import", "wgpu"]
 [[bin]]
 name = "boogu-verify-artifacts"
 path = "src/bin/boogu_verify_artifacts.rs"
+required-features = ["import"]
+
+[[bin]]
+name = "boogu-prepare-cdn-release"
+path = "src/bin/boogu_prepare_cdn_release.rs"
+required-features = ["import"]
+
+[[bin]]
+name = "boogu-prepare-vae-encoder-f32-diagnostic"
+path = "src/bin/boogu_prepare_vae_encoder_f32_diagnostic.rs"
 required-features = ["import"]
 
 [[bench]]

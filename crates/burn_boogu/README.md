@@ -81,9 +81,9 @@ evidence rather than inheriting a claim from another shape.
 | Profile | Storage | Execution contract | Status |
 | --- | --- | --- | --- |
 | `f16` | all floating tensors F16 | F16 Qwen/denoiser | diagnostic; Qwen vision accumulates excessive F16 drift |
-| `f16-qwen-vision-f32` | Qwen vision F32, other model weights F16 | F32 Qwen vision, F16 text/denoiser; VAE is F32 compatibility or verified F16 native policy | native parity reference/default |
+| `f16-qwen-vision-f32` | Qwen vision F32, other model weights F16 | F32 Qwen vision, F16 text/denoiser; VAE is F32 compatibility or verified F16 native policy | canonical production policy; frontend alias `production` |
 | `q8s-block32-f32` | eligible matrices Q8S block-32, other tensors F16 | policy depends on owner; F16 vision remains diagnostic | diagnostic |
-| `q8s-block32-f32-qwen-vision-f32` | Qwen vision F32, eligible non-vision matrices Q8S | split policy below | native Q8 reference |
+| `q8s-block32-f32-qwen-vision-f32` | Qwen vision F32, eligible non-vision matrices Q8S | split policy below | legacy diagnostic; not in the production CDN set |
 
 The Q8 split is required by measured Burn 0.21 behavior:
 
@@ -105,21 +105,27 @@ be selected independently on sync and async Qwen/denoiser sources with
 
 ## Residency policies
 
-Native high-VRAM execution retains verified Qwen stages after their first use, keeps one resident
-denoiser across all four DMD calls, and loads then retains the VAE encoder/decoder at their
-respective boundaries. The retaining Qwen and VAE wrappers clone shared WGPU handles on warm
-requests rather than re-reading Burnpacks.
+The Bevy native high-VRAM factory eagerly verifies and materializes the exact request graph before
+reporting ready: required Qwen and VAE modules plus one denoiser remain resident on WGPU. Forward
+then clones shared handles and performs no model-weight filesystem read, decode, or upload. Core
+runners can use the same retaining wrappers lazily when startup latency is preferable. Native
+construction can use `load_resident_denoiser_from_directory_with_policies` when sufficient VRAM is
+available.
 
-The layer-streamed diagnostic keeps Qwen, VAE, and denoiser stages short-lived. Browser execution
-uses the non-`Send` async stage traits and a bounded fetch/cache reader; it must not retain the
-complete bundle in Wasm linear memory. Native construction can use
-`load_resident_denoiser_from_directory_with_policies` when sufficient VRAM is available.
+The Bevy browser production factory applies the equivalent contract to non-`Send` async sources:
+one bounded, verified payload is held in Wasm during preload, then discarded after its initialized
+dense-F32 WebGPU module is retained. The complete bundle is never held in Wasm linear memory, and
+forward performs no model-weight HTTP read, decode, or upload. Explicit layer-streamed diagnostics
+keep stages short-lived and intentionally repeat that traffic. The exact 1.5K parity route has its
+own narrower lifetime: it retains all 48 denoiser stages across four DMD steps and clears them
+before VAE decode.
 
 ## Binaries
 
 | Binary | Purpose |
 | --- | --- |
-| `boogu-import` | convert a pinned Hugging Face snapshot into sealed bounded semantic Burnpacks |
+| `boogu-import` | convert a pinned Hugging Face snapshot into a descriptive sealed candidate bundle |
+| `boogu-prepare-cdn-release` | split three exact legacy monoliths into two shared component entries and three dependency-pinned parents, with strict closure reports |
 | `boogu-run` | native verified-artifact WGPU generation/editing; Qwen/VAE retained after first use, resident denoiser |
 | `boogu-run-wgpu-blackbox` | native WGPU runner exposing required padded blackbox attention and fail-closed kernel controls |
 | `boogu-qwen-parity` | aligned real-fixture Qwen vision/text/final-state parity and dtype observations |
@@ -131,7 +137,7 @@ Example native run:
 
 ```bash
 cargo run --release -p burn_boogu --features runtime,import,wgpu --bin boogu-run -- \
-  --artifacts .artifacts/boogu-image-0.1-turbo-f16-qwen-vision-f32 \
+  --artifacts .artifacts/boogu-image-0.1-turbo \
   --variant turbo --profile f16-qwen-vision-f32 \
   --vae-float-policy preserve-f16 --denoiser-query-chunk-size 512 \
   --prompt "A small red fox beneath a pine tree" \
@@ -146,7 +152,7 @@ The 1.5K Edit runtime uses a separately converted bundle and requires a source i
 ```bash
 cargo run --release -p burn_boogu --features runtime,import,wgpu \
   --bin boogu-run-wgpu-blackbox -- \
-  --artifacts .artifacts/boogu-image-0.1-edit-turbo-1k5-f16-qwen-vision-f32 \
+  --artifacts .artifacts/boogu-image-0.1-edit-turbo-1k5 \
   --variant edit-turbo-1k5 --profile f16-qwen-vision-f32 \
   --vae-float-policy preserve-f16 \
   --vae-group-norm-policy f16-storage-f32-accum \
@@ -166,16 +172,19 @@ cargo run --release -p burn_boogu --features runtime,import,wgpu \
 Omitting both dimensions selects the 1536×1536 model default. Other accepted native presets are
 1264×1856, 1856×1264, 1344×1744, 1744×1344, 1392×1696, 1696×1392, 1152×2032,
 2032×1152, and 2368×992; arbitrary in-envelope dimensions fail closed. Only the 1536×1536 default
-has the numerical and synchronized performance evidence below. Browser WebGPU rejects
-`edit-turbo-1k5` before artifact loading until a real browser fixture replay and synchronized
-performance run pass.
+has the native numerical and synchronized performance evidence below. Ordinary Browser WebGPU
+still rejects `edit-turbo-1k5` before artifact loading. A separate no-surface, exact-fixture route
+passed 1536×1536 numerical parity on the pinned RTX PRO 6000 Blackwell/Chrome 151 stack using
+the historical schema-v1 flat bundle. It does not qualify the new schema-v2 modular closure,
+browser performance, the ordinary UI route, another shape, or another stack; the modular browser
+replay remains pending.
 
 The parity-gated 1024 native-WGPU performance policy is selected explicitly:
 
 ```bash
 cargo run --release -p burn_boogu --features runtime,import,wgpu \
   --bin boogu-run-wgpu-blackbox -- \
-  --artifacts .artifacts/boogu-image-0.1-turbo-f16-qwen-vision-f32 \
+  --artifacts .artifacts/boogu-image-0.1-turbo \
   --variant turbo --profile f16-qwen-vision-f32 \
   --vae-float-policy preserve-f16 \
   --vae-group-norm-policy f16-storage-f32-accum \
@@ -197,14 +206,15 @@ the fully named policy above.
 ## Native performance evidence
 
 The historical tables below predate the distinct 1.5K runtime and apply only to Turbo and 1K Edit.
-The distinct 1.5K mixed-F16 artifact is sealed as
+The historical schema-v1 flat 1.5K mixed-F16 artifact is sealed as
 `4e8b12ac5ca95272f9009080a23baf1bc52d1b0e7aebf2e9e5f394a492369213`. Its external exhaustive
 1536×1536 fixture contains 372 tensors: q128 Qwen passes 70/70 semantic stages and the portable
 streamed denoiser passes 240/240 internal boundaries. The exact accelerated production full chain
 also passes: Qwen relative RMSE/cosine `0.09276403/0.9956884`, worst DMD velocity
 `0.12193716/0.99257636`, final latent `0.07782394/0.99699116`, decode
 `0.08242943/0.99667007`, and RGB `33.72779 dB/0.9920097` SSIM. Its JSON SHA-256 is
-`5834c99b9139ce054891b30e29ecad4bf2d8a4ed1fb9d6482628d1d7350e87ef`, with empty stderr.
+`5834c99b9139ce054891b30e29ecad4bf2d8a4ed1fb9d6482628d1d7350e87ef`, with empty stderr. This
+historical evidence is not attributed to the current schema-v2 modular release.
 
 The exact-policy uncached one-cold/five-warm result is Burn p50/nearest-rank p95
 `12.553919/12.830840 s` versus upstream `5.968882/6.003932 s`, or `2.1032x/2.1371x`. This is a
@@ -343,6 +353,7 @@ replay; `boogu-full-parity` owns production execution-dtype propagation.
   acceptance on the reported RTX PRO 6000. Wider query partitions fail closed. Browser WebGPU does
   not inherit this native cooperative-matrix claim. The native CUDA probe produced invalid output
   and is excluded from supported correctness and performance claims.
-- `edit-turbo-1k5` is native-only and cannot reuse the 1K Edit artifact, fixture, or evidence row.
-  Browser construction rejects it until browser numerical and performance parity are independently
-  established.
+- `edit-turbo-1k5` is not exposed by the ordinary browser UI and cannot reuse the 1K Edit artifact,
+  fixture, or evidence row. A historical surface-free browser route authenticated the legacy
+  schema-v1 monolith, but the modular five-entry closure still needs its own rerun; browser UI and
+  performance qualification remain separate gates.
