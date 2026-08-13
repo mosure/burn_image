@@ -1,9 +1,11 @@
 //! Usable model-neutral Bevy controls for generation and editing.
 
 use bevy::{
+    input::mouse::{MouseScrollUnit, MouseWheel},
     prelude::*,
     text::{EditableText, EditableTextFilter, TextCursorStyle},
-    ui::widget::NodeImageMode,
+    ui::InteractionDisabled,
+    window::PrimaryWindow,
 };
 #[cfg(test)]
 use burn_image::DimensionConstraints;
@@ -12,19 +14,35 @@ use burn_image::{
 };
 
 use crate::{
-    CancelImageJob, CompleteImageJob, EditorMode, ImageBytesLoaded, ImageDisplayFailed,
-    ImageEditorState, ImageIoFailed, ImageIoId, ImageJobId, ImageJobPhase, ImageJobRejected,
-    ImageJobs, ImageRunnerState, ImageRunnerStatus, LatestGeneratedImageView, LoadImageBytes,
-    PrepareImageDownload,
+    ActualSizeImageView, CancelImageJob, CompleteImageJob, EditorMode, FitImageView,
+    ImageBytesLoaded, ImageDisplayFailed, ImageEditorState, ImageFrontendSet, ImageIoFailed,
+    ImageJobId, ImageJobPhase, ImageJobRejected, ImageJobs, ImageRunnerState, ImageRunnerStatus,
+    LoadImageBytes, PrepareImageDownload, REFERENCE_IMAGE_IO_ID,
+};
+
+#[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
+use crate::ImageIoId;
+
+#[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
+use crate::{
+    ImageFileDialogCancelled, ImageFileDialogFailed, ImageFileDialogSelected, ImageFileDialogState,
+    OpenImageFileDialog, ReadDroppedImageFile, sanitize_image_file_name,
 };
 
 #[cfg(target_arch = "wasm32")]
 use crate::ImageDownloadReady;
 
 const MAX_REFERENCE_BYTES: usize = 64 * 1024 * 1024;
-const REFERENCE_IO_ID: ImageIoId = ImageIoId(1);
 #[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
 const DOWNLOAD_IO_ID: ImageIoId = ImageIoId(2);
+const DESKTOP_PANEL_WIDTH: f32 = 360.0;
+const DESKTOP_LAYOUT_MIN_WIDTH: f32 = 820.0;
+const NARROW_PANEL_HEIGHT_RATIO: f32 = 0.48;
+const NARROW_PANEL_MIN_HEIGHT: f32 = 260.0;
+const NARROW_PANEL_MAX_HEIGHT: f32 = 430.0;
+const MIN_VIEWER_HEIGHT: f32 = 160.0;
+const PANEL_MARGIN: f32 = 12.0;
+const PANEL_TOP: f32 = 52.0;
 const SIZE_PRESETS: &[(u32, u32)] = &[
     (256, 256),
     (512, 512),
@@ -87,6 +105,10 @@ struct RunButton;
 struct CancelButton;
 #[derive(Component, Default)]
 struct SaveButton;
+#[derive(Component, Default)]
+struct FitButton;
+#[derive(Component, Default)]
+struct ActualSizeButton;
 #[derive(Component)]
 struct PromptInput;
 #[derive(Component)]
@@ -101,6 +123,85 @@ struct SizeButtonLabel;
 struct ReferenceLabel;
 #[derive(Component)]
 struct ProgressLabel;
+#[derive(Component)]
+struct ProgressDetailLabel;
+#[derive(Component)]
+struct ProgressFill;
+
+#[derive(Component)]
+pub(crate) struct ImageControlPanel;
+
+#[derive(Component)]
+struct ImageControlPanelScroll;
+
+#[derive(Component, Clone, Copy)]
+struct ButtonPalette {
+    idle: Color,
+    pressed: Color,
+    disabled: Color,
+}
+
+impl ButtonPalette {
+    const fn neutral() -> Self {
+        Self {
+            idle: Color::srgb(0.14, 0.18, 0.27),
+            pressed: Color::srgb(0.24, 0.32, 0.48),
+            disabled: Color::srgb(0.085, 0.095, 0.12),
+        }
+    }
+
+    const fn action(idle: Color) -> Self {
+        Self {
+            idle,
+            pressed: Color::srgb(0.24, 0.32, 0.48),
+            disabled: Color::srgb(0.085, 0.095, 0.12),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ImageControlPanelLayout {
+    pub(crate) narrow: bool,
+    pub(crate) panel_width: f32,
+    pub(crate) panel_height: f32,
+    pub(crate) viewer_left: f32,
+    pub(crate) viewer_top: f32,
+    pub(crate) viewer_width: f32,
+    pub(crate) viewer_height: f32,
+}
+
+pub(crate) fn image_control_panel_layout(logical_size: Vec2) -> ImageControlPanelLayout {
+    let width = logical_size.x.max(1.0);
+    let height = logical_size.y.max(1.0);
+    if width >= DESKTOP_LAYOUT_MIN_WIDTH {
+        ImageControlPanelLayout {
+            narrow: false,
+            panel_width: DESKTOP_PANEL_WIDTH,
+            panel_height: (height - PANEL_TOP - PANEL_MARGIN).max(1.0),
+            viewer_left: DESKTOP_PANEL_WIDTH + 2.0 * PANEL_MARGIN,
+            viewer_top: PANEL_TOP,
+            viewer_width: (width - DESKTOP_PANEL_WIDTH - 3.0 * PANEL_MARGIN).max(1.0),
+            viewer_height: (height - PANEL_TOP - PANEL_MARGIN).max(1.0),
+        }
+    } else {
+        let available_height = (height - PANEL_TOP - 2.0 * PANEL_MARGIN).max(1.0);
+        let desired_panel_height = (height * NARROW_PANEL_HEIGHT_RATIO).clamp(
+            NARROW_PANEL_MIN_HEIGHT.min(available_height),
+            NARROW_PANEL_MAX_HEIGHT.min(available_height),
+        );
+        let panel_height =
+            desired_panel_height.min((available_height - MIN_VIEWER_HEIGHT).max(1.0));
+        ImageControlPanelLayout {
+            narrow: true,
+            panel_width: (width - 2.0 * PANEL_MARGIN).max(1.0),
+            panel_height,
+            viewer_left: PANEL_MARGIN,
+            viewer_top: PANEL_TOP,
+            viewer_width: (width - 2.0 * PANEL_MARGIN).max(1.0),
+            viewer_height: (available_height - panel_height).max(1.0),
+        }
+    }
+}
 
 pub struct ImageControlPanelPlugin;
 
@@ -111,23 +212,29 @@ impl Plugin for ImageControlPanelPlugin {
             .add_systems(
                 Update,
                 (
+                    sync_control_panel_layout,
+                    scroll_control_panel,
                     select_initial_model,
                     sync_text_inputs,
                     handle_mode_button,
                     handle_model_button,
                     handle_size_button,
                     handle_reference_button,
+                    accept_native_file_dialog,
+                    handle_view_buttons,
                     handle_run_button,
                     handle_cancel_button,
                     handle_save_button,
                     accept_reference_images,
-                    capture_outputs,
                     capture_frontend_errors,
                     update_control_labels,
+                    update_progress_panel,
+                    update_action_availability,
                     update_button_colors,
                 )
                     .chain(),
-            );
+            )
+            .add_systems(Update, capture_outputs.after(ImageFrontendSet::Feedback));
 
         #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
         app.add_systems(
@@ -148,28 +255,32 @@ fn setup_controls(mut commands: Commands) {
         .spawn((
             Node {
                 position_type: PositionType::Absolute,
-                left: px(12),
-                top: px(52),
-                bottom: px(12),
-                width: px(360),
+                left: px(PANEL_MARGIN),
+                top: px(PANEL_TOP),
+                bottom: px(PANEL_MARGIN),
+                width: px(DESKTOP_PANEL_WIDTH),
                 padding: px(14).all(),
                 row_gap: px(9),
                 flex_direction: FlexDirection::Column,
-                overflow: Overflow::clip_y(),
+                overflow: Overflow::scroll_y(),
+                scrollbar_width: 7.0,
                 border_radius: BorderRadius::all(px(8)),
                 ..default()
             },
+            ScrollPosition(Vec2::ZERO),
             BackgroundColor(Color::srgba(0.055, 0.065, 0.085, 0.96)),
+            ImageControlPanel,
+            ImageControlPanelScroll,
         ))
         .with_children(|panel| {
             panel.spawn((
-                Text::new("IMAGE GENERATION / EDIT"),
+                Text::new("IMAGE GENERATION AND EDITING"),
                 TextFont::from_font_size(18.0),
                 TextColor(Color::srgb(0.78, 0.86, 1.0)),
             ));
 
             spawn_labeled_button::<ModeButton, ModeButtonLabel>(panel, "Mode", "Generate");
-            spawn_labeled_button::<ModelButton, ModelButtonLabel>(panel, "Model", "waiting…");
+            spawn_labeled_button::<ModelButton, ModelButtonLabel>(panel, "Model", "waiting...");
 
             panel.spawn((
                 Text::new("Prompt / instruction"),
@@ -247,7 +358,8 @@ fn setup_controls(mut commands: Commands) {
                     Button,
                     ReferenceButton,
                     control_button_node(),
-                    BackgroundColor(button_color(false)),
+                    ButtonPalette::neutral(),
+                    BackgroundColor(ButtonPalette::neutral().idle),
                 ))
                 .with_children(|button| {
                     button.spawn((
@@ -278,36 +390,145 @@ fn setup_controls(mut commands: Commands) {
                     );
                 });
 
+            panel
+                .spawn(Node {
+                    width: percent(100),
+                    column_gap: px(7),
+                    ..default()
+                })
+                .with_children(|row| {
+                    spawn_action_button::<FitButton>(
+                        row,
+                        "Fit image",
+                        Color::srgb(0.18, 0.25, 0.36),
+                    );
+                    spawn_action_button::<ActualSizeButton>(
+                        row,
+                        "100%",
+                        Color::srgb(0.18, 0.25, 0.36),
+                    );
+                });
+
             panel.spawn((
-                Text::new("Waiting for a WGPU model runtime"),
+                Text::new("Preparing model runtime"),
                 TextFont::from_font_size(13.0),
-                TextColor(Color::srgb(0.74, 0.78, 0.84)),
+                TextColor(Color::srgb(0.84, 0.88, 0.94)),
                 TextLayout {
                     linebreak: LineBreak::WordOrCharacter,
                     ..default()
                 },
                 ProgressLabel,
             ));
-        });
 
-    commands.spawn((
-        ImageNode {
-            image_mode: NodeImageMode::Auto,
-            ..default()
-        },
-        Node {
-            position_type: PositionType::Absolute,
-            left: px(390),
-            right: px(12),
-            top: px(52),
-            bottom: px(12),
-            max_width: percent(100),
-            max_height: percent(100),
-            margin: auto().all(),
-            ..default()
-        },
-        LatestGeneratedImageView,
-    ));
+            panel
+                .spawn((
+                    Node {
+                        position_type: PositionType::Relative,
+                        width: percent(100),
+                        height: px(7),
+                        overflow: Overflow::clip(),
+                        border_radius: BorderRadius::all(px(4)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.13, 0.15, 0.19)),
+                ))
+                .with_children(|track| {
+                    track.spawn((
+                        Node {
+                            position_type: PositionType::Absolute,
+                            left: px(0),
+                            top: px(0),
+                            width: percent(28),
+                            height: percent(100),
+                            border_radius: BorderRadius::all(px(4)),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.32, 0.68, 0.83)),
+                        ProgressFill,
+                    ));
+                });
+
+            panel.spawn((
+                Text::new("Waiting for the shared GPU"),
+                TextFont::from_font_size(11.0),
+                TextColor(Color::srgb(0.58, 0.64, 0.72)),
+                TextLayout {
+                    linebreak: LineBreak::WordOrCharacter,
+                    ..default()
+                },
+                ProgressDetailLabel,
+            ));
+        });
+}
+
+fn sync_control_panel_layout(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut panels: Query<&mut Node, With<ImageControlPanel>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let layout = image_control_panel_layout(window.size());
+    for mut node in &mut panels {
+        let (right, top, width, height) = if layout.narrow {
+            (
+                px(PANEL_MARGIN),
+                Val::Auto,
+                Val::Auto,
+                px(layout.panel_height),
+            )
+        } else {
+            (Val::Auto, px(PANEL_TOP), px(layout.panel_width), Val::Auto)
+        };
+        if node.left != px(PANEL_MARGIN)
+            || node.bottom != px(PANEL_MARGIN)
+            || node.right != right
+            || node.top != top
+            || node.width != width
+            || node.height != height
+        {
+            node.left = px(PANEL_MARGIN);
+            node.bottom = px(PANEL_MARGIN);
+            node.right = right;
+            node.top = top;
+            node.width = width;
+            node.height = height;
+        }
+    }
+}
+
+fn scroll_control_panel(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut wheel: MessageReader<MouseWheel>,
+    panels: Query<(&ComputedNode, &UiGlobalTransform), With<ImageControlPanel>>,
+    mut scroll_areas: Query<&mut ScrollPosition, With<ImageControlPanelScroll>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    if !panels
+        .iter()
+        .any(|(node, transform)| node.contains_point(*transform, cursor))
+    {
+        return;
+    }
+
+    let delta = wheel.read().fold(0.0, |total, event| {
+        let scale = match event.unit {
+            MouseScrollUnit::Line => 42.0,
+            MouseScrollUnit::Pixel => 1.0,
+        };
+        total + event.y * scale
+    });
+    if delta == 0.0 {
+        return;
+    }
+    for mut scroll in &mut scroll_areas {
+        scroll.0.y = (scroll.0.y - delta).max(0.0);
+    }
 }
 
 fn spawn_labeled_button<M: Component + Default, L: Component + Default>(
@@ -320,7 +541,8 @@ fn spawn_labeled_button<M: Component + Default, L: Component + Default>(
             Button,
             M::default(),
             control_button_node(),
-            BackgroundColor(button_color(false)),
+            ButtonPalette::neutral(),
+            BackgroundColor(ButtonPalette::neutral().idle),
         ))
         .with_children(|button| {
             button.spawn((
@@ -337,8 +559,10 @@ fn spawn_action_button<M: Component + Default>(
     label: &str,
     color: Color,
 ) {
+    let palette = ButtonPalette::action(color);
     row.spawn((
         Button,
+        InteractionDisabled,
         M::default(),
         Node {
             flex_grow: 1.0,
@@ -349,7 +573,8 @@ fn spawn_action_button<M: Component + Default>(
             border: px(1).all(),
             ..default()
         },
-        BackgroundColor(color),
+        palette,
+        BackgroundColor(palette.disabled),
         BorderColor::all(Color::srgb(0.35, 0.4, 0.52)),
     ))
     .with_children(|button| {
@@ -536,6 +761,12 @@ fn handle_size_button(
 fn handle_reference_button(
     interactions: Query<&Interaction, (Changed<Interaction>, With<ReferenceButton>)>,
     mut panel: ResMut<ImageControlPanelState>,
+    #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))] dialog_state: Res<
+        ImageFileDialogState,
+    >,
+    #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))] mut open: MessageWriter<
+        OpenImageFileDialog,
+    >,
 ) {
     if !interactions
         .iter()
@@ -549,14 +780,104 @@ fn handle_reference_button(
             panel.notice = format!("Could not open the browser image picker: {error:?}");
         }
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
     {
-        panel.notice = "Drop a PNG, JPEG, or WebP file anywhere on the window".into();
+        if dialog_state.is_open {
+            panel.notice = "An image picker is already open".into();
+        } else {
+            open.write(OpenImageFileDialog {
+                id: REFERENCE_IMAGE_IO_ID,
+                max_bytes: MAX_REFERENCE_BYTES,
+            });
+            panel.notice = "Opening image picker".into();
+        }
+    }
+    #[cfg(all(not(feature = "native-io"), not(target_arch = "wasm32")))]
+    {
+        panel.notice = "Drop a PNG, JPEG, or WebP file on the window".into();
     }
 }
 
+#[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
+fn accept_native_file_dialog(
+    mut selected: MessageReader<ImageFileDialogSelected>,
+    mut cancelled: MessageReader<ImageFileDialogCancelled>,
+    mut failed: MessageReader<ImageFileDialogFailed>,
+    mut load: MessageWriter<LoadImageBytes>,
+    mut panel: ResMut<ImageControlPanelState>,
+) {
+    for selected in selected.read() {
+        if selected.id != REFERENCE_IMAGE_IO_ID {
+            continue;
+        }
+        load.write(LoadImageBytes {
+            id: selected.id,
+            bytes: selected.bytes.clone(),
+            encoding: None,
+        });
+        panel.notice = format!("Loading {}", selected.file_name);
+    }
+    if cancelled
+        .read()
+        .any(|cancelled| cancelled.id == REFERENCE_IMAGE_IO_ID)
+    {
+        panel.notice = "Image selection cancelled".into();
+    }
+    for failed in failed.read() {
+        if failed.id == REFERENCE_IMAGE_IO_ID {
+            panel.notice = failed.error.to_string();
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
+fn accept_native_file_dialog() {}
+
+#[allow(clippy::type_complexity)]
+fn handle_view_buttons(
+    fit_interactions: Query<
+        &Interaction,
+        (
+            Changed<Interaction>,
+            With<FitButton>,
+            Without<InteractionDisabled>,
+        ),
+    >,
+    actual_size_interactions: Query<
+        &Interaction,
+        (
+            Changed<Interaction>,
+            With<ActualSizeButton>,
+            Without<InteractionDisabled>,
+        ),
+    >,
+    mut fit: MessageWriter<FitImageView>,
+    mut actual_size: MessageWriter<ActualSizeImageView>,
+) {
+    if fit_interactions
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
+    {
+        fit.write(FitImageView);
+    }
+    if actual_size_interactions
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
+    {
+        actual_size.write(ActualSizeImageView);
+    }
+}
+
+#[allow(clippy::type_complexity)]
 fn handle_run_button(
-    interactions: Query<&Interaction, (Changed<Interaction>, With<RunButton>)>,
+    interactions: Query<
+        &Interaction,
+        (
+            Changed<Interaction>,
+            With<RunButton>,
+            Without<InteractionDisabled>,
+        ),
+    >,
     editor: Res<ImageEditorState>,
     mut jobs: ResMut<ImageJobs>,
     mut panel: ResMut<ImageControlPanelState>,
@@ -572,19 +893,31 @@ fn handle_run_button(
         panel.notice = "Fix the seed before running".into();
         return;
     }
+    if jobs.iter().any(|job| !job.phase.is_terminal()) || has_pending_submission(&panel, &jobs) {
+        panel.notice = "An image job is already active".into();
+        return;
+    }
     let id = jobs.reserve_id();
     match editor.submission(id) {
         Ok(request) => {
             submit.write(request);
             panel.latest_job = Some(id);
-            panel.notice = format!("Queued job {}", id.0);
+            panel.notice.clear();
         }
         Err(error) => panel.notice = error.to_string(),
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn handle_cancel_button(
-    interactions: Query<&Interaction, (Changed<Interaction>, With<CancelButton>)>,
+    interactions: Query<
+        &Interaction,
+        (
+            Changed<Interaction>,
+            With<CancelButton>,
+            Without<InteractionDisabled>,
+        ),
+    >,
     jobs: Res<ImageJobs>,
     mut panel: ResMut<ImageControlPanelState>,
     mut cancel: MessageWriter<CancelImageJob>,
@@ -595,12 +928,15 @@ fn handle_cancel_button(
     {
         return;
     }
-    let id = panel.latest_job.or_else(|| {
-        jobs.iter()
-            .filter(|job| !job.phase.is_terminal())
-            .map(|job| job.id)
-            .max()
-    });
+    let id = panel
+        .latest_job
+        .filter(|id| jobs.get(*id).is_some_and(|job| !job.phase.is_terminal()))
+        .or_else(|| {
+            jobs.iter()
+                .filter(|job| !job.phase.is_terminal())
+                .map(|job| job.id)
+                .max()
+        });
     if let Some(id) = id
         && jobs.get(id).is_some_and(|job| !job.phase.is_terminal())
     {
@@ -611,8 +947,16 @@ fn handle_cancel_button(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn handle_save_button(
-    interactions: Query<&Interaction, (Changed<Interaction>, With<SaveButton>)>,
+    interactions: Query<
+        &Interaction,
+        (
+            Changed<Interaction>,
+            With<SaveButton>,
+            Without<InteractionDisabled>,
+        ),
+    >,
     mut panel: ResMut<ImageControlPanelState>,
     mut download: MessageWriter<PrepareImageDownload>,
 ) {
@@ -639,7 +983,7 @@ fn handle_save_button(
             .and_then(|path| {
                 crate::save_image_file(&path, &image, ImageEncoding::Png).map(|()| path)
             }) {
-            Ok(path) => panel.notice = format!("Saved {}", path.display()),
+            Ok(_) => panel.notice = format!("Saved {file_name}"),
             Err(error) => panel.notice = error.to_string(),
         }
     }
@@ -662,7 +1006,7 @@ fn accept_reference_images(
     mut panel: ResMut<ImageControlPanelState>,
 ) {
     for loaded in loaded.read() {
-        if loaded.id != REFERENCE_IO_ID {
+        if loaded.id != REFERENCE_IMAGE_IO_ID {
             continue;
         }
         let dimensions = loaded.image.dimensions();
@@ -679,7 +1023,7 @@ fn accept_reference_images(
         }
         panel.notice = dimensions.map_or_else(
             || "Reference image loaded".into(),
-            |size| format!("Reference loaded: {} × {}", size.width(), size.height()),
+            |size| format!("Reference loaded: {} x {}", size.width(), size.height()),
         );
     }
 }
@@ -800,14 +1144,21 @@ fn preset_dimensions(index: usize) -> Dimensions {
 }
 
 fn capture_outputs(
+    jobs: Res<ImageJobs>,
     mut outputs: MessageReader<CompleteImageJob>,
     mut panel: ResMut<ImageControlPanelState>,
 ) {
     for output in outputs.read() {
+        if !jobs
+            .get(output.id)
+            .is_some_and(|job| job.phase == ImageJobPhase::Completed)
+        {
+            continue;
+        }
         if let Some(image) = output.output.images.first() {
             panel.latest_output = Some((output.id, image.image.clone()));
             panel.latest_job = Some(output.id);
-            panel.notice = format!("Job {} completed", output.id.0);
+            panel.notice.clear();
         }
     }
 }
@@ -830,81 +1181,447 @@ fn capture_frontend_errors(
     }
 }
 
-// The five marker-filtered mutable Text queries must be a ParamSet: Bevy
+// The four marker-filtered mutable Text queries must be a ParamSet: Bevy
 // correctly rejects them as ordinary parameters because their access could
 // overlap, even though each marker is unique in this plugin.
 #[allow(clippy::type_complexity)]
 fn update_control_labels(
     editor: Res<ImageEditorState>,
     runner: Res<ImageRunnerStatus>,
-    jobs: Res<ImageJobs>,
-    panel: Res<ImageControlPanelState>,
     mut labels: ParamSet<(
         Query<&mut Text, With<ModeButtonLabel>>,
         Query<&mut Text, With<ModelButtonLabel>>,
         Query<&mut Text, With<SizeButtonLabel>>,
         Query<&mut Text, With<ReferenceLabel>>,
-        Query<&mut Text, With<ProgressLabel>>,
     )>,
 ) {
+    if !editor.is_changed() && !runner.is_changed() {
+        return;
+    }
     if let Ok(mut label) = labels.p0().single_mut() {
-        label.0 = format!(
+        let value = format!(
             "Mode: {}",
             match editor.mode {
                 EditorMode::Generate => "Generate",
                 EditorMode::Edit => "Edit",
             }
         );
+        if label.0 != value {
+            label.0 = value;
+        }
     }
     if let Ok(mut label) = labels.p1().single_mut() {
-        label.0 = match &editor.model {
+        let value = match &editor.model {
             Some(model) => format!("Model: {model}"),
             None => runner_state_label(&runner.state),
         };
+        if label.0 != value {
+            label.0 = value;
+        }
     }
     if let Ok(mut label) = labels.p2().single_mut() {
-        label.0 = editor.options.dimensions.map_or_else(
+        let value = editor.options.dimensions.map_or_else(
             || "Size: model default".into(),
-            |size| format!("Size: {} × {}", size.width(), size.height()),
+            |size| format!("Size: {} x {}", size.width(), size.height()),
         );
+        if label.0 != value {
+            label.0 = value;
+        }
     }
     if let Ok(mut label) = labels.p3().single_mut() {
-        label.0 = if editor.source.is_some() {
+        let value = if editor.source.is_some() {
             "Reference: loaded (click to replace)".into()
         } else {
             reference_button_text().into()
         };
+        if label.0 != value {
+            label.0 = value;
+        }
     }
-    if let Ok(mut label) = labels.p4().single_mut() {
-        let job_status = panel
-            .latest_job
-            .and_then(|id| jobs.get(id))
-            .map(format_job_status);
-        label.0 = if panel.notice.is_empty() {
-            job_status.unwrap_or_else(|| runner_state_label(&runner.state))
-        } else if let Some(job_status) = job_status {
-            format!("{job_status}\n{}", panel.notice)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressTone {
+    Normal,
+    Complete,
+    Warning,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProgressPresentation {
+    headline: String,
+    detail: String,
+    fraction: Option<f32>,
+    tone: ProgressTone,
+}
+
+fn progress_presentation(
+    runner: &ImageRunnerState,
+    job: Option<&crate::ImageJobRecord>,
+    notice: &str,
+) -> ProgressPresentation {
+    let mut value = job.map_or_else(
+        || runner_progress_presentation(runner),
+        job_progress_presentation,
+    );
+    if !notice.is_empty() {
+        value.detail = if value.detail.is_empty() {
+            notice.to_owned()
         } else {
-            panel.notice.clone()
+            format!("{}\n{notice}", value.detail)
         };
     }
+    value
 }
 
-fn format_job_status(job: &crate::ImageJobRecord) -> String {
-    let phase = match &job.phase {
-        ImageJobPhase::Queued => "queued".into(),
-        ImageJobPhase::Running => job
-            .last_progress
-            .as_ref()
-            .map(format_progress)
-            .unwrap_or_else(|| "running".into()),
-        ImageJobPhase::Completed => "completed".into(),
-        ImageJobPhase::Failed { error } => format!("failed: {error}"),
-        ImageJobPhase::Cancelled => "cancelled".into(),
+fn runner_progress_presentation(state: &ImageRunnerState) -> ProgressPresentation {
+    match state {
+        ImageRunnerState::Missing => ProgressPresentation {
+            headline: "Model runtime unavailable".into(),
+            detail: "Install a WGPU model runtime to generate an image".into(),
+            fraction: Some(0.0),
+            tone: ProgressTone::Failed,
+        },
+        ImageRunnerState::Initializing { message } => ProgressPresentation {
+            headline: "Preparing model runtime".into(),
+            detail: message.clone(),
+            fraction: setup_progress_fraction(message),
+            tone: ProgressTone::Normal,
+        },
+        ImageRunnerState::Ready { .. } => ProgressPresentation {
+            headline: "Model runtime ready".into(),
+            detail: "Enter a prompt, choose settings, and run".into(),
+            fraction: Some(1.0),
+            tone: ProgressTone::Complete,
+        },
+        ImageRunnerState::Failed { error } => ProgressPresentation {
+            headline: "Model runtime failed".into(),
+            detail: error.to_string(),
+            fraction: Some(0.0),
+            tone: ProgressTone::Failed,
+        },
+    }
+}
+
+fn setup_progress_fraction(message: &str) -> Option<f32> {
+    let remainder = message.strip_prefix("Model setup ")?;
+    let fraction = remainder.split(':').next()?;
+    let (completed, total) = fraction.split_once('/')?;
+    let completed = completed.trim().parse::<u32>().ok()?;
+    let total = total.trim().parse::<u32>().ok()?;
+    (total > 0 && completed <= total).then(|| completed as f32 / total as f32)
+}
+
+fn job_progress_presentation(job: &crate::ImageJobRecord) -> ProgressPresentation {
+    let prefix = format!("Job {}", job.id.0);
+    match &job.phase {
+        ImageJobPhase::Queued => ProgressPresentation {
+            headline: format!("{prefix}: queued"),
+            detail: "Waiting for the GPU runtime".into(),
+            fraction: Some(0.0),
+            tone: ProgressTone::Normal,
+        },
+        ImageJobPhase::Running => job.last_progress.as_ref().map_or_else(
+            || ProgressPresentation {
+                headline: format!("{prefix}: running"),
+                detail: "Preparing inference".into(),
+                fraction: None,
+                tone: ProgressTone::Normal,
+            },
+            |progress| event_progress_presentation(&prefix, progress),
+        ),
+        ImageJobPhase::Completed => ProgressPresentation {
+            headline: format!("{prefix}: complete"),
+            detail: "Output is ready to view or save".into(),
+            fraction: Some(1.0),
+            tone: ProgressTone::Complete,
+        },
+        ImageJobPhase::Failed { error } => ProgressPresentation {
+            headline: format!("{prefix}: failed"),
+            detail: error.to_string(),
+            fraction: Some(0.0),
+            tone: ProgressTone::Failed,
+        },
+        ImageJobPhase::Cancelled => ProgressPresentation {
+            headline: format!("{prefix}: cancelled"),
+            detail: "The request was stopped".into(),
+            fraction: Some(0.0),
+            tone: ProgressTone::Warning,
+        },
+    }
+}
+
+fn event_progress_presentation(prefix: &str, progress: &ProgressEvent) -> ProgressPresentation {
+    let (headline, detail, fraction, tone) = match progress {
+        ProgressEvent::RunStarted { .. } => (
+            "Starting inference".into(),
+            "Preparing model inputs".into(),
+            Some(0.0),
+            ProgressTone::Normal,
+        ),
+        ProgressEvent::ArtifactStarted {
+            path,
+            component,
+            file_index,
+            file_count,
+            total_bytes,
+            ..
+        } => (
+            "Loading model data".into(),
+            format!(
+                "{}: file {} of {} - {} ({})",
+                component
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "artifact".into()),
+                file_index + 1,
+                file_count,
+                path,
+                format_bytes(*total_bytes)
+            ),
+            Some(*file_index as f32 / (*file_count).max(1) as f32),
+            ProgressTone::Normal,
+        ),
+        ProgressEvent::ArtifactProgress {
+            path,
+            loaded_bytes,
+            total_bytes,
+            ..
+        } => (
+            "Loading model data".into(),
+            format!(
+                "{} - {} of {}",
+                path,
+                format_bytes(*loaded_bytes),
+                format_bytes(*total_bytes)
+            ),
+            Some(*loaded_bytes as f32 / (*total_bytes).max(1) as f32),
+            ProgressTone::Normal,
+        ),
+        ProgressEvent::ArtifactVerified { path, .. } => (
+            "Model object verified".into(),
+            path.to_string(),
+            None,
+            ProgressTone::Normal,
+        ),
+        ProgressEvent::StageStarted {
+            stage, total_steps, ..
+        } => (
+            format!("Running {}", humanize_stage(stage)),
+            total_steps.map_or_else(
+                || "Stage started".into(),
+                |steps| format!("0 of {steps} steps"),
+            ),
+            total_steps.map(|_| 0.0),
+            ProgressTone::Normal,
+        ),
+        ProgressEvent::Step {
+            stage,
+            step,
+            total_steps,
+            ..
+        } => (
+            format!("Running {}", humanize_stage(stage)),
+            format!("Step {step} of {total_steps}"),
+            Some(*step as f32 / (*total_steps).max(1) as f32),
+            ProgressTone::Normal,
+        ),
+        ProgressEvent::StageCompleted { stage, .. } => (
+            format!("{} complete", humanize_stage(stage)),
+            "Moving to the next stage".into(),
+            Some(1.0),
+            ProgressTone::Normal,
+        ),
+        ProgressEvent::Warning { message, .. } => (
+            "Runtime warning".into(),
+            message.clone(),
+            None,
+            ProgressTone::Warning,
+        ),
+        ProgressEvent::RunCompleted { .. } => (
+            "Inference complete".into(),
+            "Preparing the output image".into(),
+            Some(1.0),
+            ProgressTone::Complete,
+        ),
+        ProgressEvent::RunFailed { message, .. } => (
+            "Inference failed".into(),
+            message.clone(),
+            Some(0.0),
+            ProgressTone::Failed,
+        ),
+        ProgressEvent::RunCancelled { .. } => (
+            "Inference cancelled".into(),
+            "The request was stopped".into(),
+            Some(0.0),
+            ProgressTone::Warning,
+        ),
     };
-    format!("Job {}: {phase}", job.id.0)
+    ProgressPresentation {
+        headline: format!("{prefix}: {headline}"),
+        detail,
+        fraction,
+        tone,
+    }
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * MIB;
+    if bytes as f64 >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB)
+    } else if bytes as f64 >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn humanize_stage(stage: &str) -> String {
+    stage.replace(['-', '_'], " ")
+}
+
+#[allow(clippy::type_complexity)]
+fn update_progress_panel(
+    time: Res<Time>,
+    runner: Res<ImageRunnerStatus>,
+    jobs: Res<ImageJobs>,
+    panel: Res<ImageControlPanelState>,
+    mut labels: ParamSet<(
+        Query<&mut Text, With<ProgressLabel>>,
+        Query<&mut Text, With<ProgressDetailLabel>>,
+    )>,
+    mut fills: Query<(&mut Node, &mut BackgroundColor), With<ProgressFill>>,
+) {
+    let presentation = progress_presentation(
+        &runner.state,
+        panel.latest_job.and_then(|id| jobs.get(id)),
+        &panel.notice,
+    );
+    if presentation.fraction.is_some()
+        && !runner.is_changed()
+        && !jobs.is_changed()
+        && !panel.is_changed()
+    {
+        return;
+    }
+    if let Ok(mut label) = labels.p0().single_mut()
+        && label.0 != presentation.headline
+    {
+        label.0 = presentation.headline.clone();
+    }
+    if let Ok(mut label) = labels.p1().single_mut()
+        && label.0 != presentation.detail
+    {
+        label.0 = presentation.detail.clone();
+    }
+    for (mut node, mut background) in &mut fills {
+        let (left, width) = match presentation.fraction {
+            Some(fraction) => (px(0), percent(100.0 * fraction.clamp(0.0, 1.0))),
+            None => (
+                percent((time.elapsed_secs() * 42.0) % 128.0 - 28.0),
+                percent(28),
+            ),
+        };
+        if node.left != left || node.width != width {
+            node.left = left;
+            node.width = width;
+        }
+        let color = match presentation.tone {
+            ProgressTone::Normal => Color::srgb(0.32, 0.68, 0.83),
+            ProgressTone::Complete => Color::srgb(0.34, 0.74, 0.52),
+            ProgressTone::Warning => Color::srgb(0.84, 0.61, 0.24),
+            ProgressTone::Failed => Color::srgb(0.78, 0.28, 0.3),
+        };
+        if background.0 != color {
+            background.0 = color;
+        }
+    }
+}
+
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn update_action_availability(
+    mut commands: Commands,
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
+    jobs: Res<ImageJobs>,
+    panel: Res<ImageControlPanelState>,
+    run_buttons: Query<(Entity, Has<InteractionDisabled>), With<RunButton>>,
+    cancel_buttons: Query<
+        (Entity, Has<InteractionDisabled>),
+        (With<CancelButton>, Without<RunButton>),
+    >,
+    save_buttons: Query<
+        (Entity, Has<InteractionDisabled>),
+        (With<SaveButton>, Without<RunButton>, Without<CancelButton>),
+    >,
+    view_buttons: Query<
+        (Entity, Has<InteractionDisabled>),
+        (
+            Or<(With<FitButton>, With<ActualSizeButton>)>,
+            Without<RunButton>,
+            Without<CancelButton>,
+            Without<SaveButton>,
+        ),
+    >,
+) {
+    if !runner.is_changed() && !editor.is_changed() && !jobs.is_changed() && !panel.is_changed() {
+        return;
+    }
+    let running = jobs.iter().any(|job| !job.phase.is_terminal());
+    let can_run = !running
+        && !has_pending_submission(&panel, &jobs)
+        && panel.seed_valid
+        && matches!(runner.state, ImageRunnerState::Ready { .. })
+        && editor.model.is_some()
+        && editor.validate_request().is_ok();
+    let can_save = panel.latest_output.is_some();
+    let can_adjust_view = can_save || editor.source.is_some();
+
+    for (entity, disabled) in &run_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_run);
+    }
+    for (entity, disabled) in &cancel_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !running);
+    }
+    for (entity, disabled) in &save_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_save);
+    }
+    for (entity, disabled) in &view_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_adjust_view);
+    }
+}
+
+fn has_pending_submission(panel: &ImageControlPanelState, jobs: &ImageJobs) -> bool {
+    panel.latest_job.is_some_and(|id| {
+        jobs.get(id).is_none()
+            && panel
+                .latest_output
+                .as_ref()
+                .is_none_or(|(completed_id, _)| *completed_id != id)
+    })
+}
+
+fn set_button_disabled(
+    commands: &mut Commands,
+    entity: Entity,
+    currently_disabled: bool,
+    disabled: bool,
+) {
+    if disabled == currently_disabled {
+        return;
+    }
+    if disabled {
+        commands.entity(entity).insert(InteractionDisabled);
+    } else {
+        commands.entity(entity).remove::<InteractionDisabled>();
+    }
+}
+
+#[cfg(test)]
 fn format_progress(progress: &ProgressEvent) -> String {
     match progress {
         ProgressEvent::RunStarted { .. } => "starting".into(),
@@ -947,68 +1664,64 @@ fn runner_state_label(state: &ImageRunnerState) -> String {
 }
 
 fn update_button_colors(
-    mut buttons: Query<(&Interaction, &mut BackgroundColor), Changed<Interaction>>,
+    mut buttons: Query<(
+        &Interaction,
+        Has<InteractionDisabled>,
+        &ButtonPalette,
+        &mut BackgroundColor,
+    )>,
 ) {
-    for (interaction, mut background) in &mut buttons {
-        background.0 = button_color(*interaction == Interaction::Pressed);
-    }
-}
-
-fn button_color(pressed: bool) -> Color {
-    if pressed {
-        Color::srgb(0.24, 0.32, 0.48)
-    } else {
-        Color::srgb(0.14, 0.18, 0.27)
+    for (interaction, disabled, palette, mut background) in &mut buttons {
+        let color = if disabled {
+            palette.disabled
+        } else if *interaction == Interaction::Pressed {
+            palette.pressed
+        } else {
+            palette.idle
+        };
+        if background.0 != color {
+            background.0 = color;
+        }
     }
 }
 
 const fn reference_button_text() -> &'static str {
     if cfg!(target_arch = "wasm32") {
-        "Reference: choose image…"
+        "Reference: choose image..."
     } else {
-        "Reference: drop image on window"
+        "Reference: choose or drop image"
     }
 }
 
 #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
 fn accept_native_file_drop(
     mut drops: MessageReader<FileDragAndDrop>,
-    mut load: MessageWriter<LoadImageBytes>,
+    mut read: MessageWriter<ReadDroppedImageFile>,
     mut panel: ResMut<ImageControlPanelState>,
 ) {
     for drop in drops.read() {
         let FileDragAndDrop::DroppedFile { path_buf, .. } = drop else {
             continue;
         };
-        let result = std::fs::metadata(path_buf)
-            .map_err(crate::FrontendError::from)
-            .and_then(|metadata| {
-                if metadata.len() > MAX_REFERENCE_BYTES as u64 {
-                    Err(crate::FrontendError::invalid_request(format!(
-                        "reference image exceeds the {} MiB limit",
-                        MAX_REFERENCE_BYTES / (1024 * 1024)
-                    )))
-                } else {
-                    std::fs::read(path_buf).map_err(crate::FrontendError::from)
-                }
-            });
-        match result {
-            Ok(bytes) => {
-                load.write(LoadImageBytes {
-                    id: REFERENCE_IO_ID,
-                    bytes,
-                    encoding: None,
-                });
-                panel.notice = format!("Loading {}", path_buf.display());
-            }
-            Err(error) => panel.notice = error.to_string(),
-        }
+        let file_name = path_buf
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(sanitize_image_file_name)
+            .unwrap_or_else(|| "image".to_owned());
+        read.write(ReadDroppedImageFile {
+            id: REFERENCE_IMAGE_IO_ID,
+            path: path_buf.clone(),
+            max_bytes: MAX_REFERENCE_BYTES,
+        });
+        panel.notice = format!("Reading {file_name}");
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    static BROWSER_REFERENCE_QUEUE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BROWSER_REFERENCE_QUEUE: std::cell::RefCell<Option<Vec<u8>>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 /// Receive browser-selected image bytes from the JavaScript host.
@@ -1020,17 +1733,19 @@ pub fn provide_reference_image(bytes: Vec<u8>) -> Result<(), wasm_bindgen::JsVal
             "reference image must contain 1..=64 MiB",
         ));
     }
-    BROWSER_REFERENCE_QUEUE.with(|queue| queue.borrow_mut().push(bytes));
+    // The picker has one reference slot. If the host submits several files
+    // before Bevy's next update, retain only the newest bounded payload.
+    BROWSER_REFERENCE_QUEUE.with(|queue| *queue.borrow_mut() = Some(bytes));
     Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
 fn drain_browser_reference_queue(mut load: MessageWriter<LoadImageBytes>) {
     BROWSER_REFERENCE_QUEUE.with(|queue| {
-        for bytes in queue.borrow_mut().drain(..) {
+        if let Some(bytes) = queue.borrow_mut().take() {
             load.write(LoadImageBytes {
-                id: REFERENCE_IO_ID,
-                bytes,
+                id: REFERENCE_IMAGE_IO_ID,
+                bytes: bytes.into(),
                 encoding: None,
             });
         }
@@ -1103,12 +1818,15 @@ fn trigger_browser_download(download: &ImageDownloadReady) -> Result<(), wasm_bi
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        MIN_VIEWER_HEIGHT, event_progress_presentation, format_progress,
+        image_control_panel_layout, next_supported_size_index, preferred_size_index,
+        preset_dimensions, preset_index, runner_progress_presentation, runner_state_label,
+        setup_progress_fraction,
+    };
     #[cfg(feature = "boogu")]
     use super::{apply_descriptor_size, next_supported_size_index_for_descriptor};
-    use super::{
-        format_progress, next_supported_size_index, preferred_size_index, preset_dimensions,
-        preset_index, runner_state_label,
-    };
+    use bevy::prelude::Vec2;
     use burn_image::{DimensionConstraints, Dimensions, ModelId, ProgressEvent, RunId};
 
     fn dimensions(minimum: u32, maximum: u32, max_pixels: Option<u64>) -> DimensionConstraints {
@@ -1134,6 +1852,68 @@ mod tests {
             elapsed_micros: 5,
         };
         assert_eq!(format_progress(&event), "denoise: 3/4");
+        let presentation = event_progress_presentation("Job 1", &event);
+        assert_eq!(presentation.headline, "Job 1: Running denoise");
+        assert_eq!(presentation.detail, "Step 3 of 4");
+        assert_eq!(presentation.fraction, Some(0.75));
+    }
+
+    #[test]
+    fn model_setup_progress_is_determinate_when_numbered_correctness() {
+        assert_eq!(
+            setup_progress_fraction("Model setup 2/3: loading the denoiser"),
+            Some(2.0 / 3.0)
+        );
+        assert_eq!(setup_progress_fraction("Loading model artifacts"), None);
+
+        let state = crate::ImageRunnerState::Initializing {
+            message: "Model setup 1/3: loading Qwen".into(),
+        };
+        assert_eq!(
+            runner_progress_presentation(&state).fraction,
+            Some(1.0 / 3.0)
+        );
+    }
+
+    #[test]
+    fn controls_layout_preserves_viewer_on_wide_and_narrow_windows_correctness() {
+        let desktop = image_control_panel_layout(Vec2::new(1_280.0, 800.0));
+        assert!(!desktop.narrow);
+        assert_eq!(desktop.panel_width, 360.0);
+        assert!(desktop.viewer_width > desktop.panel_width);
+        assert!(desktop.viewer_height > 700.0);
+
+        let narrow = image_control_panel_layout(Vec2::new(600.0, 800.0));
+        assert!(narrow.narrow);
+        assert!(narrow.panel_height >= 260.0);
+        assert!(narrow.viewer_width > 500.0);
+        assert!(narrow.viewer_height > 250.0);
+
+        let short = image_control_panel_layout(Vec2::new(600.0, 360.0));
+        assert!(short.narrow);
+        assert!(short.viewer_height >= MIN_VIEWER_HEIGHT);
+        assert!(short.panel_height > 100.0);
+    }
+
+    #[test]
+    fn authored_control_source_uses_default_font_safe_ascii_correctness() {
+        assert!(
+            include_str!("controls.rs").is_ascii(),
+            "authored control text must stay within the default Bevy font's ASCII-safe subset"
+        );
+    }
+
+    #[test]
+    fn prompt_input_remains_unicode_capable_correctness() {
+        let prompt = "\u{732b}\u{3068}\u{6708} - caf\u{e9}";
+        let editor = crate::ImageEditorState {
+            prompt_or_instruction: prompt.into(),
+            ..Default::default()
+        };
+        let burn_image::ImageRequest::Generate(request) = editor.build_request().unwrap() else {
+            panic!("default editor mode must generate");
+        };
+        assert_eq!(request.prompt.as_str(), prompt);
     }
 
     #[test]

@@ -56,9 +56,15 @@
         border-radius: 0.9rem;
         box-shadow: 0 1.1rem 3rem rgb(0 0 0 / 42%);
         backdrop-filter: blur(14px);
+        pointer-events: none;
         transition:
           border-color 160ms ease,
           opacity 160ms ease;
+      }
+
+      .loader-panel details,
+      .loader-panel button {
+        pointer-events: auto;
       }
 
       .loader-panel[data-tone="ready"] {
@@ -271,9 +277,9 @@
 
       @media (max-width: 38rem) {
         .loader-panel {
-          top: auto;
+          top: 0.55rem;
           right: 0.55rem;
-          bottom: 0.55rem;
+          bottom: auto;
           left: 0.55rem;
           width: auto;
           padding: 0.82rem;
@@ -311,7 +317,7 @@
     >
       <div class="loader-header">
         <div>
-          <p class="eyebrow">Burn · WebGPU</p>
+          <p class="eyebrow">Burn / WebGPU</p>
           <span id="status" role="status" aria-live="polite" aria-atomic="true">
             Loading WebAssembly
           </span>
@@ -361,6 +367,7 @@
       const errorMessage = document.querySelector("#error-message");
       const retryButton = document.querySelector("#retry-button");
       const referenceInput = document.querySelector("#burn-image-reference-input");
+      const MAX_REFERENCE_BYTES = 64 * 1024 * 1024;
 
       const transfer = {
         current: null,
@@ -401,7 +408,7 @@
       const shortPath = (path) => {
         const name = String(path || "model object").split("/").at(-1);
         if (name.length <= 34) return name;
-        return `${name.slice(0, 17)}…${name.slice(-12)}`;
+        return `${name.slice(0, 17)}...${name.slice(-12)}`;
       };
 
       const setSummary = (message, badgeText = "WORKING", tone = "busy") => {
@@ -476,18 +483,18 @@
         const component = humanize(current.component || "model object");
         const shard =
           current.fileCount > 1
-            ? ` · shard ${current.fileIndex + 1} of ${current.fileCount}`
+            ? ` - shard ${current.fileIndex + 1} of ${current.fileCount}`
             : "";
-        primary.textContent = `${component}${shard} · ${shortPath(current.path)}`;
+        primary.textContent = `${component}${shard} - ${shortPath(current.path)}`;
         primary.title = current.path;
 
         const rate = currentTransferRate();
         const remaining = Math.max(0, current.totalBytes - current.loadedBytes);
-        const rateText = rate > 0 ? ` · ${formatBytes(rate)}/s transfer rate` : "";
-        const etaText = rate > 0 && remaining > 0 ? ` · object ETA ${formatDuration(remaining / rate)}` : "";
+        const rateText = rate > 0 ? ` - ${formatBytes(rate)}/s transfer rate` : "";
+        const etaText = rate > 0 && remaining > 0 ? ` - object ETA ${formatDuration(remaining / rate)}` : "";
         secondary.textContent = `${formatBytes(current.loadedBytes)} / ${formatBytes(
           current.totalBytes,
-        )}${rateText}${etaText} · ${formatBytes(transfer.transferredBytes)} transferred · ${
+        )}${rateText}${etaText} - ${formatBytes(transfer.transferredBytes)} transferred - ${
           transfer.verifiedObjects
         } verified`;
       };
@@ -511,6 +518,66 @@
         logActivity(`Failed: ${message}`);
       };
 
+      const failRun = (message) => {
+        invalidateTransferRender();
+        panel.dataset.compact = "true";
+        setBusy(false);
+        setSummary("Generation failed", "FAILED", "error");
+        stopProgress();
+        errorMessage.textContent = String(message);
+        errorMessage.hidden = false;
+        retryButton.hidden = true;
+        logActivity(`Generation failed: ${message}`);
+      };
+
+      const showReferenceError = (message) => {
+        panel.dataset.compact = "false";
+        errorMessage.textContent = String(message);
+        errorMessage.hidden = false;
+        logActivity(`Reference image failed: ${message}`);
+      };
+
+      const supportedReferenceFile = (file) => {
+        const type = String(file?.type || "").toLowerCase();
+        const name = String(file?.name || "").toLowerCase();
+        return (
+          ["image/png", "image/jpeg", "image/webp"].includes(type) ||
+          /\.(png|jpe?g|webp)$/.test(name)
+        );
+      };
+
+      const loadReferenceFile = async (file) => {
+        if (!file) return;
+        if (!supportedReferenceFile(file)) {
+          showReferenceError("Choose a PNG, JPEG, or WebP image.");
+          return;
+        }
+        if (!Number.isFinite(file.size) || file.size < 1 || file.size > MAX_REFERENCE_BYTES) {
+          showReferenceError("Reference image must contain 1 byte through 64 MiB.");
+          return;
+        }
+        try {
+          provide_reference_image(new Uint8Array(await file.arrayBuffer()));
+          errorMessage.hidden = true;
+          logActivity("Reference image selected");
+        } catch (error) {
+          showReferenceError(`Reference load failed: ${error}`);
+        }
+      };
+
+      window.addEventListener("dragover", (event) => {
+        if (Array.from(event.dataTransfer?.types || []).includes("Files")) {
+          event.preventDefault();
+          if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+        }
+      });
+      window.addEventListener("drop", (event) => {
+        const file = event.dataTransfer?.files?.[0];
+        if (!file) return;
+        event.preventDefault();
+        void loadReferenceFile(file);
+      });
+
       const handleRuntimeEvent = (event) => {
         const detail = event.detail;
         if (!detail || typeof detail.event !== "string") return;
@@ -528,7 +595,7 @@
           case "manifest_verified":
             setSummary("Sealed model manifest verified", "VERIFIED");
             inventory.hidden = false;
-            inventory.textContent = `${detail.weight_objects} model objects · ${formatBytes(
+            inventory.textContent = `${detail.weight_objects} model objects - ${formatBytes(
               detail.weight_bytes,
             )} bundle inventory (preloaded to WebGPU during preparation)`;
             logActivity(`Manifest ${detail.bundle} verified`);
@@ -540,7 +607,7 @@
             )} conservative WebGPU plan`;
             secondary.textContent = `${formatBytes(
               detail.conservative_f32_weight_bytes,
-            )} dense-F32 weights · ${formatBytes(detail.activation_reserve_bytes)} activation reserve`;
+            )} dense-F32 weights - ${formatBytes(detail.activation_reserve_bytes)} activation reserve`;
             logActivity("Resident WebGPU resource plan accepted; preloading required model stages");
             break;
           case "ready":
@@ -550,7 +617,7 @@
             setDeterminate(1, 1);
             primary.textContent = detail.model;
             secondary.textContent = transfer.verifiedObjects
-              ? `${formatBytes(transfer.transferredBytes)} bootstrap bytes transferred · ${
+              ? `${formatBytes(transfer.transferredBytes)} bootstrap bytes transferred - ${
                   transfer.verifiedObjects
                 } objects verified`
               : "Ready for a generation request";
@@ -574,7 +641,7 @@
             setBusy(true);
             setSummary("Generation started", "RUNNING");
             setIndeterminate();
-            primary.textContent = `${humanize(detail.task)} · preparing inputs`;
+            primary.textContent = `${humanize(detail.task)} - preparing inputs`;
             secondary.textContent = "";
             errorMessage.hidden = true;
             retryButton.hidden = true;
@@ -639,9 +706,9 @@
             setBusy(true);
             setSummary(`Running ${humanize(detail.stage)}`, "COMPUTE");
             primary.textContent = detail.total_steps
-              ? `${humanize(detail.stage)} · ${detail.total_steps} steps`
+              ? `${humanize(detail.stage)} - ${detail.total_steps} steps`
               : humanize(detail.stage);
-            secondary.textContent = `${formatBytes(transfer.transferredBytes)} transferred · ${
+            secondary.textContent = `${formatBytes(transfer.transferredBytes)} transferred - ${
               transfer.verifiedObjects
             } objects verified`;
             detail.total_steps ? setDeterminate(0, detail.total_steps) : setIndeterminate();
@@ -650,12 +717,12 @@
           case "step":
             invalidateTransferRender();
             setSummary(
-              `${humanize(detail.stage)} · step ${detail.step} of ${detail.total_steps}`,
+              `${humanize(detail.stage)} - step ${detail.step} of ${detail.total_steps}`,
               "COMPUTE",
             );
             setDeterminate(detail.step, detail.total_steps);
             primary.textContent = humanize(detail.stage);
-            secondary.textContent = `${formatBytes(transfer.transferredBytes)} transferred · ${
+            secondary.textContent = `${formatBytes(transfer.transferredBytes)} transferred - ${
               transfer.verifiedObjects
             } objects verified`;
             break;
@@ -680,7 +747,7 @@
             panel.dataset.compact = "true";
             break;
           case "run_failed":
-            fail(detail.message);
+            failRun(detail.message);
             break;
           case "run_cancelled":
             invalidateTransferRender();
@@ -701,13 +768,14 @@
         await init();
         referenceInput.addEventListener("change", async (event) => {
           const file = event.target.files?.[0];
-          if (!file) return;
           try {
-            provide_reference_image(new Uint8Array(await file.arrayBuffer()));
+            await loadReferenceFile(file);
+          } finally {
             event.target.value = "";
-          } catch (error) {
-            fail(`Reference load failed: ${error}`, false);
           }
+        });
+        referenceInput.addEventListener("cancel", (event) => {
+          event.target.value = "";
         });
         if (!transfer.observedEvent) {
           setSummary(

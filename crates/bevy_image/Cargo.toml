@@ -16,6 +16,7 @@ publish = false
 [features]
 default = ["app", "gpu-interop", "native-io"]
 app = [
+  "dep:bevy_pancam",
   "bevy/async_executor",
   "bevy/bevy_camera",
   "bevy/bevy_core_pipeline",
@@ -36,7 +37,7 @@ app = [
   "bevy/x11",
 ]
 gpu-interop = ["dep:bevy_burn", "dep:burn-wgpu", "dep:wgpu"]
-native-io = []
+native-io = ["dep:rfd"]
 # Exact Boogu model routing plus the device-aware runtime factory boundary.
 # Concrete native/browser implementations are selected by boogu-native/boogu-web;
 # the injection seam remains available to embedders.
@@ -84,6 +85,7 @@ bevy = { workspace = true, features = [
 ] }
 burn.workspace = true
 bevy_burn = { workspace = true, optional = true }
+bevy_pancam = { workspace = true, optional = true }
 burn-wgpu = { workspace = true, optional = true, features = ["fusion"] }
 burn_boogu = { path = "../burn_boogu", default-features = false, features = ["std"], optional = true }
 burn_flux_vae = { path = "../burn_flux_vae", default-features = false, optional = true }
@@ -95,6 +97,7 @@ image.workspace = true
 rand = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 rand_distr = { workspace = true, optional = true }
+rfd = { workspace = true, optional = true }
 serde.workspace = true
 serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
@@ -102,6 +105,7 @@ ureq = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

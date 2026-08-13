@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BackendStatus, FrontendError, ImageRunnerStatus};
 
+const MAX_RETAINED_TERMINAL_JOBS: usize = 8;
+
 /// Frontend-owned identifier, independent of model-runtime `RunId` values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ImageJobId(pub u64);
@@ -35,7 +37,9 @@ impl ImageJobPhase {
 pub struct ImageJobRecord {
     pub id: ImageJobId,
     pub model: ModelId,
-    pub request: ImageRequest,
+    /// Present only while the job can still execute. Terminal records release
+    /// request-owned image payloads while retaining progress and provenance context.
+    pub request: Option<ImageRequest>,
     pub phase: ImageJobPhase,
     pub last_progress: Option<ProgressEvent>,
 }
@@ -188,6 +192,10 @@ fn accept_submissions(
             });
             continue;
         }
+        prune_terminal_jobs(
+            &mut jobs.records,
+            MAX_RETAINED_TERMINAL_JOBS.saturating_sub(1),
+        );
 
         let validation = submission.request.validate().map_err(FrontendError::from);
         let availability = backend
@@ -205,12 +213,13 @@ fn accept_submissions(
             .map_or(ImageJobPhase::Queued, |error| ImageJobPhase::Failed {
                 error,
             });
+        let retained_request = error.is_none().then(|| submission.request.clone());
         jobs.records.insert(
             submission.id,
             ImageJobRecord {
                 id: submission.id,
                 model: submission.model.clone(),
-                request: submission.request.clone(),
+                request: retained_request,
                 phase,
                 last_progress: None,
             },
@@ -231,6 +240,29 @@ fn accept_submissions(
     }
 }
 
+fn prune_terminal_jobs(
+    records: &mut BTreeMap<ImageJobId, ImageJobRecord>,
+    maximum_terminal_jobs: usize,
+) {
+    let remove_count = records
+        .values()
+        .filter(|record| record.phase.is_terminal())
+        .count()
+        .saturating_sub(maximum_terminal_jobs);
+    if remove_count == 0 {
+        return;
+    }
+    let stale = records
+        .iter()
+        .filter(|(_, record)| record.phase.is_terminal())
+        .map(|(id, _)| *id)
+        .take(remove_count)
+        .collect::<Vec<_>>();
+    for id in stale {
+        records.remove(&id);
+    }
+}
+
 fn accept_cancellations(
     mut jobs: ResMut<ImageJobs>,
     mut requested: MessageReader<CancelImageJob>,
@@ -242,6 +274,7 @@ fn accept_cancellations(
         };
         if !record.phase.is_terminal() {
             record.phase = ImageJobPhase::Cancelled;
+            record.request = None;
             routed.write(ImageJobCancellationRequested {
                 id: cancellation.id,
             });
@@ -282,6 +315,7 @@ fn apply_completions(mut jobs: ResMut<ImageJobs>, mut completed: MessageReader<C
             },
             (Ok(()), true) => ImageJobPhase::Completed,
         };
+        record.request = None;
     }
 }
 
@@ -294,12 +328,15 @@ fn apply_failures(mut jobs: ResMut<ImageJobs>, mut failed: MessageReader<FailIma
             record.phase = ImageJobPhase::Failed {
                 error: failure.error.clone(),
             };
+            record.request = None;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bevy::prelude::*;
     use burn_image::{
         GenerateRequest, GenerationOptions, ImageRequest, ImageTaskKind, ModelId, ProgressEvent,
@@ -309,8 +346,8 @@ mod tests {
     use crate::{BackendDeviceInfo, BackendStatus, ImageRunnerStatus};
 
     use super::{
-        CancelImageJob, ImageJobId, ImageJobPhase, ImageJobPlugin, ImageJobs, ReportImageProgress,
-        SubmitImageJob,
+        CancelImageJob, ImageJobId, ImageJobPhase, ImageJobPlugin, ImageJobRecord, ImageJobs,
+        ReportImageProgress, SubmitImageJob,
     };
 
     fn request() -> ImageRequest {
@@ -377,6 +414,7 @@ mod tests {
             jobs.get(ImageJobId(8)).unwrap().phase,
             ImageJobPhase::Failed { .. }
         ));
+        assert!(jobs.get(ImageJobId(8)).unwrap().request.is_none());
     }
 
     #[test]
@@ -427,5 +465,75 @@ mod tests {
                 .phase,
             ImageJobPhase::Cancelled
         ));
+        assert!(
+            app.world()
+                .resource::<ImageJobs>()
+                .get(ImageJobId(9))
+                .unwrap()
+                .request
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_job_history_is_bounded_without_pruning_active_jobs_correctness() {
+        let model = ModelId::new("test/model").unwrap();
+        let mut records = BTreeMap::new();
+        for raw_id in 1..=12 {
+            let id = ImageJobId(raw_id);
+            records.insert(
+                id,
+                super::ImageJobRecord {
+                    id,
+                    model: model.clone(),
+                    request: (raw_id == 6).then_some(request()),
+                    phase: if raw_id == 6 {
+                        ImageJobPhase::Running
+                    } else {
+                        ImageJobPhase::Completed
+                    },
+                    last_progress: None,
+                },
+            );
+        }
+
+        super::prune_terminal_jobs(&mut records, 3);
+        assert_eq!(
+            records
+                .values()
+                .filter(|record| record.phase.is_terminal())
+                .count(),
+            3
+        );
+        assert!(records.contains_key(&ImageJobId(6)));
+        assert_eq!(records.len(), 4);
+    }
+
+    #[test]
+    fn job_record_serde_releases_only_terminal_request_payloads_correctness() {
+        let model = ModelId::new("test/model").unwrap();
+        let active = ImageJobRecord {
+            id: ImageJobId(1),
+            model: model.clone(),
+            request: Some(request()),
+            phase: ImageJobPhase::Running,
+            last_progress: None,
+        };
+        let active_json = serde_json::to_value(&active).unwrap();
+        assert_eq!(active_json["request"]["task"], "generate");
+        let active_roundtrip: ImageJobRecord = serde_json::from_value(active_json).unwrap();
+        assert!(active_roundtrip.request.is_some());
+
+        let terminal = ImageJobRecord {
+            id: ImageJobId(2),
+            model,
+            request: None,
+            phase: ImageJobPhase::Completed,
+            last_progress: None,
+        };
+        let terminal_json = serde_json::to_value(&terminal).unwrap();
+        assert!(terminal_json["request"].is_null());
+        let terminal_roundtrip: ImageJobRecord = serde_json::from_value(terminal_json).unwrap();
+        assert!(terminal_roundtrip.request.is_none());
     }
 }

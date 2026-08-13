@@ -10,8 +10,8 @@ const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub struct Prompt(String);
 
 impl Prompt {
-    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
-        let value = value.into();
+    /// Validate prompt text without allocating an owned [`Prompt`].
+    pub fn validate_text(value: &str) -> Result<(), ValidationError> {
         if value.trim().is_empty() {
             return Err(ValidationError::Empty { field: "prompt" });
         }
@@ -22,6 +22,12 @@ impl Prompt {
                 actual: value.len(),
             });
         }
+        Ok(())
+    }
+
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        Self::validate_text(&value)?;
         Ok(Self(value))
     }
 

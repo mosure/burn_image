@@ -13,7 +13,7 @@ keywords = ["burn", "image-generation", "image-editing", "webgpu"]
 categories = ["computer-vision", "multimedia::images"]
 
 [dependencies]
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

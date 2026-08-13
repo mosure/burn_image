@@ -28,24 +28,37 @@ inside `ImageFrontendSet::Dispatch`.
 
 ## Viewer controls
 
-`BurnImageShellPlugin` installs a usable model-neutral control panel rather
-than a demo-only status screen. It provides an editable multiline prompt or
-instruction, generate/edit switching, initialized-model selection, common
-square/landscape/portrait sizes, a numeric `u64` seed, run/cancel actions,
-structured artifact/stage/step progress, surfaced runtime and I/O errors, and
-the latest generated image. Loading a reference selects edit mode and an
-edit-capable initialized model when one is available. Size initialization and
-cycling are capability-aware: the BrowserWebGpu Boogu descriptor exposes only
-the validated 256×256 preset, while native follows the core model descriptor. The native
-Edit-Turbo 1.5K release starts at its 1536×1536 model default and exposes its official
-aspect-ratio presets through the same capability-filtered control.
+`BurnImageShellPlugin` installs a compact, responsive control panel and a
+camera-backed image viewport. The panel provides a multiline prompt or edit
+instruction, generate/edit and initialized-model selection, capability-aware
+size presets, a numeric `u64` seed, reference-image input, Run, Cancel, Save
+PNG, Fit image, and 100% controls. Loading a reference selects edit mode and an
+edit-capable model when available. The BrowserWebGpu Boogu descriptor exposes
+only its validated 256x256 preset; native follows the selected model descriptor.
+The native Edit-Turbo 1.5K release starts at 1536x1536 and exposes its official
+aspect-ratio presets through the same filtering.
 
-On native builds, drop a PNG, JPEG, or WebP file onto the window and use
-**Save PNG** to write `burn-image-<job>.png` in the current directory. In the
-browser, **Reference** opens the host file picker and **Save PNG** creates a
-Blob download. Both paths decode/encode through the same bounded host-image
-messages. A missing model runtime is shown explicitly; pressing **Run** cannot
-produce a placeholder result.
+On native builds, **Reference** opens the operating-system file dialog; a PNG,
+JPEG, or WebP can also be dropped on the window. In the browser, **Reference**
+opens the browser file picker, and the supplied web host accepts the same files
+by drag and drop. Both paths enforce the same byte bound and use the same image
+decode messages. **Save PNG** writes `burn-image-<job>.png` in the native
+current directory or starts a browser Blob download.
+
+The latest reference or generated image is fitted automatically. Drag with the
+left or middle mouse button to pan, use the wheel or a touchpad pinch to zoom
+toward the pointer, select **Fit image** to recenter and contain the image, or
+select **100%** for one image pixel per logical display pixel. Camera input is
+limited to the image viewport and is disabled while a text field or the panel
+owns input. The panel moves below the viewport on narrow windows and remains
+scrollable when vertical space is limited.
+
+Progress remains visible throughout shared-GPU setup, manifest and shard
+transfer, model-stage initialization, inference steps, output preparation,
+cancellation, and failures. The headline, detail text, and progress bar report
+the active phase instead of treating device creation or a downloaded manifest
+as model readiness. A missing model runtime is shown explicitly; pressing
+**Run** cannot produce a placeholder result.
 
 ## Boogu adapter
 
@@ -106,14 +119,14 @@ use an already verified local conversion.
 
 Use `--variant edit-turbo` with the matching Edit-Turbo bundle. The viewer also accepts the
 distinct ordinary-UI-native `--variant edit-turbo-1k5` release with a
-`boogu-image-0.1-edit-turbo-1k5` bundle. Its omitted-size default is 1536×1536; the
-official native presets are 1536×1536, 1264×1856, 1856×1264, 1344×1744, 1744×1344, 1392×1696,
-1696×1392, 1152×2032, 2032×1152, and 2368×992, bounded to 2,360,832 pixels. The viewer
+`boogu-image-0.1-edit-turbo-1k5` bundle. Its omitted-size default is 1536x1536; the
+official native presets are 1536x1536, 1264x1856, 1856x1264, 1344x1744, 1744x1344, 1392x1696,
+1696x1392, 1152x2032, 2032x1152, and 2368x992, bounded to 2,360,832 pixels. The viewer
 accepts only the authenticated `f16-qwen-vision-f32` profile for 1.5K; other profiles fail before
 artifact loading. Turbo and 1K Edit retain their four-profile selection surface. Loading and
 inference failures remain visible in the UI. The 1.5K release is also restricted to the
 high-VRAM retained policy whose exact attention/VAE configuration passed its native gate; the
-diagnostic layer-streamed policy rejects 1.5K. The 1536×1536 default is the
+diagnostic layer-streamed policy rejects 1.5K. The 1536x1536 default is the
 checkpoint-gated and benchmarked preset; the other official presets are exposed as bounded model
 configurations but do not inherit that shape-specific evidence.
 
@@ -218,7 +231,7 @@ The shell turns them into exact current-object bytes/shard progress, transfer ra
 verified-object totals, stage/step state, terminal errors, and a manual full-runtime reload action.
 
 The Wasm feature sets compile and package. Before resident-by-default production was introduced,
-an externally attested headful X11/Vulkan `headless=infer` run completed one real 256×256 Turbo
+an externally attested headful X11/Vulkan `headless=infer` run completed one real 256x256 Turbo
 request with the `f16-qwen-vision-f32` bundle through the then-layer-streamed Qwen, four DMD steps,
 and VAE decode; it encoded and attached a 60,926-byte PNG Blob. That evidence proves real WebGPU
 execution for the historical policy, not numerical or performance qualification of the new

@@ -11,6 +11,7 @@ pub mod backend;
 pub mod display;
 pub mod editor;
 pub mod error;
+pub mod file_dialog;
 pub mod io;
 pub mod jobs;
 pub mod runner;
@@ -30,15 +31,20 @@ pub mod native_boogu;
 pub mod app;
 #[cfg(feature = "app")]
 pub mod controls;
+#[cfg(feature = "app")]
+pub mod viewer;
 
 pub use artifact_stream::*;
 pub use backend::*;
 pub use display::*;
 pub use editor::*;
 pub use error::*;
+pub use file_dialog::*;
 pub use io::*;
 pub use jobs::*;
 pub use runner::*;
+#[cfg(feature = "app")]
+pub use viewer::*;
 
 #[cfg(feature = "boogu")]
 pub use boogu::*;
@@ -213,6 +219,7 @@ impl Plugin for BurnImageFrontendPlugin {
         app.add_plugins((
             ImageJobPlugin,
             ImageEditorPlugin,
+            ImageFileDialogPlugin,
             ImageIoPlugin,
             ImageDisplayPlugin,
         ));
@@ -676,9 +683,29 @@ mod web_shell_tests {
             "verifiedObjects",
             "transferredBytes",
             "Reload runtime",
+            "id=\"burn-image-reference-input\"",
+            "loadReferenceFile",
+            "MAX_REFERENCE_BYTES",
+            "failRun",
         ] {
             assert!(html.contains(required), "web shell omits {required}");
         }
         assert!(html.contains("preloaded to WebGPU during preparation"));
+    }
+
+    #[test]
+    fn authored_shell_text_uses_default_font_safe_ascii_correctness() {
+        for (path, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("controls.rs", include_str!("controls.rs")),
+            ("file_dialog.rs", include_str!("file_dialog.rs")),
+            ("viewer.rs", include_str!("viewer.rs")),
+            ("www/index.html", include_str!("../www/index.html")),
+        ] {
+            assert!(
+                source.is_ascii(),
+                "authored shell source {path} contains non-ASCII text that may render as tofu"
+            );
+        }
     }
 }

@@ -230,6 +230,13 @@ pub trait BooguRuntimeFactory: Send + Sync + 'static {
     fn start(&mut self, context: BooguFactoryContext) -> Result<(), RuntimeError>;
 
     fn poll(&mut self) -> Result<Option<Box<dyn BooguRuntime>>, RuntimeError>;
+
+    /// Return the latest human-readable construction milestone, if one was
+    /// produced since the previous call. Implementations should coalesce
+    /// high-frequency byte events and keep this method non-blocking.
+    fn take_initialization_progress(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Observable state of Boogu-specific runtime construction.
@@ -408,11 +415,14 @@ fn initialize_boogu_runtime(
         );
     }
 
-    let poll_result = host
+    let factory = host
         .factory
         .as_mut()
-        .expect("building adapter retains its factory")
-        .poll();
+        .expect("building adapter retains its factory");
+    if let Some(message) = factory.take_initialization_progress() {
+        *runner_status = ImageRunnerStatus::initializing(message);
+    }
+    let poll_result = factory.poll();
     match poll_result {
         Ok(None) => {}
         Ok(Some(runtime)) => {
@@ -664,7 +674,7 @@ fn prepare_runtime_job_for_execution(
 }
 
 fn apply_execution_defaults(request: &mut ImageRequest, execution: WgpuExecutionKind) {
-    if execution != WgpuExecutionKind::BrowserWebGpu {
+    if execution != WgpuExecutionKind::BrowserWebGpu || request.options().dimensions.is_some() {
         return;
     }
     let options = match request {

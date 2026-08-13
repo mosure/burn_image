@@ -387,6 +387,10 @@ fn validate_browser_resident_resource_plan(
         activation_reserve_bytes,
         conservative_planned_device_bytes,
     };
+    set_browser_factory_progress(format!(
+        "Model setup: GPU residency plan accepted; preloading {:.1} GiB",
+        plan.conservative_f32_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    ));
     dispatch_browser_event(
         BROWSER_RUNTIME_EVENT_NAME,
         &BrowserRuntimeEvent::ResidentResourcePlan {
@@ -410,12 +414,26 @@ fn browser_resident_artifact_required(variant: BooguVariant, component: Option<&
 }
 
 pub(crate) fn report_browser_runtime_preparing(message: impl Into<String>) {
+    let message = message.into();
+    set_browser_factory_progress(message.clone());
     dispatch_browser_event(
         BROWSER_RUNTIME_EVENT_NAME,
-        &BrowserRuntimeEvent::Preparing {
-            message: message.into(),
-        },
+        &BrowserRuntimeEvent::Preparing { message },
     );
+}
+
+thread_local! {
+    static BROWSER_FACTORY_PROGRESS: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn set_browser_factory_progress(message: String) {
+    BROWSER_FACTORY_PROGRESS.with(|progress| *progress.borrow_mut() = Some(message));
+}
+
+fn take_browser_factory_progress() -> Option<String> {
+    BROWSER_FACTORY_PROGRESS.with(|progress| progress.borrow_mut().take())
 }
 
 fn report_browser_manifest_verified(manifest: &ArtifactManifest) {
@@ -429,6 +447,9 @@ fn report_browser_manifest_verified(manifest: &ArtifactManifest) {
         .iter()
         .filter(|file| matches!(file.role, burn_image::ArtifactFileRole::Weights))
         .fold(0_u64, |total, file| total.saturating_add(file.size));
+    set_browser_factory_progress(format!(
+        "Model setup: manifest verified; {weight_objects} weight objects declared"
+    ));
     dispatch_browser_event(
         BROWSER_RUNTIME_EVENT_NAME,
         &BrowserRuntimeEvent::ManifestVerified {
@@ -458,6 +479,31 @@ pub(crate) fn report_browser_runtime_failure(message: impl Into<String>) {
 }
 
 fn dispatch_browser_progress(event: &ProgressEvent) {
+    let status = match event {
+        ProgressEvent::ArtifactStarted {
+            file_index,
+            file_count,
+            ..
+        } => Some(format!(
+            "Model setup: loading object {} of {file_count}",
+            file_index + 1
+        )),
+        ProgressEvent::ArtifactProgress {
+            loaded_bytes,
+            total_bytes,
+            ..
+        } => Some(format!(
+            "Model setup: loading current object {:.1}%",
+            100.0 * *loaded_bytes as f64 / (*total_bytes).max(1) as f64
+        )),
+        ProgressEvent::ArtifactVerified { path, .. } => {
+            Some(format!("Model setup: verified {path}"))
+        }
+        _ => None,
+    };
+    if let Some(status) = status {
+        set_browser_factory_progress(status);
+    }
     dispatch_browser_event(BROWSER_PROGRESS_EVENT_NAME, event);
 }
 
@@ -2248,6 +2294,10 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
                 Err(error)
             }
         }
+    }
+
+    fn take_initialization_progress(&mut self) -> Option<String> {
+        take_browser_factory_progress()
     }
 }
 

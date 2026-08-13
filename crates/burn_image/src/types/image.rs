@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
@@ -126,7 +126,7 @@ pub struct PixelBuffer {
     dimensions: Dimensions,
     format: PixelFormat,
     color_space: ColorSpace,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,7 +155,7 @@ impl PixelBuffer {
             dimensions,
             format,
             color_space,
-            bytes,
+            bytes: Arc::new(bytes),
         })
     }
 
@@ -176,7 +176,7 @@ impl PixelBuffer {
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+        Arc::try_unwrap(self.bytes).unwrap_or_else(|bytes| (*bytes).clone())
     }
 }
 
@@ -199,7 +199,7 @@ impl From<PixelBuffer> for PixelBufferWire {
             dimensions: value.dimensions,
             format: value.format,
             color_space: value.color_space,
-            bytes: value.bytes,
+            bytes: value.into_bytes(),
         }
     }
 }
@@ -210,7 +210,7 @@ impl From<PixelBuffer> for PixelBufferWire {
 pub struct EncodedImage {
     encoding: ImageEncoding,
     dimensions: Option<Dimensions>,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -234,7 +234,7 @@ impl EncodedImage {
         Ok(Self {
             encoding,
             dimensions,
-            bytes,
+            bytes: Arc::new(bytes),
         })
     }
 
@@ -251,7 +251,7 @@ impl EncodedImage {
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+        Arc::try_unwrap(self.bytes).unwrap_or_else(|bytes| (*bytes).clone())
     }
 }
 
@@ -268,7 +268,7 @@ impl From<EncodedImage> for EncodedImageWire {
         Self {
             encoding: value.encoding,
             dimensions: value.dimensions,
-            bytes: value.bytes,
+            bytes: value.into_bytes(),
         }
     }
 }
@@ -304,7 +304,7 @@ pub enum MaskSemantics {
 pub struct InputMask {
     dimensions: Dimensions,
     semantics: MaskSemantics,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -330,7 +330,7 @@ impl InputMask {
         Ok(Self {
             dimensions,
             semantics,
-            bytes,
+            bytes: Arc::new(bytes),
         })
     }
 
@@ -344,6 +344,10 @@ impl InputMask {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        Arc::try_unwrap(self.bytes).unwrap_or_else(|bytes| (*bytes).clone())
     }
 }
 
@@ -360,14 +364,17 @@ impl From<InputMask> for InputMaskWire {
         Self {
             dimensions: value.dimensions,
             semantics: value.semantics,
-            bytes: value.bytes,
+            bytes: value.into_bytes(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ColorSpace, Dimensions, PixelBuffer, PixelFormat};
+    use super::{
+        ColorSpace, Dimensions, EncodedImage, ImageEncoding, InputMask, MaskSemantics, PixelBuffer,
+        PixelFormat,
+    };
 
     #[test]
     fn pixel_buffer_checks_exact_byte_length_correctness() {
@@ -396,5 +403,58 @@ mod tests {
     fn invalid_dimensions_are_rejected_during_deserialization_correctness() {
         let json = r#"{"width":0,"height":512}"#;
         assert!(serde_json::from_str::<Dimensions>(json).is_err());
+    }
+
+    #[test]
+    fn cloned_image_payloads_share_backing_storage_correctness() {
+        let dimensions = Dimensions::new(2, 1).unwrap();
+        let pixels =
+            PixelBuffer::new(dimensions, PixelFormat::Rgba8, ColorSpace::Srgb, vec![1; 8]).unwrap();
+        let pixels_clone = pixels.clone();
+        assert_eq!(pixels.bytes().as_ptr(), pixels_clone.bytes().as_ptr());
+
+        let encoded = EncodedImage::new(ImageEncoding::Png, Some(dimensions), vec![2; 8]).unwrap();
+        let encoded_clone = encoded.clone();
+        assert_eq!(encoded.bytes().as_ptr(), encoded_clone.bytes().as_ptr());
+
+        let mask = InputMask::new(dimensions, MaskSemantics::WhiteEdits, vec![3; 2]).unwrap();
+        let mask_clone = mask.clone();
+        assert_eq!(mask.bytes().as_ptr(), mask_clone.bytes().as_ptr());
+    }
+
+    #[test]
+    fn shared_image_payloads_preserve_serde_and_owned_byte_api_correctness() {
+        let dimensions = Dimensions::new(2, 1).unwrap();
+        let pixels = PixelBuffer::new(
+            dimensions,
+            PixelFormat::Rgba8,
+            ColorSpace::Srgb,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+        )
+        .unwrap();
+        let json = serde_json::to_string(&pixels).unwrap();
+        let decoded: PixelBuffer = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, pixels);
+
+        let shared = pixels.clone();
+        assert_eq!(shared.into_bytes(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(pixels.bytes(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let encoded =
+            EncodedImage::new(ImageEncoding::Png, Some(dimensions), vec![9, 8, 7]).unwrap();
+        let json = serde_json::to_string(&encoded).unwrap();
+        let decoded: EncodedImage = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, encoded);
+        let shared = encoded.clone();
+        assert_eq!(shared.into_bytes(), vec![9, 8, 7]);
+        assert_eq!(encoded.bytes(), &[9, 8, 7]);
+
+        let mask = InputMask::new(dimensions, MaskSemantics::WhiteEdits, vec![u8::MAX, 0]).unwrap();
+        let json = serde_json::to_string(&mask).unwrap();
+        let decoded: InputMask = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, mask);
+        let shared = mask.clone();
+        assert_eq!(shared.into_bytes(), vec![u8::MAX, 0]);
+        assert_eq!(mask.bytes(), &[u8::MAX, 0]);
     }
 }

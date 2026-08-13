@@ -242,6 +242,7 @@ pub struct NativeBooguFactory {
     variant: BooguVariant,
     residency: NativeBooguResidencyPolicy,
     loading: Mutex<Option<Receiver<Result<NativeBooguRuntime, RuntimeError>>>>,
+    progress: Mutex<Option<Receiver<String>>>,
 }
 
 impl NativeBooguFactory {
@@ -256,6 +257,7 @@ impl NativeBooguFactory {
             variant,
             residency,
             loading: Mutex::new(None),
+            progress: Mutex::new(None),
         }
     }
 
@@ -342,12 +344,15 @@ impl BooguRuntimeFactory for NativeBooguFactory {
         }
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (progress_tx, progress_rx) = mpsc::channel();
         let variant = self.variant;
         let residency = self.residency;
         thread::Builder::new()
             .name("burn-image-boogu-loader".into())
             .spawn(move || {
-                let result = load_native_runtime(context, variant, residency);
+                let result = load_native_runtime(context, variant, residency, |message| {
+                    let _ = progress_tx.send(message);
+                });
                 let _ = ready_tx.send(result);
             })
             .map_err(|error| {
@@ -357,6 +362,11 @@ impl BooguRuntimeFactory for NativeBooguFactory {
                 )
             })?;
         *loading = Some(ready_rx);
+        *self
+            .progress
+            .lock()
+            .map_err(|_| execution_error(self.variant, "native progress mutex was poisoned"))? =
+            Some(progress_rx);
         Ok(())
     }
 
@@ -389,6 +399,23 @@ impl BooguRuntimeFactory for NativeBooguFactory {
                 ))
             }
         }
+    }
+
+    fn take_initialization_progress(&mut self) -> Option<String> {
+        let mut progress = self.progress.lock().ok()?;
+        let receiver = progress.as_ref()?;
+        let mut latest = None;
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => latest = Some(message),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    *progress = None;
+                    break;
+                }
+            }
+        }
+        latest
     }
 }
 
@@ -606,7 +633,15 @@ fn load_native_runtime(
     context: BooguFactoryContext,
     variant: BooguVariant,
     residency: NativeBooguResidencyPolicy,
+    report_progress: impl Fn(String),
 ) -> Result<NativeBooguRuntime, RuntimeError> {
+    let setup_steps = match residency {
+        NativeBooguResidencyPolicy::HighVram => 5,
+        NativeBooguResidencyPolicy::LayerStreamed => 3,
+    };
+    report_progress(format!(
+        "Model setup 0/{setup_steps}: resolving and verifying sealed artifacts"
+    ));
     bevy::log::info!(
         "initializing native Boogu runtime with residency policy {}",
         residency.label()
@@ -617,7 +652,10 @@ fn load_native_runtime(
         variant,
         context.settings.storage_profile,
         &context.settings.artifact_source,
-        |message| bevy::log::info!("{message}"),
+        |message| {
+            bevy::log::info!("{message}");
+            report_progress(format!("Model setup: {message}"));
+        },
     )
     .map_err(|error| execution_error(variant, error))?;
     let root = artifact_directories.pipeline_root().to_owned();
@@ -687,6 +725,10 @@ fn load_native_runtime(
     identity
         .validate()
         .map_err(|error| execution_error(variant, error))?;
+
+    report_progress(format!(
+        "Model setup 1/{setup_steps}: loading configuration and tokenizer"
+    ));
 
     let qwen_config = Qwen3VlConfig::from_json(
         &qwen_directory
@@ -828,8 +870,9 @@ fn load_native_runtime(
         default_seed: 0,
     };
 
-    match residency {
+    let runtime = match residency {
         NativeBooguResidencyPolicy::HighVram => {
+            report_progress("Model setup 2/5: loading denoiser weights to GPU".into());
             bevy::log::info!(
                 "eagerly loading required Qwen/VAE weights and one resident Boogu denoiser before native runtime readiness"
             );
@@ -866,6 +909,7 @@ fn load_native_runtime(
                 .unwrap_or(RetainingSynchronizationPolicy::Deferred);
             let mut qwen_source = RetainingQwen3VlStageSource::new(qwen_source)
                 .with_synchronization_policy(synchronization);
+            report_progress("Model setup 3/5: loading Qwen stages to GPU".into());
             let retained_qwen_stages = preload_retained_qwen(
                 &mut qwen_source,
                 &qwen_plan,
@@ -877,6 +921,7 @@ fn load_native_runtime(
             );
             let mut qwen = StreamingQwen3Vl::new(qwen_plan, qwen_source);
             let mut vae = RetainingBooguVaeStageSource::new(vae);
+            report_progress("Model setup 4/5: loading VAE stages and finalizing".into());
             if variant != BooguVariant::Image01Turbo {
                 drop(
                     vae.load_encoder()
@@ -953,6 +998,7 @@ fn load_native_runtime(
             }
         }
         NativeBooguResidencyPolicy::LayerStreamed => {
+            report_progress("Model setup 2/3: preparing diagnostic streamed stage loaders".into());
             let qwen = StreamingQwen3Vl::new(qwen_plan, qwen_source);
             let source = VerifiedBurnpackStageSource::<
                 NativeBackend,
@@ -981,7 +1027,11 @@ fn load_native_runtime(
                 metadata,
             )
         }
-    }
+    }?;
+    report_progress(format!(
+        "Model setup {setup_steps}/{setup_steps}: runtime ready"
+    ));
+    Ok(runtime)
 }
 
 /// Populate every base-model stage cache before the runtime accepts its first request.

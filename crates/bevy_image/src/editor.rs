@@ -42,7 +42,42 @@ impl Default for ImageEditorState {
 }
 
 impl ImageEditorState {
+    /// Validate the editor fields without cloning the potentially large source image.
+    pub fn validate_request(&self) -> Result<(), FrontendError> {
+        Prompt::validate_text(&self.prompt_or_instruction)?;
+        if !self.negative_prompt.trim().is_empty() {
+            Prompt::validate_text(&self.negative_prompt)?;
+        }
+        self.options.validate()?;
+        if self.mode == EditorMode::Generate {
+            return Ok(());
+        }
+
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| FrontendError::invalid_request("edit mode requires a source image"))?;
+        if let Some(strength) = self.edit_strength
+            && (!strength.is_finite() || !(0.0..=1.0).contains(&strength))
+        {
+            return Err(FrontendError::invalid_request(
+                "edit strength must be finite and within 0..=1",
+            ));
+        }
+        if let (Some(source), Some(mask)) = (source.dimensions(), self.mask.as_ref())
+            && source != mask.dimensions()
+        {
+            return Err(FrontendError::invalid_request(format!(
+                "edit mask dimensions {} do not match source dimensions {}",
+                mask.dimensions(),
+                source
+            )));
+        }
+        Ok(())
+    }
+
     pub fn build_request(&self) -> Result<ImageRequest, FrontendError> {
+        self.validate_request()?;
         let prompt = Prompt::new(self.prompt_or_instruction.clone())?;
         let negative_prompt = if self.negative_prompt.trim().is_empty() {
             None
@@ -132,5 +167,38 @@ mod tests {
             .unwrap(),
         ));
         assert!(editor.build_request().is_ok());
+    }
+
+    #[test]
+    fn edit_validation_and_request_share_source_pixel_storage_correctness() {
+        let dimensions = Dimensions::new(2, 2).unwrap();
+        let source = InputImage::Pixels(
+            PixelBuffer::new(
+                dimensions,
+                PixelFormat::Rgba8,
+                ColorSpace::Srgb,
+                vec![7; 16],
+            )
+            .unwrap(),
+        );
+        let source_ptr = match &source {
+            InputImage::Pixels(pixels) => pixels.bytes().as_ptr(),
+            InputImage::Encoded(_) => unreachable!(),
+        };
+        let editor = ImageEditorState {
+            mode: EditorMode::Edit,
+            prompt_or_instruction: "make it dusk".into(),
+            source: Some(source),
+            ..Default::default()
+        };
+
+        editor.validate_request().unwrap();
+        let burn_image::ImageRequest::Edit(request) = editor.build_request().unwrap() else {
+            panic!("edit mode must build an edit request");
+        };
+        let InputImage::Pixels(pixels) = request.source else {
+            panic!("pixel source must remain decoded");
+        };
+        assert_eq!(source_ptr, pixels.bytes().as_ptr());
     }
 }

@@ -2,6 +2,7 @@
 //! controls while reusing the status and image-view surfaces here.
 
 use bevy::{
+    camera::visibility::RenderLayers,
     prelude::*,
     render::{
         RenderPlugin,
@@ -19,9 +20,12 @@ pub struct BurnImageShellPlugin;
 
 impl Plugin for BurnImageShellPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(crate::controls::ImageControlPanelPlugin)
-            .add_systems(Startup, setup_shell)
-            .add_systems(Update, update_backend_text);
+        app.add_plugins((
+            crate::viewer::ImageViewerPlugin,
+            crate::controls::ImageControlPanelPlugin,
+        ))
+        .add_systems(Startup, setup_shell)
+        .add_systems(Update, update_backend_text);
     }
 }
 
@@ -86,7 +90,16 @@ where
 }
 
 fn setup_shell(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: 1,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        RenderLayers::layer(0),
+        IsDefaultUiCamera,
+    ));
     commands.spawn((
         Text::new("GPU: initializing shared Bevy/Burn WGPU device"),
         TextFont {
@@ -113,7 +126,7 @@ fn update_backend_text(
     let value = match &status.state {
         BackendState::Initializing => "GPU: initializing shared Bevy/Burn WGPU device".to_string(),
         BackendState::Ready { device } => format!(
-            "GPU: {} ({}, {}) — shared device ready",
+            "GPU: {} ({}, {}) - shared device ready",
             device.adapter_name, device.backend, device.device_type
         ),
         BackendState::Failed { reason } => format!("GPU unavailable: {reason}"),
