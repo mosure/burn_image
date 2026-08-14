@@ -21,6 +21,10 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # v0 caches may contain cargo package's expanded tests directories,
+          # which rust-cache 2.9.2 misclassifies during cleanup (upstream #193).
+          prefix-key: v1-rust-package-clean
 
       - name: Enforce source-only repository contents
         shell: bash
@@ -204,6 +208,10 @@ jobs:
             cargo metadata --format-version 1 --no-deps |
               python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
           )"
+          readonly package_directory="$target_directory/package"
+          readonly inspected_package_directory="$RUNNER_TEMP/burn-image-inspected-package-output"
+          test "$package_directory" = "$GITHUB_WORKSPACE/target/package"
+          test ! -e "$inspected_package_directory"
 
           cargo package --workspace --exclude bevy_burn_image --locked
 
@@ -242,7 +250,7 @@ jobs:
             package_id="$(cargo pkgid -p "$crate")"
             version="${package_id##*#}"
             version="${version##*@}"
-            archive="$target_directory/package/${crate}-${version}.crate"
+            archive="$package_directory/${crate}-${version}.crate"
             archive_prefix="${crate}-${version}/"
             test -f "$archive"
 
@@ -290,6 +298,12 @@ jobs:
             done
             echo "verified package $archive ($archive_bytes bytes, ${#entries[@]} files)"
           done
+
+          # Keep expanded package sources out of rust-cache's target walker.
+          # The inspected output remains available under RUNNER_TEMP until teardown.
+          mv -- "$package_directory" "$inspected_package_directory"
+          test ! -e "$package_directory"
+          test -d "$inspected_package_directory"
 
   wasm:
     runs-on: ubuntu-latest

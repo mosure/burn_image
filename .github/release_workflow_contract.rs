@@ -1,3 +1,4 @@
+const CI_WORKFLOW: &str = include_str!("workflows/ci.yml");
 const PARITY_WORKFLOW: &str = include_str!("workflows/parity.yml");
 const DEPLOY_WORKFLOW: &str = include_str!("workflows/deploy-pages.yml");
 
@@ -114,4 +115,35 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
         .rfind("          authenticate_remote_payloads")
         .expect("full remote payload authentication must remain present");
     assert!(last_manifest < authenticate);
+}
+
+#[test]
+fn package_outputs_do_not_pollute_the_native_target_cache_correctness() {
+    let native = section(CI_WORKFLOW, "  native:\n", "\n  wasm:\n");
+    assert!(native.contains("prefix-key: v1-rust-package-clean"));
+
+    let package_step = native
+        .split("      - name: Build and inspect publishable crate archives")
+        .nth(1)
+        .expect("package archive inspection step must remain present");
+    for required in [
+        "package_directory=\"$target_directory/package\"",
+        "test \"$package_directory\" = \"$GITHUB_WORKSPACE/target/package\"",
+        "mv -- \"$package_directory\" \"$inspected_package_directory\"",
+        "test ! -e \"$package_directory\"",
+        "test -d \"$inspected_package_directory\"",
+    ] {
+        assert!(
+            package_step.contains(required),
+            "package-cache cleanup contract is missing: {required}"
+        );
+    }
+
+    let verified = package_step
+        .find("verified package $archive")
+        .expect("archive verification must remain present");
+    let relocated = package_step
+        .find("mv -- \"$package_directory\"")
+        .expect("inspected package output relocation must remain present");
+    assert!(verified < relocated);
 }
