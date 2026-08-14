@@ -5,12 +5,15 @@ mod block;
 mod denoiser;
 mod embedding;
 mod feed_forward;
+pub(crate) mod linear;
 #[cfg(all(
     any(feature = "wgpu", feature = "cuda-experimental"),
     not(target_arch = "wasm32")
 ))]
 mod native_flash;
 mod norm;
+#[cfg(feature = "wgpu")]
+pub mod packed_f16;
 mod streaming;
 
 pub use attention::{DoubleStreamAttention, GqaAttention};
@@ -40,8 +43,18 @@ pub(crate) use native_flash::{
     assert_supported_wgpu_blackbox_partition_configuration,
 };
 pub use norm::{DenoiserRmsNormPolicy, RmsNormZero};
+#[cfg(feature = "wgpu")]
+pub use packed_f16::{
+    MaterializedF32Object, PACKED_F16_F32_VIEW_ALIGNMENT_BYTES,
+    PACKED_F16_F32_VIEW_ALIGNMENT_ELEMENTS, PACKED_F16_MAX_BUFFER_BYTES, PackedF16Error,
+    PackedF16Layout, PackedF16Object, PackedF16TensorLayout, align_packed_f16_f32_view_offset,
+    materialize_packed_f16_object, materialize_packed_f16_objects,
+};
+#[cfg(feature = "burnpack")]
+pub use streaming::RetainedDenoiserDTypeAudit;
 pub use streaming::{
     AsyncBooguDenoiserStageSource, AsyncRetainingDenoiserSynchronizationPolicy,
-    BooguDenoiserPrelude, BooguDenoiserTail, BooguStreamState, DenoiserStageObserver,
-    RetainingAsyncBooguDenoiserStageSource, StreamingBooguDenoiser, StreamingStageSource,
+    BooguDenoiserPrelude, BooguDenoiserTail, BooguQuantizedLinearExecutionPolicy, BooguStreamState,
+    DenoiserStageObserver, RetainingAsyncBooguDenoiserStageSource, StreamingBooguDenoiser,
+    StreamingStageSource,
 };

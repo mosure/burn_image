@@ -169,6 +169,25 @@ impl<B: Backend> AutoencoderKl<B> {
         self.decode_with_group_norm_policy(self.unscale_latents(scaled_latents), policy)
     }
 
+    /// Undo FLUX scaling and decode with one fallible allocator barrier before the final block.
+    ///
+    /// See [`Decoder::forward_with_group_norm_policy_and_tail_barrier`] for the exact boundary.
+    pub fn decode_scaled_with_group_norm_policy_and_tail_barrier<E>(
+        &self,
+        scaled_latents: Tensor<B, 4>,
+        policy: DecoderGroupNormPolicy,
+        tail_barrier: impl FnOnce(&B::Device) -> Result<(), E>,
+    ) -> Result<Tensor<B, 4>, E> {
+        let latents = self.unscale_latents(scaled_latents);
+        let latents = self
+            .post_quant_conv
+            .as_ref()
+            .map(|conv| conv.forward(latents.clone()))
+            .unwrap_or(latents);
+        self.decoder
+            .forward_with_group_norm_policy_and_tail_barrier(latents, policy, tail_barrier)
+    }
+
     /// Diffusers-style deterministic VAE forward; it does not apply pipeline latent scaling.
     pub fn forward(&self, images: Tensor<B, 4>) -> Tensor<B, 4> {
         self.decode(self.encode_mode(images))
@@ -231,6 +250,8 @@ impl AutoencoderKlConfig {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use burn::tensor::{Distribution, TensorData};
 
     use super::*;
@@ -304,6 +325,39 @@ mod tests {
         let established = values(established);
         assert_eq!(established, values(strict));
         assert_eq!(established, values(mixed));
+    }
+
+    #[test]
+    fn decoder_tail_barrier_is_exact_once_and_fallible_correctness() {
+        let device = Default::default();
+        let model = AutoencoderKlConfig::tiny().init::<TestBackend>(&device);
+        let scaled_latents = Tensor::random([1, 4, 4, 4], Distribution::Default, &device);
+        let established = model.decode_scaled_with_group_norm_policy(
+            scaled_latents.clone(),
+            DecoderGroupNormPolicy::StrictF32,
+        );
+        let calls = Cell::new(0_u32);
+        let with_barrier = model
+            .decode_scaled_with_group_norm_policy_and_tail_barrier(
+                scaled_latents.clone(),
+                DecoderGroupNormPolicy::StrictF32,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok::<(), &'static str>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(values(established), values(with_barrier));
+
+        let error = model
+            .decode_scaled_with_group_norm_policy_and_tail_barrier(
+                scaled_latents,
+                DecoderGroupNormPolicy::StrictF32,
+                |_| Err::<(), _>("barrier failed"),
+            )
+            .unwrap_err();
+        assert_eq!(error, "barrier failed");
     }
 
     fn assert_striped_tail_matches_full(latent_shape: [usize; 4], split_width: usize) {

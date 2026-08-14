@@ -1,4 +1,11 @@
-use burn::{nn, prelude::*};
+use burn::{
+    module::{ModuleMapper, Param},
+    nn,
+    prelude::*,
+    tensor::DType,
+};
+#[cfg(feature = "burnpack")]
+use burn_store::ModuleSnapshot;
 
 use crate::{
     BooguConfig, BooguDenoiserInput, BooguError,
@@ -8,7 +15,7 @@ use crate::{
 
 use super::{
     CombinedTimestepCaptionEmbedding, DoubleStreamBlock, FinalProjection, SingleStreamBlock,
-    denoiser::BooguRoPeGeometry,
+    denoiser::BooguRoPeGeometry, linear::linear_forward,
 };
 
 /// Optional observer for numerical checks at streamed denoiser boundaries.
@@ -153,14 +160,16 @@ impl<B: Backend> BooguDenoiserPrelude<B> {
                 .clone()
                 .narrow(1, generated_start, geometry.generated_len),
         );
-        let generated = self
-            .x_embedder
-            .forward(patchify(input.latent, self.config.patch_size)?);
+        let generated = linear_forward(
+            &self.x_embedder,
+            patchify(input.latent, self.config.patch_size)?,
+        );
         observer.rank3("x_embedder", generated.clone())?;
         let (reference, reference_rope) = if let Some(reference) = input.reference {
-            let mut reference = self
-                .ref_image_patch_embedder
-                .forward(patchify(reference, self.config.patch_size)?);
+            let mut reference = linear_forward(
+                &self.ref_image_patch_embedder,
+                patchify(reference, self.config.patch_size)?,
+            );
             observer.rank3("ref_image_patch_embedder", reference.clone())?;
             let index_embedding = self
                 .image_index_embedding
@@ -546,6 +555,49 @@ pub enum AsyncRetainingDenoiserSynchronizationPolicy {
     Deferred,
 }
 
+/// Execution materialization for retained denoiser modules containing Q8 weights.
+///
+/// Artifact storage and the retained cache are unaffected. The compatibility policy maps only the
+/// short-lived clone returned for a semantic stage to ordinary F32 weights, allowing the released
+/// dense [`nn::Linear`] path to run without the backend's mixed `Float x QFloat` matmul.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BooguQuantizedLinearExecutionPolicy {
+    /// Return the retained Q8 module unchanged so Boogu dispatches direct quantized matmul.
+    #[default]
+    DirectQuantizedMatmul,
+    /// Dequantize Q8 parameters in the returned stage clone before execution.
+    ///
+    /// This policy requires retained modules and per-stage synchronization. Those invariants keep
+    /// the dense F32 temporary bounded to the largest single semantic stage.
+    DenseF32PerSemanticStage,
+}
+
+struct DenseF32QuantizedParameterMapper;
+
+impl<B: Backend> ModuleMapper<B> for DenseF32QuantizedParameterMapper {
+    fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+        let (id, tensor, mapper) = param.consume();
+        let tensor = if matches!(tensor.dtype(), DType::QFloat(_)) {
+            tensor.dequantize()
+        } else {
+            tensor
+        };
+        Param::from_mapped_value(id, tensor, mapper)
+    }
+}
+
+fn materialize_quantized_linear_execution<B: Backend, M: Module<B>>(
+    module: M,
+    policy: BooguQuantizedLinearExecutionPolicy,
+) -> M {
+    match policy {
+        BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul => module,
+        BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage => {
+            module.map(&mut DenseF32QuantizedParameterMapper)
+        }
+    }
+}
+
 /// Opt-in GPU-resident cache for an asynchronous verified denoiser stage source.
 ///
 /// A cache miss delegates to the wrapped source and stores only a clone of the successfully
@@ -561,6 +613,8 @@ pub struct RetainingAsyncBooguDenoiserStageSource<B: Backend, S> {
     source: S,
     retention_enabled: bool,
     synchronization_policy: AsyncRetainingDenoiserSynchronizationPolicy,
+    quantized_linear_execution_policy: BooguQuantizedLinearExecutionPolicy,
+    dense_f32_materialized_stage_clones: usize,
     synchronization_pending: bool,
     prelude: Option<BooguDenoiserPrelude<B>>,
     context_refiners: Vec<(usize, SingleStreamBlock<B>)>,
@@ -569,6 +623,64 @@ pub struct RetainingAsyncBooguDenoiserStageSource<B: Backend, S> {
     double_stream: Vec<(usize, DoubleStreamBlock<B>)>,
     single_stream: Vec<(usize, SingleStreamBlock<B>)>,
     tail: Option<BooguDenoiserTail<B>>,
+}
+
+/// Lightweight dtype/shape audit of retained denoiser device modules.
+///
+/// Collection inspects lazy snapshots and does not copy tensor payloads back to the host.
+#[cfg(feature = "burnpack")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetainedDenoiserDTypeAudit {
+    /// Total retained parameter tensors.
+    pub tensor_count: usize,
+    /// Tensors carrying the exact Q8S block-32/F32 scheme.
+    pub q8s_block32_f32_tensor_count: usize,
+    /// Tensors carrying ordinary F32 values.
+    pub f32_tensor_count: usize,
+    /// Tensors carrying any other dtype or quantization scheme.
+    pub unexpected_dtype_tensor_count: usize,
+    /// Values represented by exact Q8S block-32/F32 snapshots.
+    pub q8s_block32_f32_elements: u64,
+    /// Values represented by F32 snapshots.
+    pub f32_elements: u64,
+}
+
+#[cfg(feature = "burnpack")]
+fn audit_retained_module<B: Backend, M: ModuleSnapshot<B>>(
+    module: &M,
+    audit: &mut RetainedDenoiserDTypeAudit,
+) {
+    use burn::tensor::{
+        DType,
+        quantization::{QuantLevel, QuantParam, QuantValue},
+    };
+
+    for snapshot in module.collect(None, None, false) {
+        let elements = snapshot.shape.iter().fold(1_u64, |total, &dimension| {
+            total.saturating_mul(dimension as u64)
+        });
+        audit.tensor_count = audit.tensor_count.saturating_add(1);
+        match snapshot.dtype {
+            DType::QFloat(scheme)
+                if scheme.value == QuantValue::Q8S
+                    && scheme.level == QuantLevel::block([32])
+                    && scheme.param == QuantParam::F32 =>
+            {
+                audit.q8s_block32_f32_tensor_count =
+                    audit.q8s_block32_f32_tensor_count.saturating_add(1);
+                audit.q8s_block32_f32_elements =
+                    audit.q8s_block32_f32_elements.saturating_add(elements);
+            }
+            DType::F32 => {
+                audit.f32_tensor_count = audit.f32_tensor_count.saturating_add(1);
+                audit.f32_elements = audit.f32_elements.saturating_add(elements);
+            }
+            _ => {
+                audit.unexpected_dtype_tensor_count =
+                    audit.unexpected_dtype_tensor_count.saturating_add(1);
+            }
+        }
+    }
 }
 
 impl<B: Backend, S> RetainingAsyncBooguDenoiserStageSource<B, S> {
@@ -587,6 +699,9 @@ impl<B: Backend, S> RetainingAsyncBooguDenoiserStageSource<B, S> {
             source,
             retention_enabled,
             synchronization_policy: AsyncRetainingDenoiserSynchronizationPolicy::PerStage,
+            quantized_linear_execution_policy:
+                BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            dense_f32_materialized_stage_clones: 0,
             synchronization_pending: false,
             prelude: None,
             context_refiners: Vec::new(),
@@ -608,6 +723,16 @@ impl<B: Backend, S> RetainingAsyncBooguDenoiserStageSource<B, S> {
         mut self,
         synchronization_policy: AsyncRetainingDenoiserSynchronizationPolicy,
     ) -> Self {
+        assert!(
+            !matches!(
+                self.quantized_linear_execution_policy,
+                BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
+            ) || matches!(
+                synchronization_policy,
+                AsyncRetainingDenoiserSynchronizationPolicy::PerStage
+            ),
+            "dense F32 stage materialization requires per-stage synchronization"
+        );
         self.synchronization_policy = synchronization_policy;
         self
     }
@@ -615,6 +740,44 @@ impl<B: Backend, S> RetainingAsyncBooguDenoiserStageSource<B, S> {
     /// Return the selected synchronization behavior.
     pub const fn synchronization_policy(&self) -> AsyncRetainingDenoiserSynchronizationPolicy {
         self.synchronization_policy
+    }
+
+    /// Select direct Q8 execution or bounded dense-F32 materialization of returned stage clones.
+    pub fn with_quantized_linear_execution_policy(
+        mut self,
+        policy: BooguQuantizedLinearExecutionPolicy,
+    ) -> Self {
+        assert!(
+            policy != BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
+                || (self.retention_enabled
+                    && matches!(
+                        self.synchronization_policy,
+                        AsyncRetainingDenoiserSynchronizationPolicy::PerStage
+                    )),
+            "dense F32 stage materialization requires retained Q8 modules and per-stage synchronization"
+        );
+        self.quantized_linear_execution_policy = policy;
+        self
+    }
+
+    /// Return the selected retained-Q8 linear execution behavior.
+    pub const fn quantized_linear_execution_policy(&self) -> BooguQuantizedLinearExecutionPolicy {
+        self.quantized_linear_execution_policy
+    }
+
+    /// Number of semantic-stage clones passed through bounded dense-F32 materialization.
+    pub const fn dense_f32_materialized_stage_clones(&self) -> usize {
+        self.dense_f32_materialized_stage_clones
+    }
+
+    fn materialize_stage<M: Module<B>>(&mut self, module: M) -> M {
+        if self.quantized_linear_execution_policy
+            == BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
+        {
+            self.dense_f32_materialized_stage_clones =
+                self.dense_f32_materialized_stage_clones.saturating_add(1);
+        }
+        materialize_quantized_linear_execution(module, self.quantized_linear_execution_policy)
     }
 
     /// Whether deferred work requires a terminal DMD-step barrier.
@@ -631,6 +794,34 @@ impl<B: Backend, S> RetainingAsyncBooguDenoiserStageSource<B, S> {
             + self.double_stream.len()
             + self.single_stream.len()
             + usize::from(self.tail.is_some())
+    }
+
+    /// Inspect retained module snapshot dtypes without materializing their payloads.
+    #[cfg(feature = "burnpack")]
+    pub fn retained_dtype_audit(&self) -> RetainedDenoiserDTypeAudit {
+        let mut audit = RetainedDenoiserDTypeAudit::default();
+        if let Some(module) = &self.prelude {
+            audit_retained_module(module, &mut audit);
+        }
+        for (_, module) in &self.context_refiners {
+            audit_retained_module(module, &mut audit);
+        }
+        for (_, module) in &self.noise_refiners {
+            audit_retained_module(module, &mut audit);
+        }
+        for (_, module) in &self.reference_refiners {
+            audit_retained_module(module, &mut audit);
+        }
+        for (_, module) in &self.double_stream {
+            audit_retained_module(module, &mut audit);
+        }
+        for (_, module) in &self.single_stream {
+            audit_retained_module(module, &mut audit);
+        }
+        if let Some(module) = &self.tail {
+            audit_retained_module(module, &mut audit);
+        }
+        audit
     }
 
     /// Drop every retained module handle while preserving the wrapped verified source.
@@ -692,14 +883,14 @@ where
     S: AsyncBooguDenoiserStageSource<B>,
 {
     async fn load_prelude(&mut self) -> Result<BooguDenoiserPrelude<B>, BooguError> {
-        if let Some(prelude) = &self.prelude {
-            return Ok(prelude.clone());
+        if let Some(prelude) = self.prelude.clone() {
+            return Ok(self.materialize_stage(prelude));
         }
         let prelude = self.source.load_prelude().await?;
         if self.retention_enabled {
             self.prelude = Some(prelude.clone());
         }
-        Ok(prelude)
+        Ok(self.materialize_stage(prelude))
     }
 
     async fn load_context_refiner(
@@ -707,13 +898,13 @@ where
         index: usize,
     ) -> Result<SingleStreamBlock<B>, BooguError> {
         if let Some(block) = cached_indexed(&self.context_refiners, index) {
-            return Ok(block);
+            return Ok(self.materialize_stage(block));
         }
         let block = self.source.load_context_refiner(index).await?;
         if self.retention_enabled {
             self.context_refiners.push((index, block.clone()));
         }
-        Ok(block)
+        Ok(self.materialize_stage(block))
     }
 
     async fn load_noise_refiner(
@@ -721,13 +912,13 @@ where
         index: usize,
     ) -> Result<SingleStreamBlock<B>, BooguError> {
         if let Some(block) = cached_indexed(&self.noise_refiners, index) {
-            return Ok(block);
+            return Ok(self.materialize_stage(block));
         }
         let block = self.source.load_noise_refiner(index).await?;
         if self.retention_enabled {
             self.noise_refiners.push((index, block.clone()));
         }
-        Ok(block)
+        Ok(self.materialize_stage(block))
     }
 
     async fn load_reference_refiner(
@@ -735,13 +926,13 @@ where
         index: usize,
     ) -> Result<SingleStreamBlock<B>, BooguError> {
         if let Some(block) = cached_indexed(&self.reference_refiners, index) {
-            return Ok(block);
+            return Ok(self.materialize_stage(block));
         }
         let block = self.source.load_reference_refiner(index).await?;
         if self.retention_enabled {
             self.reference_refiners.push((index, block.clone()));
         }
-        Ok(block)
+        Ok(self.materialize_stage(block))
     }
 
     async fn load_double_stream(
@@ -749,13 +940,13 @@ where
         index: usize,
     ) -> Result<DoubleStreamBlock<B>, BooguError> {
         if let Some(block) = cached_indexed(&self.double_stream, index) {
-            return Ok(block);
+            return Ok(self.materialize_stage(block));
         }
         let block = self.source.load_double_stream(index).await?;
         if self.retention_enabled {
             self.double_stream.push((index, block.clone()));
         }
-        Ok(block)
+        Ok(self.materialize_stage(block))
     }
 
     async fn load_single_stream(
@@ -763,24 +954,24 @@ where
         index: usize,
     ) -> Result<SingleStreamBlock<B>, BooguError> {
         if let Some(block) = cached_indexed(&self.single_stream, index) {
-            return Ok(block);
+            return Ok(self.materialize_stage(block));
         }
         let block = self.source.load_single_stream(index).await?;
         if self.retention_enabled {
             self.single_stream.push((index, block.clone()));
         }
-        Ok(block)
+        Ok(self.materialize_stage(block))
     }
 
     async fn load_tail(&mut self) -> Result<BooguDenoiserTail<B>, BooguError> {
-        if let Some(tail) = &self.tail {
-            return Ok(tail.clone());
+        if let Some(tail) = self.tail.clone() {
+            return Ok(self.materialize_stage(tail));
         }
         let tail = self.source.load_tail().await?;
         if self.retention_enabled {
             self.tail = Some(tail.clone());
         }
-        Ok(tail)
+        Ok(self.materialize_stage(tail))
     }
 
     async fn synchronize(&mut self) -> Result<(), BooguError> {
@@ -1106,10 +1297,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::TensorData;
+    use burn::{
+        module::Param,
+        tensor::{TensorData, quantization::*},
+    };
     use burn_ndarray::{NdArray, NdArrayDevice};
 
     type B = NdArray<f32>;
+
+    #[cfg(all(feature = "burnpack", feature = "wgpu", not(target_arch = "wasm32")))]
+    #[derive(Clone)]
+    struct TestAsyncDirectoryStageShardReader {
+        root: std::path::PathBuf,
+    }
+
+    #[cfg(all(feature = "burnpack", feature = "wgpu", not(target_arch = "wasm32")))]
+    impl crate::artifacts::AsyncStageShardReader for TestAsyncDirectoryStageShardReader {
+        async fn read_shard(
+            &mut self,
+            file: &burn_image::ArtifactFile,
+            max_bytes: u64,
+        ) -> Result<Vec<u8>, BooguError> {
+            if file.size > max_bytes {
+                return Err(BooguError::Artifact(format!(
+                    "sealed test shard {} exceeds {max_bytes} bytes",
+                    file.path
+                )));
+            }
+            let path = self.root.join(file.path.as_str());
+            std::fs::read(&path).map_err(|error| {
+                BooguError::Artifact(format!("failed to read {}: {error}", path.display()))
+            })
+        }
+    }
 
     struct MemoryStageSource {
         model: super::super::BooguDenoiser<B>,
@@ -1429,6 +1649,93 @@ mod tests {
             .fold(0.0, f32::max)
     }
 
+    struct TestBlockQ8Mapper {
+        scheme: QuantScheme,
+        quantized_parameters: usize,
+    }
+
+    impl TestBlockQ8Mapper {
+        fn new() -> Self {
+            Self {
+                scheme: QuantScheme::default()
+                    .with_value(QuantValue::Q8S)
+                    .with_level(QuantLevel::block([32]))
+                    .with_param(QuantParam::F32)
+                    .with_store(QuantStore::PackedU32(0)),
+                quantized_parameters: 0,
+            }
+        }
+    }
+
+    impl ModuleMapper<B> for TestBlockQ8Mapper {
+        fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
+            let (id, tensor, mapper) = param.consume();
+            let tensor = if D == 2 && tensor.dims()[D - 1].is_multiple_of(32) {
+                self.quantized_parameters += 1;
+                let device = tensor.device();
+                let shape = tensor.dims();
+                let values = tensor.into_data().to_vec::<f32>().unwrap();
+                let mut quantized = Vec::with_capacity(values.len());
+                let mut scales = Vec::with_capacity(values.len() / 32);
+                for block in values.chunks_exact(32) {
+                    let alpha = block
+                        .iter()
+                        .fold(0.0_f32, |value, element| value.max(element.abs()));
+                    let scale = if alpha == 0.0 {
+                        f32::MIN_POSITIVE
+                    } else {
+                        alpha / 127.0
+                    };
+                    scales.push(scale);
+                    quantized.extend(
+                        block
+                            .iter()
+                            .map(|value| (value / scale).round().clamp(-127.0, 127.0) as i8),
+                    );
+                }
+                Tensor::from_data(
+                    TensorData::quantized(quantized, shape, self.scheme, &scales),
+                    &device,
+                )
+            } else {
+                tensor
+            };
+            Param::from_mapped_value(id, tensor, mapper)
+        }
+    }
+
+    fn tiny_q8_config() -> BooguConfig {
+        BooguConfig {
+            hidden_size: 32,
+            num_attention_heads: 4,
+            multiple_of: 32,
+            instruction_feature_dim: 32,
+            axes_dim_rope: [4, 4, 0],
+            ..tiny_config()
+        }
+    }
+
+    fn tiny_q8_input(device: &NdArrayDevice) -> BooguDenoiserInput<B> {
+        let latent_values = (0..64)
+            .map(|index| (index as f32 - 31.0) / 64.0)
+            .collect::<Vec<_>>();
+        let reference_values = (0..64)
+            .map(|index| (17.0 - index as f32) / 80.0)
+            .collect::<Vec<_>>();
+        let instruction_values = (0..96)
+            .map(|index| (index as f32 - 48.0) / 64.0)
+            .collect::<Vec<_>>();
+        BooguDenoiserInput {
+            latent: Tensor::from_data(TensorData::new(latent_values, [1, 4, 4, 4]), device),
+            timestep: Tensor::from_data([0.375_f32], device),
+            instruction: Tensor::from_data(TensorData::new(instruction_values, [1, 3, 32]), device),
+            reference: Some(Tensor::from_data(
+                TensorData::new(reference_values, [1, 4, 4, 4]),
+                device,
+            )),
+        }
+    }
+
     #[test]
     fn async_streaming_matches_sync_boundaries_output_and_residency_correctness() {
         let config = tiny_config();
@@ -1644,5 +1951,411 @@ mod tests {
             assert_eq!(source.source().load_count(stage), 2, "stage {stage}");
         }
         assert_eq!(source.source().inner.synchronizations, 7 * 2);
+    }
+
+    #[test]
+    fn dense_stage_materialization_keeps_cached_q8_and_returns_f32_correctness() {
+        let config = tiny_config();
+        let device = Default::default();
+        let mut resident = super::super::BooguDenoiser::<B>::new(config, &device).unwrap();
+        let [input, output] = resident.x_embedder.weight.dims();
+        let elements = input * output;
+        assert!(elements.is_multiple_of(32));
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q8S)
+            .with_level(QuantLevel::block([32]))
+            .with_param(QuantParam::F32)
+            .with_store(QuantStore::PackedU32(0));
+        resident.x_embedder.weight = Param::from_tensor(Tensor::from_data(
+            TensorData::quantized(
+                vec![1_i8; elements],
+                [input, output],
+                scheme,
+                &vec![0.03125_f32; elements / 32],
+            ),
+            &device,
+        ));
+        let source = CountingAsyncStageSource::new(resident);
+        let mut source = RetainingAsyncBooguDenoiserStageSource::new(source)
+            .with_quantized_linear_execution_policy(
+                BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,
+            );
+
+        let returned = block_on_immediate(source.load_prelude()).unwrap();
+
+        assert_eq!(returned.x_embedder.weight.val().dtype(), DType::F32);
+        let returned_values = returned
+            .x_embedder
+            .weight
+            .val()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(returned_values.len(), elements);
+        assert!(returned_values.iter().all(|value| value.is_finite()));
+        assert!(
+            returned_values
+                .iter()
+                .all(|value| (*value - 0.03125).abs() < f32::EPSILON)
+        );
+        assert_eq!(source.dense_f32_materialized_stage_clones(), 1);
+        assert!(matches!(
+            source
+                .prelude
+                .as_ref()
+                .expect("prelude must remain retained")
+                .x_embedder
+                .weight
+                .val()
+                .dtype(),
+            DType::QFloat(_)
+        ));
+        assert_eq!(source.source().load_count("prelude"), 1);
+
+        let returned_again = block_on_immediate(source.load_prelude()).unwrap();
+        assert_eq!(returned_again.x_embedder.weight.val().dtype(), DType::F32);
+        let returned_again_values = returned_again
+            .x_embedder
+            .weight
+            .val()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let cached_direct_values = source
+            .prelude
+            .as_ref()
+            .expect("prelude must remain retained")
+            .x_embedder
+            .weight
+            .val()
+            .dequantize()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(returned_again_values, returned_values);
+        assert_eq!(returned_again_values, cached_direct_values);
+        assert_eq!(source.dense_f32_materialized_stage_clones(), 2);
+        assert_eq!(source.source().load_count("prelude"), 1);
+    }
+
+    #[test]
+    fn retained_q8_dense_stage_forward_matches_reference_dense_conversion_correctness() {
+        let config = tiny_q8_config();
+        let device = Default::default();
+        B::seed(&device, 83);
+        let resident = super::super::BooguDenoiser::<B>::new(config.clone(), &device).unwrap();
+        let mut quantizer = TestBlockQ8Mapper::new();
+        let quantized = resident.map(&mut quantizer);
+        assert!(quantizer.quantized_parameters > 1);
+        let expected = materialize_quantized_linear_execution(
+            quantized.clone(),
+            BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,
+        )
+        .forward(tiny_q8_input(&device))
+        .unwrap()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        assert!(expected.iter().all(|value| value.is_finite()));
+
+        let source = CountingAsyncStageSource::new(quantized);
+        let source = RetainingAsyncBooguDenoiserStageSource::new(source)
+            .with_quantized_linear_execution_policy(
+                BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,
+            );
+        let mut streamed = StreamingBooguDenoiser::new(config, source).unwrap();
+
+        for _ in 0..4 {
+            let actual = block_on_immediate(streamed.predict_async(tiny_q8_input(&device)))
+                .unwrap()
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert!(actual.iter().all(|value| value.is_finite()));
+            assert!(max_delta(&actual, &expected) < 1.0e-5);
+        }
+
+        let source = streamed.source();
+        assert_eq!(source.cached_stage_count(), 7);
+        assert_eq!(source.source().loads.len(), 7);
+        assert_eq!(source.dense_f32_materialized_stage_clones(), 7 * 4);
+        assert!(matches!(
+            source
+                .prelude
+                .as_ref()
+                .expect("prelude must remain retained")
+                .x_embedder
+                .weight
+                .val()
+                .dtype(),
+            DType::QFloat(_)
+        ));
+    }
+
+    #[cfg(all(feature = "burnpack", feature = "wgpu", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "requires a pinned real Turbo F16 artifact directory and a hardware WGPU adapter"]
+    fn real_turbo_runtime_q8_dense_stage_wgpu_dequant_reference() {
+        use std::collections::BTreeSet;
+
+        use burn_flux_vae::AutoencoderKlConfig;
+        use burn_qwen3_vl::Qwen3VlConfig;
+        use burn_store::ModuleSnapshot;
+
+        use crate::{
+            BooguVariant,
+            artifacts::{
+                BooguArtifactInventory, BooguDenoiserRuntimeQuantizationPolicy,
+                BooguFloatLoadPolicy, BooguQuantizedLoadPolicy, BooguReleaseIdentity,
+                BooguRuntimeQ8Scope, BooguStorageProfile, DirectoryStageShardReader,
+                VerifiedArtifactDirectory, VerifiedAsyncBurnpackDenoiserStageSource,
+                VerifiedBurnpackStageSource,
+            },
+        };
+
+        type BrowserMatchingWgpuBackend =
+            burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+
+        let Some(root) =
+            std::env::var_os("BURN_BOOGU_TURBO_F16_ARTIFACT_DIR").map(std::path::PathBuf::from)
+        else {
+            eprintln!(
+                "BURN_BOOGU_TURBO_F16_ARTIFACT_DIR is unset; skipping opt-in WGPU stage probe"
+            );
+            return;
+        };
+        let directory = VerifiedArtifactDirectory::open(&root).unwrap();
+        let qwen_config = Qwen3VlConfig::from_json(
+            &directory
+                .read_text("metadata/source/mllm/config.json")
+                .unwrap(),
+        )
+        .unwrap();
+        let vae_config = AutoencoderKlConfig::from_diffusers_json(
+            &directory
+                .read_text("metadata/source/vae/config.json")
+                .unwrap(),
+        )
+        .unwrap();
+        let config = BooguConfig::default();
+        let inventory = BooguArtifactInventory::new(&qwen_config, &config, &vae_config).unwrap();
+        let identity = BooguReleaseIdentity::canonical(BooguVariant::Image01Turbo);
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+
+        let device = crate::require_native_wgpu_device().expect("native hardware WGPU adapter");
+        let reader = TestAsyncDirectoryStageShardReader { root: root.clone() };
+        let runtime_q8_source = block_on_immediate(VerifiedAsyncBurnpackDenoiserStageSource::<
+            BrowserMatchingWgpuBackend,
+            _,
+        >::new(
+            &identity,
+            directory.manifest().clone(),
+            inventory.clone(),
+            config.clone(),
+            profile,
+            device,
+            reader,
+        ))
+        .unwrap()
+        .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
+        .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
+        .with_runtime_q8_scope(BooguRuntimeQ8Scope::AllInventoryEligible);
+        let mut source = RetainingAsyncBooguDenoiserStageSource::new(runtime_q8_source)
+            .with_quantized_linear_execution_policy(
+                BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,
+            );
+
+        // Noise-refiner 0 contains both the largest FFN matrices and the conditioning-driven
+        // adaptive `norm1.linear` projection implicated by the Turbo-only failure.
+        let actual = block_on_immediate(source.load_noise_refiner(0)).unwrap();
+        block_on_immediate(<RetainingAsyncBooguDenoiserStageSource<
+            BrowserMatchingWgpuBackend,
+            _,
+        > as AsyncBooguDenoiserStageSource<BrowserMatchingWgpuBackend>>::synchronize(
+            &mut source,
+        ))
+        .unwrap();
+        assert_eq!(source.dense_f32_materialized_stage_clones(), 1);
+        assert_eq!(source.noise_refiners.len(), 1);
+
+        let prefix = "noise_refiner.0.";
+        let quantized_paths = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| spec.stage == "boogu-noise-refiner-00" && spec.quantizable)
+            .map(|spec| spec.target_name.strip_prefix(prefix).unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert!(quantized_paths.contains("norm1.linear.weight"));
+        assert!(quantized_paths.contains("feed_forward.linear_1.weight"));
+
+        let cached = &source.noise_refiners[0].1;
+        let cached_snapshots = cached.collect(None, None, false);
+        assert_eq!(cached_snapshots.len(), 15);
+        for snapshot in cached_snapshots {
+            assert_eq!(
+                matches!(snapshot.dtype, DType::QFloat(_)),
+                quantized_paths.contains(&snapshot.full_path()),
+                "cached runtime dtype differs for {}",
+                snapshot.full_path()
+            );
+        }
+
+        let reference_device = NdArrayDevice::default();
+        let mut reference_source =
+            VerifiedBurnpackStageSource::<B, DirectoryStageShardReader>::from_directory(
+                &identity,
+                &root,
+                inventory,
+                config,
+                profile,
+                reference_device,
+            )
+            .unwrap()
+            .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
+            .with_quantized_load_policy(BooguQuantizedLoadPolicy::Preserve);
+        let expected = reference_source.load_noise_refiner(0).unwrap();
+
+        let mut actual_snapshots = actual.collect(None, None, false);
+        let mut expected_snapshots = expected.collect(None, None, false);
+        actual_snapshots.sort_by_key(|snapshot| snapshot.full_path());
+        expected_snapshots.sort_by_key(|snapshot| snapshot.full_path());
+        assert_eq!(actual_snapshots.len(), expected_snapshots.len());
+
+        let mut compared_quantized = 0_usize;
+        let mut compared_float = 0_usize;
+        for (actual_snapshot, expected_snapshot) in
+            actual_snapshots.into_iter().zip(expected_snapshots)
+        {
+            let path = actual_snapshot.full_path();
+            assert_eq!(path, expected_snapshot.full_path());
+            assert_eq!(actual_snapshot.dtype, DType::F32, "{path}");
+            assert_eq!(expected_snapshot.dtype, DType::F32, "{path}");
+            let actual_values = actual_snapshot.to_data().unwrap().to_vec::<f32>().unwrap();
+            let expected_values = expected_snapshot
+                .to_data()
+                .unwrap()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(actual_values.len(), expected_values.len(), "{path}");
+            assert!(
+                actual_values.iter().all(|value| value.is_finite()),
+                "mapped WGPU values are non-finite for {path}"
+            );
+            assert!(
+                expected_values.iter().all(|value| value.is_finite()),
+                "canonical F16 values are non-finite for {path}"
+            );
+
+            let (max_abs_error, squared_error, max_abs_reference) = actual_values
+                .iter()
+                .zip(&expected_values)
+                .fold((0.0_f32, 0.0_f64, 0.0_f32), |acc, (&actual, &expected)| {
+                    (
+                        acc.0.max((actual - expected).abs()),
+                        acc.1 + f64::from(actual - expected).powi(2),
+                        acc.2.max(expected.abs()),
+                    )
+                });
+            let rmse = (squared_error / actual_values.len() as f64).sqrt();
+            if quantized_paths.contains(&path) {
+                // Symmetric Q8S rounds each value to the nearest multiple of alpha / 127, so the
+                // worst possible error is alpha / 254 (plus a small F32 arithmetic allowance).
+                let q8_bound =
+                    max_abs_reference / 254.0 + f32::EPSILON * max_abs_reference.max(1.0) * 8.0;
+                assert!(
+                    max_abs_error <= q8_bound,
+                    "{path}: max_abs_error={max_abs_error} exceeds Q8 bound {q8_bound}"
+                );
+                compared_quantized += 1;
+                eprintln!(
+                    "WGPU Q8->F32 {path}: values={} max_abs_error={max_abs_error} rmse={rmse}",
+                    actual_values.len()
+                );
+            } else {
+                assert_eq!(
+                    actual_values, expected_values,
+                    "unquantized drift for {path}"
+                );
+                compared_float += 1;
+            }
+        }
+        assert_eq!(compared_quantized, quantized_paths.len());
+        assert_eq!(compared_quantized, 6);
+        assert_eq!(compared_float, 9);
+    }
+
+    #[test]
+    fn direct_quantized_execution_keeps_returned_and_cached_q8_correctness() {
+        let config = tiny_config();
+        let device = Default::default();
+        let mut resident = super::super::BooguDenoiser::<B>::new(config, &device).unwrap();
+        let [input, output] = resident.x_embedder.weight.dims();
+        let elements = input * output;
+        assert!(elements.is_multiple_of(32));
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q8S)
+            .with_level(QuantLevel::block([32]))
+            .with_param(QuantParam::F32)
+            .with_store(QuantStore::PackedU32(0));
+        resident.x_embedder.weight = Param::from_tensor(Tensor::from_data(
+            TensorData::quantized(
+                vec![1_i8; elements],
+                [input, output],
+                scheme,
+                &vec![0.03125_f32; elements / 32],
+            ),
+            &device,
+        ));
+        let source = CountingAsyncStageSource::new(resident);
+        let mut source = RetainingAsyncBooguDenoiserStageSource::new(source);
+
+        let returned = block_on_immediate(source.load_prelude()).unwrap();
+
+        assert!(matches!(
+            returned.x_embedder.weight.val().dtype(),
+            DType::QFloat(_)
+        ));
+        assert_eq!(source.dense_f32_materialized_stage_clones(), 0);
+        assert!(matches!(
+            source
+                .prelude
+                .as_ref()
+                .expect("prelude must remain retained")
+                .x_embedder
+                .weight
+                .val()
+                .dtype(),
+            DType::QFloat(_)
+        ));
+        assert_eq!(source.source().load_count("prelude"), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires retained Q8 modules and per-stage synchronization")]
+    fn dense_stage_materialization_rejects_nonretained_source_correctness() {
+        let config = tiny_config();
+        let device = Default::default();
+        let resident = super::super::BooguDenoiser::<B>::new(config, &device).unwrap();
+        let source = CountingAsyncStageSource::new(resident);
+        let _source: RetainingAsyncBooguDenoiserStageSource<B, _> =
+            RetainingAsyncBooguDenoiserStageSource::passthrough(source)
+                .with_quantized_linear_execution_policy(
+                    BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,
+                );
+    }
+
+    #[test]
+    #[should_panic(expected = "requires per-stage synchronization")]
+    fn dense_stage_materialization_rejects_deferred_synchronization_correctness() {
+        let config = tiny_config();
+        let device = Default::default();
+        let resident = super::super::BooguDenoiser::<B>::new(config, &device).unwrap();
+        let source = CountingAsyncStageSource::new(resident);
+        let _source: RetainingAsyncBooguDenoiserStageSource<B, _> =
+            RetainingAsyncBooguDenoiserStageSource::new(source)
+                .with_quantized_linear_execution_policy(
+                    BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,
+                )
+                .with_synchronization_policy(AsyncRetainingDenoiserSynchronizationPolicy::Deferred);
     }
 }

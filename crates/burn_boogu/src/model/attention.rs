@@ -4,7 +4,10 @@ use burn::{
     tensor::{module::attention, ops::AttentionModuleOptions},
 };
 
-use super::norm::{DenoiserRmsNormPolicy, rms_norm_with_policy};
+use super::{
+    linear::linear_forward,
+    norm::{DenoiserRmsNormPolicy, rms_norm_with_policy},
+};
 
 #[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
 use super::native_flash::{
@@ -561,22 +564,22 @@ impl<B: Backend> DoubleStreamAttention<B> {
         let instruction_len = instruction.dims()[1];
         let query = Tensor::cat(
             vec![
-                self.instruct_to_q.forward(instruction.clone()),
-                self.img_to_q.forward(image.clone()),
+                linear_forward(&self.instruct_to_q, instruction.clone()),
+                linear_forward(&self.img_to_q, image.clone()),
             ],
             1,
         );
         let key = Tensor::cat(
             vec![
-                self.instruct_to_k.forward(instruction.clone()),
-                self.img_to_k.forward(image.clone()),
+                linear_forward(&self.instruct_to_k, instruction.clone()),
+                linear_forward(&self.img_to_k, image.clone()),
             ],
             1,
         );
         let value = Tensor::cat(
             vec![
-                self.instruct_to_v.forward(instruction),
-                self.img_to_v.forward(image),
+                linear_forward(&self.instruct_to_v, instruction),
+                linear_forward(&self.img_to_v, image),
             ],
             1,
         );
@@ -597,12 +600,14 @@ impl<B: Backend> DoubleStreamAttention<B> {
         )
         .reshape([batch, sequence, self.heads * self.head_dim]);
 
-        let instruction = self
-            .instruct_out
-            .forward(attended.clone().narrow(1, 0, instruction_len));
-        let image = self
-            .img_out
-            .forward(attended.narrow(1, instruction_len, image_len));
+        let instruction = linear_forward(
+            &self.instruct_out,
+            attended.clone().narrow(1, 0, instruction_len),
+        );
+        let image = linear_forward(
+            &self.img_out,
+            attended.narrow(1, instruction_len, image_len),
+        );
         self.project_shared_output(instruction, image, K::SPLIT_DOUBLE_STREAM_SHARED_PROJECTION)
     }
 
@@ -618,14 +623,15 @@ impl<B: Backend> DoubleStreamAttention<B> {
         split_streams: bool,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
         if split_streams {
-            return (self.to_out.forward(image), self.to_out.forward(instruction));
+            return (
+                linear_forward(&self.to_out, image),
+                linear_forward(&self.to_out, instruction),
+            );
         }
 
         let instruction_len = instruction.dims()[1];
         let image_len = image.dims()[1];
-        let merged = self
-            .to_out
-            .forward(Tensor::cat(vec![instruction, image], 1));
+        let merged = linear_forward(&self.to_out, Tensor::cat(vec![instruction, image], 1));
         (
             merged.clone().narrow(1, instruction_len, image_len),
             merged.narrow(1, 0, instruction_len),
@@ -712,17 +718,19 @@ impl<B: Backend> GqaAttention<B> {
     ) -> Tensor<B, 3> {
         let [batch, query_len, _] = query_tokens.dims();
         let key_len = key_value_tokens.dims()[1];
-        let query =
-            self.to_q
-                .forward(query_tokens)
-                .reshape([batch, query_len, self.heads, self.head_dim]);
-        let key = self.to_k.forward(key_value_tokens.clone()).reshape([
+        let query = linear_forward(&self.to_q, query_tokens).reshape([
+            batch,
+            query_len,
+            self.heads,
+            self.head_dim,
+        ]);
+        let key = linear_forward(&self.to_k, key_value_tokens.clone()).reshape([
             batch,
             key_len,
             self.kv_heads,
             self.head_dim,
         ]);
-        let value = self.to_v.forward(key_value_tokens).reshape([
+        let value = linear_forward(&self.to_v, key_value_tokens).reshape([
             batch,
             key_len,
             self.kv_heads,
@@ -740,7 +748,7 @@ impl<B: Backend> GqaAttention<B> {
             rms_norm_policy,
         )
         .reshape([batch, query_len, self.heads * self.head_dim]);
-        self.to_out.forward(output)
+        linear_forward(&self.to_out, output)
     }
 }
 

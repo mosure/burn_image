@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BackendStatus, FrontendError, ImageRunnerStatus};
 
-const MAX_RETAINED_TERMINAL_JOBS: usize = 8;
+// Keep one terminal record for UI/provenance feedback while bounding any request-owned source
+// image retained by the public record. Pruning happens at the start of the following frame so the
+// display set can still materialize every completion from the current frame.
+const MAX_RETAINED_TERMINAL_JOBS: usize = 1;
 
 /// Frontend-owned identifier, independent of model-runtime `RunId` values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -37,9 +40,7 @@ impl ImageJobPhase {
 pub struct ImageJobRecord {
     pub id: ImageJobId,
     pub model: ModelId,
-    /// Present only while the job can still execute. Terminal records release
-    /// request-owned image payloads while retaining progress and provenance context.
-    pub request: Option<ImageRequest>,
+    pub request: ImageRequest,
     pub phase: ImageJobPhase,
     pub last_progress: Option<ProgressEvent>,
 }
@@ -160,7 +161,11 @@ impl Plugin for ImageJobPlugin {
             )
             .add_systems(
                 Update,
-                (accept_submissions, accept_cancellations)
+                (
+                    prune_terminal_job_history,
+                    accept_submissions,
+                    accept_cancellations,
+                )
                     .chain()
                     .in_set(ImageFrontendSet::Input),
             )
@@ -171,6 +176,10 @@ impl Plugin for ImageJobPlugin {
                     .in_set(ImageFrontendSet::Feedback),
             );
     }
+}
+
+fn prune_terminal_job_history(mut jobs: ResMut<ImageJobs>) {
+    prune_terminal_jobs(&mut jobs.records, MAX_RETAINED_TERMINAL_JOBS);
 }
 
 fn accept_submissions(
@@ -213,13 +222,12 @@ fn accept_submissions(
             .map_or(ImageJobPhase::Queued, |error| ImageJobPhase::Failed {
                 error,
             });
-        let retained_request = error.is_none().then(|| submission.request.clone());
         jobs.records.insert(
             submission.id,
             ImageJobRecord {
                 id: submission.id,
                 model: submission.model.clone(),
-                request: retained_request,
+                request: submission.request.clone(),
                 phase,
                 last_progress: None,
             },
@@ -274,7 +282,6 @@ fn accept_cancellations(
         };
         if !record.phase.is_terminal() {
             record.phase = ImageJobPhase::Cancelled;
-            record.request = None;
             routed.write(ImageJobCancellationRequested {
                 id: cancellation.id,
             });
@@ -315,7 +322,6 @@ fn apply_completions(mut jobs: ResMut<ImageJobs>, mut completed: MessageReader<C
             },
             (Ok(()), true) => ImageJobPhase::Completed,
         };
-        record.request = None;
     }
 }
 
@@ -328,7 +334,6 @@ fn apply_failures(mut jobs: ResMut<ImageJobs>, mut failed: MessageReader<FailIma
             record.phase = ImageJobPhase::Failed {
                 error: failure.error.clone(),
             };
-            record.request = None;
         }
     }
 }
@@ -339,15 +344,16 @@ mod tests {
 
     use bevy::prelude::*;
     use burn_image::{
-        GenerateRequest, GenerationOptions, ImageRequest, ImageTaskKind, ModelId, ProgressEvent,
-        Prompt, RunId,
+        ColorSpace, GenerateRequest, GeneratedImage, GenerationOptions, HostImage, ImageOutput,
+        ImageRequest, ImageTaskKind, ModelId, ModelProvenance, NumericFormat, PixelBuffer,
+        PixelFormat, ProgressEvent, Prompt, RunId, StageTimings,
     };
 
     use crate::{BackendDeviceInfo, BackendStatus, ImageRunnerStatus};
 
     use super::{
-        CancelImageJob, ImageJobId, ImageJobPhase, ImageJobPlugin, ImageJobRecord, ImageJobs,
-        ReportImageProgress, SubmitImageJob,
+        CancelImageJob, CompleteImageJob, ImageJobId, ImageJobPhase, ImageJobPlugin,
+        ImageJobRecord, ImageJobs, ReportImageProgress, SubmitImageJob,
     };
 
     fn request() -> ImageRequest {
@@ -356,6 +362,33 @@ mod tests {
             negative_prompt: None,
             options: GenerationOptions::default(),
         })
+    }
+
+    fn output(model: &ModelId) -> ImageOutput {
+        ImageOutput {
+            images: vec![GeneratedImage {
+                index: 0,
+                image: HostImage::Pixels(
+                    PixelBuffer::new(
+                        burn_image::Dimensions::new(1, 1).unwrap(),
+                        PixelFormat::Rgba8,
+                        ColorSpace::Srgb,
+                        vec![0, 0, 0, 255],
+                    )
+                    .unwrap(),
+                ),
+            }],
+            seed: 0,
+            timings: StageTimings::default(),
+            provenance: ModelProvenance {
+                model: model.clone(),
+                model_revision: "test-revision".into(),
+                artifact_content_digest: None,
+                numeric_format: NumericFormat::F32,
+                backend: "test-backend".into(),
+                artifacts_verified: true,
+            },
+        }
     }
 
     fn ready_backend() -> BackendStatus {
@@ -414,7 +447,6 @@ mod tests {
             jobs.get(ImageJobId(8)).unwrap().phase,
             ImageJobPhase::Failed { .. }
         ));
-        assert!(jobs.get(ImageJobId(8)).unwrap().request.is_none());
     }
 
     #[test]
@@ -465,14 +497,6 @@ mod tests {
                 .phase,
             ImageJobPhase::Cancelled
         ));
-        assert!(
-            app.world()
-                .resource::<ImageJobs>()
-                .get(ImageJobId(9))
-                .unwrap()
-                .request
-                .is_none()
-        );
     }
 
     #[test]
@@ -486,7 +510,7 @@ mod tests {
                 super::ImageJobRecord {
                     id,
                     model: model.clone(),
-                    request: (raw_id == 6).then_some(request()),
+                    request: request(),
                     phase: if raw_id == 6 {
                         ImageJobPhase::Running
                     } else {
@@ -497,43 +521,83 @@ mod tests {
             );
         }
 
-        super::prune_terminal_jobs(&mut records, 3);
+        super::prune_terminal_jobs(&mut records, 1);
         assert_eq!(
             records
                 .values()
                 .filter(|record| record.phase.is_terminal())
                 .count(),
-            3
+            1
         );
         assert!(records.contains_key(&ImageJobId(6)));
-        assert_eq!(records.len(), 4);
+        assert_eq!(records.len(), 2);
     }
 
     #[test]
-    fn job_record_serde_releases_only_terminal_request_payloads_correctness() {
+    fn same_frame_completions_remain_visible_until_the_display_frame_correctness() {
+        let mut app = App::new();
+        app.insert_resource(ready_backend())
+            .insert_resource(ready_runner())
+            .add_plugins(ImageJobPlugin);
+        let model = ModelId::new("test/model").unwrap();
+        for raw_id in [1, 2] {
+            app.world_mut()
+                .resource_mut::<Messages<SubmitImageJob>>()
+                .write(SubmitImageJob {
+                    id: ImageJobId(raw_id),
+                    model: model.clone(),
+                    request: request(),
+                });
+        }
+        app.update();
+        for raw_id in [1, 2] {
+            app.world_mut()
+                .resource_mut::<Messages<CompleteImageJob>>()
+                .write(CompleteImageJob {
+                    id: ImageJobId(raw_id),
+                    output: output(&model),
+                });
+        }
+
+        app.update();
+        let jobs = app.world().resource::<ImageJobs>();
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs.iter()
+                .all(|record| record.phase == ImageJobPhase::Completed)
+        );
+
+        app.update();
+        let jobs = app.world().resource::<ImageJobs>();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs.iter().next().unwrap().id, ImageJobId(2));
+    }
+
+    #[test]
+    fn job_record_serde_preserves_public_request_shape_correctness() {
         let model = ModelId::new("test/model").unwrap();
         let active = ImageJobRecord {
             id: ImageJobId(1),
             model: model.clone(),
-            request: Some(request()),
+            request: request(),
             phase: ImageJobPhase::Running,
             last_progress: None,
         };
         let active_json = serde_json::to_value(&active).unwrap();
         assert_eq!(active_json["request"]["task"], "generate");
         let active_roundtrip: ImageJobRecord = serde_json::from_value(active_json).unwrap();
-        assert!(active_roundtrip.request.is_some());
+        assert_eq!(active_roundtrip.request, request());
 
         let terminal = ImageJobRecord {
             id: ImageJobId(2),
             model,
-            request: None,
+            request: request(),
             phase: ImageJobPhase::Completed,
             last_progress: None,
         };
         let terminal_json = serde_json::to_value(&terminal).unwrap();
-        assert!(terminal_json["request"].is_null());
+        assert_eq!(terminal_json["request"]["task"], "generate");
         let terminal_roundtrip: ImageJobRecord = serde_json::from_value(terminal_json).unwrap();
-        assert!(terminal_roundtrip.request.is_none());
+        assert_eq!(terminal_roundtrip.request, request());
     }
 }

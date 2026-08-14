@@ -1515,6 +1515,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn browser_low_vram_qualification_harness_is_fail_closed_correctness() {
+        let source = include_str!("../tests/wasm_browser_1k5_parity.mjs");
+        for required in [
+            "BURN_IMAGE_BROWSER_1K5_RESIDENCY",
+            "requires ${RESIDENCY_ENV}=qualification-f32 or ${RESIDENCY_ENV}=low-vram",
+            "residency: lowVramMode ? \"low-vram\" : \"qualification-f32\"",
+            "browser-qualification-per-request-f32-denoiser-retained",
+            "browser-low-vram-runtime-q8-denoiser",
+            "runtime-quantize-q8s-block32-f32",
+            "low_vram_denoiser_dtype_audit.matches_inventory",
+            "on_device_quantized_execution_claimed",
+            "BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES",
+            "observed_max_framebuffer_bytes >= maximumFramebufferBytesExclusive",
+        ] {
+            assert!(
+                source.contains(required),
+                "browser harness omits {required}"
+            );
+        }
+        assert!(!source.contains("BROWSER_HIGH_VRAM_RESIDENCY_POLICY"));
+        assert!(!source.contains(
+            "const BROWSER_HIGH_VRAM_RESIDENCY_POLICY = \"browser-high-vram-resident-dense-f32\""
+        ));
+    }
+
     fn digest(dtype: &str, shape: &[usize]) -> BrowserParityTensorDigest {
         BrowserParityTensorDigest {
             dtype: dtype.into(),

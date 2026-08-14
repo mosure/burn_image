@@ -5,6 +5,13 @@
 //! denoiser for every request and all four DMD steps. No model-weight filesystem read, host decode,
 //! or host-to-device upload occurs in that runtime's forward hot path.
 //!
+//! The supported low-VRAM policy preserves the same qualified native kernels and mixed-F16
+//! execution policy, but bounds model-weight residency by streaming Qwen and one VAE half at a time
+//! while retaining only the variant-required denoiser weights across DMD steps and requests. Its
+//! static resource plan fails closed unless the inventory-audited live-weight bound plus a
+//! conservative non-weight reserve stays below 32 GB; runtime telemetry is still required before
+//! claiming a measured device peak.
+//!
 //! The explicit layer-streamed diagnostic policy is intentionally different: it rereads Qwen and
 //! VAE stages per request and denoiser stages per DMD step. It requires an explicit local artifact
 //! override and reports that traffic policy in provenance. This is deliberately separate from the
@@ -30,11 +37,14 @@ use burn_boogu::{
     NativeDenoiserRmsNormPolicy, NativeHighVramPolicy, NativePaddedBlackboxDenoiser,
     NativePortableDenoiser, NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy,
     RetainingBooguVaeStageSource, StreamingBooguDenoiser, StreamingBooguPipeline,
+    VaeDecoderMemoryPolicy,
     artifacts::{
-        BooguArtifactInventory, BooguReleaseIdentity, BooguStorageProfile,
-        DirectoryStageShardReader, VerifiedArtifactDirectory, VerifiedBurnpackQwenStageSource,
-        VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource,
-        artifact_bundle_id_is_compatible, load_resident_denoiser_from_directory_with_policies,
+        BooguArtifactInventory, BooguReleaseIdentity, BooguResidentLoadMemoryPolicy,
+        BooguStorageProfile, DirectoryStageShardReader, VerifiedArtifactDirectory,
+        VerifiedBurnpackQwenStageSource, VerifiedBurnpackStageSource,
+        VerifiedDirectoryVaeStageSource, artifact_bundle_id_is_compatible,
+        load_resident_denoiser_from_directory_with_memory_policy,
+        load_resident_denoiser_from_directory_with_policies,
         validate_canonical_release_artifact_digest,
     },
     boogu_model_descriptor, boogu_processor_config,
@@ -193,6 +203,13 @@ pub enum NativeBooguResidencyPolicy {
     /// Eagerly load every required Qwen/VAE stage and retain it with the denoiser on the GPU.
     #[default]
     HighVram,
+    /// Supported phase-resident execution below the 32-GB static device plan.
+    ///
+    /// Qwen streams one verified semantic stage at a time and each required VAE half is loaded only
+    /// for its request phase. The variant-required mixed-F16 denoiser remains resident across all
+    /// four DMD steps and later requests, preserving the qualified native kernels without repeated
+    /// denoiser weight traffic.
+    LowVram,
     /// Diagnostic-only host streaming that reloads weights inside model execution.
     ///
     /// This is not a supported production residency policy. The native factory accepts it only
@@ -206,6 +223,7 @@ impl NativeBooguResidencyPolicy {
     pub const fn label(self) -> &'static str {
         match self {
             Self::HighVram => "native-high-vram-gpu-resident-dense",
+            Self::LowVram => "native-low-vram-phase-resident-mixed-f16",
             Self::LayerStreamed => "native-diagnostic-layer-streamed",
         }
     }
@@ -224,6 +242,10 @@ impl NativeBooguResidencyPolicy {
             Self::HighVram => {
                 "diagnostic-gpu-resident-unqualified/zero-forward-host-weight-transfers"
             }
+            Self::LowVram if production_profile => {
+                "phase-resident/qwen+vae-per-request/denoiser-resident-zero-dmd-weight-reloads"
+            }
+            Self::LowVram => "unsupported-low-vram-profile/fail-closed-before-model-load",
             Self::LayerStreamed => {
                 "diagnostic-host-streamed/qwen+vae-per-request/denoiser-per-dmd-step"
             }
@@ -231,10 +253,79 @@ impl NativeBooguResidencyPolicy {
     }
 }
 
+const GIB: u64 = 1024 * 1024 * 1024;
+// Decimal GB is intentional and matches the browser contract. This is stricter than 32 GiB.
+const NATIVE_LOW_VRAM_DEVICE_BUDGET_BYTES: u64 = 32_000_000_000;
+// This is a conservative static allowance, not a measured peak. It covers activations, kernel
+// workspaces, the shared Bevy device, and allocator slack; release qualification must still
+// continuously measure total process VRAM.
+const NATIVE_LOW_VRAM_NON_WEIGHT_RESERVE_BYTES: u64 = 10_000_000_000;
+// Turbo's steady state is smaller after reference-refiner pruning, but construction currently
+// materializes the complete denoiser before releasing those dormant modules. Admission therefore
+// covers that larger authenticated initialization phase rather than only steady-state residency.
+const NATIVE_LOW_VRAM_TURBO_LIVE_WEIGHT_BYTES: u64 = 20_585_112_576;
+const NATIVE_LOW_VRAM_EDIT_LIVE_WEIGHT_BYTES: u64 = 20_971_005_440;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeLowVramResourcePlan {
+    inventory_audited_peak_weight_bytes: u64,
+    non_weight_reserve_bytes: u64,
+    planned_device_bytes: u64,
+    device_budget_bytes: u64,
+}
+
+fn native_low_vram_resource_plan(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+) -> Result<NativeLowVramResourcePlan, RuntimeError> {
+    native_low_vram_resource_plan_with_budget(variant, profile, NATIVE_LOW_VRAM_DEVICE_BUDGET_BYTES)
+}
+
+fn native_low_vram_resource_plan_with_budget(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+    device_budget_bytes: u64,
+) -> Result<NativeLowVramResourcePlan, RuntimeError> {
+    if profile != BooguStorageProfile::F16QwenVisionF32 {
+        return Err(execution_error(
+            variant,
+            format!(
+                "native low-vram currently requires profile=production ({:?}); profile {} is not qualified",
+                BooguStorageProfile::F16QwenVisionF32,
+                boogu_profile_slug(profile)
+            ),
+        ));
+    }
+    let inventory_audited_peak_weight_bytes = match variant {
+        BooguVariant::Image01Turbo => NATIVE_LOW_VRAM_TURBO_LIVE_WEIGHT_BYTES,
+        BooguVariant::Image01EditTurbo | BooguVariant::Image01EditTurbo1k5 => {
+            NATIVE_LOW_VRAM_EDIT_LIVE_WEIGHT_BYTES
+        }
+    };
+    let planned_device_bytes = inventory_audited_peak_weight_bytes
+        .checked_add(NATIVE_LOW_VRAM_NON_WEIGHT_RESERVE_BYTES)
+        .ok_or_else(|| execution_error(variant, "native low-vram resource plan overflowed"))?;
+    if planned_device_bytes >= device_budget_bytes {
+        return Err(execution_error(
+            variant,
+            format!(
+                "native low-vram resource plan requires {planned_device_bytes} device bytes (peak initialization/forward weights {inventory_audited_peak_weight_bytes} + non-weight reserve {}), which does not stay below the {device_budget_bytes}-byte decimal-GB budget",
+                NATIVE_LOW_VRAM_NON_WEIGHT_RESERVE_BYTES
+            ),
+        ));
+    }
+    Ok(NativeLowVramResourcePlan {
+        inventory_audited_peak_weight_bytes,
+        non_weight_reserve_bytes: NATIVE_LOW_VRAM_NON_WEIGHT_RESERVE_BYTES,
+        planned_device_bytes,
+        device_budget_bytes,
+    })
+}
+
 /// Loads one pinned Boogu release from a local sealed directory, then runs requests sequentially on
 /// a dedicated native worker thread.
 ///
-/// Embedders selecting a qualified native high-VRAM mixed-F16 policy must call
+/// Embedders selecting a qualified native mixed-F16 policy (high- or low-VRAM) must call
 /// [`burn_boogu::configure_native_full_autotune`] before Bevy creates or imports its WGPU device.
 /// Construction fails closed when that process-global policy was not configured in time. The
 /// packaged `burn-image-viewer` binary performs this setup automatically.
@@ -270,7 +361,7 @@ impl NativeBooguFactory {
         residency: NativeBooguResidencyPolicy,
         profile: BooguStorageProfile,
     ) -> bool {
-        qualified_native_high_vram_policy(variant, residency, profile)
+        qualified_native_execution_policy(variant, residency, profile)
             .is_some_and(|policy| matches!(policy.autotune, NativeAutotunePolicy::Full))
     }
 }
@@ -284,6 +375,11 @@ impl BooguRuntimeFactory for NativeBooguFactory {
             ));
         }
         crate::boogu::validate_variant_profile(self.variant, context.settings.storage_profile)?;
+        if self.residency == NativeBooguResidencyPolicy::LowVram {
+            // Validate the exact supported profile and the static <32-GB plan before artifact
+            // resolution, thread creation, or any model/device allocation.
+            native_low_vram_resource_plan(self.variant, context.settings.storage_profile)?;
+        }
         if self.residency == NativeBooguResidencyPolicy::LayerStreamed
             && !matches!(
                 &context.settings.artifact_source,
@@ -296,11 +392,11 @@ impl BooguRuntimeFactory for NativeBooguFactory {
             ));
         }
         if self.variant == BooguVariant::Image01EditTurbo1k5
-            && self.residency != NativeBooguResidencyPolicy::HighVram
+            && self.residency == NativeBooguResidencyPolicy::LayerStreamed
         {
             return Err(execution_error(
                 self.variant,
-                "Edit-Turbo 1.5K is released only with the parity-gated native high-VRAM policy",
+                "Edit-Turbo 1.5K rejects diagnostic per-DMD-step layer streaming; select the parity-gated native high-VRAM or supported low-VRAM policy",
             ));
         }
         if matches!(context.device, burn_wgpu::WgpuDevice::Cpu) {
@@ -331,6 +427,14 @@ impl BooguRuntimeFactory for NativeBooguFactory {
             bevy::log::warn!(
                 "starting opt-in diagnostic native host streaming: Qwen and VAE weights reload per request; denoiser weights reload for every DMD step; this mode is not production-supported"
             );
+        } else if self.residency == NativeBooguResidencyPolicy::LowVram {
+            let plan =
+                native_low_vram_resource_plan(self.variant, context.settings.storage_profile)?;
+            bevy::log::info!(
+                "starting supported native low-VRAM execution: Qwen and VAE stream per request; the variant-required denoiser remains resident; planned {:.3} GiB is below the {:.1} GiB device target",
+                plan.planned_device_bytes as f64 / GIB as f64,
+                plan.device_budget_bytes as f64 / GIB as f64,
+            );
         }
         let mut loading = self
             .loading
@@ -350,9 +454,23 @@ impl BooguRuntimeFactory for NativeBooguFactory {
         thread::Builder::new()
             .name("burn-image-boogu-loader".into())
             .spawn(move || {
-                let result = load_native_runtime(context, variant, residency, |message| {
+                let cleanup_device = context.device.clone();
+                let mut result = load_native_runtime(context, variant, residency, |message| {
                     let _ = progress_tx.send(message);
                 });
+                if result.is_err()
+                    && residency == NativeBooguResidencyPolicy::LowVram
+                    && let Err(cleanup_error) =
+                        cleanup_failed_low_vram_load(&cleanup_device, variant)
+                    && let Err(load_error) = result
+                {
+                    result = Err(execution_error(
+                        variant,
+                        format!(
+                            "{load_error}; backend cleanup after failed low-VRAM model loading also failed: {cleanup_error}"
+                        ),
+                    ));
+                }
                 let _ = ready_tx.send(result);
             })
             .map_err(|error| {
@@ -629,6 +747,28 @@ fn validate_job(
     Ok(())
 }
 
+fn cleanup_failed_low_vram_load(
+    device: &burn_wgpu::WgpuDevice,
+    variant: BooguVariant,
+) -> Result<(), RuntimeError> {
+    <NativeBackend as Backend>::sync(device).map_err(|error| {
+        execution_error(
+            variant,
+            format!(
+                "backend synchronization before failed low-VRAM loader cleanup failed: {error}"
+            ),
+        )
+    })?;
+    <NativeBackend as Backend>::memory_cleanup(device);
+    <NativeBackend as Backend>::sync(device).map_err(|error| {
+        execution_error(
+            variant,
+            format!("backend synchronization after failed low-VRAM loader cleanup failed: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
 fn load_native_runtime(
     context: BooguFactoryContext,
     variant: BooguVariant,
@@ -637,6 +777,7 @@ fn load_native_runtime(
 ) -> Result<NativeBooguRuntime, RuntimeError> {
     let setup_steps = match residency {
         NativeBooguResidencyPolicy::HighVram => 5,
+        NativeBooguResidencyPolicy::LowVram => 4,
         NativeBooguResidencyPolicy::LayerStreamed => 3,
     };
     report_progress(format!(
@@ -647,7 +788,7 @@ fn load_native_runtime(
         residency.label()
     );
     let native_policy =
-        qualified_native_high_vram_policy(variant, residency, context.settings.storage_profile);
+        qualified_native_execution_policy(variant, residency, context.settings.storage_profile);
     let artifact_directories = resolve_native_boogu_artifact_directory(
         variant,
         context.settings.storage_profile,
@@ -750,6 +891,17 @@ fn load_native_runtime(
         .map_err(|error| execution_error(variant, error))?;
     let device = context.device;
     let profile = context.settings.storage_profile;
+    let low_vram_plan = if residency == NativeBooguResidencyPolicy::LowVram {
+        let plan = native_low_vram_resource_plan(variant, profile)?;
+        report_progress(format!(
+            "Model setup 2/{setup_steps}: low-VRAM plan accepted ({:.3} GiB planned; {:.3} GiB inventory-audited peak weights; <32 decimal GB target)",
+            plan.planned_device_bytes as f64 / GIB as f64,
+            plan.inventory_audited_peak_weight_bytes as f64 / GIB as f64,
+        ));
+        Some(plan)
+    } else {
+        None
+    };
     let vae_policy = if let Some(policy) = native_policy {
         match policy.vae_execution {
             NativeVaeExecutionPolicy::PreserveF16StorageF32GroupNorm => {
@@ -855,13 +1007,28 @@ fn load_native_runtime(
     )
     .map_err(|error| execution_error(variant, error))?;
     let runtime_config = context.settings.runtime_config(variant);
-    let backend_policy = native_policy
-        .map(|policy| policy.provenance_label)
-        .unwrap_or_else(|| residency.label());
+    let backend_policy = match (residency, native_policy) {
+        (NativeBooguResidencyPolicy::HighVram, Some(policy)) => policy.provenance_label.to_owned(),
+        (NativeBooguResidencyPolicy::LowVram, Some(policy)) => format!(
+            "{}/denoiser-per-physical-shard-upload-flush-allocator-cleanup/qwen-direct-release-dtype-embedding-upload/qwen-streamed-per-stage-allocator-cleanup/vae-exact-transient-allocation-pre-tail-cleanup/phase-boundary-allocator-cleanup/qualified-native-kernels={}",
+            residency.label(),
+            native_kernel_policy_label(variant, policy)
+        ),
+        _ => residency.label().to_owned(),
+    };
+    let resource_policy = low_vram_plan.map_or_else(String::new, |plan| {
+        format!(
+            "/resource-plan-peak-weights={}-reserve={}-planned={}-budget={}",
+            plan.inventory_audited_peak_weight_bytes,
+            plan.non_weight_reserve_bytes,
+            plan.planned_device_bytes,
+            plan.device_budget_bytes,
+        )
+    });
     let metadata = BooguRuntimeMetadata {
         numeric_format: numeric_format(profile),
         backend: format!(
-            "burn-wgpu-native/shared-bevy-device/{}/{backend_policy}",
+            "burn-wgpu-native/shared-bevy-device/{}/{backend_policy}{resource_policy}",
             residency.weight_traffic_contract(profile == BooguStorageProfile::F16QwenVisionF32)
         ),
         artifact_content_digest: Some(content_digest),
@@ -981,6 +1148,7 @@ fn load_native_runtime(
                     image_processor,
                     device,
                     metadata,
+                    false,
                 )
             } else {
                 let denoiser = NativePortableDenoiser::new(denoiser);
@@ -994,8 +1162,115 @@ fn load_native_runtime(
                     image_processor,
                     device,
                     metadata,
+                    false,
                 )
             }
+        }
+        NativeBooguResidencyPolicy::LowVram => {
+            report_progress(
+                "Model setup 3/4: loading variant-scoped resident denoiser weights to GPU".into(),
+            );
+            bevy::log::info!(
+                "loading one qualified mixed-F16 denoiser for low-VRAM residency; Qwen and VAE remain verified one-stage-per-request sources"
+            );
+            let expected_reference_refiners = denoiser_config.num_refiner_layers;
+            let (mut denoiser, report) =
+                load_resident_denoiser_from_directory_with_memory_policy::<NativeBackend>(
+                    &identity,
+                    &root,
+                    inventory,
+                    denoiser_config,
+                    profile,
+                    denoiser_policy,
+                    denoiser_quantized_policy,
+                    BooguResidentLoadMemoryPolicy::ReleaseTransientBuffersPerShard,
+                    &device,
+                )
+                .map_err(|error| execution_error(variant, error))?;
+            if variant == BooguVariant::Image01Turbo {
+                if denoiser.ref_image_refiner.len() != expected_reference_refiners {
+                    return Err(execution_error(
+                        variant,
+                        format!(
+                            "loaded denoiser has {} reference refiners; the sealed configuration requires {expected_reference_refiners}",
+                            denoiser.ref_image_refiner.len()
+                        ),
+                    ));
+                }
+                // Turbo never accepts a reference image. Dropping these authenticated but unused
+                // module handles makes the retained set match the inventory-audited Turbo bound.
+                denoiser.ref_image_refiner.clear();
+            }
+            <NativeBackend as Backend>::sync(&device).map_err(|error| {
+                execution_error(
+                    variant,
+                    format!("device sync after low-VRAM denoiser load failed: {error}"),
+                )
+            })?;
+            <NativeBackend as Backend>::memory_cleanup(&device);
+            <NativeBackend as Backend>::sync(&device).map_err(|error| {
+                execution_error(
+                    variant,
+                    format!(
+                        "device sync after low-VRAM denoiser allocator cleanup failed: {error}"
+                    ),
+                )
+            })?;
+            bevy::log::info!(
+                "low-VRAM denoiser ready: {} authenticated tensors from {} shards; {} reference-refiner modules retained",
+                report.tensors,
+                report.shards,
+                denoiser.ref_image_refiner.len(),
+            );
+
+            let policy = native_policy.ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "native low-vram lost its qualified production execution policy",
+                )
+            })?;
+            let mut qwen = StreamingQwen3Vl::new(qwen_plan, qwen_source)
+                .with_release_unused_memory_after_stage(true);
+            qwen.set_query_chunk_size(policy.qwen_query_chunk_size);
+            denoiser.set_attention_query_chunk_size(policy.denoiser_query_chunk_size);
+            let denoiser_rms_norm_policy = match policy.denoiser_rms_norm {
+                NativeDenoiserRmsNormPolicy::StrictF32 => DenoiserRmsNormPolicy::StrictF32,
+            };
+            let denoiser = match policy.denoiser_attention {
+                NativeDenoiserAttentionPolicy::PaddedBlackbox => {
+                    NativePaddedBlackboxDenoiser::new(denoiser)
+                        .with_partition_configuration(
+                            policy.blackbox_num_planes,
+                            policy.blackbox_seq_kv_tiles,
+                            policy.blackbox_seq_q_tiles,
+                        )
+                        .with_rms_norm_policy(denoiser_rms_norm_policy)
+                }
+            };
+            let denoiser = match policy.denoiser_qk_preparation {
+                NativeDenoiserQkPreparationPolicy::Composed => denoiser,
+                NativeDenoiserQkPreparationPolicy::BalancedStrictQkNormRope => {
+                    denoiser.with_balanced_strict_qk_norm_rope(true)
+                }
+            };
+            let decoder_group_norm_policy = match policy.vae_execution {
+                NativeVaeExecutionPolicy::PreserveF16StorageF32GroupNorm => {
+                    DecoderGroupNormPolicy::F16StorageF32Accum
+                }
+            };
+            let pipeline = StreamingBooguPipeline::new(variant, qwen_config, qwen, vae, denoiser)
+                .with_decoder_group_norm_policy(decoder_group_norm_policy)
+                .with_decoder_memory_policy(VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup);
+            spawn_native_runtime(
+                variant,
+                runtime_config,
+                pipeline,
+                processor,
+                image_processor,
+                device,
+                metadata,
+                true,
+            )
         }
         NativeBooguResidencyPolicy::LayerStreamed => {
             report_progress("Model setup 2/3: preparing diagnostic streamed stage loaders".into());
@@ -1025,6 +1300,7 @@ fn load_native_runtime(
                 image_processor,
                 device,
                 metadata,
+                false,
             )
         }
     }?;
@@ -1121,19 +1397,35 @@ fn qwen_stage_is_required(stage: &Qwen3VlStage, include_vision: bool) -> bool {
     }
 }
 
-fn qualified_native_high_vram_policy(
+fn qualified_native_execution_policy(
     variant: BooguVariant,
     residency: NativeBooguResidencyPolicy,
     profile: BooguStorageProfile,
 ) -> Option<NativeHighVramPolicy> {
-    if residency != NativeBooguResidencyPolicy::HighVram
-        || profile != BooguStorageProfile::F16QwenVisionF32
+    if !matches!(
+        residency,
+        NativeBooguResidencyPolicy::HighVram | NativeBooguResidencyPolicy::LowVram
+    ) || profile != BooguStorageProfile::F16QwenVisionF32
     {
         return None;
     }
     match variant {
         BooguVariant::Image01Turbo | BooguVariant::Image01EditTurbo => Some(BOOGU_1K_NATIVE_POLICY),
         BooguVariant::Image01EditTurbo1k5 => Some(EDIT_TURBO_1K5_NATIVE_POLICY),
+    }
+}
+
+fn native_kernel_policy_label(
+    variant: BooguVariant,
+    _policy: NativeHighVramPolicy,
+) -> &'static str {
+    match variant {
+        BooguVariant::Image01Turbo | BooguVariant::Image01EditTurbo => {
+            "full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum"
+        }
+        BooguVariant::Image01EditTurbo1k5 => {
+            "full-autotune/1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum"
+        }
     }
 }
 
@@ -1146,12 +1438,14 @@ fn spawn_native_runtime<E>(
     image_processor: Qwen3VlImageProcessor,
     device: burn_wgpu::WgpuDevice,
     metadata: BooguRuntimeMetadata,
+    phase_boundary_memory_cleanup: bool,
 ) -> Result<NativeBooguRuntime, RuntimeError>
 where
     E: BooguExecution<NativeBackend> + Send + 'static,
 {
     let image_model = BooguImageModel::new(pipeline, processor, image_processor, device, metadata)
-        .map_err(|error| execution_error(variant, error))?;
+        .map_err(|error| execution_error(variant, error))?
+        .with_phase_boundary_memory_cleanup(phase_boundary_memory_cleanup);
     let runtime = ImageRuntime::new(runtime_config, image_model)
         .map_err(|error| execution_error(variant, error))?;
     NativeBooguRuntime::spawn(variant, runtime)
@@ -1181,8 +1475,10 @@ fn execution_error(variant: BooguVariant, message: impl std::fmt::Display) -> Ru
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{collections::BTreeMap, path::PathBuf};
 
+    use burn_boogu::artifacts::TensorOwner;
+    use burn_flux_vae::AutoencoderKlConfig;
     use burn_image::{ArtifactCachePolicy, ArtifactSource, IntegrityPolicy};
 
     use super::*;
@@ -1204,6 +1500,111 @@ mod tests {
             },
             releases: vec![],
         }
+    }
+
+    fn released_qwen_config() -> Qwen3VlConfig {
+        Qwen3VlConfig::from_json(
+            r#"{
+              "text_config": {
+                "vocab_size":151936,"hidden_size":4096,"intermediate_size":12288,
+                "num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,
+                "head_dim":128,"hidden_act":"silu","rms_norm_eps":1e-6,
+                "max_position_embeddings":262144,"rope_theta":5000000,
+                "rope_scaling":{"mrope_section":[24,20,20],"mrope_interleaved":true,"rope_type":"default"}
+              },
+              "vision_config": {
+                "depth":27,"hidden_size":1152,"intermediate_size":4304,"num_heads":16,
+                "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+                "out_hidden_size":4096,"in_channels":3,"num_position_embeddings":2304,
+                "deepstack_visual_indexes":[8,16,24],"hidden_act":"gelu_pytorch_tanh",
+                "layer_norm_eps":1e-6
+              },
+              "tie_word_embeddings":false,"image_token_id":151655,"video_token_id":151656,
+              "vision_start_token_id":151652,"vision_end_token_id":151653
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn inventory_tensor_bytes(shape: &[usize], element_bytes: u64) -> u64 {
+        shape
+            .iter()
+            .try_fold(element_bytes, |bytes, &dimension| {
+                bytes.checked_mul(dimension as u64)
+            })
+            .expect("released inventory byte size fits u64")
+    }
+
+    fn inventory_low_vram_live_weight_bounds() -> (u64, u64) {
+        let qwen = released_qwen_config();
+        let vae = AutoencoderKlConfig::flux1();
+        let inventory = BooguArtifactInventory::new(&qwen, &BooguConfig::default(), &vae).unwrap();
+
+        let mut qwen_stages = BTreeMap::<&str, u64>::new();
+        let mut vae_stages = BTreeMap::<&str, u64>::new();
+        let mut turbo_denoiser_bytes = 0_u64;
+        let mut edit_denoiser_bytes = 0_u64;
+        for spec in inventory.tensors() {
+            match spec.owner {
+                TensorOwner::Qwen3Vl if spec.stage != "qwen-lm-head" => {
+                    // The released mixed profile preserves text/embedding F16 but its explicitly
+                    // named vision stages execute in F32.
+                    if spec.stage != "qwen-embedding" {
+                        let element_bytes = if spec.stage.starts_with("qwen-vision-") {
+                            4
+                        } else {
+                            2
+                        };
+                        *qwen_stages.entry(&spec.stage).or_default() +=
+                            inventory_tensor_bytes(&spec.target_shape, element_bytes);
+                    }
+                }
+                TensorOwner::FluxVae => {
+                    *vae_stages.entry(&spec.stage).or_default() +=
+                        inventory_tensor_bytes(&spec.target_shape, 2);
+                }
+                TensorOwner::BooguDenoiser => {
+                    let bytes = inventory_tensor_bytes(&spec.target_shape, 2);
+                    edit_denoiser_bytes += bytes;
+                    if !spec.stage.starts_with("boogu-reference-refiner-") {
+                        turbo_denoiser_bytes += bytes;
+                    }
+                }
+                TensorOwner::Qwen3Vl => {}
+            }
+        }
+
+        // Qwen's large embedding is row-routed rather than loaded as the inventory's logical
+        // whole table, so account for the largest released row chunk explicitly.
+        let qwen_plan = Qwen3VlStreamingPlan::released_f16(&qwen, false).unwrap();
+        let max_embedding_chunk_bytes = qwen_plan
+            .embedding_rows
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let rows = chunk.row_range.end - chunk.row_range.start;
+                inventory_tensor_bytes(&[rows, qwen.text_config.hidden_size], 2)
+            })
+            .max()
+            .unwrap();
+        let max_inventory_qwen_stage_bytes = qwen_stages.values().copied().max().unwrap();
+        let max_qwen_stage_bytes = max_inventory_qwen_stage_bytes.max(max_embedding_chunk_bytes);
+        let max_vae_half_bytes = vae_stages.values().copied().max().unwrap();
+        let max_streamed_phase_bytes = max_qwen_stage_bytes.max(max_vae_half_bytes);
+
+        assert_eq!(max_embedding_chunk_bytes, 207_446_016);
+        assert_eq!(max_inventory_qwen_stage_bytes, 385_892_864);
+        assert_eq!(max_qwen_stage_bytes, max_inventory_qwen_stage_bytes);
+        assert!(max_vae_half_bytes < max_qwen_stage_bytes);
+        assert_eq!(
+            edit_denoiser_bytes - turbo_denoiser_bytes,
+            715_116_480,
+            "Turbo must exclude all reference-refiner weights from its resident set"
+        );
+        (
+            edit_denoiser_bytes.max(turbo_denoiser_bytes + max_streamed_phase_bytes),
+            edit_denoiser_bytes + max_streamed_phase_bytes,
+        )
     }
 
     #[test]
@@ -1232,6 +1633,10 @@ mod tests {
             "native-diagnostic-layer-streamed"
         );
         assert_eq!(
+            NativeBooguResidencyPolicy::LowVram.label(),
+            "native-low-vram-phase-resident-mixed-f16"
+        );
+        assert_eq!(
             factory.residency.weight_traffic_contract(true),
             "gpu-resident-dense/zero-forward-host-weight-transfers"
         );
@@ -1240,10 +1645,84 @@ mod tests {
             "diagnostic-gpu-resident-unqualified/zero-forward-host-weight-transfers"
         );
         assert_eq!(
+            NativeBooguResidencyPolicy::LowVram.weight_traffic_contract(true),
+            "phase-resident/qwen+vae-per-request/denoiser-resident-zero-dmd-weight-reloads"
+        );
+        assert_eq!(
+            NativeBooguResidencyPolicy::LowVram.weight_traffic_contract(false),
+            "unsupported-low-vram-profile/fail-closed-before-model-load"
+        );
+        assert_eq!(
             NativeBooguResidencyPolicy::LayerStreamed.weight_traffic_contract(false),
             "diagnostic-host-streamed/qwen+vae-per-request/denoiser-per-dmd-step"
         );
+        assert!(!NativeBooguResidencyPolicy::LowVram.is_gpu_resident());
         assert!(!NativeBooguResidencyPolicy::LayerStreamed.is_gpu_resident());
+    }
+
+    #[test]
+    fn native_low_vram_resource_plan_is_inventory_bound_and_below_32_gb_correctness() {
+        let (derived_turbo, derived_edit) = inventory_low_vram_live_weight_bounds();
+        assert_eq!(derived_turbo, NATIVE_LOW_VRAM_TURBO_LIVE_WEIGHT_BYTES);
+        assert_eq!(derived_edit, NATIVE_LOW_VRAM_EDIT_LIVE_WEIGHT_BYTES);
+
+        let turbo = native_low_vram_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        assert_eq!(
+            turbo.inventory_audited_peak_weight_bytes,
+            NATIVE_LOW_VRAM_TURBO_LIVE_WEIGHT_BYTES
+        );
+        assert_eq!(turbo.planned_device_bytes, 30_585_112_576);
+        assert!(turbo.planned_device_bytes < turbo.device_budget_bytes);
+
+        for variant in [
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            let edit =
+                native_low_vram_resource_plan(variant, BooguStorageProfile::F16QwenVisionF32)
+                    .unwrap();
+            assert_eq!(
+                edit.inventory_audited_peak_weight_bytes,
+                NATIVE_LOW_VRAM_EDIT_LIVE_WEIGHT_BYTES
+            );
+            assert_eq!(edit.planned_device_bytes, 30_971_005_440);
+            assert!(edit.planned_device_bytes < edit.device_budget_bytes);
+        }
+    }
+
+    #[test]
+    fn native_low_vram_resource_plan_fails_closed_at_budget_correctness() {
+        let accepted = native_low_vram_resource_plan(
+            BooguVariant::Image01EditTurbo,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        let error = native_low_vram_resource_plan_with_budget(
+            BooguVariant::Image01EditTurbo,
+            BooguStorageProfile::F16QwenVisionF32,
+            accepted.planned_device_bytes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not stay below"), "{error}");
+    }
+
+    #[test]
+    fn native_low_vram_rejects_non_production_profile_before_loading_correctness() {
+        let mut factory = NativeBooguFactory::with_residency(
+            BooguVariant::Image01Turbo,
+            NativeBooguResidencyPolicy::LowVram,
+        );
+        let error = factory
+            .start(context(WgpuExecutionKind::NativeWgpu))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires profile=production"), "{error}");
+        assert!(error.contains("profile f16 is not qualified"), "{error}");
     }
 
     #[test]
@@ -1271,35 +1750,40 @@ mod tests {
     }
 
     #[test]
-    fn qualified_policy_is_scoped_to_native_high_vram_mixed_f16_correctness() {
-        for variant in [BooguVariant::Image01Turbo, BooguVariant::Image01EditTurbo] {
-            assert!(NativeBooguFactory::requires_full_autotune(
-                variant,
-                NativeBooguResidencyPolicy::HighVram,
-                BooguStorageProfile::F16QwenVisionF32,
-            ));
-            assert_eq!(
-                qualified_native_high_vram_policy(
+    fn qualified_policy_covers_native_high_and_low_vram_mixed_f16_correctness() {
+        for residency in [
+            NativeBooguResidencyPolicy::HighVram,
+            NativeBooguResidencyPolicy::LowVram,
+        ] {
+            for variant in [BooguVariant::Image01Turbo, BooguVariant::Image01EditTurbo] {
+                assert!(NativeBooguFactory::requires_full_autotune(
                     variant,
-                    NativeBooguResidencyPolicy::HighVram,
+                    residency,
+                    BooguStorageProfile::F16QwenVisionF32,
+                ));
+                assert_eq!(
+                    qualified_native_execution_policy(
+                        variant,
+                        residency,
+                        BooguStorageProfile::F16QwenVisionF32,
+                    ),
+                    Some(BOOGU_1K_NATIVE_POLICY)
+                );
+            }
+            assert_eq!(
+                qualified_native_execution_policy(
+                    BooguVariant::Image01EditTurbo1k5,
+                    residency,
                     BooguStorageProfile::F16QwenVisionF32,
                 ),
-                Some(BOOGU_1K_NATIVE_POLICY)
+                Some(EDIT_TURBO_1K5_NATIVE_POLICY)
             );
-        }
-        assert_eq!(
-            qualified_native_high_vram_policy(
+            assert!(NativeBooguFactory::requires_full_autotune(
                 BooguVariant::Image01EditTurbo1k5,
-                NativeBooguResidencyPolicy::HighVram,
+                residency,
                 BooguStorageProfile::F16QwenVisionF32,
-            ),
-            Some(EDIT_TURBO_1K5_NATIVE_POLICY)
-        );
-        assert!(NativeBooguFactory::requires_full_autotune(
-            BooguVariant::Image01EditTurbo1k5,
-            NativeBooguResidencyPolicy::HighVram,
-            BooguStorageProfile::F16QwenVisionF32,
-        ));
+            ));
+        }
 
         for variant in [
             BooguVariant::Image01Turbo,
@@ -1312,7 +1796,7 @@ mod tests {
                 BooguStorageProfile::F16QwenVisionF32,
             ));
             assert_eq!(
-                qualified_native_high_vram_policy(
+                qualified_native_execution_policy(
                     variant,
                     NativeBooguResidencyPolicy::LayerStreamed,
                     BooguStorageProfile::F16QwenVisionF32,
@@ -1324,19 +1808,18 @@ mod tests {
                 BooguStorageProfile::Q8sBlock32F32,
                 BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
             ] {
-                assert!(!NativeBooguFactory::requires_full_autotune(
-                    variant,
+                for residency in [
                     NativeBooguResidencyPolicy::HighVram,
-                    profile,
-                ));
-                assert_eq!(
-                    qualified_native_high_vram_policy(
-                        variant,
-                        NativeBooguResidencyPolicy::HighVram,
-                        profile,
-                    ),
-                    None
-                );
+                    NativeBooguResidencyPolicy::LowVram,
+                ] {
+                    assert!(!NativeBooguFactory::requires_full_autotune(
+                        variant, residency, profile,
+                    ));
+                    assert_eq!(
+                        qualified_native_execution_policy(variant, residency, profile),
+                        None
+                    );
+                }
             }
         }
     }
@@ -1411,7 +1894,7 @@ mod tests {
         );
         let error = factory.start(context).unwrap_err().to_string();
         assert!(
-            error.contains("parity-gated native high-VRAM policy"),
+            error.contains("parity-gated native high-VRAM or supported low-VRAM policy"),
             "{error}"
         );
     }

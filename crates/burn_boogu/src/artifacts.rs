@@ -243,6 +243,23 @@ impl BooguArtifactInventory {
         Ok(inventory)
     }
 
+    /// Build the exact standalone Boogu denoiser inventory from its validated config.
+    ///
+    /// This is useful to audit denoiser-only residency plans without constructing unrelated Qwen
+    /// or VAE configurations. The returned contracts are identical to the denoiser subset of
+    /// [`Self::new`].
+    pub fn denoiser(denoiser: &BooguConfig) -> Result<Self, BooguError> {
+        denoiser.validate()?;
+        let mut tensors = boogu_specs(denoiser);
+        tensors.sort_by(|left, right| {
+            (&left.source_component, &left.source_name)
+                .cmp(&(&right.source_component, &right.source_name))
+        });
+        let inventory = Self { tensors };
+        inventory.validate_internal()?;
+        Ok(inventory)
+    }
+
     /// Exact tensor contracts in deterministic source-key order.
     pub fn tensors(&self) -> &[ArtifactTensorSpec] {
         &self.tensors
@@ -330,6 +347,308 @@ impl BooguArtifactInventory {
         }
         Ok(())
     }
+
+    /// Derive the exact denoiser parameter payload for runtime Q8S block-32/F32 execution.
+    ///
+    /// Inventory-qualified matrices use one signed byte per value plus one F32 scale per block of
+    /// 32 values. All other denoiser tensors are widened to F32 by the runtime load policy. Turbo
+    /// excludes edit-only reference-refiner stages. This is a parameter-payload count; allocator
+    /// alignment, activations, quantization workspace, and backend kernel scratch are separate.
+    pub fn denoiser_runtime_q8s_block32_f32_footprint(
+        &self,
+        variant: BooguVariant,
+    ) -> Result<BooguDenoiserRuntimeQ8Footprint, BooguError> {
+        self.denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+            variant,
+            BooguRuntimeQ8Scope::AllInventoryEligible,
+        )
+    }
+
+    /// Derive the exact denoiser parameter payload for one closed runtime-Q8 execution scope.
+    ///
+    /// The scope changes only the runtime adaptation of already-authenticated floating-point
+    /// tensors. It does not alter artifact eligibility, inventories, manifests, or content
+    /// digests.
+    pub fn denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+        &self,
+        variant: BooguVariant,
+        scope: BooguRuntimeQ8Scope,
+    ) -> Result<BooguDenoiserRuntimeQ8Footprint, BooguError> {
+        scope.validate_variant(variant)?;
+        let mut footprint = BooguDenoiserRuntimeQ8Footprint::default();
+        for spec in self
+            .tensors
+            .iter()
+            .filter(|spec| spec.owner == TensorOwner::BooguDenoiser)
+            .filter(|spec| variant.is_edit() || !spec.stage.starts_with("boogu-reference-refiner-"))
+        {
+            let elements = spec
+                .target_shape
+                .iter()
+                .try_fold(1_u64, |total, &dimension| {
+                    total.checked_mul(dimension as u64)
+                })
+                .ok_or_else(|| {
+                    BooguError::Artifact(format!(
+                        "runtime Q8 footprint element count overflowed for {}",
+                        spec.target_name
+                    ))
+                })?;
+            if spec.quantizable && scope.quantizes_target(&spec.target_name) {
+                if !elements.is_multiple_of(32) {
+                    return Err(BooguError::Artifact(format!(
+                        "runtime Q8 footprint is not block-32 aligned for {}",
+                        spec.target_name
+                    )));
+                }
+                footprint.quantized_elements = footprint
+                    .quantized_elements
+                    .checked_add(elements)
+                    .ok_or_else(|| {
+                    BooguError::Artifact("runtime Q8 element count overflowed".into())
+                })?;
+                footprint.quantized_tensor_count = footprint
+                    .quantized_tensor_count
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        BooguError::Artifact("runtime Q8 tensor count overflowed".into())
+                    })?;
+                let packed_bytes = elements.checked_add(elements / 32 * 4).ok_or_else(|| {
+                    BooguError::Artifact("runtime Q8 byte count overflowed".into())
+                })?;
+                footprint.quantized_payload_bytes = footprint
+                    .quantized_payload_bytes
+                    .checked_add(packed_bytes)
+                    .ok_or_else(|| {
+                        BooguError::Artifact("runtime Q8 byte count overflowed".into())
+                    })?;
+            } else {
+                footprint.f32_tensor_count =
+                    footprint.f32_tensor_count.checked_add(1).ok_or_else(|| {
+                        BooguError::Artifact("runtime F32 tensor count overflowed".into())
+                    })?;
+                footprint.f32_elements =
+                    footprint
+                        .f32_elements
+                        .checked_add(elements)
+                        .ok_or_else(|| {
+                            BooguError::Artifact("runtime F32 element count overflowed".into())
+                        })?;
+                footprint.f32_payload_bytes = footprint
+                    .f32_payload_bytes
+                    .checked_add(elements.checked_mul(4).ok_or_else(|| {
+                        BooguError::Artifact("runtime F32 byte count overflowed".into())
+                    })?)
+                    .ok_or_else(|| {
+                        BooguError::Artifact("runtime F32 byte count overflowed".into())
+                    })?;
+            }
+            footprint.tensor_count = footprint
+                .tensor_count
+                .checked_add(1)
+                .ok_or_else(|| BooguError::Artifact("runtime Q8 tensor count overflowed".into()))?;
+        }
+        footprint.total_payload_bytes = footprint
+            .quantized_payload_bytes
+            .checked_add(footprint.f32_payload_bytes)
+            .ok_or_else(|| BooguError::Artifact("runtime Q8 total byte count overflowed".into()))?;
+        if footprint.tensor_count == 0 || footprint.total_payload_bytes == 0 {
+            return Err(BooguError::Artifact(
+                "runtime Q8 denoiser footprint contains no tensors".into(),
+            ));
+        }
+        Ok(footprint)
+    }
+}
+
+/// Closed selection of inventory-eligible matrices adapted to Q8 at runtime.
+///
+/// Artifact eligibility remains immutable. A narrower scope keeps selected authenticated F16
+/// production weights in F32 only while applying a runtime execution policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BooguRuntimeQ8Scope {
+    /// Quantize every matrix marked eligible by the sealed artifact inventory.
+    #[default]
+    AllInventoryEligible,
+    /// Turbo-only runtime stability scope retaining caption and final projection linears in F32.
+    TurboCaptionAndTailF32,
+    /// Historical Turbo diagnostic scope quantizing attention and feed-forward matrices only.
+    ///
+    /// Prelude projections, timestep/caption conditioning, every adaptive modulation projection,
+    /// and the output tail remain F32. Those comparatively small, high-leverage matrices control
+    /// residual scales and gates across the full denoiser. This scope remains available for
+    /// reproducible artifact accounting, but is not the current Turbo browser policy.
+    TurboAttentionFfnCoreQ8,
+    /// Historical Turbo scope quantizing all feed-forward matrices while retaining attention in F32.
+    ///
+    /// Only the ordinary, image, and instruction feed-forward module families are selected. Every
+    /// attention, conditioning, adaptive-modulation, prelude, and output-tail matrix remains F32.
+    /// It remains available for reproducible accounting but is not the current browser policy.
+    TurboFfnCoreQ8,
+    /// Historical Turbo scope quantizing every feed-forward gate and up projection.
+    ///
+    /// Within the ordinary, image, and instruction feed-forward module families, only
+    /// `linear_1.weight` and `linear_3.weight` are selected. The `linear_2.weight` down projection,
+    /// attention, conditioning, adaptive modulation, prelude, and output tail remain F32. This
+    /// remains available for reproducible accounting but is not the current browser policy.
+    TurboFfnGateUpQ8,
+    /// Evidence-calibrated Turbo scope selecting the exact 96 main-core gate/up matrices.
+    ///
+    /// All single-stream gate/up matrices and all dual-stream image/instruction gate/up matrices
+    /// are selected. Every down projection plus every context/noise refiner matrix remains F32.
+    /// This cap-tight policy is pending a complete real-browser measurement and is not a
+    /// numerical-parity claim.
+    TurboMainCoreFfnGateUpQ8,
+}
+
+impl BooguRuntimeQ8Scope {
+    /// Stable provenance label for the runtime-only selection.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::AllInventoryEligible => "all-inventory-eligible",
+            Self::TurboCaptionAndTailF32 => "turbo-caption-tail-f32",
+            Self::TurboAttentionFfnCoreQ8 => "turbo-attention-ffn-core-q8",
+            Self::TurboFfnCoreQ8 => "turbo-ffn-core-q8",
+            Self::TurboFfnGateUpQ8 => "turbo-ffn-gate-up-q8",
+            Self::TurboMainCoreFfnGateUpQ8 => "turbo-main-core-ffn-gate-up-q8",
+        }
+    }
+
+    fn quantizes_target(self, target: &str) -> bool {
+        match self {
+            Self::AllInventoryEligible => true,
+            Self::TurboCaptionAndTailF32 => !matches!(
+                target,
+                "time_caption_embed.caption_linear.weight"
+                    | "norm_out.linear_1.weight"
+                    | "norm_out.linear_2.weight"
+            ),
+            Self::TurboAttentionFfnCoreQ8 => turbo_attention_ffn_core_q8_target(target),
+            Self::TurboFfnCoreQ8 => turbo_ffn_core_q8_target(target),
+            Self::TurboFfnGateUpQ8 => turbo_ffn_gate_up_q8_target(target),
+            Self::TurboMainCoreFfnGateUpQ8 => turbo_main_core_ffn_gate_up_q8_target(target),
+        }
+    }
+
+    fn validate_variant(self, variant: BooguVariant) -> Result<(), BooguError> {
+        if matches!(
+            self,
+            Self::TurboCaptionAndTailF32
+                | Self::TurboAttentionFfnCoreQ8
+                | Self::TurboFfnCoreQ8
+                | Self::TurboFfnGateUpQ8
+                | Self::TurboMainCoreFfnGateUpQ8
+        ) && variant != BooguVariant::Image01Turbo
+        {
+            return Err(BooguError::Artifact(format!(
+                "runtime Q8 scope {} is restricted to Image01Turbo, found {variant:?}",
+                self.label()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn turbo_attention_ffn_core_q8_target(target: &str) -> bool {
+    // Fail closed: only the exact attention and feed-forward module families are quantized. A
+    // newly added inventory-eligible projection therefore stays F32 until it is explicitly
+    // classified and numerically qualified.
+    target.ends_with(".weight")
+        && (target.contains(".attn.")
+            || target.contains(".joint_attn.")
+            || target.contains(".image_self_attn.")
+            || target.contains(".feed_forward.")
+            || target.contains(".image_ffn.")
+            || target.contains(".instruction_ffn."))
+}
+
+fn turbo_ffn_core_q8_target(target: &str) -> bool {
+    // Fail closed: attention and every newly introduced matrix family remain F32 until an exact
+    // classifier and real-checkpoint numerical evidence explicitly admit them.
+    target.ends_with(".weight")
+        && (target.contains(".feed_forward.")
+            || target.contains(".image_ffn.")
+            || target.contains(".instruction_ffn."))
+}
+
+fn turbo_ffn_gate_up_q8_target(target: &str) -> bool {
+    // Fail closed: admit only the two explicitly qualified gate/up projections. In particular,
+    // the feed-forward down projection (`linear_2`) stays F32 so accumulated quantization error is
+    // not injected directly into the residual stream.
+    (target.ends_with(".linear_1.weight") || target.ends_with(".linear_3.weight"))
+        && (target.contains(".feed_forward.")
+            || target.contains(".image_ffn.")
+            || target.contains(".instruction_ffn."))
+}
+
+fn canonical_indexed_ffn_projection_target(
+    target: &str,
+    prefix: &str,
+    layer_count: usize,
+    module_and_projection: &[&str],
+) -> bool {
+    let Some(index_and_path) = target.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((index, path)) = index_and_path.split_once('.') else {
+        return false;
+    };
+    if index.is_empty()
+        || (index.len() > 1 && index.starts_with('0'))
+        || !index.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let Ok(index) = index.parse::<usize>() else {
+        return false;
+    };
+    index < layer_count && module_and_projection.contains(&path)
+}
+
+fn turbo_main_core_ffn_gate_up_q8_target(target: &str) -> bool {
+    const SINGLE_STREAM_GATE_UP: &[&str] = &[
+        "feed_forward.linear_1.weight",
+        "feed_forward.linear_3.weight",
+    ];
+    const DOUBLE_STREAM_GATE_UP: &[&str] = &[
+        "image_ffn.linear_1.weight",
+        "image_ffn.linear_3.weight",
+        "instruction_ffn.linear_1.weight",
+        "instruction_ffn.linear_3.weight",
+    ];
+
+    canonical_indexed_ffn_projection_target(
+        target,
+        "single_stream_layers.",
+        32,
+        SINGLE_STREAM_GATE_UP,
+    ) || canonical_indexed_ffn_projection_target(
+        target,
+        "double_stream_layers.",
+        8,
+        DOUBLE_STREAM_GATE_UP,
+    )
+}
+
+/// Inventory-derived denoiser parameter payload for runtime Q8S block-32/F32 execution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BooguDenoiserRuntimeQ8Footprint {
+    /// Number of included denoiser tensor contracts.
+    pub tensor_count: usize,
+    /// Number of inventory-qualified tensors stored as blockwise Q8S.
+    pub quantized_tensor_count: usize,
+    /// Number of tensors widened to ordinary F32.
+    pub f32_tensor_count: usize,
+    /// Values stored in blockwise Q8S tensors.
+    pub quantized_elements: u64,
+    /// Values kept as ordinary F32 tensors.
+    pub f32_elements: u64,
+    /// Packed signed values plus one F32 scale per 32-value block.
+    pub quantized_payload_bytes: u64,
+    /// Four bytes per non-quantized value.
+    pub f32_payload_bytes: u64,
+    /// Sum of packed-Q8 and F32 parameter payloads.
+    pub total_payload_bytes: u64,
 }
 
 fn qwen_specs(config: &Qwen3VlConfig) -> Vec<ArtifactTensorSpec> {
@@ -989,7 +1308,12 @@ mod loading {
     use burn::{
         nn::{RmsNorm, RmsNormConfig},
         prelude::Backend,
-        tensor::{Bytes, DType, Tensor, TensorData, quantization::QuantizedBytes},
+        tensor::{
+            Bytes, DType, Tensor, TensorData,
+            quantization::{
+                QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue, QuantizedBytes,
+            },
+        },
     };
     use burn_flux_vae::{
         AutoencoderKl, AutoencoderKlConfig, FLUX_VAE_COMPONENT_ROLE, FluxVaeComponentContract,
@@ -1016,8 +1340,8 @@ mod loading {
 
     use super::{
         BOOGU_RELEASE_MAX_METADATA_BYTES, BOOGU_RELEASE_MAX_SHARD_BYTES, BooguArtifactInventory,
-        BooguConfig, BooguReleaseIdentity, SourceDType, TensorOwner, TensorTransform,
-        legacy_qwen_stage, qwen_row_slice_target, qwen_streaming_stage_name,
+        BooguConfig, BooguReleaseIdentity, BooguRuntimeQ8Scope, SourceDType, TensorOwner,
+        TensorTransform, legacy_qwen_stage, qwen_row_slice_target, qwen_streaming_stage_name,
         validate_supported_bundle_converter_version,
     };
     use crate::{
@@ -1232,10 +1556,12 @@ mod loading {
         pub converter_version: &'static str,
     }
 
-    /// The three immutable production bundles published beneath the canonical CDN root.
+    /// The three immutable production parent bundles published beneath the canonical CDN root.
     ///
-    /// Hybrid-Q8 and all-F16 bundles remain available as explicitly selected diagnostics, but are
-    /// intentionally absent from this canonical publication set.
+    /// The shared Qwen and VAE component bundles are also canonical published entries, but parent
+    /// dependency pins select them instead of a variant/profile lookup. Hybrid-Q8 and all-F16
+    /// bundles remain available as explicitly selected diagnostics and are intentionally absent
+    /// from this canonical parent selection set.
     pub const PUBLISHED_ARTIFACT_BUNDLES: [CanonicalBooguArtifactBundle; 3] = [
         CanonicalBooguArtifactBundle {
             variant: BooguVariant::Image01Turbo,
@@ -1411,6 +1737,55 @@ mod loading {
         DequantizeF16,
     }
 
+    /// Backend allocator policy while populating a resident denoiser from verified Burnpacks.
+    ///
+    /// The default preserves allocator caching for existing native/high-VRAM callers. A bounded
+    /// residency runtime can explicitly synchronize and release wholly unused upload and allocator
+    /// pages after each physical shard, preventing transient buffers from accumulating until the
+    /// complete model is loaded.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum BooguResidentLoadMemoryPolicy {
+        /// Preserve the backend allocator cache until the complete resident model is loaded.
+        #[default]
+        PreserveAllocatorCache,
+        /// Synchronize and release transient backend pages after each verified physical shard.
+        ReleaseTransientBuffersPerShard,
+    }
+
+    impl BooguResidentLoadMemoryPolicy {
+        const fn releases_transient_buffers(self) -> bool {
+            matches!(self, Self::ReleaseTransientBuffersPerShard)
+        }
+    }
+
+    /// Runtime conversion policy for verified floating-point Boogu denoiser snapshots.
+    ///
+    /// This policy is intentionally separate from [`BooguQuantizedLoadPolicy`], which describes
+    /// how an already-quantized artifact payload is loaded. Runtime conversion leaves the sealed
+    /// production Burnpacks unchanged and is accepted only by verified Boogu denoiser stage
+    /// sources. Qwen and VAE loaders cannot enable it.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum BooguDenoiserRuntimeQuantizationPolicy {
+        /// Keep authenticated floating-point denoiser snapshots floating point.
+        #[default]
+        Disabled,
+        /// Convert inventory-eligible F16/F32 denoiser matrices to Q8S block-32/F32 after
+        /// integrity, dtype, shape, and inventory eligibility have been verified.
+        Q8sBlock32F32,
+    }
+
+    impl BooguDenoiserRuntimeQuantizationPolicy {
+        /// Stable provenance label for runtime reports.
+        pub const fn label(self) -> &'static str {
+            match self {
+                Self::Disabled => "disabled",
+                Self::Q8sBlock32F32 => "runtime-quantize-q8s-block32-f32",
+            }
+        }
+    }
+
     const fn qwen_quantized_policy(profile: BooguStorageProfile) -> BooguQuantizedLoadPolicy {
         match profile {
             BooguStorageProfile::F16 | BooguStorageProfile::F16QwenVisionF32 => {
@@ -1425,29 +1800,29 @@ mod loading {
 
     #[derive(Debug, Clone, Deserialize)]
     #[serde(deny_unknown_fields)]
-    pub(super) struct SerializedTensorInventory {
-        source_name: String,
+    pub(crate) struct SerializedTensorInventory {
+        pub(crate) source_name: String,
         #[serde(default)]
-        logical_target_name: Option<String>,
-        target_name: String,
-        owner: TensorOwner,
-        component: String,
-        stage: String,
-        transform: TensorTransform,
-        source_file: String,
-        source_dtype: String,
-        source_shape: Vec<usize>,
+        pub(crate) logical_target_name: Option<String>,
+        pub(crate) target_name: String,
+        pub(crate) owner: TensorOwner,
+        pub(crate) component: String,
+        pub(crate) stage: String,
+        pub(crate) transform: TensorTransform,
+        pub(crate) source_file: String,
+        pub(crate) source_dtype: String,
+        pub(crate) source_shape: Vec<usize>,
         #[serde(default)]
-        source_row_range: Option<[usize; 2]>,
+        pub(crate) source_row_range: Option<[usize; 2]>,
         #[serde(default = "included_by_default")]
-        included: bool,
-        stored_dtype: Option<String>,
-        stored_shape: Option<Vec<usize>>,
-        source_offset: u64,
-        source_bytes: u64,
-        quantized: bool,
-        stored_sha256: Option<Sha256Digest>,
-        burnpack_object: Option<String>,
+        pub(crate) included: bool,
+        pub(crate) stored_dtype: Option<String>,
+        pub(crate) stored_shape: Option<Vec<usize>>,
+        pub(crate) source_offset: u64,
+        pub(crate) source_bytes: u64,
+        pub(crate) quantized: bool,
+        pub(crate) stored_sha256: Option<Sha256Digest>,
+        pub(crate) burnpack_object: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -2754,7 +3129,7 @@ mod loading {
         Ok((objects, tensors, largest))
     }
 
-    async fn read_verified_async<R: AsyncStageShardReader + ?Sized>(
+    pub(crate) async fn read_verified_async<R: AsyncStageShardReader + ?Sized>(
         reader: &mut R,
         file: &ArtifactFile,
         max_bytes: u64,
@@ -2791,7 +3166,7 @@ mod loading {
         }
     }
 
-    async fn verify_inventory_contract_async<R: AsyncStageShardReader + ?Sized>(
+    pub(crate) async fn verify_inventory_contract_async<R: AsyncStageShardReader + ?Sized>(
         manifest: &ArtifactManifest,
         inventory: &BooguArtifactInventory,
         profile: BooguStorageProfile,
@@ -3171,12 +3546,15 @@ mod loading {
     pub struct VerifiedBurnpackStageSource<B: Backend, R> {
         config: BooguConfig,
         inventory: BooguArtifactInventory,
+        variant: BooguVariant,
         profile: BooguStorageProfile,
         device: B::Device,
         stages: BTreeMap<String, Vec<ArtifactFile>>,
         reader: R,
         float_policy: BooguFloatLoadPolicy,
         quantized_policy: BooguQuantizedLoadPolicy,
+        runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
+        runtime_q8_scope: BooguRuntimeQ8Scope,
     }
 
     impl<B: Backend, R: StageShardReader> VerifiedBurnpackStageSource<B, R> {
@@ -3238,12 +3616,15 @@ mod loading {
             Ok(Self {
                 config,
                 inventory,
+                variant: identity.variant,
                 profile,
                 device,
                 stages,
                 reader,
                 float_policy: BooguFloatLoadPolicy::Preserve,
                 quantized_policy: BooguQuantizedLoadPolicy::Preserve,
+                runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+                runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
             })
         }
 
@@ -3257,12 +3638,31 @@ mod loading {
             self
         }
 
-        /// Select whether verified Q8S denoiser matrices remain quantized on device.
+        /// Select how already-quantized, verified Q8S denoiser matrices are loaded.
         ///
         /// Production Boogu row-layout stages use [`BooguQuantizedLoadPolicy::Preserve`] together
         /// with [`BooguFloatLoadPolicy::AdaptToF32`] and F32 activations.
         pub fn with_quantized_load_policy(mut self, policy: BooguQuantizedLoadPolicy) -> Self {
             self.quantized_policy = policy;
+            self
+        }
+
+        /// Select whether eligible verified float denoiser matrices are quantized at runtime.
+        ///
+        /// The default is [`BooguDenoiserRuntimeQuantizationPolicy::Disabled`]. Enabling Q8S
+        /// conversion does not alter artifact identity and remains constrained by the sealed
+        /// inventory plus [`Self::with_runtime_q8_scope`].
+        pub fn with_runtime_quantization_policy(
+            mut self,
+            policy: BooguDenoiserRuntimeQuantizationPolicy,
+        ) -> Self {
+            self.runtime_quantization_policy = policy;
+            self
+        }
+
+        /// Select the closed subset of inventory-eligible matrices quantized at runtime.
+        pub fn with_runtime_q8_scope(mut self, scope: BooguRuntimeQ8Scope) -> Self {
+            self.runtime_q8_scope = scope;
             self
         }
 
@@ -3294,6 +3694,15 @@ mod loading {
             prefix: &str,
             mut module: M,
         ) -> Result<M, BooguError> {
+            validate_runtime_denoiser_quantization_policy(
+                self.profile,
+                self.float_policy,
+                self.quantized_policy,
+                self.runtime_quantization_policy,
+                self.runtime_q8_scope,
+                self.variant,
+                stage,
+            )?;
             let files = self.stages.get(stage).cloned().ok_or_else(|| {
                 BooguError::Artifact(format!("manifest has no denoiser stage {stage}"))
             })?;
@@ -3331,6 +3740,7 @@ mod loading {
                     )));
                 }
                 let mut local = Vec::with_capacity(raw.len());
+                let mut runtime_quantizable_paths = BTreeSet::new();
                 for (name, snapshot) in raw {
                     let spec = self.inventory.by_target(name).ok_or_else(|| {
                         BooguError::Artifact(format!(
@@ -3364,13 +3774,22 @@ mod loading {
                             "stage {stage} tensor {name} does not start with {prefix:?}"
                         ))
                     })?;
+                    if spec.quantizable && self.runtime_q8_scope.quantizes_target(&spec.target_name)
+                    {
+                        runtime_quantizable_paths.insert(local_name.to_owned());
+                    }
                     local.push(rename_snapshot(snapshot, local_name));
                 }
                 let expected_applied = local
                     .iter()
                     .map(TensorSnapshot::full_path)
                     .collect::<BTreeSet<_>>();
-                let adapter = load_adapter(self.float_policy, self.quantized_policy);
+                let adapter = denoiser_load_adapter(
+                    self.float_policy,
+                    self.quantized_policy,
+                    self.runtime_quantization_policy,
+                    runtime_quantizable_paths,
+                );
                 let result = module.apply(local, None, adapter, false);
                 validate_partial_apply(stage, &result, &expected_applied).map_err(|error| {
                     BooguError::Artifact(format!("failed to apply stage {stage}: {error}"))
@@ -3734,7 +4153,7 @@ mod loading {
                     // verified release dtype so embeddings and the streamed text-stage weights
                     // have one exact execution dtype.
                     let dtype = data.dtype;
-                    found = Some(Tensor::<B, 2>::from_data(data, &self.device).cast(dtype));
+                    found = Some(Tensor::<B, 2>::from_data(data, (&self.device, dtype)));
                 }
             }
             found.ok_or_else(|| BooguError::Artifact(format!("Qwen row stage {stage} is empty")))
@@ -4330,7 +4749,7 @@ mod loading {
                         data = data.convert_dtype(DType::F32);
                     }
                     let dtype = data.dtype;
-                    found = Some(Tensor::<B, 2>::from_data(data, &self.device).cast(dtype));
+                    found = Some(Tensor::<B, 2>::from_data(data, (&self.device, dtype)));
                 }
                 // The current plan stores one row tensor per file; any additional file would be
                 // rejected as a duplicate on the following iteration.
@@ -4474,6 +4893,37 @@ mod loading {
         quantized_policy: BooguQuantizedLoadPolicy,
         device: &B::Device,
     ) -> Result<(BooguDenoiser<B>, BooguLoadReport), BooguArtifactLoadError> {
+        load_resident_denoiser_from_directory_with_memory_policy(
+            identity,
+            root,
+            inventory,
+            config,
+            profile,
+            float_policy,
+            quantized_policy,
+            BooguResidentLoadMemoryPolicy::PreserveAllocatorCache,
+            device,
+        )
+    }
+
+    /// Load the complete denoiser with explicit snapshot and allocator policies.
+    ///
+    /// [`BooguResidentLoadMemoryPolicy::ReleaseTransientBuffersPerShard`] is intended for a
+    /// strictly bounded native initialization path. It preserves the loaded model and numerical
+    /// policy, but retires completed materialization/upload work and releases wholly unused backend
+    /// pages before reading the next physical shard.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_resident_denoiser_from_directory_with_memory_policy<B: Backend>(
+        identity: &BooguReleaseIdentity,
+        root: impl AsRef<Path>,
+        inventory: BooguArtifactInventory,
+        config: BooguConfig,
+        profile: BooguStorageProfile,
+        float_policy: BooguFloatLoadPolicy,
+        quantized_policy: BooguQuantizedLoadPolicy,
+        memory_policy: BooguResidentLoadMemoryPolicy,
+        device: &B::Device,
+    ) -> Result<(BooguDenoiser<B>, BooguLoadReport), BooguArtifactLoadError> {
         let root = root.as_ref();
         let manifest = read_directory_manifest(root)?;
         let reader = DirectoryStageShardReader::new(root);
@@ -4485,6 +4935,7 @@ mod loading {
             profile,
             float_policy,
             quantized_policy,
+            memory_policy,
             device,
             reader,
         )
@@ -4499,6 +4950,7 @@ mod loading {
         profile: BooguStorageProfile,
         float_policy: BooguFloatLoadPolicy,
         quantized_policy: BooguQuantizedLoadPolicy,
+        memory_policy: BooguResidentLoadMemoryPolicy,
         device: &B::Device,
         mut reader: R,
     ) -> Result<(BooguDenoiser<B>, BooguLoadReport), BooguArtifactLoadError> {
@@ -4641,6 +5093,24 @@ mod loading {
             report.shards += 1;
             report.tensors += shard_paths.len();
             *report.by_stage.entry(stage).or_default() += shard_paths.len();
+            if memory_policy.releases_transient_buffers() {
+                // `apply` queues tensor materialization and upload work. Drain it on this loader
+                // thread, then release only wholly unused transient pages and wait for cleanup
+                // before parsing and uploading the next physical shard.
+                drop(result);
+                drop(store);
+                B::sync(device).map_err(|error| {
+                    BooguArtifactLoadError::Model(format!(
+                        "device sync after applying denoiser shard failed: {error}"
+                    ))
+                })?;
+                B::memory_cleanup(device);
+                B::sync(device).map_err(|error| {
+                    BooguArtifactLoadError::Model(format!(
+                        "device sync after denoiser shard allocator cleanup failed: {error}"
+                    ))
+                })?;
+            }
             // Bytes, the Burnpack store, and host snapshots are dropped before the next file.
         }
         let missing = expected.difference(&applied).cloned().collect::<Vec<_>>();
@@ -5174,13 +5644,18 @@ mod loading {
     /// returned device module therefore contains exactly one semantic denoiser stage.
     pub struct VerifiedAsyncBurnpackDenoiserStageSource<B: Backend, R> {
         config: BooguConfig,
+        variant: BooguVariant,
+        profile: BooguStorageProfile,
         device: B::Device,
         entries: Vec<SerializedTensorInventory>,
+        runtime_quantizable_targets: BTreeSet<String>,
         stages: BTreeMap<String, Vec<ArtifactFile>>,
         reader: R,
         max_bytes: u64,
         float_policy: BooguFloatLoadPolicy,
         quantized_policy: BooguQuantizedLoadPolicy,
+        runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
+        runtime_q8_scope: BooguRuntimeQ8Scope,
     }
 
     impl<B: Backend, R: AsyncStageShardReader> VerifiedAsyncBurnpackDenoiserStageSource<B, R> {
@@ -5210,6 +5685,12 @@ mod loading {
                 .iter()
                 .filter(|spec| spec.owner == TensorOwner::BooguDenoiser)
                 .map(|spec| spec.stage.clone())
+                .collect::<BTreeSet<_>>();
+            let runtime_quantizable_targets = inventory
+                .tensors()
+                .iter()
+                .filter(|spec| spec.owner == TensorOwner::BooguDenoiser && spec.quantizable)
+                .map(|spec| spec.target_name.clone())
                 .collect::<BTreeSet<_>>();
             let actual_stages = entries
                 .iter()
@@ -5262,13 +5743,18 @@ mod loading {
             }
             Ok(Self {
                 config,
+                variant: identity.variant,
+                profile,
                 device,
                 entries,
+                runtime_quantizable_targets,
                 stages,
                 reader,
                 max_bytes,
                 float_policy: BooguFloatLoadPolicy::Preserve,
                 quantized_policy: BooguQuantizedLoadPolicy::Preserve,
+                runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+                runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
             })
         }
 
@@ -5278,12 +5764,31 @@ mod loading {
             self
         }
 
-        /// Select whether verified Q8S denoiser matrices remain quantized on device.
+        /// Select how already-quantized, verified Q8S denoiser matrices are loaded.
         ///
         /// Production WebGPU uses [`BooguQuantizedLoadPolicy::Preserve`] with F32 floating-point
         /// snapshots and activations; host dequantization remains available for diagnostics.
         pub fn with_quantized_load_policy(mut self, policy: BooguQuantizedLoadPolicy) -> Self {
             self.quantized_policy = policy;
+            self
+        }
+
+        /// Select whether eligible verified float denoiser matrices are quantized at runtime.
+        ///
+        /// The default is [`BooguDenoiserRuntimeQuantizationPolicy::Disabled`]. Enabling Q8S
+        /// conversion does not alter artifact identity and remains constrained by the sealed
+        /// inventory plus [`Self::with_runtime_q8_scope`].
+        pub fn with_runtime_quantization_policy(
+            mut self,
+            policy: BooguDenoiserRuntimeQuantizationPolicy,
+        ) -> Self {
+            self.runtime_quantization_policy = policy;
+            self
+        }
+
+        /// Select the closed subset of inventory-eligible matrices quantized at runtime.
+        pub fn with_runtime_q8_scope(mut self, scope: BooguRuntimeQ8Scope) -> Self {
+            self.runtime_q8_scope = scope;
             self
         }
 
@@ -5308,6 +5813,15 @@ mod loading {
             prefix: &str,
             mut module: M,
         ) -> Result<M, BooguError> {
+            validate_runtime_denoiser_quantization_policy(
+                self.profile,
+                self.float_policy,
+                self.quantized_policy,
+                self.runtime_quantization_policy,
+                self.runtime_q8_scope,
+                self.variant,
+                stage,
+            )?;
             let files = self.stages.get(stage).cloned().ok_or_else(|| {
                 BooguError::Artifact(format!("manifest has no denoiser stage {stage}"))
             })?;
@@ -5346,6 +5860,7 @@ mod loading {
                     )));
                 }
                 let mut local = Vec::with_capacity(snapshots.len());
+                let mut runtime_quantizable_paths = BTreeSet::new();
                 for (name, snapshot) in snapshots {
                     let entry = expected.get(name).ok_or_else(|| {
                         BooguError::Artifact(format!(
@@ -5378,6 +5893,11 @@ mod loading {
                             "stage {stage} tensor {name} does not start with {prefix:?}"
                         ))
                     })?;
+                    if self.runtime_quantizable_targets.contains(name)
+                        && self.runtime_q8_scope.quantizes_target(name)
+                    {
+                        runtime_quantizable_paths.insert(local_name.to_owned());
+                    }
                     local.push(rename_snapshot(snapshot, local_name));
                 }
                 let expected_applied = local
@@ -5387,7 +5907,12 @@ mod loading {
                 let result = module.apply(
                     local,
                     None,
-                    load_adapter(self.float_policy, self.quantized_policy),
+                    denoiser_load_adapter(
+                        self.float_policy,
+                        self.quantized_policy,
+                        self.runtime_quantization_policy,
+                        runtime_quantizable_paths,
+                    ),
                     false,
                 );
                 validate_partial_apply(stage, &result, &expected_applied).map_err(|error| {
@@ -6173,7 +6698,7 @@ mod loading {
         Ok(())
     }
 
-    fn validate_release_manifest(
+    pub(crate) fn validate_release_manifest(
         identity: &BooguReleaseIdentity,
         manifest: &ArtifactManifest,
         inventory: &BooguArtifactInventory,
@@ -6283,7 +6808,7 @@ mod loading {
             .collect()
     }
 
-    fn declared_target_max_shard_bytes(
+    pub(crate) fn declared_target_max_shard_bytes(
         manifest: &ArtifactManifest,
     ) -> Result<u64, BooguArtifactLoadError> {
         let value = manifest
@@ -6516,10 +7041,127 @@ mod loading {
         }
     }
 
-    #[derive(Debug, Clone, Copy)]
-    struct ArtifactLoadAdapter {
+    pub(super) fn validate_runtime_denoiser_quantization_policy(
+        profile: BooguStorageProfile,
         float_policy: BooguFloatLoadPolicy,
         quantized_policy: BooguQuantizedLoadPolicy,
+        runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
+        runtime_q8_scope: BooguRuntimeQ8Scope,
+        variant: BooguVariant,
+        stage: &str,
+    ) -> Result<(), BooguError> {
+        if runtime_quantization_policy == BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32
+            && !matches!(
+                profile,
+                BooguStorageProfile::F16 | BooguStorageProfile::F16QwenVisionF32
+            )
+        {
+            return Err(BooguError::Artifact(format!(
+                "stage {stage} runtime Q8S quantization requires a sealed F16 production denoiser; profile {profile:?} already stores quantized tensors"
+            )));
+        }
+        if runtime_quantization_policy == BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32
+            && quantized_policy != BooguQuantizedLoadPolicy::Preserve
+        {
+            return Err(BooguError::Artifact(format!(
+                "stage {stage} runtime Q8S quantization requires the stored-payload quantized load policy Preserve"
+            )));
+        }
+        runtime_q8_scope.validate_variant(variant)?;
+        if runtime_q8_scope != BooguRuntimeQ8Scope::AllInventoryEligible
+            && (profile != BooguStorageProfile::F16QwenVisionF32
+                || float_policy != BooguFloatLoadPolicy::AdaptToF32
+                || quantized_policy != BooguQuantizedLoadPolicy::Preserve
+                || runtime_quantization_policy
+                    != BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
+        {
+            return Err(BooguError::Artifact(format!(
+                "stage {stage} runtime Q8 scope {} requires the production F16/Qwen-vision-F32 profile, AdaptToF32, and runtime Q8S quantization",
+                runtime_q8_scope.label()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Quantize one row-layout floating-point payload with the canonical Boogu Q8S algorithm.
+    ///
+    /// Both the offline importer and the verified runtime denoiser adapter call this function, so
+    /// block scaling, rounding, clamping, zero-block handling, and packed storage stay byte-for-byte
+    /// identical for identical input values. The caller remains responsible for authenticating the
+    /// source tensor and proving that its inventory contract permits quantization.
+    pub fn quantize_q8s_block32_f32(
+        values: Vec<f32>,
+        shape: Vec<usize>,
+    ) -> Result<TensorData, TensorSnapshotError> {
+        let elements = shape.iter().try_fold(1_usize, |product, dimension| {
+            product.checked_mul(*dimension)
+        });
+        if elements != Some(values.len()) {
+            return Err(TensorSnapshotError::DataError(format!(
+                "Q8S shape {shape:?} describes {elements:?} elements, received {} values",
+                values.len()
+            )));
+        }
+        if !values.len().is_multiple_of(32) {
+            return Err(TensorSnapshotError::DataError(
+                "Q8S block tensor length is not divisible by 32".into(),
+            ));
+        }
+        let mut quantized = Vec::with_capacity(values.len());
+        let mut scales = Vec::with_capacity(values.len() / 32);
+        for block in values.chunks_exact(32) {
+            if block.iter().any(|value| !value.is_finite()) {
+                return Err(TensorSnapshotError::DataError(
+                    "cannot quantize a non-finite checkpoint value".into(),
+                ));
+            }
+            let alpha = block
+                .iter()
+                .fold(0.0_f32, |value, element| value.max(element.abs()));
+            let scale = if alpha == 0.0 {
+                f32::MIN_POSITIVE
+            } else {
+                alpha / 127.0
+            };
+            scales.push(scale);
+            let inverse = scale.recip();
+            quantized.extend(
+                block
+                    .iter()
+                    .map(|value| (value * inverse).round().clamp(-127.0, 127.0) as i8),
+            );
+        }
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q8S)
+            .with_level(QuantLevel::block([32]))
+            .with_param(QuantParam::F32)
+            .with_store(QuantStore::PackedU32(0));
+        Ok(TensorData::quantized(quantized, shape, scheme, &scales))
+    }
+
+    pub(super) fn quantize_verified_float_q8s_block32_f32(
+        data: TensorData,
+    ) -> Result<TensorData, TensorSnapshotError> {
+        if !matches!(data.dtype, DType::F16 | DType::F32) {
+            return Err(TensorSnapshotError::DataError(format!(
+                "runtime Q8S denoiser quantization requires a verified F16/F32 snapshot, found {:?}",
+                data.dtype
+            )));
+        }
+        let shape = data.shape.to_vec();
+        let values = data
+            .convert_dtype(DType::F32)
+            .to_vec::<f32>()
+            .map_err(|error| TensorSnapshotError::DataError(error.to_string()))?;
+        quantize_q8s_block32_f32(values, shape)
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct ArtifactLoadAdapter {
+        pub(super) float_policy: BooguFloatLoadPolicy,
+        pub(super) quantized_policy: BooguQuantizedLoadPolicy,
+        pub(super) runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
+        pub(super) runtime_quantizable_paths: Option<BTreeSet<String>>,
     }
 
     pub(super) fn load_adapter(
@@ -6534,6 +7176,29 @@ mod loading {
             Some(Box::new(ArtifactLoadAdapter {
                 float_policy,
                 quantized_policy,
+                runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+                runtime_quantizable_paths: None,
+            }) as Box<dyn ModuleAdapter>)
+        }
+    }
+
+    fn denoiser_load_adapter(
+        float_policy: BooguFloatLoadPolicy,
+        quantized_policy: BooguQuantizedLoadPolicy,
+        runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
+        runtime_quantizable_paths: BTreeSet<String>,
+    ) -> Option<Box<dyn ModuleAdapter>> {
+        if float_policy == BooguFloatLoadPolicy::Preserve
+            && quantized_policy == BooguQuantizedLoadPolicy::Preserve
+            && runtime_quantization_policy == BooguDenoiserRuntimeQuantizationPolicy::Disabled
+        {
+            None
+        } else {
+            Some(Box::new(ArtifactLoadAdapter {
+                float_policy,
+                quantized_policy,
+                runtime_quantization_policy,
+                runtime_quantizable_paths: Some(runtime_quantizable_paths),
             }) as Box<dyn ModuleAdapter>)
         }
     }
@@ -6602,6 +7267,42 @@ mod loading {
 
     impl ModuleAdapter for ArtifactLoadAdapter {
         fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
+            if self.runtime_quantization_policy
+                == BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32
+            {
+                let Some(runtime_quantizable_paths) = &self.runtime_quantizable_paths else {
+                    return TensorSnapshot::from_closure(
+                        Rc::new(|| {
+                            Err(TensorSnapshotError::DataError(
+                                "runtime Q8S policy is restricted to inventory-qualified Boogu denoiser stages"
+                                    .into(),
+                            ))
+                        }),
+                        snapshot.dtype,
+                        snapshot.shape.clone(),
+                        snapshot.path_stack.clone().unwrap_or_default(),
+                        snapshot.container_stack.clone().unwrap_or_default(),
+                        snapshot.tensor_id.unwrap_or_default(),
+                    );
+                };
+                if runtime_quantizable_paths.contains(&snapshot.full_path()) {
+                    let data_fn = snapshot.clone_data_fn();
+                    return TensorSnapshot::from_closure(
+                        Rc::new(move || quantize_verified_float_q8s_block32_f32(data_fn()?)),
+                        DType::QFloat(
+                            QuantScheme::default()
+                                .with_value(QuantValue::Q8S)
+                                .with_level(QuantLevel::block([32]))
+                                .with_param(QuantParam::F32)
+                                .with_store(QuantStore::PackedU32(0)),
+                        ),
+                        snapshot.shape.clone(),
+                        snapshot.path_stack.clone().unwrap_or_default(),
+                        snapshot.container_stack.clone().unwrap_or_default(),
+                        snapshot.tensor_id.unwrap_or_default(),
+                    );
+                }
+            }
             let output_dtype = match (snapshot.dtype, self.quantized_policy, self.float_policy) {
                 (DType::QFloat(_), BooguQuantizedLoadPolicy::DequantizeF16, float_policy) => {
                     let data_fn = snapshot.clone_data_fn();
@@ -6634,7 +7335,7 @@ mod loading {
         }
 
         fn clone_box(&self) -> Box<dyn ModuleAdapter> {
-            Box::new(*self)
+            Box::new(self.clone())
         }
     }
 }
@@ -6642,23 +7343,31 @@ mod loading {
 #[cfg(feature = "burnpack")]
 pub use loading::{
     AsyncStageShardRead, AsyncStageShardReader, BooguArtifactLoadError, BooguBurnpackLoader,
-    BooguComponentVerification, BooguFloatLoadPolicy, BooguLoadReport, BooguModels,
-    BooguModularReleaseVerification, BooguQuantizedLoadPolicy, BooguReleaseVerification,
-    BooguStorageProfile, BooguVaeEncoderF32DiagnosticManifest, CanonicalBooguArtifactBundle,
-    DirectoryStageShardReader, PUBLISHED_ARTIFACT_BUNDLES, StageShardReader,
-    VerifiedArtifactDirectory, VerifiedAsyncBurnpackDenoiserStageSource,
-    VerifiedAsyncBurnpackQwenStageSource, VerifiedAsyncBurnpackVaeStageSource,
-    VerifiedBurnpackQwenStageSource, VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource,
-    artifact_bundle_id_is_compatible, canonical_published_bundle, legacy_artifact_bundle_id,
-    load_resident_denoiser_from_directory, load_resident_denoiser_from_directory_with_policies,
-    load_resident_qwen_base_from_directory, load_resident_vae_from_directory, load_vae_decoder,
-    load_vae_decoder_from_directory, load_vae_encoder, load_vae_encoder_from_directory,
-    preferred_artifact_bundle_id, promotable_legacy_artifact_digest,
+    BooguComponentVerification, BooguDenoiserRuntimeQuantizationPolicy, BooguFloatLoadPolicy,
+    BooguLoadReport, BooguModels, BooguModularReleaseVerification, BooguQuantizedLoadPolicy,
+    BooguReleaseVerification, BooguResidentLoadMemoryPolicy, BooguStorageProfile,
+    BooguVaeEncoderF32DiagnosticManifest, CanonicalBooguArtifactBundle, DirectoryStageShardReader,
+    PUBLISHED_ARTIFACT_BUNDLES, StageShardReader, VerifiedArtifactDirectory,
+    VerifiedAsyncBurnpackDenoiserStageSource, VerifiedAsyncBurnpackQwenStageSource,
+    VerifiedAsyncBurnpackVaeStageSource, VerifiedBurnpackQwenStageSource,
+    VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource, artifact_bundle_id_is_compatible,
+    canonical_published_bundle, legacy_artifact_bundle_id, load_resident_denoiser_from_directory,
+    load_resident_denoiser_from_directory_with_memory_policy,
+    load_resident_denoiser_from_directory_with_policies, load_resident_qwen_base_from_directory,
+    load_resident_vae_from_directory, load_vae_decoder, load_vae_decoder_from_directory,
+    load_vae_encoder, load_vae_encoder_from_directory, preferred_artifact_bundle_id,
+    promotable_legacy_artifact_digest, quantize_q8s_block32_f32,
     stamp_edit_turbo_1k5_vae_encoder_f32_diagnostic_metadata,
     validate_canonical_release_artifact_digest, validate_edit_turbo_1k5_release_artifact_digest,
     validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest,
     verify_modular_release_artifact_directories, verify_published_release_artifact_directory,
     verify_release_artifact_directory,
+};
+
+#[cfg(all(feature = "burnpack", feature = "wgpu"))]
+pub(crate) use loading::{
+    SerializedTensorInventory, declared_target_max_shard_bytes, read_verified_async,
+    validate_release_manifest, verify_inventory_contract_async,
 };
 
 #[cfg(test)]
@@ -6671,6 +7380,490 @@ mod tests {
     use burn_image::Sha256Digest;
     #[cfg(feature = "burnpack")]
     use burn_image::{ArtifactFile, ArtifactManifest};
+
+    #[test]
+    fn turbo_ffn_core_q8_scope_is_exact_and_fail_closed_correctness() {
+        let scope = BooguRuntimeQ8Scope::TurboFfnCoreQ8;
+        assert_eq!(scope.label(), "turbo-ffn-core-q8");
+        for target in [
+            "single_stream_layers.0.feed_forward.linear_1.weight",
+            "double_stream_layers.0.image_ffn.linear_2.weight",
+            "double_stream_layers.0.instruction_ffn.linear_3.weight",
+        ] {
+            assert!(scope.quantizes_target(target), "did not select {target}");
+        }
+        for target in [
+            "single_stream_layers.0.attn.to_q.weight",
+            "double_stream_layers.0.joint_attn.to_q.weight",
+            "double_stream_layers.0.image_self_attn.to_q.weight",
+            "single_stream_layers.0.feed_forward.linear_1.bias",
+            "time_caption_embed.caption_linear.weight",
+            "norm_out.linear_1.weight",
+            "feed_forward.weight",
+        ] {
+            assert!(
+                !scope.quantizes_target(target),
+                "unexpectedly selected {target}"
+            );
+        }
+
+        let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
+        let quantized = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| {
+                spec.quantizable
+                    && !spec.stage.starts_with("boogu-reference-refiner-")
+                    && scope.quantizes_target(&spec.target_name)
+            })
+            .map(|spec| spec.target_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(quantized.len(), 156);
+        assert!(
+            quantized
+                .iter()
+                .all(|target| turbo_ffn_core_q8_target(target))
+        );
+
+        let footprint = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+                BooguVariant::Image01Turbo,
+                scope,
+            )
+            .unwrap();
+        assert_eq!(footprint.tensor_count, 912);
+        assert_eq!(footprint.quantized_tensor_count, 156);
+        assert_eq!(footprint.f32_tensor_count, 756);
+        assert_eq!(footprint.quantized_elements, 7_111_802_880);
+        assert_eq!(footprint.f32_elements, 2_823_195_168);
+        assert_eq!(footprint.quantized_payload_bytes, 8_000_778_240);
+        assert_eq!(footprint.f32_payload_bytes, 11_292_780_672);
+        assert_eq!(footprint.total_payload_bytes, 19_293_558_912);
+        for variant in [
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            assert!(
+                inventory
+                    .denoiser_runtime_q8s_block32_f32_footprint_with_scope(variant, scope)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn turbo_ffn_gate_up_q8_scope_is_exact_and_fail_closed_correctness() {
+        let scope = BooguRuntimeQ8Scope::TurboFfnGateUpQ8;
+        assert_eq!(scope.label(), "turbo-ffn-gate-up-q8");
+        for target in [
+            "single_stream_layers.0.feed_forward.linear_1.weight",
+            "single_stream_layers.0.feed_forward.linear_3.weight",
+            "double_stream_layers.0.image_ffn.linear_1.weight",
+            "double_stream_layers.0.image_ffn.linear_3.weight",
+            "double_stream_layers.0.instruction_ffn.linear_1.weight",
+            "double_stream_layers.0.instruction_ffn.linear_3.weight",
+        ] {
+            assert!(scope.quantizes_target(target), "did not select {target}");
+        }
+        for target in [
+            "single_stream_layers.0.feed_forward.linear_2.weight",
+            "double_stream_layers.0.image_ffn.linear_2.weight",
+            "double_stream_layers.0.instruction_ffn.linear_2.weight",
+            "single_stream_layers.0.attn.linear_1.weight",
+            "single_stream_layers.0.feed_forward.linear_1.bias",
+            "single_stream_layers.0.feed_forward.other_linear_1.weight",
+            "feed_forward.linear_1.weight",
+        ] {
+            assert!(
+                !scope.quantizes_target(target),
+                "unexpectedly selected {target}"
+            );
+        }
+
+        let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
+        let quantized = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| {
+                spec.quantizable
+                    && !spec.stage.starts_with("boogu-reference-refiner-")
+                    && scope.quantizes_target(&spec.target_name)
+            })
+            .map(|spec| spec.target_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(quantized.len(), 104);
+        assert!(
+            quantized
+                .iter()
+                .all(|target| turbo_ffn_gate_up_q8_target(target))
+        );
+
+        let footprint = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+                BooguVariant::Image01Turbo,
+                scope,
+            )
+            .unwrap();
+        assert_eq!(footprint.tensor_count, 912);
+        assert_eq!(footprint.quantized_tensor_count, 104);
+        assert_eq!(footprint.f32_tensor_count, 808);
+        assert_eq!(footprint.quantized_elements, 4_741_201_920);
+        assert_eq!(footprint.f32_elements, 5_193_796_128);
+        assert_eq!(footprint.quantized_payload_bytes, 5_333_852_160);
+        assert_eq!(footprint.f32_payload_bytes, 20_775_184_512);
+        assert_eq!(footprint.total_payload_bytes, 26_109_036_672);
+        for variant in [
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            assert!(
+                inventory
+                    .denoiser_runtime_q8s_block32_f32_footprint_with_scope(variant, scope)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn turbo_main_core_ffn_gate_up_q8_scope_matches_exact_canonical_target_set_correctness() {
+        let scope = BooguRuntimeQ8Scope::TurboMainCoreFfnGateUpQ8;
+        assert_eq!(scope.label(), "turbo-main-core-ffn-gate-up-q8");
+
+        let mut expected = BTreeSet::<String>::new();
+        for layer in 0..32 {
+            for projection in [1, 3] {
+                expected.insert(format!(
+                    "single_stream_layers.{layer}.feed_forward.linear_{projection}.weight"
+                ));
+            }
+        }
+        for layer in 0..8 {
+            for module in ["image_ffn", "instruction_ffn"] {
+                for projection in [1, 3] {
+                    expected.insert(format!(
+                        "double_stream_layers.{layer}.{module}.linear_{projection}.weight"
+                    ));
+                }
+            }
+        }
+        assert_eq!(expected.len(), 96);
+        assert!(expected.iter().all(|target| scope.quantizes_target(target)));
+
+        for target in [
+            "single_stream_layers.0.feed_forward.linear_2.weight",
+            "single_stream_layers.32.feed_forward.linear_1.weight",
+            "single_stream_layers.00.feed_forward.linear_1.weight",
+            "single_stream_layers.+1.feed_forward.linear_1.weight",
+            "double_stream_layers.0.image_ffn.linear_2.weight",
+            "double_stream_layers.8.image_ffn.linear_1.weight",
+            "double_stream_layers.01.image_ffn.linear_1.weight",
+            "double_stream_layers.0.feed_forward.linear_1.weight",
+            "context_refiner.0.feed_forward.linear_1.weight",
+            "context_refiner.0.feed_forward.linear_3.weight",
+            "noise_refiner.0.feed_forward.linear_1.weight",
+            "noise_refiner.0.feed_forward.linear_3.weight",
+            "single_stream_layers.0.feed_forward.linear_1.bias",
+            "single_stream_layers.0.feed_forward.linear_1.weight.extra",
+            "prefix.single_stream_layers.0.feed_forward.linear_1.weight",
+        ] {
+            assert!(
+                !scope.quantizes_target(target),
+                "unexpectedly selected {target}"
+            );
+        }
+
+        let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
+        let selected = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| {
+                spec.quantizable
+                    && !spec.stage.starts_with("boogu-reference-refiner-")
+                    && scope.quantizes_target(&spec.target_name)
+            })
+            .map(|spec| spec.target_name.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(selected, expected);
+
+        let footprint = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+                BooguVariant::Image01Turbo,
+                scope,
+            )
+            .unwrap();
+        assert_eq!(footprint.tensor_count, 912);
+        assert_eq!(footprint.quantized_tensor_count, 96);
+        assert_eq!(footprint.f32_tensor_count, 816);
+        assert_eq!(footprint.quantized_elements, 4_376_494_080);
+        assert_eq!(footprint.f32_elements, 5_558_503_968);
+        assert_eq!(footprint.quantized_payload_bytes, 4_923_555_840);
+        assert_eq!(footprint.f32_payload_bytes, 22_234_015_872);
+        assert_eq!(footprint.total_payload_bytes, 27_157_571_712);
+        for variant in [
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            assert!(
+                inventory
+                    .denoiser_runtime_q8s_block32_f32_footprint_with_scope(variant, scope)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_q8_denoiser_footprint_is_inventory_derived_and_variant_exact_correctness() {
+        let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
+        assert!(
+            inventory
+                .tensors()
+                .iter()
+                .all(|spec| spec.owner == TensorOwner::BooguDenoiser)
+        );
+        let turbo = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint(BooguVariant::Image01Turbo)
+            .unwrap();
+        let edit = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint(BooguVariant::Image01EditTurbo)
+            .unwrap();
+        let edit_1k5 = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint(BooguVariant::Image01EditTurbo1k5)
+            .unwrap();
+        let turbo_caption_tail_f32 = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+                BooguVariant::Image01Turbo,
+                BooguRuntimeQ8Scope::TurboCaptionAndTailF32,
+            )
+            .unwrap();
+        let turbo_attention_ffn_core_q8 = inventory
+            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+                BooguVariant::Image01Turbo,
+                BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8,
+            )
+            .unwrap();
+        let excluded = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| {
+                spec.quantizable
+                    && !BooguRuntimeQ8Scope::TurboCaptionAndTailF32
+                        .quantizes_target(&spec.target_name)
+            })
+            .map(|spec| spec.target_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            excluded,
+            BTreeSet::from([
+                "norm_out.linear_1.weight",
+                "norm_out.linear_2.weight",
+                "time_caption_embed.caption_linear.weight",
+            ])
+        );
+        assert_eq!(turbo.total_payload_bytes, 12_155_919_232);
+        assert_eq!(edit.total_payload_bytes, 12_590_785_792);
+        assert_eq!(edit_1k5, edit);
+        assert_eq!(turbo_caption_tail_f32.tensor_count, 912);
+        assert_eq!(turbo_caption_tail_f32.quantized_tensor_count, 362);
+        assert_eq!(turbo_caption_tail_f32.f32_tensor_count, 550);
+        assert_eq!(turbo_caption_tail_f32.quantized_elements, 9_577_041_920);
+        assert_eq!(turbo_caption_tail_f32.f32_elements, 357_956_128);
+        assert_eq!(
+            turbo_caption_tail_f32.quantized_payload_bytes,
+            10_774_172_160
+        );
+        assert_eq!(turbo_caption_tail_f32.f32_payload_bytes, 1_431_824_512);
+        assert_eq!(turbo_caption_tail_f32.total_payload_bytes, 12_205_996_672);
+        assert_eq!(
+            turbo_caption_tail_f32.total_payload_bytes - turbo.total_payload_bytes,
+            50_077_440
+        );
+        let core_scope_excluded = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| {
+                spec.quantizable
+                    && !spec.stage.starts_with("boogu-reference-refiner-")
+                    && !BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8
+                        .quantizes_target(&spec.target_name)
+            })
+            .map(|spec| spec.target_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(core_scope_excluded.len(), 81);
+        assert!(
+            core_scope_excluded
+                .iter()
+                .all(|target| { !turbo_attention_ffn_core_q8_target(target) })
+        );
+        let core_scope_quantized = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| {
+                spec.quantizable
+                    && !spec.stage.starts_with("boogu-reference-refiner-")
+                    && BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8
+                        .quantizes_target(&spec.target_name)
+            })
+            .map(|spec| spec.target_name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(core_scope_quantized.len(), 284);
+        assert!(
+            core_scope_quantized
+                .iter()
+                .all(|target| turbo_attention_ffn_core_q8_target(target))
+        );
+        assert_eq!(
+            core_scope_quantized
+                .iter()
+                .filter(|target| {
+                    target.contains(".attn.")
+                        || target.contains(".joint_attn.")
+                        || target.contains(".image_self_attn.")
+                })
+                .count(),
+            128
+        );
+        assert_eq!(
+            core_scope_quantized
+                .iter()
+                .filter(|target| target.contains(".feed_forward."))
+                .chain(core_scope_quantized.iter().filter(|target| {
+                    target.contains(".image_ffn.") || target.contains(".instruction_ffn.")
+                }),)
+                .count(),
+            156
+        );
+        for required in [
+            "x_embedder.weight",
+            "time_caption_embed.caption_linear.weight",
+            "time_caption_embed.time_linear_1.weight",
+            "time_caption_embed.time_linear_2.weight",
+            "noise_refiner.0.norm1.linear.weight",
+            "double_stream_layers.0.image_norm1.linear.weight",
+            "double_stream_layers.7.instruction_norm2.linear.weight",
+            "single_stream_layers.31.norm1.linear.weight",
+            "norm_out.linear_1.weight",
+            "norm_out.linear_2.weight",
+        ] {
+            assert!(core_scope_excluded.contains(required), "missing {required}");
+        }
+        assert_eq!(turbo_attention_ffn_core_q8.tensor_count, 912);
+        assert_eq!(turbo_attention_ffn_core_q8.quantized_tensor_count, 284);
+        assert_eq!(turbo_attention_ffn_core_q8.f32_tensor_count, 628);
+        assert_eq!(
+            turbo_attention_ffn_core_q8.quantized_elements,
+            8_556_871_680
+        );
+        assert_eq!(turbo_attention_ffn_core_q8.f32_elements, 1_378_126_368);
+        assert_eq!(
+            turbo_attention_ffn_core_q8.quantized_payload_bytes,
+            9_626_480_640
+        );
+        assert_eq!(turbo_attention_ffn_core_q8.f32_payload_bytes, 5_512_505_472);
+        assert_eq!(
+            turbo_attention_ffn_core_q8.total_payload_bytes,
+            15_138_986_112
+        );
+        assert!(
+            inventory
+                .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+                    BooguVariant::Image01EditTurbo1k5,
+                    BooguRuntimeQ8Scope::TurboCaptionAndTailF32,
+                )
+                .is_err()
+        );
+        assert!(
+            inventory
+                .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
+                    BooguVariant::Image01EditTurbo,
+                    BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            turbo.total_payload_bytes,
+            turbo.quantized_payload_bytes + turbo.f32_payload_bytes
+        );
+        assert_eq!(
+            edit.total_payload_bytes,
+            edit.quantized_payload_bytes + edit.f32_payload_bytes
+        );
+
+        let reference_refiner_bytes = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| spec.stage.starts_with("boogu-reference-refiner-"))
+            .map(|spec| {
+                let elements = spec.target_shape.iter().product::<usize>() as u64;
+                if spec.quantizable {
+                    elements + elements / 32 * 4
+                } else {
+                    elements * 4
+                }
+            })
+            .sum::<u64>();
+        assert!(reference_refiner_bytes > 0);
+        assert_eq!(
+            edit.total_payload_bytes - turbo.total_payload_bytes,
+            reference_refiner_bytes
+        );
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn turbo_caption_tail_f32_runtime_q8_scope_is_fail_closed_correctness() {
+        let scope = BooguRuntimeQ8Scope::TurboCaptionAndTailF32;
+        loading::validate_runtime_denoiser_quantization_policy(
+            BooguStorageProfile::F16QwenVisionF32,
+            BooguFloatLoadPolicy::AdaptToF32,
+            BooguQuantizedLoadPolicy::Preserve,
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            scope,
+            BooguVariant::Image01Turbo,
+            "boogu-prelude",
+        )
+        .unwrap();
+
+        for result in [
+            loading::validate_runtime_denoiser_quantization_policy(
+                BooguStorageProfile::F16,
+                BooguFloatLoadPolicy::AdaptToF32,
+                BooguQuantizedLoadPolicy::Preserve,
+                BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+                scope,
+                BooguVariant::Image01Turbo,
+                "boogu-prelude",
+            ),
+            loading::validate_runtime_denoiser_quantization_policy(
+                BooguStorageProfile::F16QwenVisionF32,
+                BooguFloatLoadPolicy::Preserve,
+                BooguQuantizedLoadPolicy::Preserve,
+                BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+                scope,
+                BooguVariant::Image01Turbo,
+                "boogu-prelude",
+            ),
+            loading::validate_runtime_denoiser_quantization_policy(
+                BooguStorageProfile::F16QwenVisionF32,
+                BooguFloatLoadPolicy::AdaptToF32,
+                BooguQuantizedLoadPolicy::Preserve,
+                BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+                scope,
+                BooguVariant::Image01Turbo,
+                "boogu-prelude",
+            ),
+            loading::validate_runtime_denoiser_quantization_policy(
+                BooguStorageProfile::F16QwenVisionF32,
+                BooguFloatLoadPolicy::AdaptToF32,
+                BooguQuantizedLoadPolicy::Preserve,
+                BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+                scope,
+                BooguVariant::Image01EditTurbo1k5,
+                "boogu-prelude",
+            ),
+        ] {
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn canonical_release_identity_correctness() {
@@ -8288,8 +9481,8 @@ mod tests {
     #[cfg(feature = "burnpack")]
     #[test]
     fn async_denoiser_source_loads_one_verified_stage_at_a_time_correctness() {
-        use crate::AsyncBooguDenoiserStageSource;
-        use burn::backend::NdArray;
+        use crate::{AsyncBooguDenoiserStageSource, StreamingStageSource};
+        use burn::{backend::NdArray, tensor::DType};
         use burn_store::ModuleSnapshot;
         use futures::executor::block_on;
 
@@ -8297,17 +9490,17 @@ mod tests {
             patch_size: 2,
             in_channels: 4,
             out_channels: 4,
-            hidden_size: 8,
+            hidden_size: 32,
             num_layers: 2,
             num_double_stream_layers: 1,
             num_refiner_layers: 1,
-            num_attention_heads: 2,
+            num_attention_heads: 4,
             num_kv_heads: 1,
-            multiple_of: 8,
+            multiple_of: 32,
             norm_eps: 1.0e-5,
-            axes_dim_rope: [2, 2, 0],
+            axes_dim_rope: [4, 4, 0],
             axes_lens: [16, 16, 16],
-            instruction_feature_dim: 8,
+            instruction_feature_dim: 32,
             timestep_scale: 1000.0,
         };
         let device = Default::default();
@@ -8315,28 +9508,117 @@ mod tests {
         let inventory = BooguArtifactInventory {
             tensors: boogu_specs(&config),
         };
+        let context_quantizable = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| spec.stage == "boogu-context-refiner-00" && spec.quantizable)
+            .map(|spec| {
+                spec.target_name
+                    .strip_prefix("context_refiner.0.")
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(!context_quantizable.is_empty());
+        let prelude_quantizable = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| spec.stage == "boogu-prelude" && spec.quantizable)
+            .map(|spec| spec.target_name.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(prelude_quantizable.contains("time_caption_embed.caption_linear.weight"));
+        let tail_quantizable = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| spec.stage == "boogu-tail" && spec.quantizable)
+            .map(|spec| spec.target_name.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(tail_quantizable.contains("norm_out.linear_1.weight"));
         let (directory, manifest) = write_tiny_float_artifact(
             &inventory,
             resident.collect(None, None, false),
-            BooguStorageProfile::F16,
+            BooguStorageProfile::F16QwenVisionF32,
         );
+        let identity = BooguReleaseIdentity::canonical(BooguVariant::Image01Turbo);
+        let mut sync_source =
+            VerifiedBurnpackStageSource::<NdArray<f32>, DirectoryStageShardReader>::from_directory(
+                &identity,
+                directory.path(),
+                inventory.clone(),
+                config.clone(),
+                BooguStorageProfile::F16QwenVisionF32,
+                device,
+            )
+            .unwrap()
+            .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
+            .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
+            .with_runtime_q8_scope(BooguRuntimeQ8Scope::TurboCaptionAndTailF32);
+        let sync_prelude = sync_source.load_prelude().unwrap();
+        for snapshot in sync_prelude.collect(None, None, false) {
+            let expected_q8 = prelude_quantizable.contains(&snapshot.full_path())
+                && snapshot.full_path() != "time_caption_embed.caption_linear.weight";
+            assert_eq!(
+                matches!(snapshot.dtype, DType::QFloat(_)),
+                expected_q8,
+                "unexpected scoped sync runtime dtype for {}",
+                snapshot.full_path()
+            );
+            if snapshot.full_path() == "time_caption_embed.caption_linear.weight" {
+                assert_eq!(snapshot.dtype, DType::F32);
+            }
+        }
+        let sync_tail = sync_source.load_tail().unwrap();
+        for snapshot in sync_tail.collect(None, None, false) {
+            let expected_q8 = tail_quantizable.contains(&snapshot.full_path())
+                && !matches!(
+                    snapshot.full_path().as_str(),
+                    "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
+                );
+            assert_eq!(
+                matches!(snapshot.dtype, DType::QFloat(_)),
+                expected_q8,
+                "unexpected scoped sync runtime dtype for {}",
+                snapshot.full_path()
+            );
+            if matches!(
+                snapshot.full_path().as_str(),
+                "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
+            ) {
+                assert_eq!(snapshot.dtype, DType::F32);
+            }
+        }
         let reader = AsyncMemoryShardReader::from_directory(&directory, &manifest);
         let mut source = block_on(
             VerifiedAsyncBurnpackDenoiserStageSource::<NdArray<f32>, _>::new(
-                &BooguReleaseIdentity::canonical(BooguVariant::Image01Turbo),
+                &identity,
                 manifest.clone(),
                 inventory,
                 config,
-                BooguStorageProfile::F16,
+                BooguStorageProfile::F16QwenVisionF32,
                 device,
                 reader,
             ),
         )
         .unwrap()
-        .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32);
+        .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
+        .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
+        .with_runtime_q8_scope(BooguRuntimeQ8Scope::TurboCaptionAndTailF32);
 
         source.reader_mut().requests.clear();
-        block_on(source.load_prelude()).unwrap();
+        let prelude = block_on(source.load_prelude()).unwrap();
+        for snapshot in prelude.collect(None, None, false) {
+            let expected_q8 = prelude_quantizable.contains(&snapshot.full_path())
+                && snapshot.full_path() != "time_caption_embed.caption_linear.weight";
+            assert_eq!(
+                matches!(snapshot.dtype, DType::QFloat(_)),
+                expected_q8,
+                "unexpected scoped runtime dtype for {}",
+                snapshot.full_path()
+            );
+            if snapshot.full_path() == "time_caption_embed.caption_linear.weight" {
+                assert_eq!(snapshot.dtype, DType::F32);
+            }
+        }
         let prelude_files = manifest
             .files
             .iter()
@@ -8353,13 +9635,48 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(requested, prelude_files);
 
+        let context = block_on(source.load_context_refiner(0)).unwrap();
+        let context_snapshots = context.collect(None, None, false);
+        assert!(
+            context_snapshots
+                .iter()
+                .any(|snapshot| matches!(snapshot.dtype, DType::QFloat(_)))
+        );
+        for snapshot in context_snapshots {
+            assert_eq!(
+                matches!(snapshot.dtype, DType::QFloat(_)),
+                context_quantizable.contains(&snapshot.full_path()),
+                "unexpected runtime dtype for {}",
+                snapshot.full_path()
+            );
+        }
+
+        let tail = block_on(source.load_tail()).unwrap();
+        for snapshot in tail.collect(None, None, false) {
+            let expected_q8 = tail_quantizable.contains(&snapshot.full_path())
+                && !matches!(
+                    snapshot.full_path().as_str(),
+                    "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
+                );
+            assert_eq!(
+                matches!(snapshot.dtype, DType::QFloat(_)),
+                expected_q8,
+                "unexpected scoped runtime dtype for {}",
+                snapshot.full_path()
+            );
+            if matches!(
+                snapshot.full_path().as_str(),
+                "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
+            ) {
+                assert_eq!(snapshot.dtype, DType::F32);
+            }
+        }
+
         block_on(async {
-            source.load_context_refiner(0).await.unwrap();
             source.load_noise_refiner(0).await.unwrap();
             source.load_reference_refiner(0).await.unwrap();
             source.load_double_stream(0).await.unwrap();
             source.load_single_stream(0).await.unwrap();
-            source.load_tail().await.unwrap();
             source.synchronize().await.unwrap();
         });
         assert!(source.reader().largest_response as u64 <= source.max_shard_bytes());
@@ -8409,6 +9726,18 @@ mod tests {
         let inventory = BooguArtifactInventory {
             tensors: boogu_specs(&config),
         };
+        let sync_context_quantizable = inventory
+            .tensors()
+            .iter()
+            .filter(|spec| spec.stage == "boogu-context-refiner-00" && spec.quantizable)
+            .map(|spec| {
+                spec.target_name
+                    .strip_prefix("context_refiner.0.")
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(!sync_context_quantizable.is_empty());
         let device = Default::default();
         let model = crate::BooguDenoiser::<NdArray<f32>>::new(config.clone(), &device).unwrap();
         let source = model
@@ -8574,7 +9903,7 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        let (_, report) = load_resident_denoiser_from_directory::<NdArray<f32>>(
+        let (resident, report) = load_resident_denoiser_from_directory::<NdArray<f32>>(
             &identity,
             resident_directory.path(),
             inventory.clone(),
@@ -8586,6 +9915,40 @@ mod tests {
         .unwrap();
         assert_eq!(report.tensors, inventory.tensors().len());
         assert_eq!(report.shards, manifest.components.len());
+        let (cleanup_model, cleanup_report) =
+            load_resident_denoiser_from_directory_with_memory_policy::<NdArray<f32>>(
+                &identity,
+                resident_directory.path(),
+                inventory.clone(),
+                config.clone(),
+                BooguStorageProfile::F16,
+                BooguFloatLoadPolicy::AdaptToF32,
+                BooguQuantizedLoadPolicy::Preserve,
+                BooguResidentLoadMemoryPolicy::ReleaseTransientBuffersPerShard,
+                &device,
+            )
+            .unwrap();
+        assert_eq!(cleanup_report, report);
+        assert_eq!(
+            BooguResidentLoadMemoryPolicy::default(),
+            BooguResidentLoadMemoryPolicy::PreserveAllocatorCache
+        );
+        let mut resident_snapshots = resident.collect(None, None, false);
+        let mut cleanup_snapshots = cleanup_model.collect(None, None, false);
+        resident_snapshots.sort_by_key(|snapshot| snapshot.full_path());
+        cleanup_snapshots.sort_by_key(|snapshot| snapshot.full_path());
+        assert_eq!(resident_snapshots.len(), cleanup_snapshots.len());
+        for (resident_snapshot, cleanup_snapshot) in
+            resident_snapshots.into_iter().zip(cleanup_snapshots)
+        {
+            assert_eq!(resident_snapshot.full_path(), cleanup_snapshot.full_path());
+            assert_eq!(resident_snapshot.dtype, cleanup_snapshot.dtype);
+            assert_eq!(resident_snapshot.shape, cleanup_snapshot.shape);
+            assert_eq!(
+                resident_snapshot.to_data().unwrap(),
+                cleanup_snapshot.to_data().unwrap()
+            );
+        }
 
         let mut source = VerifiedBurnpackStageSource::<NdArray<f32>, _>::new(
             &identity,
@@ -8597,9 +9960,18 @@ mod tests {
             reader,
         )
         .unwrap()
-        .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32);
+        .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
+        .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32);
         source.load_prelude().unwrap();
-        source.load_context_refiner(0).unwrap();
+        let context = source.load_context_refiner(0).unwrap();
+        for snapshot in context.collect(None, None, false) {
+            assert_eq!(
+                matches!(snapshot.dtype, DType::QFloat(_)),
+                sync_context_quantizable.contains(&snapshot.full_path()),
+                "unexpected runtime dtype for {}",
+                snapshot.full_path()
+            );
+        }
         source.load_noise_refiner(0).unwrap();
         source.load_reference_refiner(0).unwrap();
         source.load_double_stream(0).unwrap();
@@ -8690,8 +10062,124 @@ mod tests {
 
     #[cfg(feature = "burnpack")]
     #[test]
+    fn runtime_q8s_matches_canonical_importer_bytes_and_scales_correctness() {
+        use burn::{
+            module::ParamId,
+            tensor::{DType, TensorData, quantization::QuantizedBytes},
+        };
+        use burn_store::{ModuleAdapter, TensorSnapshot};
+
+        let values = (-32..32)
+            .map(|value| value as f32 * 0.031_25)
+            .collect::<Vec<_>>();
+        let expected = quantize_q8s_block32_f32(values.clone(), vec![2, 32]).unwrap();
+        let source = TensorSnapshot::from_data(
+            TensorData::new(values, [2, 32]).convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let adapter = loading::ArtifactLoadAdapter {
+            float_policy: BooguFloatLoadPolicy::AdaptToF32,
+            quantized_policy: BooguQuantizedLoadPolicy::Preserve,
+            runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            runtime_quantizable_paths: Some(BTreeSet::from(["weight".into()])),
+        };
+        let actual = adapter.adapt(&source).to_data().unwrap();
+        assert_eq!(actual.dtype, expected.dtype);
+        assert_eq!(actual.shape, expected.shape);
+
+        let DType::QFloat(scheme) = actual.dtype else {
+            unreachable!()
+        };
+        let actual_parts = QuantizedBytes {
+            bytes: actual.bytes,
+            scheme,
+            num_elements: 64,
+        }
+        .into_vec_i8();
+        let expected_parts = QuantizedBytes {
+            bytes: expected.bytes,
+            scheme,
+            num_elements: 64,
+        }
+        .into_vec_i8();
+        assert_eq!(actual_parts.0, expected_parts.0);
+        assert_eq!(actual_parts.1.scales, expected_parts.1.scales);
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn runtime_q8s_quantizes_only_inventory_eligible_paths_correctness() {
+        use burn::{
+            module::ParamId,
+            tensor::{DType, TensorData},
+        };
+        use burn_store::{ModuleAdapter, TensorSnapshot};
+
+        let adapter = loading::ArtifactLoadAdapter {
+            float_policy: BooguFloatLoadPolicy::AdaptToF32,
+            quantized_policy: BooguQuantizedLoadPolicy::Preserve,
+            runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            runtime_quantizable_paths: Some(BTreeSet::from(["weight".into()])),
+        };
+        let eligible = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 32], [1, 32]).convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let bias = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 32], [32]).convert_dtype(DType::F16),
+            vec!["bias".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        assert!(matches!(adapter.adapt(&eligible).dtype, DType::QFloat(_)));
+        assert_eq!(adapter.adapt(&bias).dtype, DType::F32);
+
+        let disabled = loading::ArtifactLoadAdapter {
+            float_policy: BooguFloatLoadPolicy::AdaptToF32,
+            quantized_policy: BooguQuantizedLoadPolicy::Preserve,
+            runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+            runtime_quantizable_paths: Some(BTreeSet::from(["weight".into()])),
+        };
+        assert_eq!(disabled.adapt(&eligible).dtype, DType::F32);
+        assert_eq!(
+            BooguDenoiserRuntimeQuantizationPolicy::default(),
+            BooguDenoiserRuntimeQuantizationPolicy::Disabled
+        );
+        assert_eq!(
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32.label(),
+            "runtime-quantize-q8s-block32-f32"
+        );
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn runtime_q8s_rejects_nonfinite_misaligned_and_nonfloat_sources_correctness() {
+        use burn::tensor::{
+            TensorData,
+            quantization::{QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue},
+        };
+
+        assert!(quantize_q8s_block32_f32(vec![f32::NAN; 32], vec![1, 32]).is_err());
+        assert!(quantize_q8s_block32_f32(vec![0.0; 31], vec![1, 31]).is_err());
+        assert!(quantize_q8s_block32_f32(vec![0.0; 32], vec![2, 32]).is_err());
+
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q8S)
+            .with_level(QuantLevel::block([32]))
+            .with_param(QuantParam::F32)
+            .with_store(QuantStore::PackedU32(0));
+        let q8 = TensorData::quantized(vec![0_i8; 32], [1, 32], scheme, &[1.0]);
+        assert!(loading::quantize_verified_float_q8s_block32_f32(q8).is_err());
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
     #[ignore = "requires the pinned real Q8 bundle and Hugging Face snapshot"]
-    fn real_q8_non_square_linear_payload_and_cpu_forward_reference() {
+    fn real_q8_layout_policy_and_wgpu_row_forward_reference() {
         use std::{
             fs::File,
             io::{Read, Seek, SeekFrom},
@@ -8867,7 +10355,7 @@ mod tests {
 
         #[cfg(feature = "wgpu")]
         if std::env::var_os("BURN_BOOGU_Q8_RUN_WGPU").is_some() {
-            type WgpuBackend = burn_wgpu::Wgpu<f32, i32, u32>;
+            type WgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
 
             let wgpu_device = crate::require_native_wgpu_device().unwrap();
             let local = TensorSnapshot::from_data(
@@ -8892,7 +10380,7 @@ mod tests {
                 .unwrap();
             let wgpu_mapped_metrics = metrics(&wgpu_internal, &source_transposed);
             eprintln!(
-                "WGPU mapped Q8 [in,out] vs BF16 transpose: finite={} max_abs={} rmse={} cosine={}",
+                "raw WGPU mapped Q8 [in,out] vs BF16 transpose: finite={} max_abs={} rmse={} cosine={}",
                 wgpu_internal.iter().all(|value| value.is_finite()),
                 wgpu_mapped_metrics.0,
                 wgpu_mapped_metrics.1,
@@ -8917,14 +10405,14 @@ mod tests {
             let wgpu_f32_metrics = metrics(&wgpu_output_f32, &reference);
             let wgpu_f16_metrics = metrics(&wgpu_output_f16, &reference);
             eprintln!(
-                "WGPU F32 x Q8 linear: finite={} max_abs={} rmse={} cosine={}",
+                "raw WGPU F32 x Q8 linear: finite={} max_abs={} rmse={} cosine={}",
                 wgpu_output_f32.iter().all(|value| value.is_finite()),
                 wgpu_f32_metrics.0,
                 wgpu_f32_metrics.1,
                 wgpu_f32_metrics.2
             );
             eprintln!(
-                "WGPU F16 x Q8 linear: finite={} max_abs={} rmse={} cosine={}",
+                "raw WGPU F16 x Q8 linear: finite={} max_abs={} rmse={} cosine={}",
                 wgpu_output_f16.iter().all(|value| value.is_finite()),
                 wgpu_f16_metrics.0,
                 wgpu_f16_metrics.1,
@@ -9016,37 +10504,48 @@ mod tests {
                 TensorData::new(row_input, [1, 64]),
                 &wgpu_device,
             );
-            let row_f32 = row_linear
-                .forward(row_wgpu_input.clone())
+            let row_f32 = crate::model::linear::linear_forward(&row_linear, row_wgpu_input.clone())
                 .cast(burn::tensor::DType::F32)
                 .into_data()
                 .to_vec::<f32>()
                 .unwrap();
-            let row_f16 = row_linear
-                .forward(row_wgpu_input.cast(burn::tensor::DType::F16))
-                .cast(burn::tensor::DType::F32)
-                .into_data()
-                .to_vec::<f32>()
-                .unwrap();
+            let row_f16 = crate::model::linear::linear_forward(
+                &row_linear,
+                row_wgpu_input.cast(burn::tensor::DType::F16),
+            )
+            .cast(burn::tensor::DType::F32)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
             let row_f32_metrics = metrics(&row_f32, &row_reference);
             let row_f16_metrics = metrics(&row_f16, &row_reference);
             eprintln!(
-                "WGPU Boogu Row F32 x Q8: finite={} max_abs={} rmse={} cosine={}",
+                "raw WGPU Boogu Row F32 x Q8: finite={} max_abs={} rmse={} cosine={}",
                 row_f32.iter().all(|value| value.is_finite()),
                 row_f32_metrics.0,
                 row_f32_metrics.1,
                 row_f32_metrics.2
             );
             eprintln!(
-                "WGPU Boogu Row F16 x Q8: finite={} max_abs={} rmse={} cosine={}",
+                "raw WGPU Boogu Row F16 x Q8: finite={} max_abs={} rmse={} cosine={}",
                 row_f16.iter().all(|value| value.is_finite()),
                 row_f16_metrics.0,
                 row_f16_metrics.1,
                 row_f16_metrics.2
             );
-            assert!(wgpu_mapped_metrics.2 > 0.999 && wgpu_f16_metrics.2 > 0.999);
-            assert!(row_raw_metrics.2 > 0.999 && row_f16_metrics.2 > 0.999);
+            // Burn's column-layout mapper cannot transpose block-quantized parameters while
+            // preserving their scale geometry. This negative control is why production Qwen
+            // dequantizes each bounded stage before applying the normal float transpose. The
+            // Boogu denoiser uses row-layout parameters and must remain packed through matmul.
+            assert!(!wgpu_mapped_metrics.2.is_finite() || wgpu_mapped_metrics.2 < 0.99);
+            assert!(!wgpu_f16_metrics.2.is_finite() || wgpu_f16_metrics.2 < 0.99);
+            assert!(
+                row_f32.iter().all(|value| value.is_finite())
+                    && row_raw_metrics.2 > 0.999
+                    && row_f32_metrics.2 > 0.999
+            );
         }
-        assert!(raw_metrics.2 > 0.999 && mapped_metrics.2 > 0.999 && output_metrics.2 > 0.999);
+        assert!(raw_metrics.2 > 0.999);
+        assert!(mapped_metrics.2 < 0.99 && output_metrics.2 < 0.99);
     }
 }

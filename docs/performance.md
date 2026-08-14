@@ -17,7 +17,10 @@ Reports record:
 
 - adapter, driver, operating system, browser, Burn/WGPU and upstream revisions;
 - artifact profile and on-disk/downloaded byte counts;
-- native residency policy (`native-high-vram` or `diagnostic-layer-streamed`) and bytes reread per step;
+- native residency policy (`native-high-vram`, `low-vram`, or `diagnostic-layer-streamed`) and
+  bytes reread per request/step;
+- browser residency policy (`resident`, `low-vram`, or `layer-streamed-diagnostic`), exact denoiser
+  storage/execution policy, and retained-stage or request-scoped packed-cache audit;
 - cold manifest-to-first-pixel time and warm inference time;
 - tokenizer, Qwen, VAE encode, each denoiser/DMD step, VAE decode, readback, and encoding times;
 - peak host RSS, Wasm memory high-water mark, and peak/delta GPU memory;
@@ -27,6 +30,11 @@ Reports record:
 Native timings use backend synchronization around measured GPU regions. Browser timings use
 timestamp queries when exposed, otherwise queue-completion wall time and clearly label it as such.
 CPU submission time is not presented as GPU execution time.
+
+Browser measurements require both checkout root patches: patched `wgpu` provides bounded writes
+and result-bearing queue completion, while patched `cubecl-wgpu` submits pending upload-only work
+and propagates queue/error-scope failures. A downstream runner must apply equivalent versions of
+both; Cargo does not inherit root patches from published dependencies.
 
 Native `burn-wgpu` builds enable CubeCL autotuning; Wasm builds deliberately do not. A native
 report must include the first-call tuning/compilation cost in the cold sample and measure warm
@@ -212,13 +220,15 @@ The historical schema-v1 flat mixed-F16 1.5K conversion is sealed under bundle d
 249 files, 38,224,723,721 bytes, 223 semantic objects, and 1,940 tensors; its report SHA-256 is
 `b702ef29e4a9e26afc67d2fdf8ad46582f561995d6041763439a6ed7ef3ee64f`. This establishes artifact
 identity and integrity, not numerical or performance parity for the current schema-v2 modular
-closure; its browser replay remains pending.
+closure. The current modular browser low-VRAM replay is recorded below; synchronized browser
+performance remains pending.
 
 The 1536x1536 fixture-injected native WGPU full chain subsequently passed its production
 execution-dtype gate. Its JSON SHA-256 is
 `5834c99b9139ce054891b30e29ecad4bf2d8a4ed1fb9d6482628d1d7350e87ef`; stderr is empty. The
 `131.883 s` fresh-process total includes artifact loading and cold compilation/autotune, so it is
-not a benchmark sample and does not fill the table below.
+not a benchmark sample and does not fill the table below. This is high-VRAM evidence; it does not
+by itself qualify native low-VRAM. The separate low-VRAM result is recorded below.
 
 | Runtime/configuration | Shape | Burn p50 / p95 | Upstream p50 / p95 | Ratio | Status |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -228,9 +238,14 @@ Both sides used the same prompt/source/seed, `align_res=false`, one unreported w
 five measured warm requests, synchronization, and uncached conditioning. The p95 comparison above
 uses nearest rank on both five-sample sets; the upstream JSON additionally records its linearly
 interpolated p95 as `6.002870 s`. The target is `<= 2x` at p50 and p95. Cached repeated-request
-timing cannot replace this comparison. The ordinary browser UI rejects this variant and there is
-no browser 1.5K performance row. A separate no-surface schema-v1 flat-bundle parity replay is
-numerical evidence only; the new modular composition still requires its own replay.
+timing cannot replace this comparison. The ordinary browser UI now exposes this variant and its ten
+official shapes, but there is still no current modular browser 1.5K performance row. A separate
+no-surface current modular low-VRAM replay now supplies 1536x1536 numerical and memory
+qualification, not a synchronized performance comparison. The modular `qualification-f32` replay
+is an optional non-blocking control diagnostic, disabled by default in the release workflow. Its
+last run ended in device loss. The exact F32 fixture route is per-request denoiser retention, not
+the ordinary all-stage-resident UI policy and not a substitute for the mandatory low-VRAM numerical
+and measured-memory gate.
 
 The exact released policy used full autotune, retained Qwen q128 with synchronization deferred to
 the terminal Qwen-stage barrier, `p4/kv1/q1` denoiser q16384 with strict-F32 RMSNorm and composed
@@ -293,12 +308,157 @@ qualified only for 1K; splitting the double-stream shared projection was effecti
 
 The native viewer defaults to `native-high-vram`: every required Qwen/VAE stage and the denoiser
 are verified and resident before **Ready**, so measured forward execution contains no model-weight
-filesystem/decode/upload traffic. `diagnostic-layer-streamed` is an explicit local-only memory
-tradeoff whose benchmark must include repeated Qwen, VAE, and denoiser artifact reads and
-verification. Browser production now follows the same ready-state boundary with dense-F32 WebGPU
-modules; its explicit `layer-streamed-diagnostic` policy is the only ordinary browser mode that
-repeats model-weight traffic. Historical streamed-browser numbers do not qualify the resident
-default.
+filesystem/decode/upload traffic. Native `low-vram` instead streams Qwen per semantic stage and the
+required VAE half per phase while retaining one mixed-F16 denoiser across all four DMD steps;
+`diagnostic-layer-streamed` additionally reloads the denoiser per step and remains an explicit
+local-only diagnostic.
+
+Explicit browser `resident` follows the high-VRAM ready-state boundary with dense-F32 WebGPU
+modules and remains an advanced unqualified mode. Default browser `low-vram` is variant-aware:
+Edit retains an inventory-qualified runtime-Q8/F32 denoiser for one request. Ordinary Turbo
+authenticates 46 stages / 106 objects / 912 F16 tensors into a 19,870,010,624-byte packed cache,
+widens one semantic stage at a time on device, and executes dense-F32 matmul. Across four DMD steps
+it requires 184 stage materializations and 424 object unpacks, with zero artifact/cache/network
+traffic. After DMD, the exact F32 latent crosses a synchronized host handoff and the packed cache is
+proven empty before VAE decode; a later request must rehydrate it from persistent cache. The current
+browser VAE source initializes the complete 335,278,732-byte F32 autoencoder before applying
+selected encoder or decoder objects, so planning accounts for that full module even though
+artifact transport remains stage-bounded.
+`layer-streamed-diagnostic` additionally reloads denoiser weights every step.
+Historical streamed-browser numbers do not qualify either production policy; the current modular
+low-VRAM result below is the relevant 1536x1536 qualification.
+
+### Low-VRAM memory qualification
+
+Both low-VRAM implementations use a strict decimal cap of 32,000,000,000 bytes, not 32 GiB. The
+current static plans are:
+
+| Runtime / release | Planned device bytes | Composition |
+| --- | ---: | --- |
+| Native Turbo | 30,585,112,576 | 20,585,112,576 peak initialization weights (before dormant reference-refiner release) plus 10,000,000,000 non-weight reserve |
+| Native 1K/1.5K Edit | 30,971,005,440 | 20,971,005,440 live mixed-F16 weights plus 10,000,000,000 non-weight reserve |
+| Browser Turbo | 26,492,170,880 | 19,870,010,624-byte request-scoped packed-F16 cache plus the 1,753,654,656-byte maximum dense-F32 semantic stage and 4,868,505,600-byte activation reserve; the 22,304,263,424-byte preload peak is lower |
+| Browser 1K/1.5K Edit | 30,402,341,120 | audited runtime-Q8/F32 denoiser, 771,785,728-byte max streamed F32 Qwen stage, two quantization buffers, and twelve activation buffers |
+
+These are conservative fail-closed planning bounds, not measured peaks. Turbo's exact-size
+persistent Qwen text-layer pool is not covered by a derived byte bound, so its aggregate measured
+GPU-memory gate remains mandatory. Qualification remains release-specific; the measured results
+below must be identified separately from the plans.
+
+Native Turbo now has a cold 1024x1024 low-VRAM output-qualification candidate from the canonical
+modular closure. The report returned `ok=true`, and its fresh isolated XDG cache emitted six
+`Loaded 0 autotune cached entries` records. All 2,246 PID-scoped samples matched the process and
+were nonzero. Overall and VAE-decode peak framebuffer use was 27,055 MiB /
+28,369,223,680 bytes; initialization, Qwen, and DMD peaked at 24,814,551,040, 27,087,863,808, and
+27,096,252,416 bytes respectively. The 1024x1024 PNG remained exactly 1,448,891 bytes at SHA-256
+`b2cfbc50f7c8f9d486799abd8c5be90c8770059a1dbc020ad02ac41a91abfab1` across the allocation
+change. Total cold-process time was `281.404 s`, including `212.459 s` of inference. Those times
+include canonical closure verification, loading, cold compilation/autotune, inference, and output;
+they are qualification timing rather than a synchronized warm performance row.
+
+The closure verified 223 weight objects, 253 files, 1,940 tensors, and 38,224,723,494 bytes under
+parent digest `555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36`. Report SHA-256 is
+`4f67f468110addef18a4d6f27d4ed01ab57f1c3c03de7174e6450fe793d38376`. Native Turbo low-VRAM
+uploads the Qwen embedding directly in its released F16 dtype and gives VAE decode exact-size
+transient allocations with synchronization/cleanup before the decoder tail. These are
+low-VRAM-only, math-neutral allocator policies. The report is not a fixture-backed numerical or
+cross-runtime parity result and does not qualify browser Turbo or another shape.
+
+Current-source native Edit-Turbo 1.5K passed its 1536x1536 full-chain gate with 608 attempted
+samples and 607 matched/nonzero PID-scoped samples. Sampling used a configured 250 ms delay plus
+`nvidia-smi` subprocess latency. Peak framebuffer use was 28,906 MiB / 30,310,137,856 bytes, strictly below the
+32,000,000,000-byte cap. RGB was `33.72779 dB` / `0.9920097` SSIM and propagated decode was
+`0.08242943` relative RMSE / `0.99667007` cosine; total fresh-process qualification time was
+`173.546 s`. Report SHA-256 is
+`a013adfcd30b7e6b2323ecc3723b22396f9858d14dd3cdd4a0da2699e199abe3`. This evidence is scoped to
+the historical schema-v1 flat artifact digest
+`4e8b12ac5ca95272f9009080a23baf1bc52d1b0e7aebf2e9e5f394a492369213`, native Burn WGPU, and the
+reported RTX PRO 6000 Blackwell/610.43.02 stack; it is not a warm performance benchmark or modular
+artifact result.
+
+Ordinary rendered browser Turbo 1024 passed its current packed-F16 output/surface/memory gate. The
+Chrome GPU process peaked at 22,824 MiB / 23,932,698,624 bytes across 748/748 matched intervals,
+461 active, with 99% peak SM activity. Its 780.261-second end-to-end duration includes preload,
+network/cache population, compilation, inference, UI interaction, and PNG save, so it is
+qualification timing rather than a warm performance row. Report SHA-256 is
+`36525be1d5ff482c409c3b7484027fcb335340e474e4a95f182720ea3f032a28`; the same-seed native/browser
+quality report passed at `37.517250061 dB` PSNR / `0.985732973` SSIM with SHA-256
+`31da8e541013c38dd215257431159a99c7112ad79714a079e2a4b25f9c855103`. Serialized Run C measured
+the same peak and output but is diagnostic-only; its report SHA-256 is
+`b0dfcc8e53fd7ad1c4731d3169e2f43c50063aa2b54e5ca6347789e18630c6e6`.
+
+The first current-source browser Edit-Turbo 1.5K computation passed its inner modular 1536x1536
+exact-fixture and memory gates, but its immutable outer report failed only on the stale host-key
+expectation for retired resource-plan field `audited_max_streamed_stage_bytes`. Corrected offline replay is
+clean but noncanonical; that failed-outer report SHA-256 is
+`3dec48ec032c7abd1ffcb9aab1546d81765e97503340f8ea895724dfe1aacd5b`.
+
+The subsequent 2026-08-14 source-bound rerun is the canonical pass. It completed in `904.960 s`,
+matched all 443 GPU sample intervals, recorded 224 active intervals and 99% peak SM activity, and
+peaked at 29,828 MiB / 31,276,924,928 bytes—723,075,072 bytes below the decimal cap. Peak Wasm
+linear memory was 2,009,137,152 bytes. Final RGB was `34.531677 dB` PSNR / `0.99253726` SSIM;
+report SHA-256 is `c895ae2c1cba3823afe756035b6e564d5ef27caf3722f5f350c07e23086e3b54`.
+This is qualification timing and a scoped no-surface numerical/memory result, not a warm
+performance row.
+
+The browser measurements used quota-aware Chrome shared-memory admission: BigInt `statfs` plus a
+real bounded 256 MiB write/`fsync`/delete probe admitted `/dev/shm`, rejected quota-limited `/tmp`,
+and therefore omitted `--disable-dev-shm-usage`. As of 2026-08-14, canonical CDN/Pages deployment is
+still blocked by HTTP 403 responses and missing Range/`Content-Range` CORS exposure; local modular
+measurements do not waive that publication gate.
+
+Native 1K Edit and browser 1K Edit low-VRAM qualification remain pending. Native Turbo has
+the artifact/output/memory candidate recorded above but still lacks an exact-noise full-chain
+cross-runtime parity result. Ordinary rendered packed-F16 Turbo 1024 now has the output/memory
+result above, and the same-engine two-request ordinary smoke also passes. Exact-noise parity, the
+other browser shapes, the explicit dense-F32 resident policy, synchronized browser performance,
+and cross-stack portability remain pending.
+Their real-checkpoint runs must capture the complete workload window, prove positive GPU activity
+and process-scoped framebuffer samples, satisfy the applicable numerical and memory gates, and
+report host RSS/Wasm memory beside device memory.
+
+Neither current Turbo run is a performance row. Serialized Run C is explicitly diagnostic-only;
+the ordinary run is a cold, cache-populating output qualification. Both establish stable
+post-terminal rendering and the packed-F16 output/memory measurement for their named scopes, not
+warm latency.
+
+The manual release workflow's exhaustive 1024 Turbo first-DMD diagnostic is an additional
+fail-closed stability check, not a performance row or a parity result. The current diagnostic runs
+one packed-F16/dense-F32 prediction and proves zero DMD artifact/range/cache/network traffic. Its
+final-source hardware run passed with outcome `diagnostic-passed-no-full-parity-claim`, binding
+JavaScript SHA-256 `64197f892ae850d901a9b76ff70dba7f543fa70af02028f605bb9eb126dc1b37`, WebAssembly SHA-256
+`001f0bcc93fbaeea9a9b32d2adcb8b46f1897b80d36386919c03d69869dca86b`, probe/harness SHA-256
+`d6485fa204233b25c1d12128410ae162a8d1ce59053179d3f31a3db63155dd88`, contract SHA-256
+`dadd84a4ef9c5162c4aea7f3251cb40461e08d969bfaada3ae99f94dc6fb4b86`, report SHA-256
+`0a600471ec9e3119eeaebd616e9dd29a84c62067881b6f9834949019f92d5eab`, and console SHA-256
+`20af8aa43d3a53608c0658fabbef0fb8d7e85f2ff4b9655736fc74b959d489fe`. The exact cache held 46
+stages / 106 objects / 912 tensors; one prediction performed 46 stage materializations and 106
+object unpacks, read 19,870,010,624 packed bytes, and wrote 39,740,021,248 dense-F32 bytes. Velocity
+relative RMSE / cosine were `0.03869645` / `0.9992708`, and prediction relative RMSE / cosine were
+`0.042713966` / `0.99910367`. `/dev/shm` passed quota-aware admission, and process-group exit,
+Chrome-profile removal, and artifact-server teardown were clean. This is one-prediction diagnostic
+stability evidence only: it makes no calibrated numerical-correctness, full-chain/full-resolution
+parity, fully on-device-quantized execution, or performance claim. The predecessor core-Q8
+diagnostic remains historical: five selected fixture tensors / 1,941,506 bytes were authenticated
+and finite velocity/prediction metrics were
+`0.039951164` / `0.044186924` relative RMSE and `0.99920744` / `0.9990256` cosine. Report SHA-256
+was `62e14a0712811e088b33d74d047fa6370c5ae8191920cbbc87313b93fb3e68d0`, with outcome
+`diagnostic-passed-no-full-parity-claim`; it is not current packed-F16 evidence.
+
+The canonical same-engine rendered gate passed two sequential ordinary requests on one engine, so
+cache behavior is not inferred from separate browser launches. Exactly one adapter request, one
+device request, and one Chrome GPU process served both requests; packed-cache preload attempts were
+`[1, 2]`. Request 2 read all 186 objects / 35,106,151,424 bytes / 8,489 ranges as cache hits, with
+zero misses and zero network requests or bytes. Both requests completed four zero-I/O DMD steps,
+digest-preserving Qwen and DMD-to-VAE handoffs, cache-ready-to-empty cleanup, and one violation-free
+surface-suspension window followed by successful acquisition. The process group exited, the Chrome
+profile was removed, and page/GPU error lists were empty. The measured Chrome GPU-process peak was
+23,255 MiB / 24,384,634,880 bytes. Distinct 1024x1024 downloads have SHA-256
+`5d7a947301c9cefef8bca5cd42db52b98fe3fca440e98d302312eff6afe2eb38` and
+`815c553a70a4322aa8e49a51aeb0d46b75ccf2178b435c9b0ba0fedec3da5e0c`; canonical report SHA-256
+is `90da22207398ae907e6b0d0bc93881c689a2a7362a1e52aac5435deac525b5d5`. Its 1,363.764-second
+duration is cold qualification timing, not a synchronized warm performance row, and the result is
+an ordinary same-engine rendered smoke rather than numerical parity.
 
 The first reviewed native baseline is the
 [2026-08-11 RTX PRO 6000 report](reports/2026-08-11-rtx-pro-6000.md). It records a real performance

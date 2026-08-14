@@ -1065,6 +1065,7 @@ dependencies = [
  "bevy_ecs",
  "bevy_input",
  "bevy_math",
+ "bevy_picking",
  "bevy_reflect",
  "bevy_window",
  "log",
@@ -2597,10 +2598,12 @@ dependencies = [
  "burn-wgpu",
  "burn_image",
  "getrandom 0.4.3",
+ "half",
  "image",
  "safetensors 0.7.0",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokenizers 0.21.4",
@@ -3603,8 +3606,6 @@ dependencies = [
 [[package]]
 name = "cubecl-wgpu"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3663c6e1a86187172b2cee495b6b533e7d91a2cb37e26f421649e315fe4c3a"
 dependencies = [
  "ash",
  "async-channel",
@@ -9380,8 +9381,6 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76e8840e1ba2881d4cbb18d2147627a56af426ff064c0401eb0c8410c6325d07"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.1",

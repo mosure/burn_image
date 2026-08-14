@@ -1,6 +1,9 @@
 use burn::{nn, prelude::*, tensor::activation::silu};
 
-use super::norm::{DenoiserRmsNormPolicy, layer_norm_no_affine, rms_norm_with_policy};
+use super::{
+    linear::linear_forward,
+    norm::{DenoiserRmsNormPolicy, layer_norm_no_affine, rms_norm_with_policy},
+};
 
 /// Combined timestep and Qwen caption embedding.
 #[derive(Module, Debug)]
@@ -59,15 +62,15 @@ impl<B: Backend> CombinedTimestepCaptionEmbedding<B> {
         rms_norm_policy: DenoiserRmsNormPolicy,
     ) -> (Tensor<B, 2>, Tensor<B, 3>) {
         let time = timestep_embedding(timestep, self.frequency_width, self.timestep_scale);
-        let time = self
-            .time_linear_2
-            .forward(silu(self.time_linear_1.forward(time)));
+        let time = linear_forward(
+            &self.time_linear_2,
+            silu(linear_forward(&self.time_linear_1, time)),
+        );
         debug_assert_eq!(time.dims()[1], self.conditioning_width);
-        let caption = self.caption_linear.forward(rms_norm_with_policy(
-            &self.caption_norm,
-            instruction,
-            rms_norm_policy,
-        ));
+        let caption = linear_forward(
+            &self.caption_linear,
+            rms_norm_with_policy(&self.caption_norm, instruction, rms_norm_policy),
+        );
         (time, caption)
     }
 }
@@ -117,8 +120,10 @@ impl<B: Backend> FinalProjection<B> {
 
     /// Project joint tokens to latent patches.
     pub fn forward(&self, tokens: Tensor<B, 3>, conditioning: Tensor<B, 2>) -> Tensor<B, 3> {
-        let scale = self.linear_1.forward(silu(conditioning)).unsqueeze_dim(1) + 1.0;
-        self.linear_2
-            .forward(layer_norm_no_affine(tokens, self.epsilon) * scale)
+        let scale = linear_forward(&self.linear_1, silu(conditioning)).unsqueeze_dim(1) + 1.0;
+        linear_forward(
+            &self.linear_2,
+            layer_norm_no_affine(tokens, self.epsilon) * scale,
+        )
     }
 }

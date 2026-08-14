@@ -37,6 +37,14 @@ presets are supported request shapes without independent parity or performance q
 | `quantized` | Q8 profile marker; artifact storage and load policy remain explicit |
 | `reference-hooks` | named denoiser observations for exhaustive fixture comparison |
 
+The repository root patches both `wgpu` 29.0.4 and `cubecl-wgpu` 0.10.0. The former bounds browser
+`writeBuffer`/`writeTexture` calls and exposes rejected queue-completion promises; the latter submits
+pending upload-only work and propagates queue/error-scope failure through asynchronous
+synchronization. Cargo does not propagate root patches through a published crate. Downstream
+crates.io consumers of `webgpu` must vendor/apply equivalent `wgpu` **and** `cubecl-wgpu` patches in
+their own workspace root until both changes are upstream/resolvable. A graph missing either patch
+does not inherit the repository/Pages browser support claim.
+
 ## Public API map
 
 - `BooguConfig`, `BooguDenoiser`, and `BooguDenoiserInput` describe the released Boogu-specific
@@ -80,10 +88,16 @@ evidence rather than inheriting a claim from another shape.
 
 | Profile | Storage | Execution contract | Status |
 | --- | --- | --- | --- |
-| `f16` | all floating tensors F16 | F16 Qwen/denoiser | diagnostic; Qwen vision accumulates excessive F16 drift |
-| `f16-qwen-vision-f32` | Qwen vision F32, other model weights F16 | F32 Qwen vision, F16 text/denoiser; VAE is F32 compatibility or verified F16 native policy | canonical production policy; frontend alias `production` |
+| `f16` | all floating tensors F16 | owner/backend-specific diagnostic execution; no ordinary-browser production claim | diagnostic; Qwen vision accumulates excessive F16 drift |
+| `f16-qwen-vision-f32` | Qwen vision F32, other model weights F16 | owner-specific: native mixed F16, browser Edit runtime-Q8/F32, browser Turbo packed-F16 widened stagewise to dense F32; typed VAE policy | canonical production storage; frontend alias `production` |
 | `q8s-block32-f32` | eligible matrices Q8S block-32, other tensors F16 | policy depends on owner; F16 vision remains diagnostic | diagnostic |
 | `q8s-block32-f32-qwen-vision-f32` | Qwen vision F32, eligible non-vision matrices Q8S | split policy below | legacy diagnostic; not in the production CDN set |
+
+The user-facing Bevy native viewer and browser entry point call the canonical mixed storage policy
+simply `production`. `f16-qwen-vision-f32` is the precise sealed manifest and runtime-provenance
+identity, so low-level conversion, runner, and parity binaries retain it in their `--profile`
+arguments. The name means that Qwen vision is the F32 exception; it does not mean the whole model
+is stored or executed F32.
 
 The Q8 split is required by measured Burn 0.21 behavior:
 
@@ -99,9 +113,31 @@ The Q8 split is required by measured Burn 0.21 behavior:
   path. The latter has a separate retained-decoder numerical gate and must not be inferred for an
   untested backend.
 
-`Preserve` is rejected by `boogu-qwen-parity` for a Q8 Qwen profile. The same quantized policy can
+`Preserve` is rejected by `boogu-qwen-parity` for a Q8 Qwen profile. The stored-payload policy can
 be selected independently on sync and async Qwen/denoiser sources with
-`with_quantized_load_policy`.
+`with_quantized_load_policy`. That API retains its original closed choice between `Preserve` and
+`DequantizeF16`; it never converts an ordinary float artifact to Q8.
+
+`BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32` is the separate runtime conversion policy
+used by browser low-VRAM Edit over the unchanged production artifact. It is disabled by default and
+can be enabled only on verified denoiser stage sources through
+`with_runtime_quantization_policy`. It converts only inventory-qualified row-layout denoiser
+matrices to packed Q8S block-32/F32; Qwen and the VAE execution selected for each phase remain F32.
+VAE artifact transport applies only the selected objects, while the current source initializes the
+full module as detailed below. The retained-denoiser audit verifies tensor counts, dtypes, element
+counts, and packed payload bytes without reading weights back through the host. Edit preserves
+QFloat weights into `q_matmul`. The first current-source modular 1536x1536 computation passed its
+inner full-chain and memory gates but the stale host-key contract left the outer report failed. The
+corrected source-bound canonical rerun now passes the exact no-surface numerical/memory gate; it did
+not capture a backend kernel trace, so no on-device quantized-execution claim is made.
+
+Ordinary browser Turbo does not runtime-quantize. Its
+`VerifiedAsyncPackedF16DenoiserStageSource` authenticates the canonical F16 denoiser objects, pads
+them for aligned device views, and retains packed U32 arenas. Each semantic stage is widened on
+device to an exact dense-F32 module, executed with dense-F32 matmul, and released before the next
+stage. The request-scoped packed cache is cleared before VAE decode and rehydrated before the next
+request. The retired Turbo Q8 selectors remain fail-closed; their historical evidence does not
+qualify packed-F16 execution.
 
 ## Residency policies
 
@@ -112,13 +148,112 @@ runners can use the same retaining wrappers lazily when startup latency is prefe
 construction can use `load_resident_denoiser_from_directory_with_policies` when sufficient VRAM is
 available.
 
-The Bevy browser production factory applies the equivalent contract to non-`Send` async sources:
-one bounded, verified payload is held in Wasm during preload, then discarded after its initialized
-dense-F32 WebGPU module is retained. The complete bundle is never held in Wasm linear memory, and
-forward performs no model-weight HTTP read, decode, or upload. Explicit layer-streamed diagnostics
-keep stages short-lived and intentionally repeat that traffic. The exact 1.5K parity route has its
-own narrower lifetime: it retains all 48 denoiser stages across four DMD steps and clears them
-before VAE decode.
+The implemented native low-VRAM composition uses the same mixed-F16 production weights and
+qualified native attention/VAE policies. Qwen streams one verified stage at a time, the required
+VAE half is materialized for its request phase, and one variant-scoped denoiser remains resident
+across all four DMD steps and later requests. Static plans are 30,585,112,576 bytes for Turbo and
+30,971,005,440 bytes for either Edit release, including a conservative 10,000,000,000-byte
+non-weight reserve. The limit is decimal 32,000,000,000 bytes rather than 32 GiB; these plans are
+not measured peaks. A fresh-cache native Turbo 1024x1024 run passed its separate
+output-qualification gate with `ok=true`. All 2,246 PID-scoped samples matched and were nonzero; the
+overall/VAE-decode peak was 27,055 MiB / 28,369,223,680 bytes, with initialization, Qwen, and DMD
+phase peaks of 24,814,551,040, 27,087,863,808, and 27,096,252,416 bytes. The canonical modular
+closure verified 223 objects, 253 files, 1,940 tensors, and 38,224,723,494 bytes under digest
+`555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36`. Its 1,448,891-byte PNG
+remained byte-identical across the allocation change at SHA-256
+`b2cfbc50f7c8f9d486799abd8c5be90c8770059a1dbc020ad02ac41a91abfab1`; total/inference time was
+`281.404/212.459 s`, and six autotune-load messages each reported zero cached entries. Report
+SHA-256 is `4f67f468110addef18a4d6f27d4ed01ab57f1c3c03de7174e6450fe793d38376`.
+
+The low-VRAM-only allocator policy uploads the Qwen embedding directly in its released F16 dtype
+and uses exact-size VAE transient allocation with synchronization/cleanup before the decoder tail.
+It is math-neutral and does not change high-VRAM or browser execution. The report is an
+output-qualification candidate, not fixture-backed numerical or cross-runtime parity, browser evidence,
+or a warm benchmark. The current-source 1536x1536 Edit-Turbo 1.5K replay separately passed the
+strict PID-scoped memory and full-chain numerical gate at 28,906 MiB / 30,310,137,856 bytes. It
+attempted 608 samples, matched 607 with nonzero framebuffer use, and recorded no sampler error.
+Its report SHA-256 is
+`a013adfcd30b7e6b2323ecc3723b22396f9858d14dd3cdd4a0da2699e199abe3`, scoped to the reported RTX
+PRO 6000 Blackwell/610.43.02 native WGPU stack and historical flat artifact digest
+`4e8b12ac5ca95272f9009080a23baf1bc52d1b0e7aebf2e9e5f394a492369213`; 1K Edit remains
+unmeasured in low-VRAM mode.
+
+The optional Bevy browser high-VRAM factory applies the equivalent contract to non-`Send` async
+sources: one bounded, verified payload is held in Wasm during preload, then discarded after its
+initialized dense-F32 WebGPU module is retained. The complete bundle is never held in Wasm linear
+memory, and forward performs no model-weight HTTP read, decode, or upload. This explicit advanced
+policy is not currently qualified.
+
+The browser low-VRAM default is variant-aware. Edit streams Qwen and selected VAE objects and
+retains an inventory-qualified runtime-Q8/F32 denoiser for four DMD steps before clearing it for
+decode. Ordinary Turbo uses packed F16 widened to dense F32 per semantic stage. Initial setup
+authenticates 46 stages / 106 objects / 912 tensors and retains 19,870,010,624 padded packed-F16
+bytes. Each request performs 184 stage materializations and 424 object unpacks across four DMD
+steps, with zero DMD artifact/cache/network traffic. After DMD, an exact F32 latent handoff crosses
+queue barriers, the packed cache and allocator state are cleared, and VAE decode starts only after
+the cache is proven empty. The next request rehydrates the 106 objects from the integrity-checked
+persistent range cache.
+
+Turbo's static packed-F16 plan records a 22,304,263,424-byte preload peak and a
+26,492,170,880-byte conservative inference bound. The exact-size persistent Qwen text-layer pool is
+not included in that derived bound and therefore requires the measured aggregate GPU-memory gate.
+The first Generate request reads Qwen text and VAE decoder objects only, exactly 80 /
+15,235,984,896 bytes / 3,709 ranges. A second same-engine request includes the packed-cache
+rehydration and reads 186 objects / 35,106,151,424 bytes / 8,489 cache-hit ranges with zero network
+responses. The browser source applies only selected VAE objects but initializes the complete
+335,278,732-byte F32 autoencoder before selection.
+
+Serialized Run C and the ordinary rendered Turbo 1024 run both completed the current packed-F16
+model/output/surface/memory work at a 23,932,698,624-byte measured Chrome GPU peak. Run C remains
+diagnostic-only (report SHA-256
+`b0dfcc8e53fd7ad1c4731d3169e2f43c50063aa2b54e5ca6347789e18630c6e6`). The ordinary report
+SHA-256 is `36525be1d5ff482c409c3b7484027fcb335340e474e4a95f182720ea3f032a28`; its 1,452,562-byte
+PNG SHA-256 is `5d7a947301c9cefef8bca5cd42db52b98fe3fca440e98d302312eff6afe2eb38`. Same-seed native/browser
+output quality passed at `37.517250061 dB` PSNR / `0.985732973` SSIM, but independent RNG makes that a
+quality gate rather than exact-noise parity; quality-report SHA-256 is
+`31da8e541013c38dd215257431159a99c7112ad79714a079e2a4b25f9c855103`. The final-source
+packed-F16 Turbo first-DMD diagnostic passed with outcome
+`diagnostic-passed-no-full-parity-claim`. It binds JavaScript SHA-256
+`64197f892ae850d901a9b76ff70dba7f543fa70af02028f605bb9eb126dc1b37`, WebAssembly SHA-256
+`001f0bcc93fbaeea9a9b32d2adcb8b46f1897b80d36386919c03d69869dca86b`, probe/harness SHA-256
+`d6485fa204233b25c1d12128410ae162a8d1ce59053179d3f31a3db63155dd88`, contract SHA-256
+`dadd84a4ef9c5162c4aea7f3251cb40461e08d969bfaada3ae99f94dc6fb4b86`, report SHA-256
+`0a600471ec9e3119eeaebd616e9dd29a84c62067881b6f9834949019f92d5eab`, and console SHA-256
+`20af8aa43d3a53608c0658fabbef0fb8d7e85f2ff4b9655736fc74b959d489fe`. The exact cache held 46
+stages / 106 objects / 912 tensors; one prediction performed 46 stage materializations and 106
+object unpacks, read 19,870,010,624 packed bytes, wrote 39,740,021,248 dense-F32 bytes, and made
+zero DMD artifact/range/cache/network traffic. Velocity relative RMSE / cosine were `0.03869645` /
+`0.9992708`, and prediction relative RMSE / cosine were `0.042713966` / `0.99910367`. `/dev/shm`
+passed quota-aware admission, and process-group exit, Chrome-profile removal, and artifact-server
+teardown were clean. This is one-prediction diagnostic stability evidence only: it makes no
+calibrated numerical-correctness, full-chain/full-resolution parity, or fully on-device-quantized
+execution claim.
+
+A predecessor core-Q8 first-DMD diagnostic produced finite output and report SHA-256
+`62e14a0712811e088b33d74d047fa6370c5ae8191920cbbc87313b93fb3e68d0` with outcome
+`diagnostic-passed-no-full-parity-claim`; it remains historical and does not qualify the current
+policy. The canonical same-page/same-engine rerun passed two sequential ordinary requests with one
+adapter request, one device request, one Chrome GPU process, and packed-cache preload attempts
+`[1, 2]`. Request 2 read all 186 objects / 35,106,151,424 bytes / 8,489 ranges from persistent
+cache, with 8,489 hits, zero misses, and zero network traffic. Both requests completed four zero-I/O
+DMD steps, digest-preserving Qwen and DMD-to-VAE handoffs, cache-ready-to-empty cleanup, and one
+violation-free surface-suspension window followed by successful acquisition. Peak Chrome
+GPU-process memory was 24,384,634,880 bytes; page/GPU error lists were empty, the process group
+exited, and the Chrome profile was removed. The distinct 1024x1024 downloads have SHA-256
+`5d7a947301c9cefef8bca5cd42db52b98fe3fca440e98d302312eff6afe2eb38` and
+`815c553a70a4322aa8e49a51aeb0d46b75ccf2178b435c9b0ba0fedec3da5e0c`; canonical report SHA-256
+is `90da22207398ae907e6b0d0bc93881c689a2a7362a1e52aac5435deac525b5d5`. This qualifies the
+ordinary same-engine rendered smoke only, not numerical parity.
+
+The first current-source modular 1536x1536 Edit-Turbo 1.5K attempt passed all inner numerical,
+artifact, fixture, dtype-audit, and measured-memory checks, but its outer report failed because the
+host expected retired resource-plan field `audited_max_streamed_stage_bytes`; the runtime correctly
+emitted `audited_max_streamed_qwen_stage_f32_bytes`. Offline replay with the corrected validator was
+noncanonical. The subsequent source-bound rerun passed with top-level `ok=true`, 443/443 matched GPU
+intervals, 224 active, peak 29,828 MiB / 31,276,924,928 bytes, and final RGB
+`34.531677 dB` / `0.99253726` SSIM. Report SHA-256 is
+`c895ae2c1cba3823afe756035b6e564d5ef27caf3722f5f350c07e23086e3b54`. Explicit layer-streamed
+diagnostics additionally reload denoiser stages on every step and intentionally repeat that traffic.
 
 ## Binaries
 
@@ -169,15 +304,19 @@ cargo run --release -p burn_boogu --features runtime,import,wgpu \
   --width 1536 --height 1536 --seed 42 --repeat 6
 ```
 
-Omitting both dimensions selects the 1536×1536 model default. Other accepted native presets are
-1264×1856, 1856×1264, 1344×1744, 1744×1344, 1392×1696, 1696×1392, 1152×2032,
-2032×1152, and 2368×992; arbitrary in-envelope dimensions fail closed. Only the 1536×1536 default
-has the native numerical and synchronized performance evidence below. Ordinary Browser WebGPU
-still rejects `edit-turbo-1k5` before artifact loading. A separate no-surface, exact-fixture route
-passed 1536×1536 numerical parity on the pinned RTX PRO 6000 Blackwell/Chrome 151 stack using
-the historical schema-v1 flat bundle. It does not qualify the new schema-v2 modular closure,
-browser performance, the ordinary UI route, another shape, or another stack; the modular browser
-replay remains pending.
+Omitting both dimensions selects the 1536x1536 model default. Other accepted native and browser presets are
+1264x1856, 1856x1264, 1344x1744, 1744x1344, 1392x1696, 1696x1392, 1152x2032,
+2032x1152, and 2368x992; arbitrary in-envelope dimensions fail closed. Only the 1536x1536 default
+has the native high-VRAM numerical and synchronized performance evidence below. Browser descriptors
+and the ordinary UI now expose the same ten shapes, using a shape-aware strict-F32 striped VAE tail
+at and above 1024. The first current modular low-VRAM no-surface exact-fixture computation passed
+its 1536x1536 inner numerical and memory checks but failed only the stale host-key contract. The
+corrected source-bound rerun now passes on the pinned RTX PRO 6000 Blackwell/Chrome 151 stack. It
+does not qualify browser performance, the rendered ordinary UI, another shape, or another stack. The modular
+`qualification-f32` fixture route is an optional non-blocking control diagnostic, disabled by
+default in the release workflow. Its last run ended in device loss; it is request-scoped F32
+denoiser retention, not the ordinary all-stage-resident UI policy, and it cannot replace the
+mandatory low-VRAM numerical and measured-memory gate.
 
 The parity-gated 1024 native-WGPU performance policy is selected explicitly:
 
@@ -335,25 +474,55 @@ replay; `boogu-full-parity` owns production execution-dtype propagation.
 
 ## Current limits
 
+As of 2026-08-14, canonical CDN publication remains blocked: the five prepared model entry URLs
+return HTTP 403 and do not expose the required Range/`Content-Range` headers through CORS. The
+positive browser evidence above used verified local modular artifacts and does not waive that gate.
+Linux browser harnesses also use BigInt `statfs` plus a real bounded 256 MiB write/`fsync`/delete
+quota probe; current runs admitted `/dev/shm`, rejected quota-limited `/tmp`, and omitted
+`--disable-dev-shm-usage`.
+
 - Native WGPU has real-checkpoint numerical evidence at 256x256 and operational/performance
-  acceptance at 1024x1024 for Turbo and 1K Edit. The 1.5K runtime/configuration, strict artifact
+  acceptance at 1024x1024 for Turbo and 1K Edit. Native Turbo additionally has a cold 1024x1024
+  low-VRAM output-qualification candidate below the strict memory cap; it is not a fixture-backed
+  parity result. The 1.5K runtime/configuration, strict artifact
   identity, 1536x1536 production full-chain numerical gate, and synchronized performance row are
   validated; its exact-policy uncached p50/p95 are `2.1032x/2.1371x`, so performance parity is not
   achieved. Exhaustive q128 Qwen and portable-denoiser components are covered, while accelerated
-  attention is gated through propagated full-chain boundaries. The concrete browser
-  runtime has completed one real hardware-WebGPU
-  Turbo request at its deliberately narrower 256x256 limit, but that ordinary prompt/seed run is
-  not upstream fixture parity. The production headless Bevy swap-chain smoke remains failed on
-  this Chrome/host combination; see the repository web report for the exact distinction.
-- Q8 reduces stored/denoiser device weight cost, but Qwen currently executes from stage-local F16
-  dequantization because the Burn 0.21 Col Q8 mapper is not numerically valid.
+  attention is gated through propagated full-chain boundaries. Browser descriptors and buffer plans
+  now match native shapes: 256-1024 for Turbo/1K Edit and all ten official 1.5K presets. The first
+  current modular runtime-Q8 low-VRAM 1536x1536 Edit computation passed its inner numerical and
+  memory gates but not its stale host contract; the corrected source-bound canonical rerun now
+  passes for that exact no-surface scope. The modular
+  `qualification-f32` path is an optional non-blocking control diagnostic whose passing result
+  remains absent; ordinary all-stage-resident UI, 1.5K rendered-window, other shapes, and
+  synchronized browser performance gates remain pending. Current packed-F16 Turbo 1024 has a
+  passing ordinary rendered output/memory result, a passing same-engine two-request ordinary smoke,
+  and a separate passing diagnostic-only serialized result; exact-noise full-chain parity remains
+  pending. Historical
+  browser evidence includes the predecessor core-Q8 Turbo first-DMD diagnostic, one ordinary
+  streamed 256x256 Turbo request, and one exact no-surface flat-bundle 1536x1536 replay; those older
+  runs do not expand the current packed-F16 or modular-result scope.
+- Stored-Q8 Qwen currently executes from stage-local F16 dequantization because the Burn 0.21 Col
+  Q8 mapper is not numerically valid. Browser low-VRAM Edit runtime-quantizes only qualified
+  row-layout denoiser matrices and source dispatch preserves them into `q_matmul`. The positive
+  current-source canonical computation captured no backend kernel trace and therefore keeps
+  `on_device_quantized_execution_claimed=false`. Ordinary
+  Turbo uses packed-F16 storage and dense-F32 execution instead.
+- Native and browser low-VRAM use a strict decimal 32,000,000,000-byte cap. Static plans must not
+  be reported as peaks; native modular Turbo has a measured 28,369,223,680-byte
+  output-qualification pass, current-source native historical-flat 1.5K has a measured
+  30,310,137,856-byte numerical pass, ordinary rendered browser Turbo 1024 has a measured
+  23,932,698,624-byte output pass, and current modular browser 1.5K has an exact no-surface
+  numerical/memory pass at 31,276,924,928 bytes. Other release/runtime tuples remain pending.
 - Performance comparisons are meaningful only after the matching numerical gate passes and must
   name artifact digest, backend, adapter, dimensions, and residency policy.
 - The forced native-WGPU padded blackbox `p4/kv1/q1` policy has direct numerical and end-to-end
   acceptance on the reported RTX PRO 6000. Wider query partitions fail closed. Browser WebGPU does
   not inherit this native cooperative-matrix claim. The native CUDA probe produced invalid output
   and is excluded from supported correctness and performance claims.
-- `edit-turbo-1k5` is not exposed by the ordinary browser UI and cannot reuse the 1K Edit artifact,
-  fixture, or evidence row. A historical surface-free browser route authenticated the legacy
-  schema-v1 monolith, but the modular five-entry closure still needs its own rerun; browser UI and
-  performance qualification remain separate gates.
+- `edit-turbo-1k5` is exposed by the ordinary browser UI but cannot reuse the 1K Edit artifact,
+  fixture, or evidence row. The current surface-free low-VRAM source-bound rerun authenticated the
+  modular five-entry closure and passed the 1536x1536 numerical/memory gate after the first attempt's
+  stale host-key failure. The required low-VRAM gate is not weakened by the optional,
+  non-blocking `qualification-f32` control diagnostic. The ordinary all-stage-resident rendered UI,
+  other shapes, and performance qualification remain separate gates.

@@ -7,6 +7,7 @@ members = [
   "crates/burn_boogu",
   "crates/bevy_image",
 ]
+exclude = ["patches/wgpu-29.0.4", "patches/cubecl-wgpu-0.10.0"]
 
 [workspace.package]
 version = "0.1.1"
@@ -60,7 +61,20 @@ url = "2.5"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = "0.3"
-wgpu = "29.0"
+wgpu = "=29.0.4"
+
+[patch.crates-io]
+# Chrome/Dawn may route large WebGPU writeBuffer calls through an unstable shared-memory transport.
+# The vendored WebGPU backend splits browser uploads into bounded JS calls.
+wgpu = { path = "patches/wgpu-29.0.4" }
+# A CubeCL synchronization following an upload-only model shard must submit pending wgpu writes
+# even when no compute task has been queued. New shader modules/layouts/pipelines and every bounded
+# WGPU task/write batch are wrapped in validation, out-of-memory, and internal error scopes whose
+# results are drained by the next sync. These make sync a truthful upload/computation boundary
+# without disabling bounded task batching. Runtime limits and optional execution features are
+# taken from the logical device for the WGSL/browser path, including a non-blocking Wasm path for
+# ordinary inference when device timestamp queries are unavailable.
+cubecl-wgpu = { path = "patches/cubecl-wgpu-0.10.0" }
 
 [profile.dev.package."*"]
 opt-level = 3

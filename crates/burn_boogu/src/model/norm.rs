@@ -4,6 +4,8 @@ use burn::{
     tensor::{DType, activation::silu},
 };
 
+use super::linear::linear_forward;
+
 /// Numerical policy for RMS normalization inside the Boogu denoiser.
 ///
 /// The default retains Burn's released whole-input F32 normalization. The mixed-storage policy is
@@ -139,7 +141,7 @@ impl<B: Backend> RmsNormZero<B> {
         conditioning: Tensor<B, 2>,
     ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
         let width = normalized.dims()[2];
-        let modulation = self.linear.forward(silu(conditioning));
+        let modulation = linear_forward(&self.linear, silu(conditioning));
         let chunks = modulation.split_with_sizes(vec![width, width, width, width], 1);
         let scale_msa = chunks[0].clone();
         let gate_msa = chunks[1].clone();

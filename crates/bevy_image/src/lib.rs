@@ -22,10 +22,14 @@ pub mod boogu;
 pub mod browser_boogu;
 #[cfg(all(feature = "boogu-web", any(test, target_arch = "wasm32")))]
 mod browser_parity_fixture;
+#[cfg(all(feature = "boogu-web", any(test, target_arch = "wasm32")))]
+mod browser_turbo_first_dmd_fixture;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub mod native_artifact_cache;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub mod native_boogu;
+#[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
+pub mod native_output_qualification;
 
 #[cfg(feature = "app")]
 pub mod app;
@@ -54,6 +58,8 @@ pub use browser_boogu::*;
 pub use native_artifact_cache::*;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub use native_boogu::*;
+#[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
+pub use native_output_qualification::*;
 
 use bevy::prelude::*;
 
@@ -92,6 +98,7 @@ enum BrowserHeadlessMode {
     Bootstrap,
     F16Probe,
     Infer,
+    TurboFirstDmd,
     Parity,
     VaeReference,
 }
@@ -102,8 +109,12 @@ enum BrowserHeadlessMode {
 ))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BrowserResidencySelector {
-    #[default]
     Resident,
+    QualificationF32,
+    #[default]
+    LowVram,
+    RuntimeQ8,
+    PreloadedPackedF16,
     LayerStreamedDiagnostic,
 }
 
@@ -113,14 +124,31 @@ enum BrowserResidencySelector {
 ))]
 fn parse_browser_residency(value: Option<&str>) -> Result<BrowserResidencySelector, String> {
     match value {
-        None | Some("resident") | Some("high-vram-resident-dense-f32") => {
+        None | Some("low-vram") => Ok(BrowserResidencySelector::LowVram),
+        Some("low-vram-runtime-q8-denoiser") => Ok(BrowserResidencySelector::RuntimeQ8),
+        Some("low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser") => {
+            Ok(BrowserResidencySelector::PreloadedPackedF16)
+        }
+        Some("low-vram-preloaded-main-core-ffn-gate-up-q8-denoiser") => Err(
+            "the Turbo main-core gate/up-Q8 browser policy is retired after failing its final numerical gate; use residency=low-vram or residency=low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser"
+                .into(),
+        ),
+        Some("low-vram-retained-q8-dense-f32-per-stage-denoiser") => Err(
+            "the retained-Q8 dense-F32-per-stage browser policy is retired after real-browser non-finite output; use residency=low-vram"
+                .into(),
+        ),
+        Some("resident") | Some("high-vram-resident-dense-f32") => {
             Ok(BrowserResidencySelector::Resident)
+        }
+        Some("qualification-f32")
+        | Some("qualification-per-request-f32-denoiser-retained") => {
+            Ok(BrowserResidencySelector::QualificationF32)
         }
         Some("layer-streamed-diagnostic") => {
             Ok(BrowserResidencySelector::LayerStreamedDiagnostic)
         }
         Some(_) => Err(
-            "unsupported browser residency; use residency=resident or the explicit residency=layer-streamed-diagnostic"
+            "unsupported browser residency; use residency=resident, residency=qualification-f32, residency=low-vram, residency=low-vram-runtime-q8-denoiser, residency=low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser, or the explicit residency=layer-streamed-diagnostic"
                 .into(),
         ),
     }
@@ -136,10 +164,11 @@ fn parse_browser_headless_mode(value: Option<&str>) -> Result<Option<BrowserHead
         Some("bootstrap") => Ok(Some(BrowserHeadlessMode::Bootstrap)),
         Some("f16-probe") => Ok(Some(BrowserHeadlessMode::F16Probe)),
         Some("infer") => Ok(Some(BrowserHeadlessMode::Infer)),
+        Some("turbo-first-dmd") => Ok(Some(BrowserHeadlessMode::TurboFirstDmd)),
         Some("parity") => Ok(Some(BrowserHeadlessMode::Parity)),
         Some("vae-reference") => Ok(Some(BrowserHeadlessMode::VaeReference)),
         Some(_) => Err(
-            "unsupported headless mode; use headless=bootstrap, headless=f16-probe, headless=infer, headless=vae-reference, or headless=parity"
+            "unsupported headless mode; use headless=bootstrap, headless=f16-probe, headless=infer, headless=turbo-first-dmd, headless=vae-reference, or headless=parity"
                 .into(),
         ),
     }
@@ -158,23 +187,10 @@ fn parse_browser_boogu_variant(
     let variant = match value.unwrap_or("turbo") {
         "turbo" => BooguVariant::Image01Turbo,
         "edit" | "edit-turbo" => BooguVariant::Image01EditTurbo,
-        "1k5" | "edit-turbo-1k5"
-            if matches!(
-                headless,
-                Some(BrowserHeadlessMode::Parity | BrowserHeadlessMode::VaeReference)
-            ) =>
-        {
-            BooguVariant::Image01EditTurbo1k5
-        }
-        "1k5" | "edit-turbo-1k5" => {
-            return Err(
-                "Boogu Edit-Turbo 1.5K is available only through the explicit headless=parity qualification or headless=vae-reference diagnostic route"
-                    .into(),
-            );
-        }
+        "1k5" | "edit-turbo-1k5" => BooguVariant::Image01EditTurbo1k5,
         value => {
             return Err(format!(
-                "unsupported Boogu variant {value:?}; browser supports turbo or edit-turbo, while headless=parity requires edit-turbo-1k5"
+                "unsupported Boogu variant {value:?}; browser supports turbo, edit-turbo, or edit-turbo-1k5"
             ));
         }
     };
@@ -191,6 +207,10 @@ fn parse_browser_boogu_variant(
                 _ => unreachable!("guard restricts this branch to fixture modes"),
             }
         ));
+    }
+    if headless == Some(BrowserHeadlessMode::TurboFirstDmd) && variant != BooguVariant::Image01Turbo
+    {
+        return Err("headless=turbo-first-dmd requires variant=turbo".into());
     }
     Ok(variant)
 }
@@ -279,22 +299,49 @@ fn report_browser_vae_reference_terminal_failure(window: &web_sys::Window, error
     web_sys::console::error_1(&JsValue::from_str(&message));
 }
 
+#[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
+fn report_browser_turbo_first_dmd_terminal_failure(window: &web_sys::Window, error: &str) {
+    use wasm_bindgen::JsValue;
+
+    let message = format!("BURN_IMAGE_HEADLESS_TURBO_FIRST_DMD_FAILED {error}");
+    if let Some(status) = window
+        .document()
+        .and_then(|document| document.get_element_by_id("status"))
+    {
+        status.set_text_content(Some(&message));
+    }
+    web_sys::console::error_1(&JsValue::from_str(&message));
+}
+
 /// Start the concrete browser Boogu runtime.
 ///
 /// Query parameters select `variant`, `profile`, `residency`, and the absolute remote `artifacts`
 /// base URL.
 /// When `artifacts` is omitted, the app uses the exact manifest bundle id beneath
 /// `https://aberration.technology/model/`. The default is Turbo with
-/// `profile=production` and `residency=resident`; the legacy
-/// `f16-qwen-vision-f32` profile selector remains accepted. The production browser path verifies,
-/// materializes, and retains its exact request graph on WebGPU before reporting ready. The
+/// `profile=production` and `residency=low-vram`; the legacy
+/// `f16-qwen-vision-f32` profile selector remains accepted. The default low-VRAM production path
+/// verifies the complete manifest closure before reporting ready. Turbo preloads a
+/// complete authenticated packed-F16 denoiser and materializes exactly one semantic stage to F32
+/// at a time; this is storage compression, not on-device quantized execution. Qwen and VAE stages
+/// remain streamed. Edit variants retain a request-scoped, all-eligible runtime-Q8 denoiser and use
+/// direct quantized matmul. Both policies have conservative sub-32-GB
+/// resource plans and exact per-request cache/network traffic reports. Ordinary Turbo UI loading
+/// requires the integrity-checked persistent range cache.
+/// Explicit `residency=resident` instead materializes and retains the exact request graph on WebGPU
+/// before reporting ready. `headless=parity&residency=low-vram` replays the low-VRAM policy against the exact
+/// authenticated 1.5K fixture. Exact F32 fixture replay uses
+/// `headless=parity&residency=qualification-f32`: Qwen/VAE are streamed per request and only the
+/// F32 denoiser is retained through the four DMD steps, so its evidence does not claim all-stage
+/// resident-dense execution. The
 /// intentionally host-heavy `residency=layer-streamed-diagnostic` path requires an explicit
 /// `artifacts=` URL and is not a supported production mode.
 /// `headless=bootstrap` selects an opt-in no-surface F32 compute diagnostic;
 /// `headless=f16-probe` runs the same final-norm probe while requiring and preserving WebGPU
-/// `shader-f16`. `headless=vae-reference` runs a diagnostic-only repeated VAE encoder probe over
-/// the authenticated 1.5K fixture. `headless=parity&variant=edit-turbo-1k5&fixture=https://...` is
-/// the only browser surface allowed to make a complete 1.5K qualification claim.
+/// `shader-f16`. `headless=infer` accepts the full Turbo 256-1024 release range; edit inference,
+/// including 1.5K, uses the ordinary UI because it requires a reference image.
+/// `headless=vae-reference` and `headless=parity&variant=edit-turbo-1k5&fixture=https://...` retain
+/// their exact authenticated-fixture contracts.
 #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
@@ -307,6 +354,7 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
     let params = web_sys::UrlSearchParams::new_with_str(&search)?;
     let parity_requested = params.get("headless").as_deref() == Some("parity");
     let vae_reference_requested = params.get("headless").as_deref() == Some("vae-reference");
+    let turbo_first_dmd_requested = params.get("headless").as_deref() == Some("turbo-first-dmd");
     let configuration = (|| {
         let headless = parse_browser_headless_mode(params.get("headless").as_deref())
             .map_err(|error| JsValue::from_str(&error))?;
@@ -319,6 +367,35 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
                 "residency=layer-streamed-diagnostic requires an explicit artifacts= URL",
             ));
         }
+        if residency == BrowserResidencySelector::QualificationF32
+            && headless != Some(BrowserHeadlessMode::Parity)
+        {
+            return Err(JsValue::from_str(
+                "residency=qualification-f32 is reserved for headless=parity exact-fixture replay",
+            ));
+        }
+        if headless == Some(BrowserHeadlessMode::Parity)
+            && !matches!(
+                residency,
+                BrowserResidencySelector::QualificationF32
+                    | BrowserResidencySelector::LowVram
+                    | BrowserResidencySelector::RuntimeQ8
+            )
+        {
+            return Err(JsValue::from_str(
+                "headless=parity requires residency=qualification-f32 or residency=low-vram",
+            ));
+        }
+        if headless == Some(BrowserHeadlessMode::TurboFirstDmd)
+            && !matches!(
+                residency,
+                BrowserResidencySelector::LowVram | BrowserResidencySelector::PreloadedPackedF16
+            )
+        {
+            return Err(JsValue::from_str(
+                "headless=turbo-first-dmd requires residency=low-vram or the exact preloaded packed-F16 dense-F32-per-stage policy selector",
+            ));
+        }
         if residency == BrowserResidencySelector::LayerStreamedDiagnostic
             && !matches!(headless, None | Some(BrowserHeadlessMode::Infer))
         {
@@ -328,6 +405,13 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         }
         let variant = parse_browser_boogu_variant(params.get("variant").as_deref(), headless)
             .map_err(|error| JsValue::from_str(&error))?;
+        if variant == burn_boogu::BooguVariant::Image01Turbo
+            && residency == BrowserResidencySelector::RuntimeQ8
+        {
+            return Err(JsValue::from_str(
+                "ordinary Turbo rejects residency=low-vram-runtime-q8-denoiser because its direct-Q8 path is not numerically qualified; use residency=low-vram",
+            ));
+        }
         let profile_selector = params
             .get("profile")
             .unwrap_or_else(|| BOOGU_PRODUCTION_PROFILE_SELECTOR.to_owned());
@@ -338,11 +422,15 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         })?;
         if matches!(
             headless,
-            Some(BrowserHeadlessMode::Parity | BrowserHeadlessMode::VaeReference)
+            Some(
+                BrowserHeadlessMode::Parity
+                    | BrowserHeadlessMode::VaeReference
+                    | BrowserHeadlessMode::TurboFirstDmd
+            )
         ) && profile != burn_boogu::artifacts::BooguStorageProfile::F16QwenVisionF32
         {
             return Err(JsValue::from_str(
-                "1.5K fixture diagnostics require profile=production",
+                "fixture diagnostics require profile=production",
             ));
         }
         let artifacts = match params.get("artifacts") {
@@ -377,6 +465,10 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         }
         Err(error) if vae_reference_requested => {
             report_browser_vae_reference_terminal_failure(&window, &browser_js_error(&error));
+            return Ok(());
+        }
+        Err(error) if turbo_first_dmd_requested => {
+            report_browser_turbo_first_dmd_terminal_failure(&window, &browser_js_error(&error));
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -422,6 +514,82 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         });
         return Ok(());
     }
+    if headless == Some(BrowserHeadlessMode::TurboFirstDmd) {
+        let fixture_profile_value = params
+            .get("fixture-profile")
+            .unwrap_or_else(|| "release-256-bf16".into());
+        let fixture_profile =
+            match browser_turbo_first_dmd_fixture::BrowserTurboFirstDmdFixtureProfile::parse(
+                &fixture_profile_value,
+            ) {
+                Some(profile) => profile,
+                None => {
+                    report_browser_turbo_first_dmd_terminal_failure(
+                        &window,
+                        "unsupported fixture-profile; use release-256-bf16 or qualification-1024-bf16",
+                    );
+                    return Ok(());
+                }
+            };
+        let fixture_base = match params
+            .get("fixture")
+            .ok_or_else(|| {
+                JsValue::from_str(
+                    "headless=turbo-first-dmd requires an absolute HTTP(S) fixture= base URL",
+                )
+            })
+            .and_then(|fixture| {
+                RemoteBaseUrl::new(fixture)
+                    .map_err(|error| JsValue::from_str(&format!("invalid fixture= URL: {error}")))
+            }) {
+            Ok(fixture_base) => fixture_base,
+            Err(error) => {
+                report_browser_turbo_first_dmd_terminal_failure(&window, &browser_js_error(&error));
+                return Ok(());
+            }
+        };
+        let status = window
+            .document()
+            .and_then(|document| document.get_element_by_id("status"));
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = BrowserBooguFactory::turbo_first_dmd_no_surface(
+                variant,
+                settings,
+                fixture_base,
+                fixture_profile,
+            )
+            .await;
+            let (message, failed) = match result {
+                Ok(report) => match serde_json::to_string(&report) {
+                    Ok(json) if report.diagnostic_passed && !report.numerical_parity_claimed => (
+                        format!("BURN_IMAGE_HEADLESS_TURBO_FIRST_DMD_OK {json}"),
+                        false,
+                    ),
+                    Ok(json) => (
+                        format!("BURN_IMAGE_HEADLESS_TURBO_FIRST_DMD_FAILED {json}"),
+                        true,
+                    ),
+                    Err(error) => (
+                        format!("BURN_IMAGE_HEADLESS_TURBO_FIRST_DMD_FAILED report JSON: {error}"),
+                        true,
+                    ),
+                },
+                Err(error) => (
+                    format!("BURN_IMAGE_HEADLESS_TURBO_FIRST_DMD_FAILED {error}"),
+                    true,
+                ),
+            };
+            if let Some(status) = status {
+                status.set_text_content(Some(&message));
+            }
+            if failed {
+                web_sys::console::error_1(&JsValue::from_str(&message));
+            } else {
+                web_sys::console::info_1(&JsValue::from_str(&message));
+            }
+        });
+        return Ok(());
+    }
     if headless == Some(BrowserHeadlessMode::Infer) {
         let request = boogu::prepare_headless_generate_request(
             variant,
@@ -438,6 +606,18 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
             let policy = match residency {
                 BrowserResidencySelector::Resident => {
                     BrowserBooguResidencyPolicy::HighVramResidentDenseF32
+                }
+                BrowserResidencySelector::QualificationF32 => {
+                    unreachable!("configuration reserves qualification-f32 for parity")
+                }
+                BrowserResidencySelector::LowVram => {
+                    browser_boogu::default_browser_low_vram_residency(variant)
+                }
+                BrowserResidencySelector::RuntimeQ8 => {
+                    BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser
+                }
+                BrowserResidencySelector::PreloadedPackedF16 => {
+                    BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
                 }
                 BrowserResidencySelector::LayerStreamedDiagnostic => {
                     BrowserBooguResidencyPolicy::LayerStreamedDiagnostic
@@ -554,8 +734,34 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
             .document()
             .and_then(|document| document.get_element_by_id("status"));
         wasm_bindgen_futures::spawn_local(async move {
-            let result =
-                BrowserBooguFactory::parity_no_surface(variant, settings, fixture_base).await;
+            let result = match residency {
+                BrowserResidencySelector::QualificationF32 => {
+                    BrowserBooguFactory::parity_no_surface(variant, settings, fixture_base).await
+                }
+                BrowserResidencySelector::LowVram => {
+                    BrowserBooguFactory::parity_no_surface_with_residency(
+                        variant,
+                        settings,
+                        browser_boogu::default_browser_low_vram_residency(variant),
+                        fixture_base,
+                    )
+                    .await
+                }
+                BrowserResidencySelector::RuntimeQ8 => {
+                    BrowserBooguFactory::parity_no_surface_with_residency(
+                        variant,
+                        settings,
+                        BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser,
+                        fixture_base,
+                    )
+                    .await
+                }
+                BrowserResidencySelector::Resident
+                | BrowserResidencySelector::PreloadedPackedF16
+                | BrowserResidencySelector::LayerStreamedDiagnostic => {
+                    unreachable!("configuration accepts only qualification residencies for parity")
+                }
+            };
             let (message, failed) = match result {
                 Ok(report) => match serde_json::to_string(&report) {
                     Ok(json) if report.numerical_parity_claimed => {
@@ -581,7 +787,25 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         return Ok(());
     }
     let factory = match residency {
-        BrowserResidencySelector::Resident => BrowserBooguFactory::new(variant),
+        BrowserResidencySelector::Resident => BrowserBooguFactory::with_residency(
+            variant,
+            BrowserBooguResidencyPolicy::HighVramResidentDenseF32,
+        ),
+        BrowserResidencySelector::QualificationF32 => {
+            unreachable!("configuration reserves qualification-f32 for parity")
+        }
+        BrowserResidencySelector::LowVram => BrowserBooguFactory::with_residency(
+            variant,
+            browser_boogu::default_browser_low_vram_residency(variant),
+        ),
+        BrowserResidencySelector::RuntimeQ8 => BrowserBooguFactory::with_residency(
+            variant,
+            BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser,
+        ),
+        BrowserResidencySelector::PreloadedPackedF16 => BrowserBooguFactory::with_residency(
+            variant,
+            BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser,
+        ),
         BrowserResidencySelector::LayerStreamedDiagnostic => BrowserBooguFactory::with_residency(
             variant,
             BrowserBooguResidencyPolicy::LayerStreamedDiagnostic,
@@ -595,7 +819,7 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
 mod web_shell_tests {
     #[cfg(feature = "boogu")]
     #[test]
-    fn browser_1k5_routes_are_explicit_and_fail_closed_correctness() {
+    fn browser_1k5_ui_and_fixture_routes_are_explicit_and_fail_closed_correctness() {
         use burn_boogu::BooguVariant;
 
         let parity = super::parse_browser_headless_mode(Some("parity")).unwrap();
@@ -624,9 +848,10 @@ mod web_shell_tests {
             Some(super::BrowserHeadlessMode::F16Probe),
             Some(super::BrowserHeadlessMode::Infer),
         ] {
-            let error =
-                super::parse_browser_boogu_variant(Some("edit-turbo-1k5"), headless).unwrap_err();
-            assert!(error.contains("explicit headless=parity"), "{error}");
+            assert_eq!(
+                super::parse_browser_boogu_variant(Some("edit-turbo-1k5"), headless).unwrap(),
+                BooguVariant::Image01EditTurbo1k5
+            );
         }
         for headless in [parity, vae_reference] {
             for variant in [None, Some("turbo"), Some("edit-turbo")] {
@@ -635,6 +860,34 @@ mod web_shell_tests {
             }
         }
         assert!(super::parse_browser_headless_mode(Some("parity-ish")).is_err());
+    }
+
+    #[cfg(feature = "boogu")]
+    #[test]
+    fn browser_turbo_first_dmd_route_is_exact_and_variant_scoped_correctness() {
+        use burn_boogu::BooguVariant;
+
+        let mode = super::parse_browser_headless_mode(Some("turbo-first-dmd")).unwrap();
+        assert_eq!(mode, Some(super::BrowserHeadlessMode::TurboFirstDmd));
+        assert_eq!(
+            super::parse_browser_boogu_variant(Some("turbo"), mode).unwrap(),
+            BooguVariant::Image01Turbo
+        );
+        for edit in ["edit", "edit-turbo", "1k5", "edit-turbo-1k5"] {
+            let error = super::parse_browser_boogu_variant(Some(edit), mode).unwrap_err();
+            assert!(error.contains("requires variant=turbo"), "{error}");
+        }
+        let source = include_str!("lib.rs");
+        for required in [
+            "BURN_IMAGE_HEADLESS_TURBO_FIRST_DMD_OK",
+            "BURN_IMAGE_HEADLESS_TURBO_FIRST_DMD_FAILED",
+            "BrowserBooguFactory::turbo_first_dmd_no_surface",
+        ] {
+            assert!(
+                source.contains(required),
+                "Turbo first-DMD route omits {required}"
+            );
+        }
     }
 
     #[cfg(feature = "boogu")]
@@ -655,20 +908,90 @@ mod web_shell_tests {
 
     #[cfg(feature = "boogu")]
     #[test]
-    fn browser_residency_defaults_to_resident_and_streaming_is_explicit_correctness() {
+    fn browser_residency_defaults_to_low_vram_and_streaming_is_explicit_correctness() {
         assert_eq!(
             super::parse_browser_residency(None).unwrap(),
-            super::BrowserResidencySelector::Resident
+            super::BrowserResidencySelector::LowVram
         );
         assert_eq!(
             super::parse_browser_residency(Some("resident")).unwrap(),
             super::BrowserResidencySelector::Resident
         );
         assert_eq!(
+            super::parse_browser_residency(Some("qualification-f32")).unwrap(),
+            super::BrowserResidencySelector::QualificationF32
+        );
+        assert_eq!(
+            super::parse_browser_residency(Some("low-vram")).unwrap(),
+            super::BrowserResidencySelector::LowVram
+        );
+        assert_eq!(
+            super::parse_browser_residency(Some("low-vram-runtime-q8-denoiser")).unwrap(),
+            super::BrowserResidencySelector::RuntimeQ8
+        );
+        assert!(
+            super::parse_browser_residency(Some(
+                "low-vram-retained-q8-dense-f32-per-stage-denoiser"
+            ))
+            .unwrap_err()
+            .contains("retired")
+        );
+        assert!(
+            super::parse_browser_residency(Some(
+                "low-vram-preloaded-main-core-ffn-gate-up-q8-denoiser"
+            ))
+            .unwrap_err()
+            .contains("retired")
+        );
+        assert_eq!(
+            super::parse_browser_residency(Some(
+                "low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser"
+            ))
+            .unwrap(),
+            super::BrowserResidencySelector::PreloadedPackedF16
+        );
+        for retired_or_internal in [
+            "browser-low-vram-preloaded-main-core-ffn-gate-up-q8-denoiser",
+            "low-vram-preloaded-ffn-gate-up-q8-denoiser",
+            "browser-low-vram-preloaded-ffn-gate-up-q8-denoiser",
+            "low-vram-preloaded-ffn-core-q8-denoiser",
+            "browser-low-vram-preloaded-ffn-core-q8-denoiser",
+            "low-vram-preloaded-attention-ffn-core-q8-denoiser",
+            "browser-low-vram-preloaded-attention-ffn-core-q8-denoiser",
+        ] {
+            assert!(super::parse_browser_residency(Some(retired_or_internal)).is_err());
+        }
+        assert_eq!(
             super::parse_browser_residency(Some("layer-streamed-diagnostic")).unwrap(),
             super::BrowserResidencySelector::LayerStreamedDiagnostic
         );
         assert!(super::parse_browser_residency(Some("streamed")).is_err());
+    }
+
+    #[test]
+    fn explicit_runtime_q8_routes_do_not_reenter_variant_default_correctness() {
+        let source = include_str!("lib.rs");
+        for anchor in [
+            "if headless == Some(BrowserHeadlessMode::Infer)",
+            "let factory = match residency",
+        ] {
+            let route = source
+                .split_once(anchor)
+                .unwrap_or_else(|| panic!("missing browser routing anchor {anchor}"))
+                .1
+                .split_once("BrowserResidencySelector::RuntimeQ8 =>")
+                .unwrap_or_else(|| panic!("missing explicit runtime-Q8 route after {anchor}"))
+                .1;
+            let branch = &route[..route.len().min(400)];
+            assert!(
+                branch.contains("BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser"),
+                "explicit runtime-Q8 route after {anchor} does not select the direct-Q policy"
+            );
+            assert!(
+                !branch.contains("default_browser_low_vram_residency"),
+                "explicit runtime-Q8 route after {anchor} silently reentered the variant default"
+            );
+        }
     }
 
     #[test]
@@ -684,13 +1007,21 @@ mod web_shell_tests {
             "transferredBytes",
             "Reload runtime",
             "id=\"burn-image-reference-input\"",
+            "id=\"model-release\"",
+            "id=\"model-release-note\"",
+            "configureModelReleaseSelector",
+            "./model_selector.mjs",
             "loadReferenceFile",
             "MAX_REFERENCE_BYTES",
             "failRun",
         ] {
             assert!(html.contains(required), "web shell omits {required}");
         }
-        assert!(html.contains("preloaded to WebGPU during preparation"));
+        assert!(html.contains("loaded into WebGPU according"));
+        assert!(html.contains("case \"low_vram_resource_plan\""));
+        assert!(html.contains("case \"artifact_traffic\""));
+        assert!(html.contains("persistent-cache hits"));
+        assert!(html.contains("conservative WebGPU plan (not measured)"));
     }
 
     #[test]
@@ -701,6 +1032,10 @@ mod web_shell_tests {
             ("file_dialog.rs", include_str!("file_dialog.rs")),
             ("viewer.rs", include_str!("viewer.rs")),
             ("www/index.html", include_str!("../www/index.html")),
+            (
+                "www/model_selector.mjs",
+                include_str!("../www/model_selector.mjs"),
+            ),
         ] {
             assert!(
                 source.is_ascii(),

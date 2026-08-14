@@ -1,5 +1,7 @@
 use burn::{nn, prelude::*, tensor::activation::silu};
 
+use super::linear::linear_forward;
+
 /// Lumina SwiGLU feed-forward network.
 #[derive(Module, Debug)]
 pub struct LuminaFeedForward<B: Backend> {
@@ -28,7 +30,8 @@ impl<B: Backend> LuminaFeedForward<B> {
 
     /// Apply SwiGLU and the output projection.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let gated = silu(self.linear_1.forward(x.clone())) * self.linear_3.forward(x);
-        self.linear_2.forward(gated)
+        let gated =
+            silu(linear_forward(&self.linear_1, x.clone())) * linear_forward(&self.linear_3, x);
+        linear_forward(&self.linear_2, gated)
     }
 }

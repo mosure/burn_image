@@ -5,13 +5,15 @@
 //! [`Qwen3VlStageSource`] or [`AsyncQwen3VlStageSource`].
 
 use core::{marker::PhantomData, ops::Range};
+use std::collections::BTreeSet;
 
 use burn::{
     module::Module,
     nn::{Embedding, EmbeddingConfig, RmsNorm},
-    tensor::{Bool, IndexingUpdateOp, Int, Tensor, TensorData, backend::Backend},
+    tensor::{Bool, DType, IndexingUpdateOp, Int, Tensor, TensorData, backend::Backend},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     DeepstackEmbeddings, Grid, MropePositionIds, Qwen3VlConfig, Qwen3VlError, Qwen3VlTextConfig,
@@ -32,6 +34,10 @@ use crate::{
 /// approximately 193-MiB bindings. Call [`RowChunkPlan::for_max_bytes`] with the adapter's
 /// reported limit when it is lower.
 pub const DEFAULT_VOCABULARY_CHUNKS: usize = 6;
+
+/// Stable provenance label for the exact host-routed embedding policy.
+pub const HOST_ROUTED_F16_EMBEDDING_POLICY: &str =
+    "authenticated-full-f16-row-objects/host-token-row-select/f16-to-f32/one-compact-upload";
 
 /// A contiguous row slice of an embedding or vocabulary projection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -414,6 +420,282 @@ fn row_slice(source: &str, chunk: &RowChunkSpec) -> RowSliceWeightSpec {
         chunk_shape: [chunk.rows(), chunk.hidden_size],
         row_range: chunk.row_range.clone(),
     }
+}
+
+/// Opt-in embedding execution for a streamed Qwen base-model forward.
+///
+/// The default preserves the existing device-routed chunk lookup. The host-routed mode exists for
+/// constrained browser adapters that can authenticate one released F16 row object at a time but
+/// must not upload six large embedding chunks merely to select a few prompt rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Qwen3VlEmbeddingExecutionPolicy {
+    /// Upload every bounded row chunk and route token IDs with backend indexing operations.
+    #[default]
+    DeviceRoutedChunks,
+    /// Select exact F16 row bytes on the host, widen only selected rows, then upload one F32
+    /// `[batch, sequence, hidden]` tensor. The source must explicitly support this policy.
+    ExactHostRoutedF16ToF32 {
+        /// Read the compact upload back before the first text block and require byte identity.
+        verify_device_roundtrip_before_text: bool,
+    },
+}
+
+/// Auditable accounting for one exact host-routed embedding assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostRoutedEmbeddingReport {
+    pub policy: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub input_token_count: usize,
+    pub unique_token_count: usize,
+    pub plan_chunk_count: usize,
+    pub authenticated_object_count: usize,
+    pub authenticated_object_bytes: u64,
+    pub authenticated_f16_payload_bytes: u64,
+    pub selected_row_occurrences: usize,
+    pub selected_unique_rows: usize,
+    pub selected_f16_bytes: u64,
+    pub host_f32_payload_bytes: u64,
+    pub host_to_device_upload_bytes: u64,
+    pub immediate_device_to_host_readback_bytes: u64,
+    pub total_device_transfer_bytes: u64,
+    pub host_f32_sha256: String,
+    pub device_f32_sha256: Option<String>,
+    pub device_roundtrip_verified_before_text: bool,
+    pub device_roundtrip_digest_matches: bool,
+    pub all_finite: bool,
+    pub not_all_zero: bool,
+    pub coverage_complete: bool,
+}
+
+/// A compact uploaded embedding plus its host-side artifact and transfer provenance.
+pub struct HostRoutedEmbedding<B: Backend> {
+    pub tensor: Tensor<B, 3>,
+    pub report: HostRoutedEmbeddingReport,
+}
+
+/// Backend-neutral exact row assembler used by verified artifact sources.
+///
+/// Full F16 objects are validated by their source and presented one at a time. This state copies
+/// only rows addressed by the already-host token IDs, preserving duplicate IDs and original
+/// position order. It therefore stays bounded by the final activation size rather than the full
+/// vocabulary table.
+pub struct HostRoutedF16EmbeddingState {
+    input_ids: Vec<i64>,
+    covered: Vec<bool>,
+    selected_f16_bytes: Vec<u8>,
+    unique_token_ids: BTreeSet<i64>,
+    batch: usize,
+    sequence: usize,
+    total_rows: usize,
+    hidden_size: usize,
+    applied_chunk_count: usize,
+    authenticated_object_count: usize,
+    authenticated_object_bytes: u64,
+    authenticated_f16_payload_bytes: u64,
+}
+
+impl HostRoutedF16EmbeddingState {
+    pub fn new(input_ids: &[Vec<i64>], total_rows: usize, hidden_size: usize) -> Result<Self> {
+        let batch = input_ids.len();
+        let sequence = input_ids.first().map_or(0, Vec::len);
+        if batch == 0
+            || sequence == 0
+            || hidden_size == 0
+            || input_ids.iter().any(|row| row.len() != sequence)
+            || input_ids
+                .iter()
+                .flatten()
+                .any(|&id| id < 0 || id as usize >= total_rows)
+        {
+            return Err(Qwen3VlError::InvalidInput(
+                "host-routed embedding ids must be a non-empty rectangular in-vocabulary batch"
+                    .into(),
+            ));
+        }
+        let input_ids = input_ids.iter().flatten().copied().collect::<Vec<_>>();
+        let unique_token_ids = input_ids.iter().copied().collect::<BTreeSet<_>>();
+        let selected_bytes = batch
+            .checked_mul(sequence)
+            .and_then(|value| value.checked_mul(hidden_size))
+            .and_then(|value| value.checked_mul(2))
+            .ok_or_else(|| {
+                Qwen3VlError::InvalidInput(
+                    "host-routed embedding output byte count overflowed".into(),
+                )
+            })?;
+        Ok(Self {
+            covered: vec![false; input_ids.len()],
+            selected_f16_bytes: vec![0; selected_bytes],
+            input_ids,
+            unique_token_ids,
+            batch,
+            sequence,
+            total_rows,
+            hidden_size,
+            applied_chunk_count: 0,
+            authenticated_object_count: 0,
+            authenticated_object_bytes: 0,
+            authenticated_f16_payload_bytes: 0,
+        })
+    }
+
+    /// Apply one fully authenticated, name/shape/dtype-validated F16 row object.
+    pub fn apply_chunk_data(
+        &mut self,
+        spec: &RowChunkSpec,
+        data: &TensorData,
+        authenticated_object_bytes: u64,
+    ) -> Result<()> {
+        if spec.total_rows != self.total_rows
+            || spec.hidden_size != self.hidden_size
+            || spec.element_bytes != 2
+            || data.shape.as_slice() != [spec.rows(), spec.hidden_size]
+            || data.dtype != DType::F16
+        {
+            return Err(Qwen3VlError::InvalidInput(format!(
+                "host-routed F16 embedding chunk metadata differs from accumulator: spec={spec:?}, shape={:?}, dtype={:?}",
+                data.shape, data.dtype
+            )));
+        }
+        let expected_bytes = spec.byte_len();
+        if data.bytes.len() != expected_bytes {
+            return Err(Qwen3VlError::InvalidInput(format!(
+                "host-routed F16 embedding chunk has {} payload bytes, expected {expected_bytes}",
+                data.bytes.len()
+            )));
+        }
+        let row_bytes = self.hidden_size.checked_mul(2).ok_or_else(|| {
+            Qwen3VlError::InvalidInput("host-routed embedding row byte count overflowed".into())
+        })?;
+        for (position, &id) in self.input_ids.iter().enumerate() {
+            let id = id as usize;
+            if !spec.row_range.contains(&id) {
+                continue;
+            }
+            if self.covered[position] {
+                return Err(Qwen3VlError::InvalidInput(
+                    "overlapping host-routed embedding chunks cover the same token twice".into(),
+                ));
+            }
+            let local_row = id - spec.row_range.start;
+            let source_start = local_row.checked_mul(row_bytes).ok_or_else(|| {
+                Qwen3VlError::InvalidInput(
+                    "host-routed embedding source row offset overflowed".into(),
+                )
+            })?;
+            let source_end = source_start.checked_add(row_bytes).ok_or_else(|| {
+                Qwen3VlError::InvalidInput("host-routed embedding source row end overflowed".into())
+            })?;
+            let target_start = position.checked_mul(row_bytes).ok_or_else(|| {
+                Qwen3VlError::InvalidInput(
+                    "host-routed embedding destination row offset overflowed".into(),
+                )
+            })?;
+            let target_end = target_start.checked_add(row_bytes).ok_or_else(|| {
+                Qwen3VlError::InvalidInput(
+                    "host-routed embedding destination row end overflowed".into(),
+                )
+            })?;
+            self.selected_f16_bytes[target_start..target_end]
+                .copy_from_slice(&data.bytes[source_start..source_end]);
+            self.covered[position] = true;
+        }
+        self.applied_chunk_count = self.applied_chunk_count.checked_add(1).ok_or_else(|| {
+            Qwen3VlError::InvalidInput("host-routed embedding chunk count overflowed".into())
+        })?;
+        self.authenticated_object_count = self
+            .authenticated_object_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                Qwen3VlError::InvalidInput("host-routed embedding object count overflowed".into())
+            })?;
+        self.authenticated_object_bytes = self
+            .authenticated_object_bytes
+            .checked_add(authenticated_object_bytes)
+            .ok_or_else(|| {
+                Qwen3VlError::InvalidInput(
+                    "host-routed embedding authenticated byte count overflowed".into(),
+                )
+            })?;
+        self.authenticated_f16_payload_bytes = self
+            .authenticated_f16_payload_bytes
+            .checked_add(u64::try_from(expected_bytes).map_err(|_| {
+                Qwen3VlError::InvalidInput(
+                    "host-routed embedding payload byte count does not fit u64".into(),
+                )
+            })?)
+            .ok_or_else(|| {
+                Qwen3VlError::InvalidInput(
+                    "host-routed embedding payload byte count overflowed".into(),
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Finish exact coverage and widen only the compact selected F16 payload to F32 on the host.
+    pub fn finish(self) -> Result<(TensorData, HostRoutedEmbeddingReport)> {
+        if self.covered.iter().any(|covered| !covered) {
+            return Err(Qwen3VlError::InvalidInput(
+                "host-routed embedding chunks did not cover every input token".into(),
+            ));
+        }
+        let selected_f16_bytes = u64::try_from(self.selected_f16_bytes.len()).map_err(|_| {
+            Qwen3VlError::InvalidInput(
+                "host-routed selected F16 byte count does not fit u64".into(),
+            )
+        })?;
+        let data = TensorData::from_bytes_vec(
+            self.selected_f16_bytes,
+            [self.batch, self.sequence, self.hidden_size],
+            DType::F16,
+        )
+        .convert_dtype(DType::F32);
+        let values = data.as_slice::<f32>().map_err(|error| {
+            Qwen3VlError::InvalidInput(format!(
+                "failed to inspect host-routed F32 embedding: {error}"
+            ))
+        })?;
+        let all_finite = values.iter().all(|value| value.is_finite());
+        let not_all_zero = values.iter().any(|value| *value != 0.0);
+        let host_f32_sha256 = sha256_hex(&data.bytes);
+        let host_f32_payload_bytes = u64::try_from(data.bytes.len()).map_err(|_| {
+            Qwen3VlError::InvalidInput("host-routed F32 payload byte count does not fit u64".into())
+        })?;
+        let report = HostRoutedEmbeddingReport {
+            policy: HOST_ROUTED_F16_EMBEDDING_POLICY.into(),
+            shape: vec![self.batch, self.sequence, self.hidden_size],
+            dtype: "f32".into(),
+            input_token_count: self.input_ids.len(),
+            unique_token_count: self.unique_token_ids.len(),
+            plan_chunk_count: self.applied_chunk_count,
+            authenticated_object_count: self.authenticated_object_count,
+            authenticated_object_bytes: self.authenticated_object_bytes,
+            authenticated_f16_payload_bytes: self.authenticated_f16_payload_bytes,
+            selected_row_occurrences: self.input_ids.len(),
+            selected_unique_rows: self.unique_token_ids.len(),
+            selected_f16_bytes,
+            host_f32_payload_bytes,
+            host_to_device_upload_bytes: host_f32_payload_bytes,
+            immediate_device_to_host_readback_bytes: 0,
+            total_device_transfer_bytes: host_f32_payload_bytes,
+            host_f32_sha256,
+            device_f32_sha256: None,
+            device_roundtrip_verified_before_text: false,
+            device_roundtrip_digest_matches: false,
+            all_finite,
+            not_all_zero,
+            coverage_complete: true,
+        };
+        Ok((data, report))
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// One short-lived embedding table slice in source `[row, hidden]` layout.
@@ -813,19 +1095,39 @@ impl<B: Backend> Qwen3VlTextState<B> {
         layer: &Qwen3VlDecoderLayer<B>,
         observer: &mut O,
     ) -> Result<()> {
+        self.apply_layer_transition(index, layer)?;
+        self.observe_layer(index, observer)
+    }
+
+    fn apply_layer_transition(
+        &mut self,
+        index: usize,
+        layer: &Qwen3VlDecoderLayer<B>,
+    ) -> Result<()> {
+        self.validate_layer_index(index)?;
+        let hidden_states = layer.forward(
+            self.hidden_states.clone(),
+            self.cos.clone(),
+            self.sin.clone(),
+            self.attention_mask.as_ref(),
+        );
+        self.commit_layer_output(index, hidden_states)
+    }
+
+    fn validate_layer_index(&self, index: usize) -> Result<()> {
         if index != self.next_layer || index >= self.config.num_hidden_layers {
             return Err(Qwen3VlError::InvalidInput(format!(
                 "text layer {index} is out of streamed order; expected {}",
                 self.next_layer
             )));
         }
+        Ok(())
+    }
+
+    fn commit_layer_output(&mut self, index: usize, hidden_states: Tensor<B, 3>) -> Result<()> {
+        self.validate_layer_index(index)?;
         let [batch, sequence, hidden] = self.hidden_states.dims();
-        self.hidden_states = layer.forward(
-            self.hidden_states.clone(),
-            self.cos.clone(),
-            self.sin.clone(),
-            self.attention_mask.as_ref(),
-        );
+        self.hidden_states = hidden_states;
         if let Some(deepstack) = &self.deepstack
             && let Some(feature) = deepstack.features.get(index)
         {
@@ -848,6 +1150,14 @@ impl<B: Backend> Qwen3VlTextState<B> {
                 .reshape([batch, sequence, hidden]);
         }
         self.next_layer += 1;
+        Ok(())
+    }
+
+    fn observe_layer<O: Qwen3VlStageObserver<B>>(
+        &self,
+        index: usize,
+        observer: &mut O,
+    ) -> Result<()> {
         observer.rank3(
             &Qwen3VlStage::TextBlock { index },
             self.hidden_states.clone(),
@@ -870,6 +1180,43 @@ impl<B: Backend> Qwen3VlTextState<B> {
     }
 }
 
+/// Ordered internal readback boundaries for an opt-in streamed text-layer diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Qwen3VlTextLayerDiagnosticBoundary {
+    LayerInput,
+    InputLayerNormGamma,
+    IdentityAddCanary,
+    InputNorm,
+    AttentionOutput,
+    FirstResidual,
+    PostAttentionNorm,
+    MlpOutput,
+    FinalResidualOutput,
+}
+
+impl Qwen3VlTextLayerDiagnosticBoundary {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LayerInput => "layer_input",
+            Self::InputLayerNormGamma => "input_layernorm_gamma",
+            Self::IdentityAddCanary => "identity_add_canary",
+            Self::InputNorm => "input_norm",
+            Self::AttentionOutput => "attention_output",
+            Self::FirstResidual => "first_residual",
+            Self::PostAttentionNorm => "post_attention_norm",
+            Self::MlpOutput => "mlp_output",
+            Self::FinalResidualOutput => "final_residual_output",
+        }
+    }
+
+    pub const fn tensor_kind(self) -> &'static str {
+        match self {
+            Self::InputLayerNormGamma => "parameter-sentinel",
+            _ => "activation",
+        }
+    }
+}
+
 /// Observer boundaries are exact semantic points suitable for parity fixtures and timing.
 pub trait Qwen3VlStageObserver<B: Backend> {
     fn rank2(&mut self, _stage: &Qwen3VlStage, _activation: Tensor<B, 2>) -> Result<()> {
@@ -879,9 +1226,142 @@ pub trait Qwen3VlStageObserver<B: Backend> {
     fn rank3(&mut self, _stage: &Qwen3VlStage, _activation: Tensor<B, 3>) -> Result<()> {
         Ok(())
     }
+
+    /// Observe a rank-three activation after the stage source's synchronization contract.
+    ///
+    /// The asynchronous streamed executor calls this only after [`AsyncQwen3VlStageSource::synchronize`]
+    /// returns. Sources using deferred synchronization therefore expose their declared deferred
+    /// boundary; callers that require completed device work must use a per-stage source barrier.
+    #[allow(async_fn_in_trait)]
+    async fn rank3_after_synchronize(
+        &mut self,
+        _stage: &Qwen3VlStage,
+        _activation: Tensor<B, 3>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the asynchronous executor should split and immediately synchronize/read one text
+    /// layer's internal operations. The default keeps the ordinary fused submission unchanged.
+    fn text_layer_boundary_diagnostics_requested(&self, _index: usize) -> bool {
+        false
+    }
+
+    /// Observe a rank-one parameter sentinel after its explicit diagnostic barrier.
+    #[allow(async_fn_in_trait)]
+    async fn text_layer_parameter_after_synchronize(
+        &mut self,
+        _index: usize,
+        _boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        _parameter: Tensor<B, 1>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Observe a rank-three internal activation after its explicit diagnostic barrier.
+    #[allow(async_fn_in_trait)]
+    async fn text_layer_activation_after_synchronize(
+        &mut self,
+        _index: usize,
+        _boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        _activation: Tensor<B, 3>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<B: Backend> Qwen3VlStageObserver<B> for () {}
+
+/// Allocation route for temporary activations created by one streamed text decoder layer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Qwen3VlTextLayerAllocationPolicy {
+    /// Use the backend's ordinary allocator behavior.
+    #[default]
+    BackendDefault,
+    /// Route the layer's temporary and output allocations through the backend persistent pool.
+    ///
+    /// CubeCL's persistent pool is exact-size and distinct from its dynamic allocation pools. A
+    /// synchronized sequence of equal-shaped decoder layers can therefore reuse the first layer's
+    /// reserved buffers without sharing dynamic allocator bookkeeping with long-lived weights.
+    ExactSizePersistent,
+}
+
+impl Qwen3VlTextLayerAllocationPolicy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BackendDefault => "backend-default",
+            Self::ExactSizePersistent => "backend-exact-size-persistent-pool-per-text-layer",
+        }
+    }
+}
+
+/// Source synchronization inserted between loading a text block and submitting its forward pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Qwen3VlTextBlockLoadSynchronizationPolicy {
+    /// Preserve the ordinary executor contract: synchronize after each block forward.
+    #[default]
+    PostForwardOnly,
+    /// Synchronize immediately after every async block load, then retain the ordinary post-forward
+    /// barrier. This prevents a large staged upload and its first kernels sharing one submission.
+    PreForwardAndPostForward,
+}
+
+impl Qwen3VlTextBlockLoadSynchronizationPolicy {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PostForwardOnly => "post-forward-sync-only",
+            Self::PreForwardAndPostForward => {
+                "async-source-sync-after-every-text-block-load-before-forward/plus-post-forward-sync"
+            }
+        }
+    }
+}
+
+fn with_text_layer_allocation_policy<B, Input, Output, Func>(
+    policy: Qwen3VlTextLayerAllocationPolicy,
+    device: &B::Device,
+    input: Input,
+    func: Func,
+) -> Output
+where
+    B: Backend,
+    Input: Send,
+    Output: Send,
+    Func: Fn(Input) -> Output + Send,
+{
+    match policy {
+        Qwen3VlTextLayerAllocationPolicy::BackendDefault => func(input),
+        Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent => {
+            B::memory_persistent_allocations(device, input, func)
+        }
+    }
+}
+
+fn apply_streamed_text_layer<B: Backend, O: Qwen3VlStageObserver<B>>(
+    policy: Qwen3VlTextLayerAllocationPolicy,
+    mut state: Qwen3VlTextState<B>,
+    index: usize,
+    layer: Qwen3VlDecoderLayer<B>,
+    observer: &mut O,
+    device: &B::Device,
+) -> Result<(Qwen3VlTextState<B>, Qwen3VlDecoderLayer<B>)> {
+    if policy == Qwen3VlTextLayerAllocationPolicy::BackendDefault {
+        state.apply_layer(index, &layer, observer)?;
+        return Ok((state, layer));
+    }
+    let (state, layer, transition) = with_text_layer_allocation_policy::<B, _, _, _>(
+        policy,
+        device,
+        (state, layer),
+        |(mut state, layer)| {
+            let transition = state.apply_layer_transition(index, &layer);
+            (state, layer, transition)
+        },
+    );
+    transition?;
+    state.observe_layer(index, observer)?;
+    Ok((state, layer))
+}
 
 /// Source of verified short-lived base-model stages. Implementations may synchronously consume
 /// bytes prefetched by an async CDN layer; every returned module can be dropped after its matching
@@ -1216,6 +1696,16 @@ pub trait AsyncQwen3VlStageSource<B: Backend> {
         &mut self,
         spec: &RowChunkSpec,
     ) -> core::result::Result<EmbeddingRowChunk<B>, Self::Error>;
+    /// Optionally authenticate full F16 row objects, select requested rows on the host, and
+    /// upload one compact F32 embedding. Sources return `None` unless they explicitly implement
+    /// this fail-closed execution policy.
+    async fn load_host_routed_f16_embedding_f32(
+        &mut self,
+        _input_ids: &[Vec<i64>],
+        _device: &B::Device,
+    ) -> core::result::Result<Option<HostRoutedEmbedding<B>>, Self::Error> {
+        Ok(None)
+    }
     async fn load_vision_prelude(
         &mut self,
     ) -> core::result::Result<Qwen3VlVisionPrelude<B>, Self::Error>;
@@ -1412,6 +1902,21 @@ where
         Ok(chunk)
     }
 
+    async fn load_host_routed_f16_embedding_f32(
+        &mut self,
+        input_ids: &[Vec<i64>],
+        device: &B::Device,
+    ) -> core::result::Result<Option<HostRoutedEmbedding<B>>, Self::Error> {
+        // Host routing deliberately bypasses the device-row cache. Retaining full embedding
+        // chunks would defeat its memory contract, so an enabled retaining wrapper fails closed.
+        if self.retention_enabled || !self.embedding_rows.is_empty() {
+            return Ok(None);
+        }
+        self.source
+            .load_host_routed_f16_embedding_f32(input_ids, device)
+            .await
+    }
+
     async fn load_vision_prelude(
         &mut self,
     ) -> core::result::Result<Qwen3VlVisionPrelude<B>, Self::Error> {
@@ -1543,6 +2048,11 @@ pub struct StreamingQwen3Vl<B: Backend, S> {
     pub plan: Qwen3VlStreamingPlan,
     pub source: S,
     query_chunk_size: usize,
+    release_unused_memory_after_stage: bool,
+    embedding_execution_policy: Qwen3VlEmbeddingExecutionPolicy,
+    text_layer_allocation_policy: Qwen3VlTextLayerAllocationPolicy,
+    text_block_load_synchronization_policy: Qwen3VlTextBlockLoadSynchronizationPolicy,
+    last_host_routed_embedding_report: Option<HostRoutedEmbeddingReport>,
     _backend: PhantomData<B>,
 }
 
@@ -1565,12 +2075,84 @@ impl<B: Backend, S> StreamingQwen3Vl<B, S> {
             plan,
             source,
             query_chunk_size: 128,
+            release_unused_memory_after_stage: false,
+            embedding_execution_policy: Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks,
+            text_layer_allocation_policy: Qwen3VlTextLayerAllocationPolicy::BackendDefault,
+            text_block_load_synchronization_policy:
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly,
+            last_host_routed_embedding_report: None,
             _backend: PhantomData,
         }
     }
 
     pub fn set_query_chunk_size(&mut self, query_chunk_size: usize) {
         self.query_chunk_size = query_chunk_size.max(1);
+    }
+
+    /// Release backend allocator pages with no live handles after each synchronized weight stage.
+    ///
+    /// The default preserves allocator caching. Explicitly memory-bounded runtimes can enable this
+    /// when a source streams one semantic module at a time and its synchronization contract makes
+    /// dropping that module safe before the next load.
+    pub const fn with_release_unused_memory_after_stage(mut self, enabled: bool) -> Self {
+        self.release_unused_memory_after_stage = enabled;
+        self
+    }
+
+    /// Whether each synchronized semantic stage is followed by backend allocator cleanup.
+    pub const fn releases_unused_memory_after_stage(&self) -> bool {
+        self.release_unused_memory_after_stage
+    }
+
+    /// Select the embedding execution route. Host routing is opt-in and fails when the wrapped
+    /// verified source does not implement it.
+    pub const fn with_embedding_execution_policy(
+        mut self,
+        policy: Qwen3VlEmbeddingExecutionPolicy,
+    ) -> Self {
+        self.embedding_execution_policy = policy;
+        self
+    }
+
+    pub const fn embedding_execution_policy(&self) -> Qwen3VlEmbeddingExecutionPolicy {
+        self.embedding_execution_policy
+    }
+
+    /// Select the allocator used for temporaries and outputs created inside each text layer.
+    pub const fn with_text_layer_allocation_policy(
+        mut self,
+        policy: Qwen3VlTextLayerAllocationPolicy,
+    ) -> Self {
+        self.text_layer_allocation_policy = policy;
+        self
+    }
+
+    pub const fn text_layer_allocation_policy(&self) -> Qwen3VlTextLayerAllocationPolicy {
+        self.text_layer_allocation_policy
+    }
+
+    /// Select whether asynchronous text blocks receive an explicit source barrier after load and
+    /// before forward submission. The existing post-forward synchronization is always retained.
+    pub const fn with_text_block_load_synchronization_policy(
+        mut self,
+        policy: Qwen3VlTextBlockLoadSynchronizationPolicy,
+    ) -> Self {
+        self.text_block_load_synchronization_policy = policy;
+        self
+    }
+
+    pub const fn text_block_load_synchronization_policy(
+        &self,
+    ) -> Qwen3VlTextBlockLoadSynchronizationPolicy {
+        self.text_block_load_synchronization_policy
+    }
+
+    pub fn last_host_routed_embedding_report(&self) -> Option<&HostRoutedEmbeddingReport> {
+        self.last_host_routed_embedding_report.as_ref()
+    }
+
+    pub fn take_last_host_routed_embedding_report(&mut self) -> Option<HostRoutedEmbeddingReport> {
+        self.last_host_routed_embedding_report.take()
     }
 }
 
@@ -1587,6 +2169,12 @@ where
         input: Qwen3VlModelInput<B>,
         observer: &mut O,
     ) -> core::result::Result<Qwen3VlModelOutput<B>, StreamingForwardError<S::Error>> {
+        self.last_host_routed_embedding_report = None;
+        if self.embedding_execution_policy != Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks {
+            return Err(StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                "exact host-routed embeddings require forward_base_async".into(),
+            )));
+        }
         config.validate().map_err(StreamingForwardError::Model)?;
         self.plan
             .embedding_rows
@@ -1657,6 +2245,12 @@ where
                 .synchronize()
                 .map_err(StreamingForwardError::Source)?;
             drop(chunk);
+            if self.release_unused_memory_after_stage {
+                self.source
+                    .synchronize()
+                    .map_err(StreamingForwardError::Source)?;
+                B::memory_cleanup(&device);
+            }
         }
         let mut embeddings = embedding_state
             .finish()
@@ -1692,6 +2286,12 @@ where
                 .synchronize()
                 .map_err(StreamingForwardError::Source)?;
             drop(prelude);
+            if self.release_unused_memory_after_stage {
+                self.source
+                    .synchronize()
+                    .map_err(StreamingForwardError::Source)?;
+                B::memory_cleanup(&device);
+            }
 
             for index in 0..config.vision_config.depth {
                 let mut block = self
@@ -1708,6 +2308,12 @@ where
                     .synchronize()
                     .map_err(StreamingForwardError::Source)?;
                 drop(block);
+                if self.release_unused_memory_after_stage {
+                    self.source
+                        .synchronize()
+                        .map_err(StreamingForwardError::Source)?;
+                    B::memory_cleanup(&device);
+                }
 
                 if let Some(merger_index) = config
                     .vision_config
@@ -1728,6 +2334,12 @@ where
                         .synchronize()
                         .map_err(StreamingForwardError::Source)?;
                     drop(merger);
+                    if self.release_unused_memory_after_stage {
+                        self.source
+                            .synchronize()
+                            .map_err(StreamingForwardError::Source)?;
+                        B::memory_cleanup(&device);
+                    }
                 }
             }
         }
@@ -1748,6 +2360,12 @@ where
                 .synchronize()
                 .map_err(StreamingForwardError::Source)?;
             drop(merger);
+            if self.release_unused_memory_after_stage {
+                self.source
+                    .synchronize()
+                    .map_err(StreamingForwardError::Source)?;
+                B::memory_cleanup(&device);
+            }
         }
 
         let mut visual_outputs = Vec::with_capacity(indexed_visual_outputs.len());
@@ -1807,13 +2425,25 @@ where
                 .load_text_block(index)
                 .map_err(StreamingForwardError::Source)?;
             layer.self_attn.set_query_chunk_size(self.query_chunk_size);
-            text_state
-                .apply_layer(index, &layer, observer)
-                .map_err(StreamingForwardError::Model)?;
+            (text_state, layer) = apply_streamed_text_layer(
+                self.text_layer_allocation_policy,
+                text_state,
+                index,
+                layer,
+                observer,
+                &device,
+            )
+            .map_err(StreamingForwardError::Model)?;
             self.source
                 .synchronize()
                 .map_err(StreamingForwardError::Source)?;
             drop(layer);
+            if self.release_unused_memory_after_stage {
+                self.source
+                    .synchronize()
+                    .map_err(StreamingForwardError::Source)?;
+                B::memory_cleanup(&device);
+            }
         }
         let norm = self
             .source
@@ -1826,6 +2456,12 @@ where
             .synchronize()
             .map_err(StreamingForwardError::Source)?;
         drop(norm);
+        if self.release_unused_memory_after_stage {
+            self.source
+                .synchronize()
+                .map_err(StreamingForwardError::Source)?;
+            B::memory_cleanup(&device);
+        }
         if let Some(hidden_states) = &mut hidden_states {
             hidden_states.push(last_hidden_state.clone());
         }
@@ -1844,6 +2480,194 @@ where
     B: Backend,
     S: AsyncQwen3VlStageSource<B>,
 {
+    async fn synchronize_text_layer_activation_boundary<O: Qwen3VlStageObserver<B>>(
+        &mut self,
+        observer: &mut O,
+        index: usize,
+        boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        activation: Tensor<B, 3>,
+    ) -> core::result::Result<(), StreamingForwardError<S::Error>> {
+        self.source
+            .synchronize()
+            .await
+            .map_err(StreamingForwardError::Source)?;
+        observer
+            .text_layer_activation_after_synchronize(index, boundary, activation)
+            .await
+            .map_err(StreamingForwardError::Model)
+    }
+
+    async fn synchronize_text_layer_parameter_boundary<O: Qwen3VlStageObserver<B>>(
+        &mut self,
+        observer: &mut O,
+        index: usize,
+        boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        parameter: Tensor<B, 1>,
+    ) -> core::result::Result<(), StreamingForwardError<S::Error>> {
+        self.source
+            .synchronize()
+            .await
+            .map_err(StreamingForwardError::Source)?;
+        observer
+            .text_layer_parameter_after_synchronize(index, boundary, parameter)
+            .await
+            .map_err(StreamingForwardError::Model)
+    }
+
+    /// Rendered diagnostics can opt into an explicitly serialized layer transition. Every
+    /// boundary is synchronized and consumed by the observer before the next operation is
+    /// submitted, so readbacks cannot observe a later reuse of the same allocator slot.
+    async fn apply_streamed_text_layer_with_boundary_diagnostics<O: Qwen3VlStageObserver<B>>(
+        &mut self,
+        state: Qwen3VlTextState<B>,
+        index: usize,
+        layer: Qwen3VlDecoderLayer<B>,
+        observer: &mut O,
+        device: &B::Device,
+    ) -> core::result::Result<
+        (Qwen3VlTextState<B>, Qwen3VlDecoderLayer<B>),
+        StreamingForwardError<S::Error>,
+    > {
+        state
+            .validate_layer_index(index)
+            .map_err(StreamingForwardError::Model)?;
+        let policy = self.text_layer_allocation_policy;
+        let layer_input = state.hidden_states.clone();
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::LayerInput,
+            layer_input.clone(),
+        )
+        .await?;
+        self.synchronize_text_layer_parameter_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::InputLayerNormGamma,
+            layer.input_layernorm.gamma.val(),
+        )
+        .await?;
+
+        let identity_add_canary = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            layer_input.clone(),
+            |input| {
+                let zeros = input.zeros_like();
+                input + zeros
+            },
+        );
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::IdentityAddCanary,
+            identity_add_canary,
+        )
+        .await?;
+
+        let input_norm = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            layer_input.clone(),
+            |input| layer.input_layernorm.forward(input),
+        );
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::InputNorm,
+            input_norm.clone(),
+        )
+        .await?;
+
+        let attention_output = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            (input_norm, state.cos.clone(), state.sin.clone()),
+            |(input, cos, sin)| {
+                layer
+                    .self_attn
+                    .forward(input, cos, sin, state.attention_mask.as_ref())
+            },
+        );
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::AttentionOutput,
+            attention_output.clone(),
+        )
+        .await?;
+
+        let first_residual = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            (layer_input, attention_output),
+            |(residual, attention)| residual + attention,
+        );
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::FirstResidual,
+            first_residual.clone(),
+        )
+        .await?;
+
+        let post_attention_norm = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            first_residual.clone(),
+            |input| layer.post_attention_layernorm.forward(input),
+        );
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::PostAttentionNorm,
+            post_attention_norm.clone(),
+        )
+        .await?;
+
+        let mlp_output = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            post_attention_norm,
+            |input| layer.mlp.forward(input),
+        );
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::MlpOutput,
+            mlp_output.clone(),
+        )
+        .await?;
+
+        let final_residual = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            (first_residual, mlp_output),
+            |(residual, mlp)| residual + mlp,
+        );
+        let (state, transition) = with_text_layer_allocation_policy::<B, _, _, _>(
+            policy,
+            device,
+            (state, final_residual),
+            |(mut state, output)| {
+                let transition = state.commit_layer_output(index, output);
+                (state, transition)
+            },
+        );
+        transition.map_err(StreamingForwardError::Model)?;
+        self.synchronize_text_layer_activation_boundary(
+            observer,
+            index,
+            Qwen3VlTextLayerDiagnosticBoundary::FinalResidualOutput,
+            state.hidden_states.clone(),
+        )
+        .await?;
+        state
+            .observe_layer(index, observer)
+            .map_err(StreamingForwardError::Model)?;
+        Ok((state, layer))
+    }
+
     /// Asynchronously execute the complete ordinary Qwen3-VL base model while retaining only
     /// activations and one semantic weight stage.
     ///
@@ -1857,6 +2681,32 @@ where
         input: Qwen3VlModelInput<B>,
         observer: &mut O,
     ) -> core::result::Result<Qwen3VlModelOutput<B>, StreamingForwardError<S::Error>> {
+        self.forward_base_async_inner(config, input, None, observer)
+            .await
+    }
+
+    /// Asynchronously execute the base model while reusing the exact CPU token IDs that created
+    /// `input.input_ids`. This is the production entrypoint for host-routed F16 embedding assembly;
+    /// existing callers retain the original device-input API above.
+    pub async fn forward_base_async_with_host_input_ids<O: Qwen3VlStageObserver<B>>(
+        &mut self,
+        config: &Qwen3VlConfig,
+        input: Qwen3VlModelInput<B>,
+        host_input_ids: &[Vec<i64>],
+        observer: &mut O,
+    ) -> core::result::Result<Qwen3VlModelOutput<B>, StreamingForwardError<S::Error>> {
+        self.forward_base_async_inner(config, input, Some(host_input_ids), observer)
+            .await
+    }
+
+    async fn forward_base_async_inner<O: Qwen3VlStageObserver<B>>(
+        &mut self,
+        config: &Qwen3VlConfig,
+        input: Qwen3VlModelInput<B>,
+        host_input_ids: Option<&[Vec<i64>]>,
+        observer: &mut O,
+    ) -> core::result::Result<Qwen3VlModelOutput<B>, StreamingForwardError<S::Error>> {
+        self.last_host_routed_embedding_report = None;
         config.validate().map_err(StreamingForwardError::Model)?;
         self.plan
             .embedding_rows
@@ -1888,53 +2738,207 @@ where
             )));
         }
 
-        let input_data = input_ids.into_data_async().await.map_err(|error| {
-            StreamingForwardError::Model(Qwen3VlError::InvalidInput(format!(
-                "failed to asynchronously read token ids for row-routed embedding: {error}"
-            )))
-        })?;
-        let flat_ids = input_data
-            .convert::<i64>()
-            .to_vec::<i64>()
-            .map_err(|error| {
+        let host_ids = if let Some(host_input_ids) = host_input_ids {
+            host_input_ids.to_vec()
+        } else {
+            let input_data = input_ids.into_data_async().await.map_err(|error| {
                 StreamingForwardError::Model(Qwen3VlError::InvalidInput(format!(
-                    "failed to decode token ids for row-routed embedding: {error}"
+                    "failed to asynchronously read token ids for row-routed embedding: {error}"
                 )))
             })?;
-        let host_ids = flat_ids
-            .chunks_exact(sequence)
-            .map(<[i64]>::to_vec)
-            .collect::<Vec<_>>();
-        if host_ids.len() != batch {
+            let flat_ids = input_data
+                .convert::<i64>()
+                .to_vec::<i64>()
+                .map_err(|error| {
+                    StreamingForwardError::Model(Qwen3VlError::InvalidInput(format!(
+                        "failed to decode token ids for row-routed embedding: {error}"
+                    )))
+                })?;
+            flat_ids
+                .chunks_exact(sequence)
+                .map(<[i64]>::to_vec)
+                .collect::<Vec<_>>()
+        };
+        if host_ids.len() != batch
+            || host_ids.iter().any(|row| row.len() != sequence)
+            || host_ids
+                .iter()
+                .flatten()
+                .any(|&id| id < 0 || id as usize >= config.text_config.vocab_size)
+        {
             return Err(StreamingForwardError::Model(Qwen3VlError::InvalidInput(
-                "token-id tensor shape is inconsistent with its data".into(),
+                "host token IDs are inconsistent with the model input shape or vocabulary".into(),
             )));
         }
-        let mut embedding_state = ChunkedEmbeddingState::new(
-            &host_ids,
-            config.text_config.vocab_size,
-            config.text_config.hidden_size,
-            &device,
-        )
-        .map_err(StreamingForwardError::Model)?;
-        for spec in &self.plan.embedding_rows.chunks {
-            let chunk = self
-                .source
-                .load_embedding_rows(spec)
-                .await
-                .map_err(StreamingForwardError::Source)?;
-            embedding_state
-                .apply_chunk(&chunk)
+        let mut embeddings = match self.embedding_execution_policy {
+            Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks => {
+                let mut embedding_state = ChunkedEmbeddingState::new(
+                    &host_ids,
+                    config.text_config.vocab_size,
+                    config.text_config.hidden_size,
+                    &device,
+                )
                 .map_err(StreamingForwardError::Model)?;
-            self.source
-                .synchronize()
-                .await
-                .map_err(StreamingForwardError::Source)?;
-            drop(chunk);
-        }
-        let mut embeddings = embedding_state
-            .finish()
-            .map_err(StreamingForwardError::Model)?;
+                for spec in &self.plan.embedding_rows.chunks {
+                    let chunk = self
+                        .source
+                        .load_embedding_rows(spec)
+                        .await
+                        .map_err(StreamingForwardError::Source)?;
+                    embedding_state
+                        .apply_chunk(&chunk)
+                        .map_err(StreamingForwardError::Model)?;
+                    self.source
+                        .synchronize()
+                        .await
+                        .map_err(StreamingForwardError::Source)?;
+                    drop(chunk);
+                    if self.release_unused_memory_after_stage {
+                        self.source
+                            .synchronize()
+                            .await
+                            .map_err(StreamingForwardError::Source)?;
+                        B::memory_cleanup(&device);
+                    }
+                }
+                embedding_state
+                    .finish()
+                    .map_err(StreamingForwardError::Model)?
+            }
+            Qwen3VlEmbeddingExecutionPolicy::ExactHostRoutedF16ToF32 {
+                verify_device_roundtrip_before_text,
+            } => {
+                if self.release_unused_memory_after_stage {
+                    return Err(StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                        "host-routed embedding policy is incompatible with per-stage allocator cleanup"
+                            .into(),
+                    )));
+                }
+                let HostRoutedEmbedding {
+                    tensor,
+                    mut report,
+                } = self
+                    .source
+                    .load_host_routed_f16_embedding_f32(&host_ids, &device)
+                    .await
+                    .map_err(StreamingForwardError::Source)?
+                    .ok_or_else(|| {
+                        StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                            "the selected Qwen source does not support exact host-routed F16 embeddings"
+                                .into(),
+                        ))
+                    })?;
+                let expected_tokens = batch.checked_mul(sequence).ok_or_else(|| {
+                    StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                        "host-routed embedding token count overflowed".into(),
+                    ))
+                })?;
+                let expected_selected_f16_bytes = expected_tokens
+                    .checked_mul(config.text_config.hidden_size)
+                    .and_then(|value| value.checked_mul(2))
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or_else(|| {
+                        StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                            "host-routed embedding selected byte count overflowed".into(),
+                        ))
+                    })?;
+                let expected_f32_bytes =
+                    expected_selected_f16_bytes.checked_mul(2).ok_or_else(|| {
+                        StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                            "host-routed embedding F32 byte count overflowed".into(),
+                        ))
+                    })?;
+                let expected_authenticated_f16_bytes = self
+                    .plan
+                    .embedding_rows
+                    .chunks
+                    .iter()
+                    .try_fold(0_u64, |total, spec| {
+                        u64::try_from(spec.byte_len())
+                            .ok()
+                            .and_then(|bytes| total.checked_add(bytes))
+                    })
+                    .ok_or_else(|| {
+                        StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                            "host-routed embedding authenticated byte count overflowed".into(),
+                        ))
+                    })?;
+                if tensor.dims() != [batch, sequence, config.text_config.hidden_size]
+                    || tensor.dtype() != DType::F32
+                    || report.shape != vec![batch, sequence, config.text_config.hidden_size]
+                    || report.dtype != "f32"
+                    || report.policy != HOST_ROUTED_F16_EMBEDDING_POLICY
+                    || report.input_token_count != expected_tokens
+                    || report.selected_row_occurrences != expected_tokens
+                    || report.selected_f16_bytes != expected_selected_f16_bytes
+                    || report.host_f32_payload_bytes != expected_f32_bytes
+                    || report.host_to_device_upload_bytes != expected_f32_bytes
+                    || report.total_device_transfer_bytes != expected_f32_bytes
+                    || report.authenticated_object_count != self.plan.embedding_rows.chunks.len()
+                    || report.authenticated_object_bytes < report.authenticated_f16_payload_bytes
+                    || report.authenticated_f16_payload_bytes != expected_authenticated_f16_bytes
+                    || !report.all_finite
+                    || !report.not_all_zero
+                    || !report.coverage_complete
+                    || report.plan_chunk_count != self.plan.embedding_rows.chunks.len()
+                {
+                    return Err(StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                        "host-routed embedding source returned a tensor or report outside the exact policy contract"
+                            .into(),
+                    )));
+                }
+                // The only upload is the compact F32 activation. Drain it exactly once before
+                // any text-layer consumer is loaded or submitted.
+                self.source
+                    .synchronize()
+                    .await
+                    .map_err(StreamingForwardError::Source)?;
+                if verify_device_roundtrip_before_text {
+                    let uploaded = tensor.clone().into_data_async().await.map_err(|error| {
+                        StreamingForwardError::Model(Qwen3VlError::InvalidInput(format!(
+                            "host-routed embedding immediate readback failed: {error}"
+                        )))
+                    })?;
+                    if uploaded.shape.as_slice()
+                        != [batch, sequence, config.text_config.hidden_size]
+                        || uploaded.dtype != DType::F32
+                    {
+                        return Err(StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                            "host-routed embedding immediate readback shape or dtype drifted"
+                                .into(),
+                        )));
+                    }
+                    let readback_bytes = u64::try_from(uploaded.bytes.len()).map_err(|_| {
+                        StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                            "host-routed embedding readback byte count does not fit u64".into(),
+                        ))
+                    })?;
+                    let device_sha256 = sha256_hex(&uploaded.bytes);
+                    let digest_matches = device_sha256 == report.host_f32_sha256
+                        && readback_bytes == report.host_f32_payload_bytes;
+                    report.device_f32_sha256 = Some(device_sha256);
+                    report.immediate_device_to_host_readback_bytes = readback_bytes;
+                    report.total_device_transfer_bytes = report
+                        .host_to_device_upload_bytes
+                        .checked_add(readback_bytes)
+                        .ok_or_else(|| {
+                            StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                                "host-routed embedding transfer byte count overflowed".into(),
+                            ))
+                        })?;
+                    report.device_roundtrip_verified_before_text = true;
+                    report.device_roundtrip_digest_matches = digest_matches;
+                    if !digest_matches {
+                        return Err(StreamingForwardError::Model(Qwen3VlError::InvalidInput(
+                            "host-routed embedding immediate device readback differs from the exact host F32 payload"
+                                .into(),
+                        )));
+                    }
+                }
+                self.last_host_routed_embedding_report = Some(report);
+                tensor
+            }
+        };
         let text_dtype = embeddings.dtype();
         let last_embedding_chunk = self.plan.embedding_rows.chunks.len() - 1;
         observer
@@ -1968,6 +2972,13 @@ where
                 .await
                 .map_err(StreamingForwardError::Source)?;
             drop(prelude);
+            if self.release_unused_memory_after_stage {
+                self.source
+                    .synchronize()
+                    .await
+                    .map_err(StreamingForwardError::Source)?;
+                B::memory_cleanup(&device);
+            }
 
             for index in 0..config.vision_config.depth {
                 let mut block = self
@@ -1986,6 +2997,13 @@ where
                     .await
                     .map_err(StreamingForwardError::Source)?;
                 drop(block);
+                if self.release_unused_memory_after_stage {
+                    self.source
+                        .synchronize()
+                        .await
+                        .map_err(StreamingForwardError::Source)?;
+                    B::memory_cleanup(&device);
+                }
 
                 if let Some(merger_index) = config
                     .vision_config
@@ -2008,6 +3026,13 @@ where
                         .await
                         .map_err(StreamingForwardError::Source)?;
                     drop(merger);
+                    if self.release_unused_memory_after_stage {
+                        self.source
+                            .synchronize()
+                            .await
+                            .map_err(StreamingForwardError::Source)?;
+                        B::memory_cleanup(&device);
+                    }
                 }
             }
         }
@@ -2030,6 +3055,13 @@ where
                 .await
                 .map_err(StreamingForwardError::Source)?;
             drop(merger);
+            if self.release_unused_memory_after_stage {
+                self.source
+                    .synchronize()
+                    .await
+                    .map_err(StreamingForwardError::Source)?;
+                B::memory_cleanup(&device);
+            }
         }
 
         let mut visual_outputs = Vec::with_capacity(indexed_visual_outputs.len());
@@ -2089,15 +3121,51 @@ where
                 .load_text_block(index)
                 .await
                 .map_err(StreamingForwardError::Source)?;
+            if self.text_block_load_synchronization_policy
+                == Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward
+            {
+                self.source
+                    .synchronize()
+                    .await
+                    .map_err(StreamingForwardError::Source)?;
+            }
             layer.self_attn.set_query_chunk_size(self.query_chunk_size);
-            text_state
-                .apply_layer(index, &layer, observer)
+            if observer.text_layer_boundary_diagnostics_requested(index) {
+                (text_state, layer) = self
+                    .apply_streamed_text_layer_with_boundary_diagnostics(
+                        text_state, index, layer, observer, &device,
+                    )
+                    .await?;
+            } else {
+                (text_state, layer) = apply_streamed_text_layer(
+                    self.text_layer_allocation_policy,
+                    text_state,
+                    index,
+                    layer,
+                    observer,
+                    &device,
+                )
                 .map_err(StreamingForwardError::Model)?;
+            }
             self.source
                 .synchronize()
                 .await
                 .map_err(StreamingForwardError::Source)?;
             drop(layer);
+            observer
+                .rank3_after_synchronize(
+                    &Qwen3VlStage::TextBlock { index },
+                    text_state.hidden_states.clone(),
+                )
+                .await
+                .map_err(StreamingForwardError::Model)?;
+            if self.release_unused_memory_after_stage {
+                self.source
+                    .synchronize()
+                    .await
+                    .map_err(StreamingForwardError::Source)?;
+                B::memory_cleanup(&device);
+            }
         }
         let norm = self
             .source
@@ -2112,6 +3180,17 @@ where
             .await
             .map_err(StreamingForwardError::Source)?;
         drop(norm);
+        observer
+            .rank3_after_synchronize(&Qwen3VlStage::TextFinalNorm, last_hidden_state.clone())
+            .await
+            .map_err(StreamingForwardError::Model)?;
+        if self.release_unused_memory_after_stage {
+            self.source
+                .synchronize()
+                .await
+                .map_err(StreamingForwardError::Source)?;
+            B::memory_cleanup(&device);
+        }
         if let Some(hidden_states) = &mut hidden_states {
             hidden_states.push(last_hidden_state.clone());
         }
@@ -2129,7 +3208,7 @@ where
 mod tests {
     use super::*;
     use crate::{Qwen3VlModel, Qwen3VlModelInput, Qwen3VlVisualInput, config::tiny_config};
-    use burn_ndarray::NdArray;
+    use burn_ndarray::{NdArray, NdArrayDevice};
     use core::convert::Infallible;
 
     struct ResidentStageSource<B: Backend> {
@@ -2342,6 +3421,33 @@ mod tests {
     }
 
     #[test]
+    fn streamed_allocator_cleanup_is_explicit_and_disabled_by_default_correctness() {
+        type B = NdArray<f32>;
+        let config = tiny_config();
+        let device = NdArrayDevice::default();
+        let embedding_rows = RowChunkPlan::even(
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+            2,
+            size_of::<f32>(),
+        )
+        .unwrap();
+        let plan = Qwen3VlStreamingPlan::new(&config, embedding_rows, None).unwrap();
+        let source = ResidentStageSource {
+            model: Qwen3VlModel::<B>::new(config, &device).unwrap(),
+            synchronizations: 0,
+            loads: Vec::new(),
+        };
+        let streamed = StreamingQwen3Vl::<B, _>::new(plan, source);
+        assert!(!streamed.releases_unused_memory_after_stage());
+        assert!(
+            streamed
+                .with_release_unused_memory_after_stage(true)
+                .releases_unused_memory_after_stage()
+        );
+    }
+
+    #[test]
     fn hybrid_webgpu_policy_keeps_every_stage_below_binding_limit_correctness() {
         let mut config = tiny_config();
         config.text_config.vocab_size = 151_936;
@@ -2418,6 +3524,124 @@ mod tests {
     }
 
     #[test]
+    fn host_routed_f16_embedding_matches_full_lookup_and_accounts_exact_bytes_correctness() {
+        let hidden = 4;
+        let plan = RowChunkPlan::even(8, hidden, 3, 2).unwrap();
+        let full = (0..8 * hidden)
+            .map(|index| match index {
+                0 => half::f16::from_bits(0x0001),
+                1 => half::f16::from_bits(0x8000),
+                2 => half::f16::from_bits(0x7bff),
+                _ => half::f16::from_f32(index as f32 / 17.0 - 0.75),
+            })
+            .collect::<Vec<_>>();
+        // Shuffled positions, repeated IDs, and all three chunks exercise exact positional copies.
+        let ids = vec![vec![7, 0, 3, 7], vec![2, 5, 1, 3]];
+        let mut state = HostRoutedF16EmbeddingState::new(&ids, 8, hidden).unwrap();
+        let mut authenticated = 0_u64;
+        for spec in &plan.chunks {
+            let values = &full[spec.row_range.start * hidden..spec.row_range.end * hidden];
+            let data = TensorData::new(values.to_vec(), [spec.rows(), hidden]);
+            let framed_bytes = u64::try_from(data.bytes.len()).unwrap() + 512;
+            authenticated += framed_bytes;
+            state.apply_chunk_data(spec, &data, framed_bytes).unwrap();
+        }
+        let (actual, report) = state.finish().unwrap();
+        let actual = actual.to_vec::<f32>().unwrap();
+        let expected = ids
+            .iter()
+            .flatten()
+            .flat_map(|&id| {
+                full[id as usize * hidden..id as usize * hidden + hidden]
+                    .iter()
+                    .map(|value| value.to_f32())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        let device = NdArrayDevice::default();
+        let mut existing =
+            ChunkedEmbeddingState::<NdArray<f32>>::new(&ids, 8, hidden, &device).unwrap();
+        for spec in &plan.chunks {
+            let values = full[spec.row_range.start * hidden..spec.row_range.end * hidden]
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>();
+            existing
+                .apply_chunk(
+                    &EmbeddingRowChunk::new(
+                        spec.clone(),
+                        Tensor::from_data(TensorData::new(values, [spec.rows(), hidden]), &device),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let existing = existing
+            .finish()
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(actual, existing);
+        assert_eq!(report.shape, vec![2, 4, hidden]);
+        assert_eq!(report.input_token_count, 8);
+        assert_eq!(report.unique_token_count, 6);
+        assert_eq!(report.plan_chunk_count, 3);
+        assert_eq!(report.authenticated_object_count, 3);
+        assert_eq!(report.authenticated_object_bytes, authenticated);
+        assert_eq!(
+            report.authenticated_f16_payload_bytes,
+            8 * hidden as u64 * 2
+        );
+        assert_eq!(report.selected_f16_bytes, 8 * hidden as u64 * 2);
+        assert_eq!(report.host_f32_payload_bytes, 8 * hidden as u64 * 4);
+        assert_eq!(report.host_to_device_upload_bytes, 8 * hidden as u64 * 4);
+        assert_eq!(report.total_device_transfer_bytes, 8 * hidden as u64 * 4);
+        assert!(report.all_finite);
+        assert!(report.not_all_zero);
+        assert!(report.coverage_complete);
+    }
+
+    #[test]
+    fn host_routed_f16_embedding_rejects_overlap_missing_and_invalid_ids_correctness() {
+        let plan = RowChunkPlan::even(4, 2, 2, 2).unwrap();
+        let chunk = TensorData::new(
+            vec![half::f16::ONE; plan.chunks[0].rows() * 2],
+            [plan.chunks[0].rows(), 2],
+        );
+
+        let mut overlap = HostRoutedF16EmbeddingState::new(&[vec![0, 1]], 4, 2).unwrap();
+        overlap
+            .apply_chunk_data(&plan.chunks[0], &chunk, 16)
+            .unwrap();
+        assert!(
+            overlap
+                .apply_chunk_data(&plan.chunks[0], &chunk, 16)
+                .unwrap_err()
+                .to_string()
+                .contains("twice")
+        );
+
+        let mut missing = HostRoutedF16EmbeddingState::new(&[vec![0, 3]], 4, 2).unwrap();
+        missing
+            .apply_chunk_data(&plan.chunks[0], &chunk, 16)
+            .unwrap();
+        assert!(missing.finish().unwrap_err().to_string().contains("cover"));
+        assert!(HostRoutedF16EmbeddingState::new(&[vec![4]], 4, 2).is_err());
+
+        let wrong_dtype = TensorData::new(
+            vec![1.0_f32; plan.chunks[0].rows() * 2],
+            [plan.chunks[0].rows(), 2],
+        );
+        let mut state = HostRoutedF16EmbeddingState::new(&[vec![0]], 4, 2).unwrap();
+        assert!(
+            state
+                .apply_chunk_data(&plan.chunks[0], &wrong_dtype, 32)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn streamed_text_layers_match_resident_text_model_correctness() {
         type B = NdArray<f32>;
         let config = tiny_config().text_config;
@@ -2448,6 +3672,88 @@ mod tests {
         for (left, right) in streamed.iter().zip(expected) {
             assert!((left - right).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn streamed_text_layer_allocation_policy_is_math_neutral_correctness() {
+        type B = NdArray<f32>;
+        let config = tiny_config();
+        let device = NdArrayDevice::default();
+        B::seed(&device, 37);
+        let resident = Qwen3VlModel::<B>::new(config.clone(), &device).unwrap();
+        let input = Qwen3VlModelInput {
+            input_ids: Tensor::<B, 2, Int>::from_data([[1_i64, 2, 3]], &device),
+            attention_mask: None,
+            position_ids: None,
+            images: None,
+            videos: None,
+            output_hidden_states: false,
+        };
+        // Initialize lazy parameters once before cloning the resident source for both policies.
+        resident.forward(input.clone()).unwrap();
+        let embedding_rows = RowChunkPlan::even(
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+            2,
+            size_of::<f32>(),
+        )
+        .unwrap();
+        let plan = Qwen3VlStreamingPlan::new(&config, embedding_rows, None).unwrap();
+        let source = |model| ResidentStageSource {
+            model,
+            synchronizations: 0,
+            loads: Vec::new(),
+        };
+
+        let mut ordinary = StreamingQwen3Vl::<B, _>::new(plan.clone(), source(resident.clone()));
+        assert_eq!(
+            ordinary.text_layer_allocation_policy(),
+            Qwen3VlTextLayerAllocationPolicy::BackendDefault
+        );
+        assert_eq!(
+            ordinary.text_layer_allocation_policy().label(),
+            "backend-default"
+        );
+        assert_eq!(
+            ordinary.text_block_load_synchronization_policy(),
+            Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly
+        );
+        assert_eq!(
+            ordinary.text_block_load_synchronization_policy().label(),
+            "post-forward-sync-only"
+        );
+        let ordinary = ordinary
+            .forward_base(&config, input.clone(), &mut ())
+            .unwrap()
+            .last_hidden_state
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        let mut persistent = StreamingQwen3Vl::<B, _>::new(plan, source(resident))
+            .with_text_layer_allocation_policy(
+                Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent,
+            )
+            .with_text_block_load_synchronization_policy(
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward,
+            );
+        assert_eq!(
+            persistent.text_layer_allocation_policy().label(),
+            "backend-exact-size-persistent-pool-per-text-layer"
+        );
+        assert_eq!(
+            persistent.text_block_load_synchronization_policy().label(),
+            "async-source-sync-after-every-text-block-load-before-forward/plus-post-forward-sync"
+        );
+        let persistent = persistent
+            .forward_base(&config, input, &mut ())
+            .unwrap()
+            .last_hidden_state
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(ordinary, persistent);
     }
 
     #[test]
@@ -2513,12 +3819,27 @@ mod tests {
             synchronizations: 0,
             loads: Vec::new(),
         };
-        let mut async_streamed = StreamingQwen3Vl::<B, _>::new(plan, async_source);
+        let mut async_streamed = StreamingQwen3Vl::<B, _>::new(plan.clone(), async_source);
         let mut asynchronous_observer = RecordingObserver::default();
         let async_actual = block_on_immediate(async_streamed.forward_base_async(
             &config,
-            input,
+            input.clone(),
             &mut asynchronous_observer,
+        ))
+        .unwrap();
+        let barrier_source = ResidentStageSource {
+            model: resident,
+            synchronizations: 0,
+            loads: Vec::new(),
+        };
+        let mut barrier_streamed = StreamingQwen3Vl::<B, _>::new(plan, barrier_source)
+            .with_text_block_load_synchronization_policy(
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward,
+            );
+        let barrier_actual = block_on_immediate(barrier_streamed.forward_base_async(
+            &config,
+            input,
+            &mut RecordingObserver::default(),
         ))
         .unwrap();
 
@@ -2537,6 +3858,11 @@ mod tests {
             .into_data()
             .to_vec::<f32>()
             .unwrap();
+        let barrier_values = barrier_actual
+            .last_hidden_state
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         let max_hidden_delta = actual_values
             .iter()
             .zip(expected_values)
@@ -2546,6 +3872,11 @@ mod tests {
             .iter()
             .zip(&actual_values)
             .map(|(asynchronous, synchronous)| (asynchronous - synchronous).abs())
+            .fold(0.0_f32, f32::max);
+        let max_barrier_delta = barrier_values
+            .iter()
+            .zip(&actual_values)
+            .map(|(barrier, synchronous)| (barrier - synchronous).abs())
             .fold(0.0_f32, f32::max);
         let expected_vision = expected.vision_output.unwrap();
         let actual_vision = actual.vision_output.unwrap();
@@ -2605,6 +3936,10 @@ mod tests {
             max_async_delta < 1e-5 && max_async_pool_delta < 1e-5,
             "async versus sync max hidden delta {max_async_delta:e}; vision pool {max_async_pool_delta:e}"
         );
+        assert!(
+            max_barrier_delta < 1e-5,
+            "pre-forward barrier versus sync max hidden delta {max_barrier_delta:e}"
+        );
         assert_eq!(
             actual.hidden_states.as_ref().unwrap().len(),
             expected.hidden_states.as_ref().unwrap().len()
@@ -2625,6 +3960,10 @@ mod tests {
         assert_eq!(
             async_streamed.source.synchronizations,
             expected_synchronizations
+        );
+        assert_eq!(
+            barrier_streamed.source.synchronizations,
+            expected_synchronizations + config.text_config.num_hidden_layers
         );
     }
 

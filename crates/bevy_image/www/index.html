@@ -63,7 +63,8 @@
       }
 
       .loader-panel details,
-      .loader-panel button {
+      .loader-panel button,
+      .loader-panel select {
         pointer-events: auto;
       }
 
@@ -73,6 +74,8 @@
       }
 
       .loader-panel[data-compact="true"] {
+        top: auto;
+        bottom: 1rem;
         width: min(21rem, calc(100vw - 2rem));
       }
 
@@ -131,6 +134,49 @@
         letter-spacing: 0.08em;
       }
 
+      .release-control {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        gap: 0.28rem 0.65rem;
+        align-items: center;
+        margin-top: 0.72rem;
+      }
+
+      .release-control label {
+        color: #bcd0c7;
+        font-size: 0.74rem;
+        font-weight: 700;
+      }
+
+      .release-control select {
+        min-width: 0;
+        padding: 0.38rem 1.8rem 0.38rem 0.5rem;
+        color: #f5fffa;
+        background: #18241f;
+        border: 1px solid #456b5c;
+        border-radius: 0.45rem;
+        font: inherit;
+        font-size: 0.76rem;
+      }
+
+      .release-control select:focus-visible {
+        outline: 2px solid #a9e3ca;
+        outline-offset: 2px;
+      }
+
+      .release-control select:disabled {
+        cursor: not-allowed;
+        opacity: 0.62;
+      }
+
+      .release-control-note {
+        grid-column: 1 / -1;
+        margin: 0;
+        color: #82928c;
+        font-size: 0.68rem;
+        line-height: 1.35;
+      }
+
       .loader-panel[data-tone="error"] .state-badge {
         color: #ffd1d1;
         background: rgb(195 63 63 / 18%);
@@ -170,6 +216,14 @@
             no-repeat,
           #252b2d;
         animation: loading-sweep 1.25s ease-in-out infinite;
+      }
+
+      html[data-surface-inference="suspended"],
+      html[data-surface-inference="suspended"] *,
+      html[data-surface-inference="suspended"] *::before,
+      html[data-surface-inference="suspended"] *::after {
+        animation-play-state: paused !important;
+        transition: none !important;
       }
 
       @keyframes loading-sweep {
@@ -284,6 +338,14 @@
           width: auto;
           padding: 0.82rem;
         }
+
+        .loader-panel[data-compact="true"] {
+          top: auto;
+          right: 0.55rem;
+          bottom: 0.55rem;
+          left: auto;
+          width: min(21rem, calc(100vw - 1.1rem));
+        }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -301,7 +363,8 @@
         .loader-panel,
         progress,
         .state-badge,
-        .retry-button {
+        .retry-button,
+        .release-control select {
           border: 1px solid CanvasText;
         }
       }
@@ -325,14 +388,23 @@
         <span id="state-badge" class="state-badge" aria-hidden="true">STARTING</span>
       </div>
 
+      <div class="release-control">
+        <label for="model-release">Model release</label>
+        <select id="model-release" aria-describedby="model-release-note" autocomplete="off">
+          <option value="turbo">Turbo 1K generation</option>
+          <option value="edit-turbo">Edit-Turbo 1K</option>
+          <option value="edit-turbo-1k5">Edit-Turbo 1.5K</option>
+        </select>
+        <p id="model-release-note" class="release-control-note"></p>
+      </div>
+
       <progress id="artifact-progress" aria-label="Current model object or inference stage"></progress>
       <p id="progress-primary" class="progress-primary">Preparing the browser runtime</p>
       <p id="progress-secondary" class="progress-secondary"></p>
       <p id="inventory-note" class="inventory-note" hidden></p>
       <p class="model-note">
-        Large model objects are range-streamed, SHA-256 verified, and preloaded to WebGPU during
-        preparation. Keep this tab open; after readiness, forward execution reuses resident GPU
-        weights instead of transferring them again.
+        Large model objects are range-streamed, SHA-256 verified, and loaded into WebGPU according
+        to the selected residency policy. Keep this tab open while the runtime is active.
       </p>
 
       <details>
@@ -355,6 +427,7 @@
 
     <script type="module">
       import init, { provide_reference_image } from "./out/bevy_burn_image.js";
+      import { configureModelReleaseSelector } from "./model_selector.mjs";
 
       const panel = document.querySelector("#model-loader");
       const status = document.querySelector("#status");
@@ -367,7 +440,15 @@
       const errorMessage = document.querySelector("#error-message");
       const retryButton = document.querySelector("#retry-button");
       const referenceInput = document.querySelector("#burn-image-reference-input");
+      const modelRelease = document.querySelector("#model-release");
+      const modelReleaseNote = document.querySelector("#model-release-note");
       const MAX_REFERENCE_BYTES = 64 * 1024 * 1024;
+
+      configureModelReleaseSelector({
+        select: modelRelease,
+        note: modelReleaseNote,
+        location,
+      });
 
       const transfer = {
         current: null,
@@ -520,7 +601,7 @@
 
       const failRun = (message) => {
         invalidateTransferRender();
-        panel.dataset.compact = "true";
+        panel.dataset.compact = "false";
         setBusy(false);
         setSummary("Generation failed", "FAILED", "error");
         stopProgress();
@@ -583,6 +664,14 @@
         if (!detail || typeof detail.event !== "string") return;
         transfer.observedEvent = true;
         switch (detail.event) {
+          case "surface_inference_suspended":
+            document.documentElement.dataset.surfaceInference = "suspended";
+            logActivity("Rendered surface paused for request-scoped WebGPU inference");
+            break;
+          case "surface_inference_resumed":
+            delete document.documentElement.dataset.surfaceInference;
+            logActivity("Rendered surface resumed after the runtime terminal");
+            break;
           case "preparing":
             panel.dataset.compact = "false";
             setBusy(true);
@@ -597,7 +686,7 @@
             inventory.hidden = false;
             inventory.textContent = `${detail.weight_objects} model objects - ${formatBytes(
               detail.weight_bytes,
-            )} bundle inventory (preloaded to WebGPU during preparation)`;
+            )} authenticated bundle inventory`;
             logActivity(`Manifest ${detail.bundle} verified`);
             break;
           case "resident_resource_plan":
@@ -609,6 +698,88 @@
               detail.conservative_f32_weight_bytes,
             )} dense-F32 weights - ${formatBytes(detail.activation_reserve_bytes)} activation reserve`;
             logActivity("Resident WebGPU resource plan accepted; preloading required model stages");
+            break;
+          case "low_vram_resource_plan":
+            setSummary("Low-VRAM model plan verified", "PLANNED");
+            primary.textContent = `${formatBytes(
+              detail.conservative_planned_device_bytes,
+            )} conservative WebGPU plan (not measured)`;
+            secondary.textContent = `${formatBytes(
+              detail.audited_retained_q8_denoiser_bytes,
+            )} packed denoiser - ${formatBytes(
+              detail.audited_max_phase_local_f32_stage_bytes,
+            )} largest phase-local F32 stage - strict ${formatBytes(
+              detail.strict_device_cap_bytes,
+            )} cap`;
+            logActivity("Low-VRAM WebGPU resource plan accepted; stages load by request phase");
+            break;
+          case "denoiser_preload":
+            setSummary("Denoiser preload verified", "PRELOADED");
+            setDeterminate(detail.retained_stages, 46);
+            primary.textContent = `${detail.retained_stages}/46 denoiser stages retained on WebGPU`;
+            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network ranges - ${formatBytes(
+              detail.traffic.network_response_bytes,
+            )} network`;
+            logActivity("Retained denoiser preload verified");
+            break;
+          case "packed_f16_resource_plan":
+            setSummary("Packed-F16 Turbo plan verified", "PLANNED");
+            primary.textContent = `${formatBytes(
+              detail.conservative_planned_device_bytes,
+            )} conservative inference plan (not measured)`;
+            secondary.textContent = `${formatBytes(
+              detail.retained_packed_f16_denoiser_bytes,
+            )} authenticated packed-F16 retained - ${formatBytes(
+              detail.max_materialized_stage_f32_bytes,
+            )} maximum dense-F32 stage - strict ${formatBytes(
+              detail.strict_device_cap_bytes,
+            )} cap`;
+            logActivity(
+              "Turbo packed-F16 storage plan accepted; all 46 semantic stages widen to dense F32 one stage at a time",
+            );
+            break;
+          case "packed_f16_denoiser_preload":
+            setSummary("Packed-F16 denoiser preload verified", "PRELOADED");
+            setDeterminate(detail.cached_stages, 46);
+            primary.textContent = `${detail.cached_stages}/46 stages - ${detail.cached_objects}/106 authenticated objects retained`;
+            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network ranges - ${formatBytes(
+              detail.cached_bytes,
+            )} packed-F16 on WebGPU`;
+            logActivity(
+              "Complete packed-F16 Turbo denoiser retained before inference; DMD uses bounded dense-F32 stage materialization",
+            );
+            break;
+          case "packed_f16_denoiser_lifecycle":
+            setSummary("Packed-F16 DMD lifecycle verified", "VERIFIED");
+            primary.textContent = `${detail.lifecycle.stage_materializations} bounded dense-F32 stage materializations - ${detail.lifecycle.cached_stages}/46 packed stages retained`;
+            secondary.textContent = `${formatBytes(
+              detail.lifecycle.packed_read_bytes,
+            )} packed reads - ${formatBytes(
+              detail.lifecycle.f32_write_bytes,
+            )} dense-F32 writes - zero DMD artifact traffic`;
+            logActivity("Packed-F16 raw cache remained exact through the complete four-step DMD request");
+            break;
+          case "packed_f16_dmd_vae_handoff":
+            setSummary("Packed-F16 cache released before VAE", "RELEASED");
+            primary.textContent = `${formatBytes(
+              detail.report.payload_bytes,
+            )} final F32 latent preserved across the allocator boundary`;
+            secondary.textContent = `${detail.report.packed_cache_after_cleanup.cached_stages}/46 packed stages - ${formatBytes(
+              detail.report.packed_cache_after_cleanup.cached_bytes,
+            )} packed bytes retained before VAE`;
+            logActivity(
+              "Final DMD latent verified after reupload; request-scoped packed cache is empty before VAE decode",
+            );
+            break;
+          case "artifact_traffic":
+            setSummary("Request artifact traffic verified", "VERIFIED");
+            primary.textContent = `${detail.traffic.verified_objects} objects - ${formatBytes(
+              detail.traffic.object_read_bytes,
+            )} authenticated request bytes`;
+            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network ranges - ${formatBytes(
+              detail.traffic.network_response_bytes,
+            )} network`;
+            logActivity("Per-request logical, persistent-cache, and network traffic recorded");
             break;
           case "ready":
             invalidateTransferRender();

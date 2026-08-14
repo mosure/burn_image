@@ -119,6 +119,8 @@ pub(crate) fn sanitize_image_file_name(value: &str) -> String {
 #[cfg(all(feature = "app", feature = "native-io", not(target_arch = "wasm32")))]
 mod native {
     use std::{
+        fs::File,
+        io::Read,
         path::Path,
         sync::{Mutex, mpsc},
     };
@@ -357,7 +359,12 @@ mod native {
         max_bytes: usize,
         file_name: &str,
     ) -> Result<Vec<u8>, FrontendError> {
-        let metadata = std::fs::metadata(path).map_err(|error| {
+        let file = File::open(path).map_err(|error| {
+            native_io_error(format!(
+                "could not open selected image {file_name}: {error}"
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|error| {
             native_io_error(format!(
                 "could not inspect selected image {file_name}: {error}"
             ))
@@ -371,11 +378,16 @@ mod native {
             return Err(too_large_error(file_name, metadata.len(), max_bytes));
         }
 
-        let bytes = std::fs::read(path).map_err(|error| {
-            native_io_error(format!(
-                "could not read selected image {file_name}: {error}"
-            ))
-        })?;
+        // The handle can outlive a rename, and `take(max + 1)` preserves the byte bound even if
+        // the selected file grows after the metadata check.
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                native_io_error(format!(
+                    "could not read selected image {file_name}: {error}"
+                ))
+            })?;
         if bytes.is_empty() {
             return Err(FrontendError::invalid_request(format!(
                 "selected image {file_name} is empty"

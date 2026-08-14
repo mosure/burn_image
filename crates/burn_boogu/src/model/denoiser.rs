@@ -9,6 +9,7 @@ use crate::{
 use super::{
     CombinedTimestepCaptionEmbedding, DoubleStreamBlock, FinalProjection, SingleStreamBlock,
     attention::{AttentionKernel, PortableChunkedAttention},
+    linear::linear_forward,
     norm::DenoiserRmsNormPolicy,
 };
 
@@ -151,7 +152,7 @@ pub struct BooguDenoiser<B: Backend> {
 }
 
 impl<B: Backend> BooguDenoiser<B> {
-    /// Initialize a model. Real inference replaces initialized parameters from verified artifacts.
+    /// Declare a model with lazy parameters populated later from verified artifacts.
     pub fn new(config: BooguConfig, device: &B::Device) -> Result<Self, BooguError> {
         config.validate()?;
         let width = config.hidden_size;
@@ -335,9 +336,10 @@ impl<B: Backend> BooguDenoiser<B> {
             );
         }
 
-        let mut generated = self
-            .x_embedder
-            .forward(patchify(input.latent, self.config.patch_size)?);
+        let mut generated = linear_forward(
+            &self.x_embedder,
+            patchify(input.latent, self.config.patch_size)?,
+        );
         let generated_start = text_len + geometry.reference_len;
         let generated_rope = (
             joint_cos
@@ -357,9 +359,10 @@ impl<B: Backend> BooguDenoiser<B> {
         }
 
         let mut image = if let Some(reference) = input.reference {
-            let mut reference = self
-                .ref_image_patch_embedder
-                .forward(patchify(reference, self.config.patch_size)?);
+            let mut reference = linear_forward(
+                &self.ref_image_patch_embedder,
+                patchify(reference, self.config.patch_size)?,
+            );
             let embedding = self
                 .image_index_embedding
                 .weight

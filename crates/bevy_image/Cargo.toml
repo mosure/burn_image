@@ -27,6 +27,7 @@ app = [
   "bevy/bevy_ui",
   "bevy/bevy_ui_render",
   "bevy/bevy_ui_widgets",
+  "bevy/ui_picking",
   "bevy/bevy_window",
   "bevy/bevy_winit",
   "bevy/default_app",
@@ -59,12 +60,13 @@ boogu-native = [
   "dep:ureq",
 ]
 # Concrete browser-local runtime over bounded HTTP Range readers and asynchronous semantic
-# Qwen/VAE/denoiser sources. Production preloads and retains dense-F32 WebGPU stages; bounded host
-# payloads are released after upload. Layer streaming is an explicit diagnostic policy.
+# Qwen/VAE/denoiser sources. Production defaults to the bounded low-VRAM policy; explicit resident
+# mode eagerly retains dense-F32 WebGPU stages. Layer streaming remains diagnostic-only.
 boogu-web = [
   "web",
   "boogu",
   "burn_boogu/runtime",
+  "burn_boogu/webgpu",
   "dep:burn_flux_vae",
   "dep:burn_qwen3_vl",
   "burn_qwen3_vl/tokenizers",
@@ -118,6 +120,8 @@ wasm-bindgen-futures.workspace = true
 web-sys = { workspace = true, features = [
   "Blob",
   "BlobPropertyBag",
+  "Cache",
+  "CacheStorage",
   "console",
   "CustomEvent",
   "CustomEventInit",
@@ -132,6 +136,7 @@ web-sys = { workspace = true, features = [
   "Request",
   "RequestInit",
   "Response",
+  "ResponseInit",
   "Url",
   "UrlSearchParams",
   "Window",
@@ -144,3 +149,8 @@ crate-type = ["rlib", "cdylib"]
 name = "burn-image-viewer"
 path = "src/main.rs"
 required-features = ["app", "gpu-interop"]
+
+[[bin]]
+name = "burn-image-output-quality"
+path = "src/bin/output_quality.rs"
+required-features = ["boogu-native"]

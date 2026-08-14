@@ -60,12 +60,15 @@ pub use processor::{
 pub use rope::{MropePositionIds, PositionDelta};
 pub use streaming::{
     AsyncQwen3VlCausalLmStageSource, AsyncQwen3VlStageSource, AsyncRetainingSynchronizationPolicy,
-    ChunkedEmbeddingState, DEFAULT_VOCABULARY_CHUNKS, EmbeddingRowChunk, OutputProjectionRowChunk,
-    Qwen3VlCausalLmStageSource, Qwen3VlStage, Qwen3VlStageDType, Qwen3VlStageDTypePolicy,
+    ChunkedEmbeddingState, DEFAULT_VOCABULARY_CHUNKS, EmbeddingRowChunk,
+    HOST_ROUTED_F16_EMBEDDING_POLICY, HostRoutedEmbedding, HostRoutedEmbeddingReport,
+    HostRoutedF16EmbeddingState, OutputProjectionRowChunk, Qwen3VlCausalLmStageSource,
+    Qwen3VlEmbeddingExecutionPolicy, Qwen3VlStage, Qwen3VlStageDType, Qwen3VlStageDTypePolicy,
     Qwen3VlStageDescriptor, Qwen3VlStageObserver, Qwen3VlStageSource, Qwen3VlStreamingPlan,
-    Qwen3VlTextState, Qwen3VlVisionPrelude, Qwen3VlVisionState, RetainingAsyncQwen3VlStageSource,
-    RetainingQwen3VlStageSource, RetainingSynchronizationPolicy, RowChunkPlan, RowChunkSpec,
-    RowSliceWeightSpec, StreamingForwardError, StreamingQwen3Vl,
+    Qwen3VlTextBlockLoadSynchronizationPolicy, Qwen3VlTextLayerAllocationPolicy,
+    Qwen3VlTextLayerDiagnosticBoundary, Qwen3VlTextState, Qwen3VlVisionPrelude, Qwen3VlVisionState,
+    RetainingAsyncQwen3VlStageSource, RetainingQwen3VlStageSource, RetainingSynchronizationPolicy,
+    RowChunkPlan, RowChunkSpec, RowSliceWeightSpec, StreamingForwardError, StreamingQwen3Vl,
 };
 pub use text::{DeepstackEmbeddings, Qwen3VlDecoderLayer};
 pub use vision::{Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger};

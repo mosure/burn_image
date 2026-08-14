@@ -14,6 +14,18 @@ use crate::{
     host_image_rgba8,
 };
 
+/// Browser event emitted only after a completed job's output has been validated and materialized
+/// as a Bevy texture.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const BROWSER_OUTPUT_READY_EVENT_NAME: &str = "burn-image-output-ready";
+
+/// wasm-bindgen represents `u64` as JavaScript `BigInt`; decimal text preserves the full
+/// [`ImageJobId`] range while keeping the browser event JSON-serializable.
+#[cfg(any(target_arch = "wasm32", test))]
+fn browser_output_ready_job_id(job: ImageJobId) -> String {
+    job.0.to_string()
+}
+
 /// Maximum number of generated output textures retained by the frontend.
 ///
 /// Exact [`GeneratedImageView`] bindings remain available for this recent
@@ -177,6 +189,7 @@ fn materialize_completed_images(
                         handle,
                         dimensions,
                     });
+                    dispatch_browser_output_ready(key, dimensions, &completion.output.provenance);
                 }
                 Err(error) => {
                     failed.write(ImageDisplayFailed { key, error });
@@ -184,6 +197,68 @@ fn materialize_completed_images(
             }
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_browser_output_ready(
+    key: DisplayKey,
+    dimensions: Dimensions,
+    provenance: &burn_image::ModelProvenance,
+) {
+    let result = (|| {
+        let detail = js_sys::Object::new();
+        let set = |name: &str, value: wasm_bindgen::JsValue| {
+            js_sys::Reflect::set(&detail, &name.into(), &value)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        };
+        set("event", "ready".into())?;
+        set("job_id", browser_output_ready_job_id(key.job).into())?;
+        set("output_index", key.output_index.into())?;
+        set("width", dimensions.width().into())?;
+        set("height", dimensions.height().into())?;
+        set("model", provenance.model.as_str().into())?;
+        set("model_revision", provenance.model_revision.as_str().into())?;
+        let numeric_format = match &provenance.numeric_format {
+            burn_image::NumericFormat::F32 => "f32",
+            burn_image::NumericFormat::F16 => "f16",
+            burn_image::NumericFormat::Bf16 => "bf16",
+            burn_image::NumericFormat::I8 => "i8",
+            burn_image::NumericFormat::U8 => "u8",
+            burn_image::NumericFormat::Other(value) => value.as_str(),
+        };
+        set("numeric_format", numeric_format.into())?;
+        set("backend", provenance.backend.as_str().into())?;
+        set("artifacts_verified", provenance.artifacts_verified.into())?;
+        if let Some(digest) = provenance.artifact_content_digest {
+            set("artifact_content_digest", digest.to_string().into())?;
+        }
+
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(detail.as_ref());
+        let event =
+            web_sys::CustomEvent::new_with_event_init_dict(BROWSER_OUTPUT_READY_EVENT_NAME, &init)
+                .map_err(|error| format!("{error:?}"))?;
+        let window = web_sys::window().ok_or_else(|| "Window is unavailable".to_owned())?;
+        window
+            .dispatch_event(event.as_ref())
+            .map_err(|error| format!("{error:?}"))?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        web_sys::console::warn_1(
+            &format!("failed to dispatch browser event {BROWSER_OUTPUT_READY_EVENT_NAME}: {error}")
+                .into(),
+        );
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_browser_output_ready(
+    _key: DisplayKey,
+    _dimensions: Dimensions,
+    _provenance: &burn_image::ModelProvenance,
+) {
 }
 
 #[cfg(feature = "app")]
@@ -259,6 +334,28 @@ mod tests {
             TextureFormat::Rgba8UnormSrgb
         );
         assert_eq!(texture.asset_usage, RenderAssetUsages::RENDER_WORLD);
+    }
+
+    #[test]
+    fn rendered_model_smoke_tracks_materialized_output_contract_correctness() {
+        let contract = include_str!("../tests/wasm_rendered_surface_contract.mjs");
+        let harness = include_str!("../tests/wasm_rendered_surface_smoke.mjs");
+        assert!(contract.contains(BROWSER_OUTPUT_READY_EVENT_NAME));
+        assert!(contract.contains("isCanonicalU64DecimalString"));
+        assert!(harness.contains("OUTPUT_READY_EVENT_NAME"));
+        assert!(harness.contains("outputJobIdMatchesNumericRunId"));
+        assert!(harness.contains("artifact_content_digest"));
+        assert!(BROWSER_OUTPUT_READY_EVENT_NAME.is_ascii());
+    }
+
+    #[test]
+    fn browser_output_ready_job_id_is_exact_canonical_u64_decimal_correctness() {
+        assert_eq!(browser_output_ready_job_id(ImageJobId(0)), "0");
+        assert_eq!(browser_output_ready_job_id(ImageJobId(7)), "7");
+        let maximum = browser_output_ready_job_id(ImageJobId(u64::MAX));
+        assert_eq!(maximum, "18446744073709551615");
+        assert!(!maximum.starts_with('0'));
+        assert!(maximum.bytes().all(|byte| byte.is_ascii_digit()));
     }
 
     fn test_displayed_image(assets: &mut Assets<Image>) -> DisplayedImage {

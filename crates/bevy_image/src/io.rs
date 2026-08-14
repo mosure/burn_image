@@ -260,7 +260,32 @@ fn encoding_to_format(encoding: ImageEncoding) -> Option<ImageFormat> {
 
 #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
 pub fn load_image_file(path: impl AsRef<std::path::Path>) -> Result<InputImage, FrontendError> {
-    decode_input_image(&std::fs::read(path)?, None)
+    use std::{fs::File, io::Read};
+
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(FrontendError::invalid_request(format!(
+            "input image is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_DECODED_RGBA_BYTES {
+        return Err(FrontendError::invalid_request(format!(
+            "input image must contain 1..={MAX_DECODED_RGBA_BYTES} bytes, found {}",
+            metadata.len()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_DECODED_RGBA_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DECODED_RGBA_BYTES {
+        return Err(FrontendError::invalid_request(format!(
+            "input image exceeds the {MAX_DECODED_RGBA_BYTES}-byte limit"
+        )));
+    }
+    decode_input_image(&bytes, None)
 }
 
 #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
@@ -710,6 +735,27 @@ mod tests {
     use burn_image::{ColorSpace, HostImage, PixelBuffer, PixelFormat};
 
     use super::*;
+
+    #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_file_loader_rejects_non_regular_and_oversized_inputs_correctness() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let directory = tempfile::tempdir().unwrap();
+        let non_regular = load_image_file(directory.path())
+            .expect_err("a directory must not be treated as an input image");
+        assert!(non_regular.message.contains("regular file"));
+
+        let oversized_path = directory.path().join("oversized.png");
+        let mut oversized = std::fs::File::create(&oversized_path).unwrap();
+        oversized
+            .seek(SeekFrom::Start(MAX_DECODED_RGBA_BYTES))
+            .unwrap();
+        oversized.write_all(&[0]).unwrap();
+        let error = load_image_file(&oversized_path)
+            .expect_err("an input above the byte ceiling must fail before decoding");
+        assert!(error.message.contains("1..="));
+    }
 
     #[test]
     fn png_roundtrip_preserves_rgba_pixels_correctness() {

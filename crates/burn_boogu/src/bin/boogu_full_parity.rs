@@ -6,7 +6,13 @@ use std::{
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    time::Instant,
+    process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use burn::{
@@ -42,6 +48,9 @@ use serde::{Deserialize, Serialize};
 
 type B = burn_wgpu::Wgpu<f32, i32, u32>;
 const DEFAULT_QUERY_CHUNK_SIZE: usize = 128;
+// Decimal GB is intentional and matches the browser low-VRAM qualification contract.
+const NATIVE_LOW_VRAM_STRICT_DEVICE_CEILING_BYTES: u64 = 32_000_000_000;
+const NVIDIA_SMI_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ProfileChoice {
@@ -82,6 +91,18 @@ impl From<ProfileChoice> for BooguStorageProfile {
             ProfileChoice::Q8sBlock32F32QwenVisionF32 => Self::Q8sBlock32F32QwenVisionF32,
         }
     }
+}
+
+/// Named native runtime contracts that may make a qualification claim.
+///
+/// Omitting this selector preserves the existing component-level diagnostic controls. Selecting a
+/// named policy makes the CLI fail closed unless every component control matches that policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum NativeRuntimePolicyChoice {
+    /// Stream verified Qwen stages, load one unretained VAE half per phase, and retain the exact
+    /// qualified mixed-F16 denoiser across all four DMD steps.
+    LowVram,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -227,6 +248,11 @@ struct Args {
     /// Exact converted storage profile; it must match the sealed manifest.
     #[arg(long, value_enum, default_value = "f16-qwen-vision-f32")]
     profile: ProfileChoice,
+    /// Select a named native qualification contract. `low-vram` requires the exact production
+    /// numerical policy, streamed/per-stage Qwen, unretained phase-loaded VAE, a resident
+    /// denoiser, `--require`, and in-process PID-scoped peak framebuffer telemetry below 32 GB.
+    #[arg(long, value_enum)]
+    native_runtime_policy: Option<NativeRuntimePolicyChoice>,
     /// Retain verified Qwen stages after first load or drop each stage immediately.
     #[arg(long, value_enum, default_value = "retained")]
     qwen_residency: QwenResidency,
@@ -429,6 +455,15 @@ struct GateEvaluation {
 #[derive(Debug, Serialize)]
 struct PolicyReport {
     native_autotune: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    native_runtime_policy: Option<NativeRuntimePolicyChoice>,
+    native_weight_traffic_contract: &'static str,
+    vae_residency: &'static str,
+    denoiser_residency: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict_peak_device_ceiling_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_peak_telemetry: Option<&'static str>,
     qwen_residency: QwenResidency,
     qwen_synchronization_policy: QwenSynchronizationPolicyChoice,
     qwen_quantized_load: &'static str,
@@ -501,6 +536,25 @@ fn policy_report(
         && !(variant == BooguVariant::Image01EditTurbo1k5 && args.allow_unvalidated_1k5_policy);
     PolicyReport {
         native_autotune: "full",
+        native_runtime_policy: args.native_runtime_policy,
+        native_weight_traffic_contract: match args.native_runtime_policy {
+            Some(NativeRuntimePolicyChoice::LowVram) => {
+                "phase-resident/qwen+vae-per-run/denoiser-resident-zero-dmd-weight-reloads"
+            }
+            None => "explicit-component-controls/no-named-residency-qualification",
+        },
+        // This binary deliberately uses the ordinary non-retaining verified VAE source. Each half
+        // is synchronized and dropped at its phase boundary by StreamingBooguPipeline.
+        vae_residency: "unretained-phase-loaded-encoder-then-decoder",
+        // The denoiser is reconstructed once before Qwen starts and remains alive for all four
+        // DMD steps. It is never a per-step stage source in this full-chain binary.
+        denoiser_residency: "resident-across-all-four-dmd-steps",
+        strict_peak_device_ceiling_bytes: args
+            .native_runtime_policy
+            .map(|_| NATIVE_LOW_VRAM_STRICT_DEVICE_CEILING_BYTES),
+        required_peak_telemetry: args.native_runtime_policy.map(|_| {
+            "in-process-pid-scoped-nvidia-smi-configured-250ms-delay-total-framebuffer/strictly-less-than-ceiling"
+        }),
         qwen_residency: args.qwen_residency,
         qwen_synchronization_policy: args.qwen_synchronization_policy,
         qwen_quantized_load: if args.profile.is_q8() {
@@ -552,9 +606,18 @@ fn is_exact_native_release_policy(
     query_chunk_sizes: QueryChunkSizes,
 ) -> bool {
     let policy = native_release_policy(variant);
+    let qwen_residency_matches = match args.native_runtime_policy {
+        Some(NativeRuntimePolicyChoice::LowVram) => {
+            args.qwen_residency == QwenResidency::Streamed
+                && args.qwen_synchronization_policy == QwenSynchronizationPolicyChoice::PerStage
+        }
+        None => {
+            args.qwen_residency == QwenResidency::Retained
+                && args.qwen_synchronization_policy == QwenSynchronizationPolicyChoice::Deferred
+        }
+    };
     args.profile == ProfileChoice::F16QwenVisionF32
-        && matches!(args.qwen_residency, QwenResidency::Retained)
-        && args.qwen_synchronization_policy == QwenSynchronizationPolicyChoice::Deferred
+        && qwen_residency_matches
         && args.vae_float_policy == VaeFloatPolicyChoice::PreserveF16
         && args.vae_group_norm_policy == VaeGroupNormPolicyChoice::F16StorageF32Accum
         && args.vae_attention_query_chunk_size == policy.vae_attention_query_chunk_size
@@ -569,6 +632,30 @@ fn is_exact_native_release_policy(
         && args.blackbox_num_planes == policy.blackbox_num_planes
         && args.blackbox_seq_kv_tiles == policy.blackbox_seq_kv_tiles
         && args.blackbox_seq_q_tiles == policy.blackbox_seq_q_tiles
+}
+
+fn validate_native_runtime_policy(
+    args: &Args,
+    variant: BooguVariant,
+    query_chunk_sizes: QueryChunkSizes,
+) -> Result<(), &'static str> {
+    let Some(NativeRuntimePolicyChoice::LowVram) = args.native_runtime_policy else {
+        return Ok(());
+    };
+    if !args.require {
+        return Err(
+            "--native-runtime-policy low-vram requires --require; numerical gates may not be disabled for qualification",
+        );
+    }
+    if args.allow_unvalidated_1k5_policy {
+        return Err("--native-runtime-policy low-vram rejects --allow-unvalidated-1k5-policy");
+    }
+    if !is_exact_native_release_policy(args, variant, query_chunk_sizes) {
+        return Err(
+            "--native-runtime-policy low-vram requires profile=f16-qwen-vision-f32, streamed per-stage Qwen, preserve-F16 VAE q4096 with f16-storage-f32-accum GroupNorm, and the exact release padded-blackbox denoiser policy; its in-process PID-scoped nvidia-smi gate must additionally prove sampled total framebuffer stays strictly below 32,000,000,000 bytes",
+        );
+    }
+    Ok(())
 }
 
 fn is_exact_1k5_release_policy(args: &Args, query_chunk_sizes: QueryChunkSizes) -> bool {
@@ -586,7 +673,7 @@ fn validate_1k5_release_policy(
     {
         return Err(
             "Edit-Turbo 1.5K full-chain parity requires the exact native release policy: \
-             retained deferred-sync Qwen q128, preserve-F16 VAE q4096 with f16-storage-f32-accum GroupNorm, \
+             retained deferred-sync Qwen q128, or explicit low-vram streamed per-stage Qwen q128; preserve-F16 VAE q4096 with f16-storage-f32-accum GroupNorm, \
              and padded-blackbox p4/kv1/q1 denoiser q16384 with strict-f32 RMSNorm and composed Q/K preparation; pass \
              --allow-unvalidated-1k5-policy only for explicitly diagnostic runs",
         );
@@ -774,6 +861,246 @@ struct TimingReport {
     total_milliseconds: f64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PidFramebufferSamples {
+    attempted_samples: u64,
+    matched_samples: u64,
+    nonzero_samples: u64,
+    peak_total_framebuffer_mib: u64,
+    sample_error_count: u64,
+    sample_errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceMemoryQualification {
+    provider: &'static str,
+    process_id: u32,
+    sample_interval_milliseconds: u64,
+    attempted_samples: u64,
+    matched_samples: u64,
+    nonzero_samples: u64,
+    peak_total_framebuffer_mib: u64,
+    peak_total_framebuffer_bytes: u64,
+    strict_ceiling_bytes: u64,
+    strictly_below_ceiling: bool,
+    sample_error_count: u64,
+    sample_errors: Vec<String>,
+    passed: bool,
+    failures: Vec<String>,
+}
+
+struct NvidiaSmiPidMonitor {
+    process_id: u32,
+    sample_interval: Duration,
+    stop: Arc<AtomicBool>,
+    samples: Arc<Mutex<PidFramebufferSamples>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl NvidiaSmiPidMonitor {
+    fn start(sample_interval: Duration) -> Result<Self, Box<dyn Error>> {
+        let inventory = Command::new("nvidia-smi")
+            .args(["--query-gpu=uuid", "--format=csv,noheader,nounits"])
+            .output()
+            .map_err(|error| {
+                format!("native low-vram qualification requires nvidia-smi GPU telemetry: {error}")
+            })?;
+        if !inventory.status.success() {
+            return Err(format!(
+                "native low-vram qualification could not inventory NVIDIA GPUs: {}",
+                String::from_utf8_lossy(&inventory.stderr).trim()
+            )
+            .into());
+        }
+        if String::from_utf8_lossy(&inventory.stdout)
+            .lines()
+            .all(|line| line.trim().is_empty())
+        {
+            return Err(
+                "native low-vram qualification requires at least one nvidia-smi GPU".into(),
+            );
+        }
+
+        let process_id = std::process::id();
+        let stop = Arc::new(AtomicBool::new(false));
+        let samples = Arc::new(Mutex::new(PidFramebufferSamples::default()));
+        let worker_stop = stop.clone();
+        let worker_samples = samples.clone();
+        let worker = thread::Builder::new()
+            .name("boogu-low-vram-nvidia-smi".into())
+            .spawn(move || {
+                loop {
+                    let sample = sample_pid_total_framebuffer_mib(process_id);
+                    if let Ok(mut samples) = worker_samples.lock() {
+                        samples.attempted_samples += 1;
+                        match sample {
+                            Ok(Some(total_mib)) => {
+                                samples.matched_samples += 1;
+                                samples.nonzero_samples += u64::from(total_mib > 0);
+                                samples.peak_total_framebuffer_mib =
+                                    samples.peak_total_framebuffer_mib.max(total_mib);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                samples.sample_error_count += 1;
+                                if samples.sample_errors.len() < 8 {
+                                    samples.sample_errors.push(error);
+                                }
+                            }
+                        }
+                    }
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(sample_interval);
+                }
+            })?;
+        Ok(Self {
+            process_id,
+            sample_interval,
+            stop,
+            samples,
+            worker: Some(worker),
+        })
+    }
+
+    fn finish(mut self) -> Result<DeviceMemoryQualification, Box<dyn Error>> {
+        self.stop_and_join()?;
+        let samples = self
+            .samples
+            .lock()
+            .map_err(|_| "nvidia-smi telemetry state was poisoned")?
+            .clone();
+        Ok(evaluate_device_memory_qualification(
+            self.process_id,
+            self.sample_interval,
+            samples,
+        ))
+    }
+
+    fn stop_and_join(&mut self) -> Result<(), Box<dyn Error>> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| "nvidia-smi telemetry worker panicked")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NvidiaSmiPidMonitor {
+    fn drop(&mut self) {
+        let _ = self.stop_and_join();
+    }
+}
+
+fn sample_pid_total_framebuffer_mib(process_id: u32) -> Result<Option<u64>, String> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .map_err(|error| format!("failed to sample nvidia-smi compute processes: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "nvidia-smi process sample failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    parse_pid_total_framebuffer_mib(&String::from_utf8_lossy(&output.stdout), process_id)
+}
+
+fn parse_pid_total_framebuffer_mib(output: &str, process_id: u32) -> Result<Option<u64>, String> {
+    let mut matched = false;
+    let mut total_mib = 0_u64;
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (pid, used_memory) = line
+            .split_once(',')
+            .ok_or_else(|| format!("unparseable nvidia-smi process row {line:?}"))?;
+        let row_pid = pid
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("unparseable nvidia-smi process PID {pid:?}"))?;
+        if row_pid != process_id {
+            continue;
+        }
+        matched = true;
+        let used_memory = used_memory.trim().trim_end_matches("MiB").trim();
+        let used_memory_mib = used_memory.parse::<u64>().map_err(|_| {
+            format!("unparseable nvidia-smi framebuffer value {used_memory:?} for PID {process_id}")
+        })?;
+        total_mib = total_mib
+            .checked_add(used_memory_mib)
+            .ok_or_else(|| "PID-scoped framebuffer sum overflowed u64".to_owned())?;
+    }
+    Ok(matched.then_some(total_mib))
+}
+
+fn evaluate_device_memory_qualification(
+    process_id: u32,
+    sample_interval: Duration,
+    samples: PidFramebufferSamples,
+) -> DeviceMemoryQualification {
+    const MIN_MATCHED_SAMPLES: u64 = 4;
+    const MIN_NONZERO_SAMPLES: u64 = 4;
+    const MIB: u64 = 1024 * 1024;
+
+    let peak_total_framebuffer_bytes = samples.peak_total_framebuffer_mib.saturating_mul(MIB);
+    let strictly_below_ceiling =
+        peak_total_framebuffer_bytes < NATIVE_LOW_VRAM_STRICT_DEVICE_CEILING_BYTES;
+    let mut failures = Vec::new();
+    if samples.matched_samples < MIN_MATCHED_SAMPLES {
+        failures.push(format!(
+            "nvidia-smi matched PID {process_id} in only {} intervals; at least {MIN_MATCHED_SAMPLES} are required",
+            samples.matched_samples
+        ));
+    }
+    if samples.nonzero_samples < MIN_NONZERO_SAMPLES {
+        failures.push(format!(
+            "nvidia-smi observed nonzero PID framebuffer in only {} intervals; at least {MIN_NONZERO_SAMPLES} are required",
+            samples.nonzero_samples
+        ));
+    }
+    if samples.sample_error_count != 0 {
+        failures.push(format!(
+            "nvidia-smi encountered {} sampling errors",
+            samples.sample_error_count
+        ));
+    }
+    if !strictly_below_ceiling {
+        failures.push(format!(
+            "PID-scoped total framebuffer peak was {} MiB ({} bytes), which is not strictly below {} bytes",
+            samples.peak_total_framebuffer_mib,
+            peak_total_framebuffer_bytes,
+            NATIVE_LOW_VRAM_STRICT_DEVICE_CEILING_BYTES
+        ));
+    }
+    DeviceMemoryQualification {
+        provider: "nvidia-smi",
+        process_id,
+        sample_interval_milliseconds: u64::try_from(sample_interval.as_millis())
+            .unwrap_or(u64::MAX),
+        attempted_samples: samples.attempted_samples,
+        matched_samples: samples.matched_samples,
+        nonzero_samples: samples.nonzero_samples,
+        peak_total_framebuffer_mib: samples.peak_total_framebuffer_mib,
+        peak_total_framebuffer_bytes,
+        strict_ceiling_bytes: NATIVE_LOW_VRAM_STRICT_DEVICE_CEILING_BYTES,
+        strictly_below_ceiling,
+        sample_error_count: samples.sample_error_count,
+        sample_errors: samples.sample_errors,
+        passed: failures.is_empty(),
+        failures,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct FullChainReport {
     report_schema_version: u32,
@@ -796,12 +1123,15 @@ struct FullChainReport {
     qwen_embedding_row_chunks: usize,
     denoiser_loaded_tensors: usize,
     denoiser_loaded_shards: usize,
+    denoiser_reference_refiner_modules_retained: usize,
     effective_instruction_length: usize,
     timings: TimingReport,
     conditioning: ConditioningMetrics,
     trajectory: TrajectoryMetrics,
     full_chain_output: FullChainOutputMetrics,
     gates: GateEvaluation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_memory_qualification: Option<DeviceMemoryQualification>,
 }
 
 #[derive(Debug, Clone)]
@@ -1011,6 +1341,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .into());
     }
     let variant = metadata.variant()?;
+    validate_native_runtime_policy(&args, variant, query_chunk_sizes)?;
     validate_1k5_release_policy(&args, variant, query_chunk_sizes)?;
     let identity = BooguReleaseIdentity::canonical(variant);
     if metadata.model_revision != identity.model_revision
@@ -1061,6 +1392,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     vae_config.attention_query_chunk_size = args.vae_attention_query_chunk_size;
     let denoiser_config = BooguConfig::default();
     let inventory = BooguArtifactInventory::new(&qwen_config, &denoiser_config, &vae_config)?;
+    let mut memory_monitor = args
+        .native_runtime_policy
+        .map(|NativeRuntimePolicyChoice::LowVram| {
+            NvidiaSmiPidMonitor::start(NVIDIA_SMI_SAMPLE_INTERVAL)
+        })
+        .transpose()?;
     let device = burn_boogu::require_native_wgpu_device()?;
     let profile: BooguStorageProfile = args.profile.into();
     let vae_policy = args.vae_float_policy.load_policy();
@@ -1104,7 +1441,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let vae_source_verification_milliseconds = vae_started.elapsed().as_secs_f64() * 1_000.0;
 
     let denoiser_started = Instant::now();
-    let (denoiser, denoiser_report) = load_resident_denoiser_from_directory_with_policies::<B>(
+    let (mut denoiser, denoiser_report) = load_resident_denoiser_from_directory_with_policies::<B>(
         &identity,
         &args.artifacts,
         inventory,
@@ -1114,6 +1451,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         denoiser_quantized_policy,
         &device,
     )?;
+    if args.native_runtime_policy == Some(NativeRuntimePolicyChoice::LowVram)
+        && variant == BooguVariant::Image01Turbo
+    {
+        denoiser.ref_image_refiner.clear();
+    }
+    let denoiser_reference_refiner_modules_retained = denoiser.ref_image_refiner.len();
     let denoiser = configure_denoiser(
         denoiser,
         DenoiserConfiguration {
@@ -1148,12 +1491,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         qwen_plan_stage_count: qwen_plan.stages.len(),
         qwen_embedding_row_chunks: qwen_plan.embedding_rows.chunks.len(),
         denoiser_report,
+        denoiser_reference_refiner_modules_retained,
         query_chunk_sizes,
         timings,
         total_started,
     };
 
-    let report = match args.qwen_residency {
+    let mut report = match args.qwen_residency {
         QwenResidency::Streamed => {
             if args.qwen_synchronization_policy != QwenSynchronizationPolicyChoice::PerStage {
                 return Err(
@@ -1179,6 +1523,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             run_chain(pipeline, context)?
         }
     };
+    report.device_memory_qualification = memory_monitor
+        .take()
+        .map(NvidiaSmiPidMonitor::finish)
+        .transpose()?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     if args.require {
         if !report.gates.supported {
@@ -1197,6 +1545,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
+    if let Some(memory) = &report.device_memory_qualification
+        && !memory.passed
+    {
+        return Err(format!(
+            "native low-vram device-memory gate failed: {}",
+            memory.failures.join(", ")
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -1211,6 +1568,7 @@ struct RunContext<'a> {
     qwen_plan_stage_count: usize,
     qwen_embedding_row_chunks: usize,
     denoiser_report: BooguLoadReport,
+    denoiser_reference_refiner_modules_retained: usize,
     query_chunk_sizes: QueryChunkSizes,
     timings: TimingReport,
     total_started: Instant,
@@ -1472,12 +1830,15 @@ where
         qwen_embedding_row_chunks: context.qwen_embedding_row_chunks,
         denoiser_loaded_tensors: context.denoiser_report.tensors,
         denoiser_loaded_shards: context.denoiser_report.shards,
+        denoiser_reference_refiner_modules_retained: context
+            .denoiser_reference_refiner_modules_retained,
         effective_instruction_length,
         timings: context.timings,
         conditioning,
         trajectory,
         full_chain_output,
         gates,
+        device_memory_qualification: None,
     })
 }
 
@@ -2405,6 +2766,55 @@ mod tests {
         }
     }
 
+    fn exact_low_vram_args(variant: BooguVariant) -> Args {
+        let policy = native_release_policy(variant);
+        let qk_preparation = match policy.denoiser_qk_preparation {
+            NativeDenoiserQkPreparationPolicy::Composed => "composed",
+            NativeDenoiserQkPreparationPolicy::BalancedStrictQkNormRope => {
+                "balanced-strict-qk-norm-rope"
+            }
+        };
+        Args::try_parse_from([
+            "boogu-full-parity".to_owned(),
+            "--artifacts".to_owned(),
+            "artifacts".to_owned(),
+            "--fixture".to_owned(),
+            "fixture".to_owned(),
+            "--profile".to_owned(),
+            "f16-qwen-vision-f32".to_owned(),
+            "--native-runtime-policy".to_owned(),
+            "low-vram".to_owned(),
+            "--qwen-residency".to_owned(),
+            "streamed".to_owned(),
+            "--qwen-synchronization-policy".to_owned(),
+            "per-stage".to_owned(),
+            "--vae-float-policy".to_owned(),
+            "preserve-f16".to_owned(),
+            "--vae-group-norm-policy".to_owned(),
+            "f16-storage-f32-accum".to_owned(),
+            "--vae-attention-query-chunk-size".to_owned(),
+            policy.vae_attention_query_chunk_size.to_string(),
+            "--qwen-query-chunk-size".to_owned(),
+            policy.qwen_query_chunk_size.to_string(),
+            "--denoiser-query-chunk-size".to_owned(),
+            policy.denoiser_query_chunk_size.to_string(),
+            "--denoiser-attention-policy".to_owned(),
+            "padded-blackbox".to_owned(),
+            "--denoiser-rms-norm-policy".to_owned(),
+            "strict-f32".to_owned(),
+            "--denoiser-qk-preparation-policy".to_owned(),
+            qk_preparation.to_owned(),
+            "--blackbox-num-planes".to_owned(),
+            policy.blackbox_num_planes.to_string(),
+            "--blackbox-seq-kv-tiles".to_owned(),
+            policy.blackbox_seq_kv_tiles.to_string(),
+            "--blackbox-seq-q-tiles".to_owned(),
+            policy.blackbox_seq_q_tiles.to_string(),
+            "--require".to_owned(),
+        ])
+        .unwrap()
+    }
+
     fn fixture_specs(variant: &str) -> BTreeMap<String, TensorSpec> {
         let sequence = if variant == "turbo" { 49 } else { 147 };
         let latent = vec![1, 16, 32, 32];
@@ -2612,6 +3022,109 @@ mod tests {
             args.denoiser_attention_policy,
             DenoiserAttentionPolicy::Portable
         );
+    }
+
+    #[test]
+    fn native_low_vram_selector_maps_exact_release_policy_and_fails_closed_correctness() {
+        for variant in [
+            BooguVariant::Image01Turbo,
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            let exact = exact_low_vram_args(variant);
+            let sizes = resolve_query_chunk_sizes(&exact).unwrap();
+            validate_native_runtime_policy(&exact, variant, sizes).unwrap();
+            assert!(is_exact_native_release_policy(&exact, variant, sizes));
+            let report = serde_json::to_value(policy_report(&exact, variant, sizes)).unwrap();
+            assert_eq!(report["native_runtime_policy"], "low-vram");
+            assert_eq!(
+                report["native_weight_traffic_contract"],
+                "phase-resident/qwen+vae-per-run/denoiser-resident-zero-dmd-weight-reloads"
+            );
+            assert_eq!(
+                report["strict_peak_device_ceiling_bytes"],
+                NATIVE_LOW_VRAM_STRICT_DEVICE_CEILING_BYTES
+            );
+            assert_eq!(report["native_release_policy_validated"], true);
+
+            let no_required_gates = Args {
+                require: false,
+                ..exact_low_vram_args(variant)
+            };
+            assert!(
+                validate_native_runtime_policy(&no_required_gates, variant, sizes)
+                    .unwrap_err()
+                    .contains("requires --require")
+            );
+            let retained_qwen = Args {
+                qwen_residency: QwenResidency::Retained,
+                qwen_synchronization_policy: QwenSynchronizationPolicyChoice::Deferred,
+                ..exact_low_vram_args(variant)
+            };
+            assert!(validate_native_runtime_policy(&retained_qwen, variant, sizes).is_err());
+        }
+    }
+
+    #[test]
+    fn native_low_vram_pid_telemetry_sums_gpus_and_enforces_strict_ceiling_correctness() {
+        assert_eq!(
+            parse_pid_total_framebuffer_mib("41, 20000\n9, 500\n41, 12767\n", 41).unwrap(),
+            Some(32_767)
+        );
+        assert_eq!(
+            parse_pid_total_framebuffer_mib("9, 500\n", 41).unwrap(),
+            None
+        );
+        assert!(parse_pid_total_framebuffer_mib("malformed", 41).is_err());
+
+        let qualified = evaluate_device_memory_qualification(
+            41,
+            NVIDIA_SMI_SAMPLE_INTERVAL,
+            PidFramebufferSamples {
+                attempted_samples: 4,
+                matched_samples: 4,
+                nonzero_samples: 4,
+                peak_total_framebuffer_mib: 30_517,
+                ..PidFramebufferSamples::default()
+            },
+        );
+        assert!(qualified.passed);
+        assert!(qualified.strictly_below_ceiling);
+
+        let at_ceiling = evaluate_device_memory_qualification(
+            41,
+            NVIDIA_SMI_SAMPLE_INTERVAL,
+            PidFramebufferSamples {
+                attempted_samples: 4,
+                matched_samples: 4,
+                nonzero_samples: 4,
+                peak_total_framebuffer_mib: 30_518,
+                ..PidFramebufferSamples::default()
+            },
+        );
+        assert!(!at_ceiling.passed);
+        assert!(!at_ceiling.strictly_below_ceiling);
+        assert!(
+            at_ceiling
+                .failures
+                .iter()
+                .any(|failure| failure.contains("not strictly below"))
+        );
+
+        let incomplete = evaluate_device_memory_qualification(
+            41,
+            NVIDIA_SMI_SAMPLE_INTERVAL,
+            PidFramebufferSamples {
+                attempted_samples: 1,
+                matched_samples: 1,
+                nonzero_samples: 1,
+                peak_total_framebuffer_mib: 1,
+                sample_error_count: 1,
+                sample_errors: vec!["sample failed".into()],
+            },
+        );
+        assert!(!incomplete.passed);
+        assert_eq!(incomplete.sample_error_count, 1);
     }
 
     #[test]

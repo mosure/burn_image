@@ -93,13 +93,78 @@ jobs:
               fi
               pending=0
             done < "$file"
-          done < <(find crates -type f -name '*.rs' -print | sort)
+          done < <(
+            {
+              find crates -type f -name '*.rs' -print
+              find .github -maxdepth 1 -type f -name '*_contract.rs' -print
+              printf '%s\n' \
+                patches/cubecl-wgpu-0.10.0/src/backend/wgsl.rs \
+                patches/cubecl-wgpu-0.10.0/src/compute/stream.rs \
+                patches/cubecl-wgpu-0.10.0/src/runtime.rs
+            } | sort -u
+          )
           exit "$status"
 
-      - name: Rustfmt
-        run: cargo fmt --all -- --check
+      - name: Test bounded browser upload planner
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 --extern alloc --test \
+            patches/wgpu-29.0.4/src/backend/webgpu_write.rs \
+            -o "$RUNNER_TEMP/wgpu-webgpu-write-tests"
+          "$RUNNER_TEMP/wgpu-webgpu-write-tests"
+
+      - name: Test vendored GPU patch source contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2024 --test \
+            .github/vendor_gpu_patch_contract.rs \
+            -o "$RUNNER_TEMP/vendor-gpu-patch-contract-tests"
+          "$RUNNER_TEMP/vendor-gpu-patch-contract-tests"
+          rustc --edition=2024 --test \
+            patches/cubecl-wgpu-0.10.0/src/compute/storage_release.rs \
+            -o "$RUNNER_TEMP/cubecl-wgpu-storage-release-tests"
+          "$RUNNER_TEMP/cubecl-wgpu-storage-release-tests"
+
+      - name: Test release workflow source contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2024 --test \
+            .github/release_workflow_contract.rs \
+            -o "$RUNNER_TEMP/release-workflow-contract-tests"
+          "$RUNNER_TEMP/release-workflow-contract-tests"
+
+      - name: Rustfmt workspace and vendored GPU patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path patches/wgpu-29.0.4/Cargo.toml --all -- --check
+          cargo fmt --manifest-path patches/cubecl-wgpu-0.10.0/Cargo.toml --all -- --check
+          rustfmt --edition=2024 --check .github/vendor_gpu_patch_contract.rs
+          rustfmt --edition=2024 --check .github/release_workflow_contract.rs
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo clippy --workspace --exclude burn_qwen3_vl \
+            --all-targets --all-features --locked --no-deps -- \
+            -D warnings
+
+          readonly source=crates/burn_qwen3_vl/src/chat.rs
+          readonly predicate='                        if (call_index == 0 && has_text) || call_index != 0 {'
+          test "$(grep -Fxc "$predicate" "$source")" -eq 1
+          if grep -RFn 'clippy::nonminimal_bool' crates/burn_qwen3_vl/src; then
+            echo "nonminimal_bool must remain a CI-only exception for the pinned template" >&2
+            exit 1
+          fi
+
+          cargo clippy -p burn_qwen3_vl \
+            --all-targets --all-features --locked --no-deps -- \
+            -D warnings -A clippy::nonminimal_bool
       - name: Unit and integration tests
         shell: bash
         run: |
@@ -112,7 +177,11 @@ jobs:
           cargo test -p burn_flux_vae --all-features --locked
           cargo test -p burn_boogu --all-features --lib --tests --locked
           cargo test -p burn_boogu --features runtime,import,wgpu,ndarray --bins --locked
-          cargo test -p bevy_burn_image --all-features --lib --locked
+          cargo test -p bevy_burn_image --all-features \
+            --lib \
+            --bin burn-image-viewer \
+            --bin burn-image-output-quality \
+            --locked
       - name: Documentation
         run: cargo doc --workspace --all-features --no-deps --locked
       - name: Check converter feature contract
@@ -232,6 +301,68 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-bindgen CLI
         run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - name: Enforce local GPU patch resolution
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          assert_local_patch() {
+            local package="$1"
+            local version="$2"
+            local patch_path="$3"
+            local tree="$RUNNER_TEMP/${package}-inverse-tree.txt"
+            local expected="$package v$version ($(realpath -e "$patch_path"))"
+            local matches=0
+
+            "$(rustup which cargo)" tree \
+              -p bevy_burn_image \
+              --target wasm32-unknown-unknown \
+              --no-default-features \
+              --features boogu-web \
+              --locked \
+              --invert "$package@$version" \
+              --prefix none > "$tree"
+
+            test -s "$tree"
+            while IFS= read -r line; do
+              case "$line" in
+                "$package v$version "*)
+                  matches=$((matches + 1))
+                  if [[ "$line" != "$expected" ]]; then
+                    echo "$package@$version resolved outside the required local patch: $line" >&2
+                    exit 1
+                  fi
+                  ;;
+              esac
+            done < "$tree"
+            if ((matches == 0)); then
+              echo "$package@$version is absent from the boogu-web inverse dependency tree" >&2
+              exit 1
+            fi
+          }
+
+          assert_local_patch wgpu 29.0.4 patches/wgpu-29.0.4
+          assert_local_patch cubecl-wgpu 0.10.0 patches/cubecl-wgpu-0.10.0
+      - name: Enforce browser Direct convolution feature contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          readonly feature_tree="$RUNNER_TEMP/boogu-web-feature-tree.txt"
+
+          "$(rustup which cargo)" tree \
+            -p bevy_burn_image \
+            --target wasm32-unknown-unknown \
+            --no-default-features \
+            --features boogu-web \
+            --locked \
+            --edges features > "$feature_tree"
+
+          test -s "$feature_tree"
+          grep -Fq 'burn-wgpu feature "webgpu"' "$feature_tree"
+          if grep -En '(burn|cubecl)[^[:space:]]* feature "autotune"' "$feature_tree"; then
+            echo "boogu-web must keep Burn/CubeCL autotune disabled; browser convolution relies on the deterministic Direct strategy" >&2
+            exit 1
+          fi
       - name: Check model crates for Wasm
         run: |
           set -euo pipefail
@@ -248,9 +379,26 @@ jobs:
         run: |
           set -euo pipefail
           node --check crates/bevy_image/tests/wasm_browser_1k5_parity.mjs
+          node --check crates/bevy_image/tests/wasm_browser_1k5_contract.mjs
+          node --check crates/bevy_image/tests/wasm_browser_1k5_contract.test.mjs
           node --check crates/bevy_image/tests/wasm_browser_1k5_scope.mjs
           node --check crates/bevy_image/tests/wasm_browser_1k5_scope.test.mjs
+          node --check crates/bevy_image/tests/wasm_rendered_surface_contract.mjs
+          node --check crates/bevy_image/tests/wasm_rendered_surface_contract.test.mjs
+          node --check crates/bevy_image/tests/wasm_rendered_surface_smoke.mjs
+          node --check crates/bevy_image/tests/wasm_turbo_first_dmd_contract.mjs
+          node --check crates/bevy_image/tests/wasm_turbo_first_dmd_contract.test.mjs
+          node --check crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs
+          node --check crates/bevy_image/www/model_selector.mjs
+          node --check crates/bevy_image/tests/web_model_selector.test.mjs
+          node --test crates/bevy_image/tests/wasm_browser_1k5_contract.test.mjs
           node --test crates/bevy_image/tests/wasm_browser_1k5_scope.test.mjs
+          node --test crates/bevy_image/tests/wasm_rendered_surface_contract.test.mjs
+          node --test crates/bevy_image/tests/wasm_turbo_first_dmd_contract.test.mjs
+          node --test crates/bevy_image/tests/web_model_selector.test.mjs
+          BURN_IMAGE_RENDERED_SURFACE_VALIDATE_ONLY=1 \
+            node crates/bevy_image/tests/wasm_rendered_surface_smoke.mjs
+          node crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs
       - name: Build and inspect browser package
         shell: bash
         run: |

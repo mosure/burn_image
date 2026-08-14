@@ -13,7 +13,7 @@ use std::{
 use burn::{
     nn::{RmsNorm, RmsNormConfig},
     prelude::Backend,
-    tensor::{Bytes, DType, Tensor},
+    tensor::{Bytes, DType, Tensor, TensorData},
 };
 use burn_image::{
     ARTIFACT_MANIFEST_SCHEMA_V1, ArtifactBundleId, ArtifactComponentId, ArtifactDependency,
@@ -27,9 +27,10 @@ use burn_store::{
 use thiserror::Error;
 
 use crate::{
-    AsyncQwen3VlStageSource, EmbeddingRowChunk, Qwen3VlConfig, Qwen3VlStage, Qwen3VlStageDType,
-    Qwen3VlStageDTypePolicy, Qwen3VlStageDescriptor, Qwen3VlStageSource, Qwen3VlStreamingPlan,
-    Qwen3VlVisionPrelude, RowChunkSpec,
+    AsyncQwen3VlStageSource, EmbeddingRowChunk, HostRoutedEmbedding, HostRoutedF16EmbeddingState,
+    Qwen3VlConfig, Qwen3VlStage, Qwen3VlStageDType, Qwen3VlStageDTypePolicy,
+    Qwen3VlStageDescriptor, Qwen3VlStageSource, Qwen3VlStreamingPlan, Qwen3VlVisionPrelude,
+    RowChunkSpec,
     text::Qwen3VlDecoderLayer,
     vision::{Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger},
 };
@@ -182,7 +183,6 @@ impl Qwen3VlComponentContract {
             .map_err(|error| Qwen3VlArtifactError::Model(error.to_string()))?;
         Self::new(manifest, config, plan)
     }
-
     /// Validate an explicit base-only row partition.
     pub fn new(
         manifest: ArtifactManifest,
@@ -280,7 +280,6 @@ impl Qwen3VlComponentContract {
             max_shard_bytes,
         })
     }
-
     pub fn manifest(&self) -> &ArtifactManifest {
         &self.manifest
     }
@@ -773,6 +772,61 @@ impl<B: Backend, R: AsyncArtifactShardReader> AsyncQwen3VlStageSource<B>
             .map_err(|error| contract("qwen-embedding", error.to_string()))
     }
 
+    async fn load_host_routed_f16_embedding_f32(
+        &mut self,
+        input_ids: &[Vec<i64>],
+        device: &B::Device,
+    ) -> Result<Option<HostRoutedEmbedding<B>>, Self::Error> {
+        let mut state = HostRoutedF16EmbeddingState::new(
+            input_ids,
+            self.contract.config.text_config.vocab_size,
+            self.contract.config.text_config.hidden_size,
+        )
+        .map_err(|error| contract("qwen-embedding", error.to_string()))?;
+        // Clone only compact metadata. Every full object is fetched, authenticated, parsed,
+        // selected, and dropped before the following object begins.
+        let specs = self.contract.plan.embedding_rows.chunks.clone();
+        for spec in specs {
+            let stage = Qwen3VlStage::EmbeddingRows {
+                chunk: spec.chunk_index,
+            };
+            let target = qwen_row_slice_target("model.language_model.embed_tokens.weight", &spec);
+            let files = self.contract.files(&stage).to_vec();
+            let mut applied = false;
+            for file in files {
+                let bytes = self.verified_bytes(&file).await?;
+                let authenticated_object_bytes = u64::try_from(bytes.len()).map_err(|_| {
+                    contract(
+                        qwen_streaming_stage_name(&stage),
+                        "authenticated row object byte count does not fit u64",
+                    )
+                })?;
+                let data = parse_row_object_data(&file, bytes, &target, &spec)?;
+                if applied {
+                    return Err(contract(
+                        qwen_streaming_stage_name(&stage),
+                        "row slice appears in more than one physical object",
+                    ));
+                }
+                state
+                    .apply_chunk_data(&spec, &data, authenticated_object_bytes)
+                    .map_err(|error| contract("qwen-embedding", error.to_string()))?;
+                applied = true;
+            }
+            if !applied {
+                return Err(contract(
+                    qwen_streaming_stage_name(&stage),
+                    "row stage is empty",
+                ));
+            }
+        }
+        let (data, report) = state
+            .finish()
+            .map_err(|error| contract("qwen-embedding", error.to_string()))?;
+        let tensor = Tensor::<B, 3>::from_data(data, device);
+        Ok(Some(HostRoutedEmbedding { tensor, report }))
+    }
+
     async fn load_vision_prelude(&mut self) -> Result<Qwen3VlVisionPrelude<B>, Self::Error> {
         let module =
             Qwen3VlVisionPrelude::new(self.contract.config.vision_config.clone(), &self.device)
@@ -945,6 +999,22 @@ fn parse_row_object<B: Backend>(
     float_policy: Qwen3VlArtifactFloatPolicy,
     device: &B::Device,
 ) -> Result<Tensor<B, 2>, Qwen3VlArtifactError> {
+    let mut data = parse_row_object_data(file, bytes, target, spec)?;
+    if float_policy == Qwen3VlArtifactFloatPolicy::AdaptToF32 {
+        data = data.convert_dtype(DType::F32);
+    }
+    let dtype = data.dtype;
+    Ok(Tensor::from_data(data, (device, dtype)))
+}
+
+/// Parse and validate the complete released row object without allocating a backend tensor.
+/// Host-routed browser execution uses this boundary to select raw F16 rows before any upload.
+fn parse_row_object_data(
+    file: &ArtifactFile,
+    bytes: Vec<u8>,
+    target: &str,
+    spec: &RowChunkSpec,
+) -> Result<TensorData, Qwen3VlArtifactError> {
     let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(bytes)));
     let snapshots = store
         .get_all_snapshots()
@@ -983,14 +1053,20 @@ fn parse_row_object<B: Backend>(
         snapshot.dtype,
         Qwen3VlStageDType::F16,
     )?;
-    let mut data = snapshot
+    let data = snapshot
         .to_data()
         .map_err(|error| contract("qwen-embedding", format!("read {name}: {error}")))?;
-    if float_policy == Qwen3VlArtifactFloatPolicy::AdaptToF32 {
-        data = data.convert_dtype(DType::F32);
+    let expected_bytes = spec.byte_len();
+    if data.bytes.len() != expected_bytes {
+        return Err(contract(
+            "qwen-embedding",
+            format!(
+                "row tensor {name} has {} payload bytes, expected {expected_bytes}",
+                data.bytes.len()
+            ),
+        ));
     }
-    let dtype = data.dtype;
-    Ok(Tensor::<B, 2>::from_data(data, device).cast(dtype))
+    Ok(data)
 }
 
 fn validate_dtype(
@@ -1084,9 +1160,11 @@ fn load_adapter(policy: Qwen3VlArtifactFloatPolicy) -> Option<Box<dyn ModuleAdap
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::{backend::Flex, module::ParamId, tensor::TensorData};
     use burn_image::{
         ArtifactBundleId, ArtifactPath, ArtifactProfileId, ModelId, NumericFormat, Sha256Digest,
     };
+    use burn_store::{BurnpackWriter, TensorSnapshot};
 
     fn identity_manifest() -> ArtifactManifest {
         ArtifactManifest {
@@ -1141,6 +1219,121 @@ mod tests {
             qwen_row_slice_target("model.language_model.embed_tokens.weight", &spec),
             "model.language_model.embed_tokens.weight.rows.02.000010-000020"
         );
+    }
+
+    #[test]
+    fn row_object_float_policy_uploads_directly_with_exact_values_correctness() {
+        let spec = RowChunkSpec {
+            chunk_index: 0,
+            row_range: 0..2,
+            total_rows: 2,
+            hidden_size: 3,
+            element_bytes: 2,
+        };
+        let target = qwen_row_slice_target("model.language_model.embed_tokens.weight", &spec);
+        let values = [-2.0_f32, -0.5, 0.0, 0.25, 1.0, 4.0];
+        let data = TensorData::new(values.to_vec(), [spec.rows(), spec.hidden_size])
+            .convert_dtype(DType::F16);
+        let snapshot =
+            TensorSnapshot::from_data(data, vec![target.clone()], Vec::new(), ParamId::new());
+        let bytes = BurnpackWriter::new(vec![snapshot])
+            .to_bytes()
+            .unwrap()
+            .to_vec();
+        let file = ArtifactFile {
+            path: ArtifactPath::new(format!("objects/{}.bpk", Sha256Digest::calculate(&bytes)))
+                .unwrap(),
+            size: bytes.len() as u64,
+            sha256: Sha256Digest::calculate(&bytes),
+            role: ArtifactFileRole::Weights,
+            component: Some(ArtifactComponentId::new("qwen-embedding-rows-00").unwrap()),
+            shard: None,
+        };
+        let device = Default::default();
+
+        let preserved = parse_row_object::<Flex>(
+            &file,
+            bytes.clone(),
+            &target,
+            &spec,
+            Qwen3VlArtifactFloatPolicy::Preserve,
+            &device,
+        )
+        .unwrap();
+        assert_eq!(preserved.dtype(), DType::F16);
+        let preserved = preserved.into_data();
+        assert_eq!(
+            preserved.convert_dtype(DType::F32).to_vec::<f32>().unwrap(),
+            values
+        );
+
+        let adapted = parse_row_object::<Flex>(
+            &file,
+            bytes,
+            &target,
+            &spec,
+            Qwen3VlArtifactFloatPolicy::AdaptToF32,
+            &device,
+        )
+        .unwrap();
+        assert_eq!(adapted.dtype(), DType::F32);
+        let adapted = adapted.into_data();
+        assert_eq!(adapted.to_vec::<f32>().unwrap(), values);
+    }
+
+    #[test]
+    #[ignore = "requires BURN_QWEN3_VL_COMPONENT_ROOT pointing at the released component bundle"]
+    fn released_artifact_host_selected_rows_digest_reference() {
+        let root = std::env::var("BURN_QWEN3_VL_COMPONENT_ROOT")
+            .expect("set BURN_QWEN3_VL_COMPONENT_ROOT to the released Qwen component directory");
+        let directory = VerifiedArtifactDirectory::open(root.clone()).unwrap();
+        let config_bytes =
+            std::fs::read(Path::new(&root).join("metadata/source/mllm/config.json")).unwrap();
+        let config = Qwen3VlConfig::from_json(std::str::from_utf8(&config_bytes).unwrap()).unwrap();
+        let contract =
+            Qwen3VlComponentContract::released_base(directory.manifest().clone(), config.clone())
+                .unwrap();
+        let ids = vec![vec![
+            151_644, 8_948, 198, 2_610, 525, 264, 10_950, 17_847, 429, 26_885, 1_550, 22_092,
+            5_335, 3_118, 389, 1_196, 11_221, 13, 576, 11_221, 525, 438, 11_017, 13, 151_645, 198,
+            151_644, 872, 198, 32, 14_029, 10_300, 315, 264, 6_303, 42_024, 11_958, 389, 264,
+            14_396, 4_158, 1_965, 13, 151_645, 198,
+        ]];
+        let mut state = HostRoutedF16EmbeddingState::new(
+            &ids,
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+        )
+        .unwrap();
+        let mut reader = DirectoryArtifactShardReader::new(&root);
+        for spec in &contract.plan.embedding_rows.chunks {
+            let stage = Qwen3VlStage::EmbeddingRows {
+                chunk: spec.chunk_index,
+            };
+            let files = contract.files(&stage);
+            assert_eq!(files.len(), 1);
+            let file = &files[0];
+            let bytes = VerifiedArtifactBytes::unverified(reader.read_shard(file).unwrap())
+                .into_verified_bytes(file, contract.max_shard_bytes())
+                .unwrap();
+            let object_bytes = bytes.len() as u64;
+            let target = qwen_row_slice_target("model.language_model.embed_tokens.weight", spec);
+            let data = parse_row_object_data(file, bytes, &target, spec).unwrap();
+            state.apply_chunk_data(spec, &data, object_bytes).unwrap();
+        }
+        let (data, report) = state.finish().unwrap();
+        assert_eq!(data.shape.as_slice(), [1, 45, 4096]);
+        assert_eq!(report.unique_token_count, 33);
+        assert_eq!(report.authenticated_object_count, 6);
+        assert_eq!(report.authenticated_object_bytes, 1_244_662_784);
+        assert_eq!(report.authenticated_f16_payload_bytes, 1_244_659_712);
+        assert_eq!(report.selected_f16_bytes, 368_640);
+        assert_eq!(report.host_f32_payload_bytes, 737_280);
+        assert_eq!(
+            report.host_f32_sha256,
+            "a6aa0501f1d6f5a622934ee10a64b526843f723937f6d5abd96058b29ea8b6fe"
+        );
+        assert!(report.all_finite && report.not_all_zero && report.coverage_complete);
     }
 
     #[test]

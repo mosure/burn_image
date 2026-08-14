@@ -155,6 +155,7 @@ pub struct BooguImageModel<B: Backend, T, E = ResidentBooguPipeline<B>> {
     device: B::Device,
     metadata: BooguRuntimeMetadata,
     conditioning_cache: Option<ConditioningCache<B>>,
+    release_unused_memory_at_phase_boundaries: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +200,24 @@ where
             device,
             metadata,
             conditioning_cache: None,
+            release_unused_memory_at_phase_boundaries: false,
         })
+    }
+
+    /// Release unused backend allocator pages after each completed model phase.
+    ///
+    /// This is intended for explicitly memory-bounded runtimes whose phase-resident weights are
+    /// already synchronized before the next component begins. Live tensors and resident model
+    /// parameters remain referenced; only allocator pages with no live handles are eligible for
+    /// release. The default preserves the backend allocator cache.
+    pub const fn with_phase_boundary_memory_cleanup(mut self, enabled: bool) -> Self {
+        self.release_unused_memory_at_phase_boundaries = enabled;
+        self
+    }
+
+    /// Whether unused allocator pages are released at synchronized model-phase boundaries.
+    pub const fn phase_boundary_memory_cleanup_enabled(&self) -> bool {
+        self.release_unused_memory_at_phase_boundaries
     }
 
     /// Access the composed resident pipeline.
@@ -256,7 +274,14 @@ where
             source: resolved.source.clone(),
             effective_length: prepared.effective_length,
         };
-        finish_stage::<B>(&self.device, context, &mut timings, "processing", started)?;
+        finish_stage::<B>(
+            &self.device,
+            context,
+            &mut timings,
+            "processing",
+            started,
+            false,
+        )?;
 
         context.check_cancelled().map_err(cancelled)?;
         let cached_instruction = self
@@ -286,7 +311,14 @@ where
             });
             instruction
         };
-        finish_stage::<B>(&self.device, context, &mut timings, "qwen", started)?;
+        finish_stage::<B>(
+            &self.device,
+            context,
+            &mut timings,
+            "qwen",
+            started,
+            self.release_unused_memory_at_phase_boundaries,
+        )?;
 
         let reference = if let Some(source) = source.as_ref() {
             context.check_cancelled().map_err(cancelled)?;
@@ -305,7 +337,14 @@ where
                 .pipeline
                 .encode_reference(normalized, epsilon)?
                 .cast(self.metadata.execution_dtypes.denoiser);
-            finish_stage::<B>(&self.device, context, &mut timings, "vae-encode", started)?;
+            finish_stage::<B>(
+                &self.device,
+                context,
+                &mut timings,
+                "vae-encode",
+                started,
+                self.release_unused_memory_at_phase_boundaries,
+            )?;
             Some(reference)
         } else {
             None
@@ -358,7 +397,14 @@ where
                 Ok(())
             },
         )?;
-        finish_stage::<B>(&self.device, context, &mut timings, "dmd", started)?;
+        finish_stage::<B>(
+            &self.device,
+            context,
+            &mut timings,
+            "dmd",
+            started,
+            self.release_unused_memory_at_phase_boundaries,
+        )?;
 
         context.check_cancelled().map_err(cancelled)?;
         context.stage_started("vae-decode", Some(1));
@@ -366,13 +412,27 @@ where
         let decoded = self
             .pipeline
             .decode(latents.cast(self.metadata.execution_dtypes.vae))?;
-        finish_stage::<B>(&self.device, context, &mut timings, "vae-decode", started)?;
+        finish_stage::<B>(
+            &self.device,
+            context,
+            &mut timings,
+            "vae-decode",
+            started,
+            self.release_unused_memory_at_phase_boundaries,
+        )?;
 
         context.check_cancelled().map_err(cancelled)?;
         context.stage_started("output", Some(1));
         let started = Instant::now();
         let image = decoder_output_to_host(decoded)?;
-        finish_stage::<B>(&self.device, context, &mut timings, "output", started)?;
+        finish_stage::<B>(
+            &self.device,
+            context,
+            &mut timings,
+            "output",
+            started,
+            self.release_unused_memory_at_phase_boundaries,
+        )?;
 
         let output = ImageOutput {
             images: vec![GeneratedImage { index: 0, image }],
@@ -414,15 +474,49 @@ where
         request: &ImageRequest,
         context: &InferenceContext,
     ) -> Result<Self::Output, RuntimeError> {
-        self.infer_inner(request, context)
-            .map_err(|error| match error {
+        let result = self.infer_inner(request, context);
+        let cleanup_error = if result.is_err() && self.release_unused_memory_at_phase_boundaries {
+            release_unused_backend_memory::<B>(&self.device, "failed inference").err()
+        } else {
+            None
+        };
+
+        result.map_err(|error| {
+            if let Some(cleanup_error) = cleanup_error {
+                return RuntimeError::ModelExecution {
+                    model: self.descriptor.id.clone(),
+                    message: format!(
+                        "{error}; backend cleanup after failed or cancelled inference also failed: {cleanup_error}"
+                    ),
+                };
+            }
+            match error {
                 BooguError::Cancelled => RuntimeError::Cancelled,
                 error => RuntimeError::ModelExecution {
                     model: self.descriptor.id.clone(),
                     message: error.to_string(),
                 },
-            })
+            }
+        })
     }
+}
+
+fn release_unused_backend_memory<B: Backend>(
+    device: &B::Device,
+    phase: &str,
+) -> Result<(), BooguError> {
+    B::sync(device).map_err(|error| {
+        BooguError::InvalidRequest(format!(
+            "backend synchronization before {phase} allocator cleanup failed: {error}"
+        ))
+    })?;
+    B::memory_cleanup(device);
+    B::sync(device).map_err(|error| {
+        BooguError::InvalidRequest(format!(
+            "backend synchronization after {phase} allocator cleanup failed: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn finish_stage<B: Backend>(
@@ -431,10 +525,15 @@ fn finish_stage<B: Backend>(
     timings: &mut Vec<StageTiming>,
     name: &str,
     started: Instant,
+    release_unused_memory: bool,
 ) -> Result<(), BooguError> {
-    B::sync(device).map_err(|error| {
-        BooguError::InvalidRequest(format!("backend synchronization failed: {error}"))
-    })?;
+    if release_unused_memory {
+        release_unused_backend_memory::<B>(device, name)?;
+    } else {
+        B::sync(device).map_err(|error| {
+            BooguError::InvalidRequest(format!("backend synchronization failed: {error}"))
+        })?;
+    }
     let elapsed = elapsed_micros(started.elapsed());
     timings.push(StageTiming {
         stage: name.into(),
@@ -658,6 +757,28 @@ mod tests {
         assert!(should_overlap_dmd_noise(false, true));
         assert!(should_overlap_dmd_noise(true, true));
         assert!(!should_overlap_dmd_noise(true, false));
+    }
+
+    #[test]
+    fn stage_completion_requires_successful_backend_sync_correctness() {
+        let source = include_str!("runtime.rs");
+        let finish_stage = source
+            .split("fn finish_stage<B: Backend>(")
+            .nth(1)
+            .expect("finish_stage must remain present")
+            .split("fn normal_tensor<")
+            .next()
+            .expect("finish_stage must end before normal_tensor");
+
+        assert!(finish_stage.contains("release_unused_backend_memory::<B>(device, name)?;"));
+        let direct_sync = finish_stage
+            .find("B::sync(device).map_err")
+            .expect("ordinary stage completion must synchronize the backend");
+        let completion = finish_stage
+            .find("context.stage_completed(name, elapsed);")
+            .expect("successful synchronization must report stage completion");
+        assert!(direct_sync < completion);
+        assert!(finish_stage[direct_sync..completion].contains(")?;"));
     }
 
     #[test]

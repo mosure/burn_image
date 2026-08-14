@@ -24,10 +24,12 @@ artifacts = ["dep:burn-store", "dep:burn_image"]
 burn.workspace = true
 burn-store = { workspace = true, optional = true }
 burn_image = { version = "0.1.1", path = "../burn_image", optional = true }
+half.workspace = true
 image.workspace = true
 safetensors = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokenizers = { workspace = true, optional = true }
 
@@ -36,6 +38,7 @@ tokenizers = { workspace = true, optional = true }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
+burn = { workspace = true, features = ["flex"] }
 burn-ndarray.workspace = true
 tempfile.workspace = true
 

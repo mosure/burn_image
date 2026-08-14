@@ -12,7 +12,7 @@ use burn::{
     module::ParamId,
     tensor::{
         DType, TensorData,
-        quantization::{QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue},
+        quantization::{QuantLevel, QuantParam, QuantValue},
     },
 };
 use burn_boogu::{
@@ -20,7 +20,7 @@ use burn_boogu::{
     artifacts::{
         ArtifactTensorSpec, BooguArtifactInventory, EDIT_TURBO_1K5_REVISION, EDIT_TURBO_REVISION,
         TURBO_REVISION, TensorOwner, TensorTransform, UPSTREAM_SOURCE_REVISION,
-        qwen_row_slice_target, qwen_streaming_stage_name,
+        quantize_q8s_block32_f32, qwen_row_slice_target, qwen_streaming_stage_name,
     },
 };
 use burn_flux_vae::AutoencoderKlConfig;
@@ -1182,7 +1182,7 @@ fn write_shard(
         let quantized = should_quantize(tensor, profile);
         let (data, stored_dtype, stored_shape) = if quantized {
             let (values, shape) = decode_transposed_f32(tensor, &source_data)?;
-            let data = quantize_q8s_block32(values, shape.clone())?;
+            let data = quantize_q8s_block32_f32(values, shape.clone())?;
             (data, "q8s-block32-f32".to_owned(), shape)
         } else if should_store_f32(tensor, profile) {
             (
@@ -1433,40 +1433,6 @@ fn decode_transposed_f32(
     Ok((values, tensor.target_shape.clone()))
 }
 
-fn quantize_q8s_block32(values: Vec<f32>, shape: Vec<usize>) -> Result<TensorData, Box<dyn Error>> {
-    if !values.len().is_multiple_of(32) {
-        return Err("Q8 block tensor length is not divisible by 32".into());
-    }
-    let mut quantized = Vec::with_capacity(values.len());
-    let mut scales = Vec::with_capacity(values.len() / 32);
-    for block in values.chunks_exact(32) {
-        if block.iter().any(|value| !value.is_finite()) {
-            return Err("cannot quantize a non-finite checkpoint value".into());
-        }
-        let alpha = block
-            .iter()
-            .fold(0.0_f32, |value, element| value.max(element.abs()));
-        let scale = if alpha == 0.0 {
-            f32::MIN_POSITIVE
-        } else {
-            alpha / 127.0
-        };
-        scales.push(scale);
-        let inverse = scale.recip();
-        quantized.extend(
-            block
-                .iter()
-                .map(|value| (value * inverse).round().clamp(-127.0, 127.0) as i8),
-        );
-    }
-    let scheme = QuantScheme::default()
-        .with_value(QuantValue::Q8S)
-        .with_level(QuantLevel::block([32]))
-        .with_param(QuantParam::F32)
-        .with_store(QuantStore::PackedU32(0));
-    Ok(TensorData::quantized(quantized, shape, scheme, &scales))
-}
-
 fn transpose_u16_bytes(source: &[u8], rows: usize, columns: usize) -> Vec<u8> {
     let mut output = vec![0_u8; source.len()];
     for row in 0..rows {
@@ -1656,7 +1622,7 @@ mod tests {
     #[test]
     fn q8s_quantization_is_finite_and_bounded_correctness() {
         let values = (0..32).map(|value| value as f32 - 16.0).collect();
-        let data = quantize_q8s_block32(values, vec![1, 32]).unwrap();
+        let data = quantize_q8s_block32_f32(values, vec![1, 32]).unwrap();
         assert!(matches!(data.dtype, DType::QFloat(scheme)
             if scheme.param == QuantParam::F32
                 && scheme.level == QuantLevel::block([32])));

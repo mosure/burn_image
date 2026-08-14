@@ -1516,6 +1516,20 @@ impl<B: Backend> BooguExecution<B> for ResidentBooguPipeline<B> {
     }
 }
 
+/// Backend allocation policy for one streamed VAE decoder execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VaeDecoderMemoryPolicy {
+    /// Preserve the backend's ordinary allocator behavior.
+    #[default]
+    BackendDefault,
+    /// Allocate decoder intermediates at their exact size and release dead pre-tail buffers.
+    ///
+    /// The decoder graph is synchronized while exact transient allocation mode is active, with a
+    /// second synchronized cleanup immediately before its final full-resolution residual block.
+    ExactTransientWithTailCleanup,
+}
+
 /// Memory-bounded composition of reusable Qwen3-VL, FLUX VAE, and Boogu executors.
 ///
 /// Only activations survive semantic stage transitions. `Q` supplies verified Qwen row/module
@@ -1527,6 +1541,7 @@ pub struct StreamingBooguPipeline<B: Backend, Q, V, D> {
     variant: BooguVariant,
     qwen_config: Qwen3VlConfig,
     decoder_group_norm_policy: DecoderGroupNormPolicy,
+    decoder_memory_policy: VaeDecoderMemoryPolicy,
     /// Verified semantic-stage Qwen executor.
     pub qwen: StreamingQwen3Vl<B, Q>,
     /// Independent verified VAE encoder/decoder source.
@@ -1548,6 +1563,7 @@ impl<B: Backend, Q, V, D> StreamingBooguPipeline<B, Q, V, D> {
             variant,
             qwen_config,
             decoder_group_norm_policy: DecoderGroupNormPolicy::StrictF32,
+            decoder_memory_policy: VaeDecoderMemoryPolicy::BackendDefault,
             qwen,
             vae,
             denoiser,
@@ -1571,6 +1587,17 @@ impl<B: Backend, Q, V, D> StreamingBooguPipeline<B, Q, V, D> {
     /// Return the decoder-only GroupNorm execution policy.
     pub const fn decoder_group_norm_policy(&self) -> DecoderGroupNormPolicy {
         self.decoder_group_norm_policy
+    }
+
+    /// Select the VAE decoder's backend allocation policy.
+    pub const fn with_decoder_memory_policy(mut self, policy: VaeDecoderMemoryPolicy) -> Self {
+        self.decoder_memory_policy = policy;
+        self
+    }
+
+    /// Return the selected VAE decoder backend allocation policy.
+    pub const fn decoder_memory_policy(&self) -> VaeDecoderMemoryPolicy {
+        self.decoder_memory_policy
     }
 }
 
@@ -1636,8 +1663,46 @@ where
         let vae_dtype: DType = decoder.decoder_float_dtype().into();
         validate_tensor_dtype("VAE decoder latent", scaled_latents.dtype(), vae_dtype)?;
         let device = scaled_latents.device();
-        let image = decoder
-            .decode_scaled_with_group_norm_policy(scaled_latents, self.decoder_group_norm_policy);
+        let image = match self.decoder_memory_policy {
+            VaeDecoderMemoryPolicy::BackendDefault => decoder.decode_scaled_with_group_norm_policy(
+                scaled_latents,
+                self.decoder_group_norm_policy,
+            ),
+            VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup => {
+                let (image, final_sync) = B::memory_persistent_allocations(
+                    &device,
+                    scaled_latents,
+                    |scaled_latents| {
+                        let image = decoder
+                            .decode_scaled_with_group_norm_policy_and_tail_barrier(
+                                scaled_latents,
+                                self.decoder_group_norm_policy,
+                                |device| {
+                                    B::sync(device).map_err(|error| {
+                                        BooguError::Artifact(format!(
+                                            "VAE decoder pre-tail synchronization failed: {error}"
+                                        ))
+                                    })?;
+                                    B::memory_cleanup(device);
+                                    B::sync(device).map_err(|error| {
+                                        BooguError::Artifact(format!(
+                                            "VAE decoder pre-tail allocator cleanup synchronization failed: {error}"
+                                        ))
+                                    })
+                                },
+                            );
+                        let sync = B::sync(&device).map_err(|error| {
+                            BooguError::Artifact(format!(
+                                "VAE decoder exact-allocation execution synchronization failed: {error}"
+                            ))
+                        });
+                        (image, sync)
+                    },
+                );
+                final_sync?;
+                image?
+            }
+        };
         B::sync(&device).map_err(|error| {
             BooguError::Artifact(format!("VAE decoder synchronization failed: {error}"))
         })?;
@@ -1882,6 +1947,10 @@ mod tests {
             strict.decoder_group_norm_policy(),
             DecoderGroupNormPolicy::StrictF32
         );
+        assert_eq!(
+            strict.decoder_memory_policy(),
+            VaeDecoderMemoryPolicy::BackendDefault
+        );
 
         let plan =
             Qwen3VlStreamingPlan::new(&config, RowChunkPlan::even(64, 8, 2, 4).unwrap(), None)
@@ -1897,10 +1966,15 @@ mod tests {
             },
             IdentityVelocity,
         )
-        .with_decoder_group_norm_policy(DecoderGroupNormPolicy::F16StorageF32Accum);
+        .with_decoder_group_norm_policy(DecoderGroupNormPolicy::F16StorageF32Accum)
+        .with_decoder_memory_policy(VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup);
         assert_eq!(
             mixed.decoder_group_norm_policy(),
             DecoderGroupNormPolicy::F16StorageF32Accum
+        );
+        assert_eq!(
+            mixed.decoder_memory_policy(),
+            VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup
         );
     }
 

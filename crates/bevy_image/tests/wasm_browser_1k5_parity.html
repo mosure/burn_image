@@ -57,9 +57,98 @@
         stage: "starting",
         report: null,
         error: null,
+        webgpu_calls: [],
       };
       globalThis.__burnImageHeadlessParity = state;
       globalThis.__burnImageHeadlessVaeReference = vaeReference ? state : null;
+
+      const recordWebGpu = (event, detail = null) => {
+        state.webgpu_calls.push({ event, at_ms: performance.now(), detail });
+      };
+      try {
+        const gpu = navigator.gpu;
+        if (!gpu) {
+          recordWebGpu("navigator-gpu-unavailable");
+        } else {
+          const requestAdapter = gpu.requestAdapter.bind(gpu);
+          Object.defineProperty(gpu, "requestAdapter", {
+            configurable: true,
+            value: async (options) => {
+              recordWebGpu("request-adapter-start", structuredClone(options ?? null));
+              try {
+                const adapter = await requestAdapter(options);
+                const adapterInfoSource = adapter?.info ?? null;
+                const adapterInfo = adapter
+                  ? {
+                      is_fallback_adapter:
+                        (typeof adapter.isFallbackAdapter === "boolean"
+                          ? adapter.isFallbackAdapter
+                          : null) ??
+                        (typeof adapterInfoSource?.isFallbackAdapter === "boolean"
+                          ? adapterInfoSource.isFallbackAdapter
+                          : null),
+                      vendor: adapterInfoSource?.vendor ?? null,
+                      architecture: adapterInfoSource?.architecture ?? null,
+                      device: adapterInfoSource?.device ?? null,
+                      description: adapterInfoSource?.description ?? null,
+                    }
+                  : null;
+                recordWebGpu("request-adapter-resolved", {
+                  available: adapter !== null,
+                  info: adapterInfo,
+                });
+                if (adapterInfo?.is_fallback_adapter === true) {
+                  throw new Error("WebGPU returned a fallback adapter");
+                }
+                if (adapter) {
+                  try {
+                    const prototype = Object.getPrototypeOf(adapter);
+                    if (!prototype.__burnImage1k5RequestDeviceInstrumented) {
+                      const requestDevice = prototype.requestDevice;
+                      Object.defineProperty(prototype, "requestDevice", {
+                        configurable: true,
+                        value: async function (descriptor) {
+                          const summary = {
+                            requiredFeatures: [...(descriptor?.requiredFeatures ?? [])],
+                            requiredLimits: { ...(descriptor?.requiredLimits ?? {}) },
+                          };
+                          recordWebGpu("request-device-start", summary);
+                          try {
+                            const device = await requestDevice.call(this, descriptor);
+                            recordWebGpu("request-device-resolved", summary);
+                            return device;
+                          } catch (error) {
+                            recordWebGpu("request-device-rejected", {
+                              ...summary,
+                              error: String(error),
+                            });
+                            throw error;
+                          }
+                        },
+                      });
+                      Object.defineProperty(
+                        prototype,
+                        "__burnImage1k5RequestDeviceInstrumented",
+                        { value: true },
+                      );
+                    }
+                  } catch (error) {
+                    recordWebGpu("request-device-instrumentation-unavailable", {
+                      error: String(error),
+                    });
+                  }
+                }
+                return adapter;
+              } catch (error) {
+                recordWebGpu("request-adapter-rejected", { error: String(error) });
+                throw error;
+              }
+            },
+          });
+        }
+      } catch (error) {
+        recordWebGpu("instrumentation-unavailable", { error: String(error) });
+      }
 
       const synchronizeState = () => {
         const message = status?.textContent ?? "";

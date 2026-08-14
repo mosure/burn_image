@@ -1,5 +1,7 @@
 //! Usable model-neutral Bevy controls for generation and editing.
 
+#[cfg(target_arch = "wasm32")]
+use bevy::input_focus::InputFocus;
 use bevy::{
     input::mouse::{MouseScrollUnit, MouseWheel},
     prelude::*,
@@ -64,6 +66,8 @@ const SIZE_PRESETS: &[(u32, u32)] = &[
     (2368, 992),
 ];
 const DEFAULT_SIZE_PRESET: (u32, u32) = (512, 512);
+#[cfg(any(target_arch = "wasm32", test))]
+const BROWSER_UI_CONTRACT_EVENT_NAME: &str = "burn-image-ui-contract";
 
 #[derive(Resource)]
 pub struct ImageControlPanelState {
@@ -245,7 +249,11 @@ impl Plugin for ImageControlPanelPlugin {
         #[cfg(target_arch = "wasm32")]
         app.add_systems(
             Update,
-            (drain_browser_reference_queue, complete_browser_download),
+            (
+                drain_browser_reference_queue,
+                complete_browser_download,
+                dispatch_browser_ui_contract.after(update_action_availability),
+            ),
         );
     }
 }
@@ -598,6 +606,181 @@ fn control_button_node() -> Node {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn dispatch_browser_ui_contract(
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
+    input_focus: Res<InputFocus>,
+    prompts: Query<
+        (
+            Entity,
+            &ComputedNode,
+            &UiGlobalTransform,
+            Has<InteractionDisabled>,
+        ),
+        With<PromptInput>,
+    >,
+    seeds: Query<
+        (
+            Entity,
+            &ComputedNode,
+            &UiGlobalTransform,
+            Has<InteractionDisabled>,
+        ),
+        (With<SeedInput>, Without<PromptInput>),
+    >,
+    runs: Query<
+        (&ComputedNode, &UiGlobalTransform, Has<InteractionDisabled>),
+        (With<RunButton>, Without<PromptInput>, Without<SeedInput>),
+    >,
+    saves: Query<
+        (&ComputedNode, &UiGlobalTransform, Has<InteractionDisabled>),
+        (
+            With<SaveButton>,
+            Without<PromptInput>,
+            Without<SeedInput>,
+            Without<RunButton>,
+        ),
+    >,
+    mut last_contract: Local<Option<(bool, bool, bool, bool, bool, bool, u32, u32)>>,
+) {
+    if !browser_model_smoke_requested() {
+        return;
+    }
+    if !matches!(runner.state, ImageRunnerState::Ready { .. }) {
+        return;
+    }
+    let (
+        Ok((prompt_entity, prompt_node, prompt_transform, prompt_disabled)),
+        Ok((seed_entity, seed_node, seed_transform, seed_disabled)),
+        Ok((run_node, run_transform, run_disabled)),
+        Ok((save_node, save_transform, save_disabled)),
+    ) = (
+        prompts.single(),
+        seeds.single(),
+        runs.single(),
+        saves.single(),
+    )
+    else {
+        return;
+    };
+    if prompt_node.is_empty() || seed_node.is_empty() || run_node.is_empty() || save_node.is_empty()
+    {
+        return;
+    }
+    let (Some(model), Some(dimensions)) = (&editor.model, editor.options.dimensions) else {
+        return;
+    };
+    let prompt_enabled = !prompt_disabled;
+    let seed_enabled = !seed_disabled;
+    let prompt_focused = input_focus.get() == Some(prompt_entity);
+    let seed_focused = input_focus.get() == Some(seed_entity);
+    let run_enabled = !run_disabled;
+    let save_enabled = !save_disabled;
+    let contract = (
+        prompt_enabled,
+        seed_enabled,
+        prompt_focused,
+        seed_focused,
+        run_enabled,
+        save_enabled,
+        dimensions.width(),
+        dimensions.height(),
+    );
+    if last_contract.as_ref() == Some(&contract) {
+        return;
+    }
+    let prompt_center = prompt_transform.to_scale_angle_translation().2;
+    let seed_center = seed_transform.to_scale_angle_translation().2;
+    let run_center = run_transform.to_scale_angle_translation().2;
+    let save_center = save_transform.to_scale_angle_translation().2;
+    let result = (|| {
+        let detail = js_sys::Object::new();
+        let set = |name: &str, value: wasm_bindgen::JsValue| {
+            js_sys::Reflect::set(&detail, &name.into(), &value)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        };
+        set("event", "ready".into())?;
+        set("model", model.as_str().into())?;
+        set("width", dimensions.width().into())?;
+        set("height", dimensions.height().into())?;
+        set("prompt_x", prompt_center.x.into())?;
+        set("prompt_y", prompt_center.y.into())?;
+        set("prompt_enabled", prompt_enabled.into())?;
+        set("prompt_focused", prompt_focused.into())?;
+        set("seed_x", seed_center.x.into())?;
+        set("seed_y", seed_center.y.into())?;
+        set("seed_enabled", seed_enabled.into())?;
+        set("seed_focused", seed_focused.into())?;
+        set("run_x", run_center.x.into())?;
+        set("run_y", run_center.y.into())?;
+        set("run_enabled", run_enabled.into())?;
+        set("save_x", save_center.x.into())?;
+        set("save_y", save_center.y.into())?;
+        set("save_enabled", save_enabled.into())?;
+
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(detail.as_ref());
+        let event =
+            web_sys::CustomEvent::new_with_event_init_dict(BROWSER_UI_CONTRACT_EVENT_NAME, &init)
+                .map_err(|error| format!("{error:?}"))?;
+        let window = web_sys::window().ok_or_else(|| "Window is unavailable".to_owned())?;
+        window
+            .dispatch_event(event.as_ref())
+            .map_err(|error| format!("{error:?}"))?;
+        Ok::<(), String>(())
+    })();
+    match result {
+        Ok(()) => *last_contract = Some(contract),
+        Err(error) => web_sys::console::warn_1(
+            &format!("failed to dispatch browser event {BROWSER_UI_CONTRACT_EVENT_NAME}: {error}")
+                .into(),
+        ),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn browser_model_smoke_requested() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Ok(search) = window.location().search() else {
+        return false;
+    };
+    web_sys::UrlSearchParams::new_with_str(&search)
+        .ok()
+        .is_some_and(|params| params.get("rendered-model-smoke").as_deref() == Some("1"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn dispatch_browser_text_value(event_name: &str, value: &str) {
+    let result = (|| {
+        let detail = js_sys::Object::new();
+        js_sys::Reflect::set(&detail, &"event".into(), &event_name.into())
+            .map_err(|error| format!("{error:?}"))?;
+        js_sys::Reflect::set(&detail, &"value".into(), &value.into())
+            .map_err(|error| format!("{error:?}"))?;
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(detail.as_ref());
+        let event =
+            web_sys::CustomEvent::new_with_event_init_dict(BROWSER_UI_CONTRACT_EVENT_NAME, &init)
+                .map_err(|error| format!("{error:?}"))?;
+        let window = web_sys::window().ok_or_else(|| "Window is unavailable".to_owned())?;
+        window
+            .dispatch_event(event.as_ref())
+            .map_err(|error| format!("{error:?}"))?;
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        web_sys::console::warn_1(
+            &format!("failed to dispatch browser event {BROWSER_UI_CONTRACT_EVENT_NAME}: {error}")
+                .into(),
+        );
+    }
+}
+
 fn select_initial_model(
     status: Res<ImageRunnerStatus>,
     mut editor: ResMut<ImageEditorState>,
@@ -632,17 +815,38 @@ fn sync_text_inputs(
     mut panel: ResMut<ImageControlPanelState>,
 ) {
     if let Ok(prompt) = prompts.single() {
-        editor.prompt_or_instruction = prompt.value().to_string();
+        let value = prompt.value().to_string();
+        if editor.prompt_or_instruction != value {
+            editor.prompt_or_instruction = value;
+            #[cfg(target_arch = "wasm32")]
+            if browser_model_smoke_requested() {
+                dispatch_browser_text_value("prompt_changed", &editor.prompt_or_instruction);
+            }
+        }
     }
     if let Ok(seed) = seeds.single() {
         let value = seed.value().to_string();
         if value.is_empty() {
-            editor.options.seed = None;
+            let changed = editor.options.seed.is_some();
+            if changed {
+                editor.options.seed = None;
+                #[cfg(target_arch = "wasm32")]
+                if browser_model_smoke_requested() {
+                    dispatch_browser_text_value("seed_changed", &value);
+                }
+            }
             panel.seed_valid = true;
         } else {
             match value.parse::<u64>() {
                 Ok(seed) => {
-                    editor.options.seed = Some(seed);
+                    let changed = editor.options.seed != Some(seed);
+                    if changed {
+                        editor.options.seed = Some(seed);
+                        #[cfg(target_arch = "wasm32")]
+                        if browser_model_smoke_requested() {
+                            dispatch_browser_text_value("seed_changed", &value);
+                        }
+                    }
                     panel.seed_valid = true;
                 }
                 Err(error) => {
@@ -666,23 +870,20 @@ fn handle_mode_button(
     {
         return;
     }
-    editor.mode = match editor.mode {
+    let requested_mode = match editor.mode {
         EditorMode::Generate => EditorMode::Edit,
         EditorMode::Edit => EditorMode::Generate,
     };
-    let task = match editor.mode {
-        EditorMode::Generate => ImageTaskKind::Generate,
-        EditorMode::Edit => ImageTaskKind::Edit,
+    let Some(descriptor) = descriptor_for_mode(&status.state, requested_mode) else {
+        panel.notice = format!(
+            "The loaded runtime does not support {} mode",
+            editor_mode_label(requested_mode)
+        );
+        return;
     };
-    if let ImageRunnerState::Ready { capabilities } = &status.state
-        && let Some(descriptor) = capabilities
-            .models
-            .iter()
-            .find(|descriptor| descriptor.capabilities.tasks.contains(&task))
-    {
-        editor.model = Some(descriptor.id.clone());
-        apply_descriptor_size(descriptor, &mut editor, &mut panel);
-    }
+    editor.mode = requested_mode;
+    editor.model = Some(descriptor.id.clone());
+    apply_descriptor_size(descriptor, &mut editor, &mut panel);
 }
 
 fn handle_model_button(
@@ -700,17 +901,10 @@ fn handle_model_button(
     let ImageRunnerState::Ready { capabilities } = &status.state else {
         return;
     };
-    if capabilities.models.is_empty() {
+    let Some(descriptor) = next_model_descriptor(&capabilities.models, editor.model.as_ref())
+    else {
         return;
-    }
-    let current = editor.model.as_ref().and_then(|model| {
-        capabilities
-            .models
-            .iter()
-            .position(|descriptor| descriptor.id == *model)
-    });
-    let descriptor =
-        &capabilities.models[current.map_or(0, |index| index + 1) % capabilities.models.len()];
+    };
     editor.model = Some(descriptor.id.clone());
     if descriptor
         .capabilities
@@ -722,6 +916,43 @@ fn handle_model_button(
         editor.mode = EditorMode::Edit;
     }
     apply_descriptor_size(descriptor, &mut editor, &mut panel);
+}
+
+fn next_model_descriptor<'a>(
+    models: &'a [ModelDescriptor],
+    current: Option<&burn_image::ModelId>,
+) -> Option<&'a ModelDescriptor> {
+    if models.len() < 2 {
+        return None;
+    }
+    let current =
+        current.and_then(|model| models.iter().position(|descriptor| descriptor.id == *model));
+    models.get(current.map_or(0, |index| index + 1) % models.len())
+}
+
+fn descriptor_for_mode(state: &ImageRunnerState, mode: EditorMode) -> Option<&ModelDescriptor> {
+    let ImageRunnerState::Ready { capabilities } = state else {
+        return None;
+    };
+    let task = editor_mode_task(mode);
+    capabilities
+        .models
+        .iter()
+        .find(|descriptor| descriptor.capabilities.tasks.contains(&task))
+}
+
+const fn editor_mode_task(mode: EditorMode) -> ImageTaskKind {
+    match mode {
+        EditorMode::Generate => ImageTaskKind::Generate,
+        EditorMode::Edit => ImageTaskKind::Edit,
+    }
+}
+
+const fn editor_mode_label(mode: EditorMode) -> &'static str {
+    match mode {
+        EditorMode::Generate => "Generate",
+        EditorMode::Edit => "Edit",
+    }
 }
 
 fn handle_size_button(
@@ -1011,20 +1242,21 @@ fn accept_reference_images(
         }
         let dimensions = loaded.image.dimensions();
         editor.source = Some(loaded.image.clone());
-        editor.mode = EditorMode::Edit;
-        if let ImageRunnerState::Ready { capabilities } = &runner.state
-            && let Some(descriptor) = capabilities
-                .models
-                .iter()
-                .find(|descriptor| descriptor.capabilities.tasks.contains(&ImageTaskKind::Edit))
-        {
+        let edit_descriptor = descriptor_for_mode(&runner.state, EditorMode::Edit);
+        if let Some(descriptor) = edit_descriptor {
+            editor.mode = EditorMode::Edit;
             editor.model = Some(descriptor.id.clone());
             apply_descriptor_size(descriptor, &mut editor, &mut panel);
         }
-        panel.notice = dimensions.map_or_else(
+        let loaded_notice = dimensions.map_or_else(
             || "Reference image loaded".into(),
             |size| format!("Reference loaded: {} x {}", size.width(), size.height()),
         );
+        panel.notice = if edit_descriptor.is_some() {
+            loaded_notice
+        } else {
+            format!("{loaded_notice}; the loaded runtime does not support Edit mode")
+        };
     }
 }
 
@@ -1082,10 +1314,12 @@ fn descriptor_supports_dimensions(descriptor: &ModelDescriptor, dimensions: Dime
 
 fn model_default_dimensions(_descriptor: &ModelDescriptor) -> Option<Dimensions> {
     #[cfg(feature = "boogu")]
-    if crate::boogu::variant_for_model(&_descriptor.id)
-        == Some(burn_boogu::BooguVariant::Image01EditTurbo1k5)
-    {
-        let edge = burn_boogu::BOOGU_1K5_DEFAULT_EDGE;
+    if let Some(variant) = crate::boogu::variant_for_model(&_descriptor.id) {
+        let edge = if variant == burn_boogu::BooguVariant::Image01EditTurbo1k5 {
+            burn_boogu::BOOGU_1K5_DEFAULT_EDGE
+        } else {
+            burn_boogu::BOOGU_DEFAULT_EDGE
+        };
         return Dimensions::new(edge, edge).ok();
     }
 
@@ -1105,6 +1339,12 @@ fn preferred_size_index(constraints: &DimensionConstraints) -> Option<usize> {
 }
 
 fn preferred_size_index_for_descriptor(descriptor: &ModelDescriptor) -> Option<usize> {
+    if let Some(dimensions) = model_default_dimensions(descriptor)
+        && descriptor_supports_dimensions(descriptor, dimensions)
+        && let Some(index) = preset_index(dimensions)
+    {
+        return Some(index);
+    }
     let default = SIZE_PRESETS
         .iter()
         .position(|preset| *preset == DEFAULT_SIZE_PRESET)
@@ -1211,10 +1451,7 @@ fn update_control_labels(
         }
     }
     if let Ok(mut label) = labels.p1().single_mut() {
-        let value = match &editor.model {
-            Some(model) => format!("Model: {model}"),
-            None => runner_state_label(&runner.state),
-        };
+        let value = model_control_label(&editor, &runner.state);
         if label.0 != value {
             label.0 = value;
         }
@@ -1238,6 +1475,39 @@ fn update_control_labels(
             label.0 = value;
         }
     }
+}
+
+fn model_control_label(editor: &ImageEditorState, runner: &ImageRunnerState) -> String {
+    let Some(model) = &editor.model else {
+        return runner_state_label(runner);
+    };
+    let ImageRunnerState::Ready { capabilities } = runner else {
+        return format!("Loaded model: {model}");
+    };
+    let display_name = capabilities
+        .descriptor(model)
+        .map(|descriptor| descriptor.display_name.as_str())
+        .unwrap_or_else(|| model.as_str());
+    if capabilities.models.len() < 2 {
+        format!("Loaded model: {display_name}")
+    } else {
+        format!("Model: {display_name}")
+    }
+}
+
+fn can_cycle_models(runner: &ImageRunnerState) -> bool {
+    matches!(
+        runner,
+        ImageRunnerState::Ready { capabilities } if capabilities.models.len() > 1
+    )
+}
+
+fn can_change_mode(runner: &ImageRunnerState, current: EditorMode) -> bool {
+    let requested = match current {
+        EditorMode::Generate => EditorMode::Edit,
+        EditorMode::Edit => EditorMode::Generate,
+    };
+    descriptor_for_mode(runner, requested).is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1549,6 +1819,11 @@ fn update_action_availability(
     editor: Res<ImageEditorState>,
     jobs: Res<ImageJobs>,
     panel: Res<ImageControlPanelState>,
+    mode_buttons: Query<(Entity, Has<InteractionDisabled>), With<ModeButton>>,
+    model_buttons: Query<
+        (Entity, Has<InteractionDisabled>),
+        (With<ModelButton>, Without<ModeButton>),
+    >,
     run_buttons: Query<(Entity, Has<InteractionDisabled>), With<RunButton>>,
     cancel_buttons: Query<
         (Entity, Has<InteractionDisabled>),
@@ -1580,7 +1855,15 @@ fn update_action_availability(
         && editor.validate_request().is_ok();
     let can_save = panel.latest_output.is_some();
     let can_adjust_view = can_save || editor.source.is_some();
+    let can_select_model = !running && can_cycle_models(&runner.state);
+    let can_select_mode = !running && can_change_mode(&runner.state, editor.mode);
 
+    for (entity, disabled) in &mode_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_select_mode);
+    }
+    for (entity, disabled) in &model_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_select_model);
+    }
     for (entity, disabled) in &run_buttons {
         set_button_disabled(&mut commands, entity, disabled, !can_run);
     }
@@ -1818,16 +2101,41 @@ fn trigger_browser_download(download: &ImageDownloadReady) -> Result<(), wasm_bi
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_arch = "wasm32", test))]
+    use super::BROWSER_UI_CONTRACT_EVENT_NAME;
     use super::{
-        MIN_VIEWER_HEIGHT, event_progress_presentation, format_progress,
-        image_control_panel_layout, next_supported_size_index, preferred_size_index,
-        preset_dimensions, preset_index, runner_progress_presentation, runner_state_label,
-        setup_progress_fraction,
+        MIN_VIEWER_HEIGHT, can_change_mode, can_cycle_models, descriptor_for_mode,
+        event_progress_presentation, format_progress, image_control_panel_layout,
+        model_control_label, next_model_descriptor, next_supported_size_index,
+        preferred_size_index, preset_dimensions, preset_index, runner_progress_presentation,
+        runner_state_label, setup_progress_fraction,
     };
     #[cfg(feature = "boogu")]
     use super::{apply_descriptor_size, next_supported_size_index_for_descriptor};
-    use bevy::prelude::Vec2;
-    use burn_image::{DimensionConstraints, Dimensions, ModelId, ProgressEvent, RunId};
+    use bevy::{prelude::Vec2, ui::InteractionDisabled};
+    use burn_image::{
+        DimensionConstraints, Dimensions, ImageTaskKind, ModelId, ProgressEvent, RunId,
+    };
+
+    fn runner_with_models(models: &[(&str, &str, &[ImageTaskKind])]) -> crate::ImageRunnerState {
+        let mut capabilities = crate::runner::tests::test_capabilities(models[0].0);
+        capabilities.models = models
+            .iter()
+            .map(|(id, display_name, tasks)| {
+                let mut descriptor = crate::runner::tests::test_capabilities(id)
+                    .models
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                descriptor.display_name = (*display_name).into();
+                descriptor.capabilities.tasks = tasks.iter().copied().collect();
+                descriptor.capabilities.supports_masks =
+                    descriptor.capabilities.tasks.contains(&ImageTaskKind::Edit);
+                descriptor
+            })
+            .collect();
+        crate::ImageRunnerState::Ready { capabilities }
+    }
 
     fn dimensions(minimum: u32, maximum: u32, max_pixels: Option<u64>) -> DimensionConstraints {
         DimensionConstraints {
@@ -1904,6 +2212,30 @@ mod tests {
     }
 
     #[test]
+    fn rendered_model_smoke_uses_real_browser_input_and_download_correctness() {
+        let contract = include_str!("../tests/wasm_rendered_surface_contract.mjs");
+        let harness = include_str!("../tests/wasm_rendered_surface_smoke.mjs");
+        assert!(contract.contains(BROWSER_UI_CONTRACT_EVENT_NAME));
+        assert!(harness.contains("UI_CONTRACT_EVENT_NAME"));
+        assert!(harness.contains("Input.dispatchMouseEvent"));
+        assert!(harness.contains("Input.dispatchKeyEvent"));
+        assert!(harness.contains("Input.dispatchKeyEvent(per-character text)"));
+        assert!(!harness.contains("Input.insertText"));
+        assert!(harness.contains("Browser.setDownloadBehavior"));
+        assert!(harness.contains("Browser.downloadProgress"));
+        assert!(!harness.contains("__burnImageDriveModelSmoke"));
+
+        let manifest = include_str!("../Cargo.toml");
+        let app_features = manifest
+            .split_once("app = [")
+            .and_then(|(_, suffix)| suffix.split_once(']'))
+            .map(|(features, _)| features)
+            .expect("bevy_image app feature must remain a literal array");
+        assert!(app_features.contains("\"bevy/bevy_picking\""));
+        assert!(app_features.contains("\"bevy/ui_picking\""));
+    }
+
+    #[test]
     fn prompt_input_remains_unicode_capable_correctness() {
         let prompt = "\u{732b}\u{3068}\u{6708} - caf\u{e9}";
         let editor = crate::ImageEditorState {
@@ -1923,6 +2255,124 @@ mod tests {
             "No model runtime installed"
         );
         let _ = ModelId::new("test/model").unwrap();
+    }
+
+    #[test]
+    fn singleton_runtime_labels_and_disables_model_selection_correctness() {
+        let runner =
+            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
+        let editor = crate::ImageEditorState {
+            model: Some(ModelId::new("test/turbo").unwrap()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            model_control_label(&editor, &runner),
+            "Loaded model: Test Turbo"
+        );
+        assert!(!can_cycle_models(&runner));
+        let crate::ImageRunnerState::Ready { capabilities } = &runner else {
+            unreachable!();
+        };
+        assert!(next_model_descriptor(&capabilities.models, editor.model.as_ref()).is_none());
+    }
+
+    #[test]
+    fn singleton_runtime_model_button_is_disabled_in_the_ecs_correctness() {
+        let runner =
+            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
+        let mut app = bevy::prelude::App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                model: Some(ModelId::new("test/turbo").unwrap()),
+                ..Default::default()
+            })
+            .init_resource::<crate::ImageJobs>()
+            .init_resource::<super::ImageControlPanelState>()
+            .add_systems(bevy::prelude::Update, super::update_action_availability);
+        let button = app.world_mut().spawn(super::ModelButton).id();
+
+        app.update();
+
+        assert!(app.world().get::<InteractionDisabled>(button).is_some());
+    }
+
+    #[test]
+    fn genuine_multi_model_runtime_keeps_model_cycling_correctness() {
+        let runner = runner_with_models(&[
+            ("test/turbo", "Test Turbo", &[ImageTaskKind::Generate]),
+            ("test/edit", "Test Edit", &[ImageTaskKind::Edit]),
+        ]);
+        let editor = crate::ImageEditorState {
+            model: Some(ModelId::new("test/turbo").unwrap()),
+            ..Default::default()
+        };
+
+        assert_eq!(model_control_label(&editor, &runner), "Model: Test Turbo");
+        assert!(can_cycle_models(&runner));
+        let crate::ImageRunnerState::Ready { capabilities } = &runner else {
+            unreachable!();
+        };
+        assert_eq!(
+            next_model_descriptor(&capabilities.models, editor.model.as_ref())
+                .unwrap()
+                .id
+                .as_str(),
+            "test/edit"
+        );
+    }
+
+    #[test]
+    fn mode_selection_never_enters_an_unsupported_task_correctness() {
+        let generation_only =
+            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
+        assert!(!can_change_mode(
+            &generation_only,
+            crate::EditorMode::Generate
+        ));
+        assert!(descriptor_for_mode(&generation_only, crate::EditorMode::Edit).is_none());
+
+        let multi = runner_with_models(&[
+            ("test/turbo", "Test Turbo", &[ImageTaskKind::Generate]),
+            ("test/edit", "Test Edit", &[ImageTaskKind::Edit]),
+        ]);
+        assert!(can_change_mode(&multi, crate::EditorMode::Generate));
+        assert_eq!(
+            descriptor_for_mode(&multi, crate::EditorMode::Edit)
+                .unwrap()
+                .id
+                .as_str(),
+            "test/edit"
+        );
+    }
+
+    #[test]
+    fn unsupported_mode_press_keeps_the_editor_dispatchable_correctness() {
+        let runner =
+            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
+        let mut app = bevy::prelude::App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                model: Some(ModelId::new("test/turbo").unwrap()),
+                ..Default::default()
+            })
+            .init_resource::<super::ImageControlPanelState>()
+            .add_systems(bevy::prelude::Update, super::handle_mode_button);
+        app.world_mut()
+            .spawn((super::ModeButton, bevy::prelude::Interaction::Pressed));
+
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<crate::ImageEditorState>().mode,
+            crate::EditorMode::Generate
+        );
+        assert_eq!(
+            app.world()
+                .resource::<super::ImageControlPanelState>()
+                .notice,
+            "The loaded runtime does not support Edit mode"
+        );
     }
 
     #[test]
@@ -1948,6 +2398,25 @@ mod tests {
                 .supports(Dimensions::new(512, 512).unwrap())
                 .is_err()
         );
+    }
+
+    #[cfg(feature = "boogu")]
+    #[test]
+    fn turbo_controls_start_at_core_1k_default_correctness() {
+        for variant in [
+            burn_boogu::BooguVariant::Image01Turbo,
+            burn_boogu::BooguVariant::Image01EditTurbo,
+        ] {
+            let descriptor = burn_boogu::boogu_model_descriptor(variant);
+            let mut editor = crate::ImageEditorState::default();
+            let mut panel = super::ImageControlPanelState::default();
+            apply_descriptor_size(&descriptor, &mut editor, &mut panel);
+
+            assert_eq!(
+                editor.options.dimensions,
+                Some(Dimensions::new(1024, 1024).unwrap())
+            );
+        }
     }
 
     #[cfg(feature = "boogu")]
@@ -1983,6 +2452,26 @@ mod tests {
         assert_eq!(
             super::preset_dimensions(next),
             Dimensions::new(1264, 1856).unwrap()
+        );
+    }
+
+    #[cfg(feature = "boogu")]
+    #[test]
+    fn switching_from_1k5_to_turbo_restores_the_core_1k_default_correctness() {
+        let descriptor = burn_boogu::boogu_model_descriptor(burn_boogu::BooguVariant::Image01Turbo);
+        let mut editor = crate::ImageEditorState::default();
+        editor.options.dimensions = Some(Dimensions::new(1536, 1536).unwrap());
+        let mut panel = super::ImageControlPanelState::default();
+
+        apply_descriptor_size(&descriptor, &mut editor, &mut panel);
+
+        assert_eq!(
+            editor.options.dimensions,
+            Some(Dimensions::new(1024, 1024).unwrap())
+        );
+        assert_eq!(
+            super::preset_dimensions(panel.size_index),
+            Dimensions::new(1024, 1024).unwrap()
         );
     }
 }

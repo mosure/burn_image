@@ -17,6 +17,8 @@ pub mod error;
 pub mod latent;
 /// Boogu diffusion-transformer modules.
 pub mod model;
+#[cfg(all(feature = "burnpack", feature = "wgpu"))]
+mod packed_f16_artifacts;
 /// End-to-end prepared and resident pipeline orchestration.
 pub mod pipeline;
 /// Boogu-specific request, image-size, and reference preprocessing policies.
@@ -41,12 +43,21 @@ pub use config::{
 };
 pub use dmd::{DmdSchedule, dmd_prediction, dmd_renoise};
 pub use error::BooguError;
+#[cfg(feature = "burnpack")]
+pub use model::RetainedDenoiserDTypeAudit;
 pub use model::{
     AsyncBooguDenoiserStageSource, AsyncRetainingDenoiserSynchronizationPolicy, BooguDenoiser,
-    BooguDenoiserInput, BooguDenoiserPrelude, BooguDenoiserTail, BooguStreamState,
-    DenoiserRmsNormPolicy, DenoiserStageObserver, DoubleStreamBlock,
-    RetainingAsyncBooguDenoiserStageSource, SingleStreamBlock, StreamingBooguDenoiser,
-    StreamingStageSource,
+    BooguDenoiserInput, BooguDenoiserPrelude, BooguDenoiserTail,
+    BooguQuantizedLinearExecutionPolicy, BooguStreamState, DenoiserRmsNormPolicy,
+    DenoiserStageObserver, DoubleStreamBlock, RetainingAsyncBooguDenoiserStageSource,
+    SingleStreamBlock, StreamingBooguDenoiser, StreamingStageSource,
+};
+#[cfg(feature = "wgpu")]
+pub use model::{
+    MaterializedF32Object, PACKED_F16_F32_VIEW_ALIGNMENT_BYTES,
+    PACKED_F16_F32_VIEW_ALIGNMENT_ELEMENTS, PACKED_F16_MAX_BUFFER_BYTES, PackedF16Error,
+    PackedF16Layout, PackedF16Object, PackedF16TensorLayout, align_packed_f16_f32_view_offset,
+    materialize_packed_f16_object, materialize_packed_f16_objects,
 };
 #[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
 pub use model::{
@@ -60,13 +71,25 @@ pub use model::{
     required_chunked_padded_blackbox_attention, required_chunked_padded_blackbox_attention_tiled,
     required_flash_unit_attention,
 };
+#[cfg(all(feature = "burnpack", feature = "wgpu"))]
+pub use packed_f16_artifacts::{
+    PackedF16DenoiserBackend, PackedF16DenoiserCacheAudit, PackedF16DenoiserCacheState,
+    TURBO_PACKED_F16_ARTIFACT_BYTES, TURBO_PACKED_F16_COMPACT_PAYLOAD_BYTES,
+    TURBO_PACKED_F16_F32_WRITE_BYTES_PER_DMD, TURBO_PACKED_F16_FOUR_DMD_READ_BYTES,
+    TURBO_PACKED_F16_FOUR_DMD_WRITE_BYTES, TURBO_PACKED_F16_MAX_OBJECT_BYTES,
+    TURBO_PACKED_F16_MAX_OBJECT_F32_BYTES, TURBO_PACKED_F16_MAX_STAGE_F32_BYTES,
+    TURBO_PACKED_F16_MAX_STAGE_PACKED_BYTES, TURBO_PACKED_F16_OBJECT_COUNT,
+    TURBO_PACKED_F16_PADDED_ELEMENTS, TURBO_PACKED_F16_PADDING_ELEMENTS,
+    TURBO_PACKED_F16_RETAINED_BYTES, TURBO_PACKED_F16_STAGE_COUNT, TURBO_PACKED_F16_TENSOR_COUNT,
+    VerifiedAsyncPackedF16DenoiserStageSource,
+};
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub use pipeline::NativeFlashUnitDenoiser;
 pub use pipeline::{
     AsyncBooguVaeStageSource, BooguDmdInput, BooguExecution, BooguPipelineOutput,
     BooguVaeStageSource, DmdDenoiser, ResidentBooguInput, ResidentBooguPipeline,
     RetainingAsyncBooguVaeStageSource, RetainingBooguVaeStageSource, StreamingBooguPipeline,
-    encode_instruction, encode_reference, run_dmd, run_dmd_with_observer,
+    VaeDecoderMemoryPolicy, encode_instruction, encode_reference, run_dmd, run_dmd_with_observer,
     trim_instruction_features,
 };
 #[cfg(feature = "burnpack")]

@@ -1,11 +1,10 @@
 //! Concrete browser-local Boogu runtime over verified bounded HTTP Range reads.
 //!
-//! The supported browser runtime eagerly verifies and materializes every Qwen, VAE, and denoiser
-//! stage once, retains only initialized WebGPU module handles, and executes inference without model
-//! artifact transport in its hot path. Explicit low-memory diagnostics retain one semantic stage at
-//! a time. The dedicated 1.5K parity route lazily retains denoiser handles across four DMD steps and
-//! clears them before its exact decoder. No route falls back to CPU or manufactures placeholder
-//! output.
+//! The high-VRAM browser runtime eagerly verifies and materializes every Qwen, VAE, and denoiser
+//! stage once. Low-VRAM execution streams Qwen and VAE stages and retains an inventory-qualified
+//! runtime-Q8 denoiser for Edit releases. Turbo retains an authenticated packed-F16 denoiser and
+//! widens exactly one semantic stage to dense F32 for ordinary execution. No route falls back to
+//! CPU or manufactures placeholder output.
 
 use std::{
     collections::VecDeque,
@@ -15,18 +14,21 @@ use std::{
 
 use burn::{
     nn::RmsNorm,
-    tensor::{DType, Tensor, TensorData},
+    tensor::{DType, Tensor, TensorData, backend::Backend},
 };
 use burn_boogu::{
     AsyncBooguDenoiserStageSource, AsyncBooguVaeStageSource, AsyncFluxVaeStageSourceAdapter,
     AsyncRetainingDenoiserSynchronizationPolicy, BooguConfig, BooguDenoiserInput,
-    BooguDenoiserPrelude, BooguDenoiserTail, BooguError, BooguRuntimeDTypes, BooguTask,
-    BooguVariant, DenoiserStageObserver, DmdSchedule, DoubleStreamBlock,
-    RetainingAsyncBooguDenoiserStageSource, RetainingAsyncBooguVaeStageSource, SingleStreamBlock,
-    StreamingBooguDenoiser,
+    BooguDenoiserPrelude, BooguDenoiserTail, BooguError, BooguQuantizedLinearExecutionPolicy,
+    BooguRuntimeDTypes, BooguTask, BooguVariant, DenoiserStageObserver, DmdSchedule,
+    DoubleStreamBlock, PackedF16DenoiserCacheAudit, PackedF16DenoiserCacheState,
+    RetainedDenoiserDTypeAudit, RetainingAsyncBooguDenoiserStageSource,
+    RetainingAsyncBooguVaeStageSource, SingleStreamBlock, StreamingBooguDenoiser,
+    VerifiedAsyncPackedF16DenoiserStageSource,
     artifacts::{
-        BooguArtifactInventory, BooguFloatLoadPolicy, BooguQuantizedLoadPolicy,
-        BooguReleaseIdentity, BooguStorageProfile, VerifiedAsyncBurnpackDenoiserStageSource,
+        BooguArtifactInventory, BooguDenoiserRuntimeQuantizationPolicy, BooguFloatLoadPolicy,
+        BooguQuantizedLoadPolicy, BooguReleaseIdentity, BooguRuntimeQ8Scope, BooguStorageProfile,
+        TensorOwner, VerifiedAsyncBurnpackDenoiserStageSource,
         VerifiedAsyncBurnpackQwenStageSource, VerifiedAsyncBurnpackVaeStageSource,
         artifact_bundle_id_is_compatible, canonical_published_bundle,
         validate_canonical_release_artifact_digest,
@@ -48,10 +50,13 @@ use burn_image::{
 };
 use burn_qwen3_vl::{
     AsyncQwen3VlStageSource, AsyncRetainingSynchronizationPolicy, EmbeddingRowChunk,
-    Qwen3VlArtifactFloatPolicy, Qwen3VlComponentContract, Qwen3VlConfig, Qwen3VlDecoderLayer,
+    HostRoutedEmbedding, HostRoutedEmbeddingReport, Qwen3VlArtifactFloatPolicy,
+    Qwen3VlComponentContract, Qwen3VlConfig, Qwen3VlDecoderLayer, Qwen3VlEmbeddingExecutionPolicy,
     Qwen3VlImageProcessor, Qwen3VlImageProcessorConfig, Qwen3VlProcessor, Qwen3VlStage,
-    Qwen3VlStageObserver, Qwen3VlTokenizer, Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger,
-    Qwen3VlVisionPrelude, RetainingAsyncQwen3VlStageSource, RowChunkSpec, StreamingQwen3Vl,
+    Qwen3VlStageObserver, Qwen3VlStreamingPlan, Qwen3VlTextBlockLoadSynchronizationPolicy,
+    Qwen3VlTextLayerAllocationPolicy, Qwen3VlTextLayerDiagnosticBoundary, Qwen3VlTokenizer,
+    Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger, Qwen3VlVisionPrelude,
+    RetainingAsyncQwen3VlStageSource, RowChunkSpec, StreamingQwen3Vl,
     VerifiedAsyncBurnpackQwen3VlStageSource, tokenizer::HfTokenizer,
 };
 use rand::SeedableRng;
@@ -64,12 +69,18 @@ use crate::{
     ImageRunnerEvent, WgpuExecutionKind,
     artifact_stream::{
         ArtifactStreamConfig, BrowserArtifactControl, BrowserArtifactEvent,
-        BrowserStageShardReader, MAX_BROWSER_MANIFEST_BYTES, artifact_progress_position,
-        fetch_browser_bounded_file, sibling_bundle_base_url,
+        BrowserArtifactTrafficSnapshot, BrowserStageShardReader, MAX_BROWSER_MANIFEST_BYTES,
+        artifact_progress_position, fetch_browser_bounded_file, sibling_bundle_base_url,
     },
     browser_parity_fixture::{
         BrowserParityFixture, BrowserParityFixtureIdentity, BrowserParityVerificationSnapshot,
         FloatMetrics, RgbMetrics, compare_float, compare_rgb,
+    },
+    browser_turbo_first_dmd_fixture::{
+        BrowserTurboFirstDmdFixture, BrowserTurboFirstDmdFixtureIdentity,
+        BrowserTurboFirstDmdFixtureProfile, BrowserTurboFirstDmdVerificationSnapshot,
+        TURBO_FIRST_DMD_INPUT, TURBO_FIRST_DMD_PREDICTION, TURBO_FIRST_DMD_QWEN,
+        TURBO_FIRST_DMD_SIGMA, TURBO_FIRST_DMD_VELOCITY,
     },
 };
 
@@ -102,6 +113,21 @@ impl AsyncQwen3VlStageSource<BrowserBackend> for BrowserVerifiedQwenSource {
             Self::Legacy(source) => source.load_embedding_rows(spec).await,
             Self::Component(source) => source
                 .load_embedding_rows(spec)
+                .await
+                .map_err(component_qwen_error),
+        }
+    }
+
+    async fn load_host_routed_f16_embedding_f32(
+        &mut self,
+        input_ids: &[Vec<i64>],
+        device: &burn_wgpu::WgpuDevice,
+    ) -> Result<Option<HostRoutedEmbedding<BrowserBackend>>, Self::Error> {
+        match self {
+            // Legacy monoliths intentionally retain their established device-routed contract.
+            Self::Legacy(_) => Ok(None),
+            Self::Component(source) => source
+                .load_host_routed_f16_embedding_f32(input_ids, device)
                 .await
                 .map_err(component_qwen_error),
         }
@@ -220,8 +246,103 @@ impl AsyncBooguVaeStageSource<BrowserBackend> for BrowserVerifiedVaeSource {
     }
 }
 
-type BrowserVerifiedDenoiserSource =
+type BrowserStandardVerifiedDenoiserSource =
     VerifiedAsyncBurnpackDenoiserStageSource<BrowserBackend, BrowserStageShardReader>;
+type BrowserPackedVerifiedDenoiserSource =
+    VerifiedAsyncPackedF16DenoiserStageSource<BrowserStageShardReader>;
+enum BrowserVerifiedDenoiserSource {
+    Standard(BrowserStandardVerifiedDenoiserSource),
+    PackedF16(BrowserPackedVerifiedDenoiserSource),
+}
+
+impl AsyncBooguDenoiserStageSource<BrowserBackend> for BrowserVerifiedDenoiserSource {
+    async fn load_prelude(&mut self) -> Result<BooguDenoiserPrelude<BrowserBackend>, BooguError> {
+        match self {
+            Self::Standard(source) => source.load_prelude().await,
+            Self::PackedF16(source) => source.load_prelude().await,
+        }
+    }
+
+    async fn load_context_refiner(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<BrowserBackend>, BooguError> {
+        match self {
+            Self::Standard(source) => source.load_context_refiner(index).await,
+            Self::PackedF16(source) => source.load_context_refiner(index).await,
+        }
+    }
+
+    async fn load_noise_refiner(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<BrowserBackend>, BooguError> {
+        match self {
+            Self::Standard(source) => source.load_noise_refiner(index).await,
+            Self::PackedF16(source) => source.load_noise_refiner(index).await,
+        }
+    }
+
+    async fn load_reference_refiner(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<BrowserBackend>, BooguError> {
+        match self {
+            Self::Standard(source) => source.load_reference_refiner(index).await,
+            Self::PackedF16(source) => source.load_reference_refiner(index).await,
+        }
+    }
+
+    async fn load_double_stream(
+        &mut self,
+        index: usize,
+    ) -> Result<DoubleStreamBlock<BrowserBackend>, BooguError> {
+        match self {
+            Self::Standard(source) => source.load_double_stream(index).await,
+            Self::PackedF16(source) => source.load_double_stream(index).await,
+        }
+    }
+
+    async fn load_single_stream(
+        &mut self,
+        index: usize,
+    ) -> Result<SingleStreamBlock<BrowserBackend>, BooguError> {
+        match self {
+            Self::Standard(source) => source.load_single_stream(index).await,
+            Self::PackedF16(source) => source.load_single_stream(index).await,
+        }
+    }
+
+    async fn load_tail(&mut self) -> Result<BooguDenoiserTail<BrowserBackend>, BooguError> {
+        match self {
+            Self::Standard(source) => source.load_tail().await,
+            Self::PackedF16(source) => source.load_tail().await,
+        }
+    }
+
+    async fn synchronize(&mut self) -> Result<(), BooguError> {
+        match self {
+            Self::Standard(source) => source.synchronize().await,
+            Self::PackedF16(source) => source.synchronize().await,
+        }
+    }
+}
+
+impl BrowserVerifiedDenoiserSource {
+    fn packed_f16(&self) -> Option<&BrowserPackedVerifiedDenoiserSource> {
+        match self {
+            Self::PackedF16(source) => Some(source),
+            Self::Standard(_) => None,
+        }
+    }
+
+    fn packed_f16_mut(&mut self) -> Option<&mut BrowserPackedVerifiedDenoiserSource> {
+        match self {
+            Self::PackedF16(source) => Some(source),
+            Self::Standard(_) => None,
+        }
+    }
+}
 type BrowserStreamingQwenSource = BrowserAsyncStageSource<BrowserVerifiedQwenSource>;
 type BrowserQwenSource =
     RetainingAsyncQwen3VlStageSource<BrowserBackend, BrowserStreamingQwenSource>;
@@ -246,6 +367,12 @@ const BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT: usize = 48;
 const BROWSER_1K5_AUTHENTICATED_ONLY_TENSOR_COUNT: usize = 17;
 const BROWSER_1K5_NUMERICAL_TENSOR_COUNT: usize = 355;
 const BROWSER_1K5_VAE_REFERENCE_REPEAT_COUNT: usize = 3;
+// Browser parity is deliberately observer-heavy. Keep each asynchronous WebGPU map bounded so a
+// single large semantic activation cannot require a 100+ MiB staging map. This does not alter the
+// tensor values or production inference path; the complete F32 vector is assembled on the host for
+// the authenticated comparison exactly as before.
+const BROWSER_PARITY_MAX_READBACK_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+const BROWSER_PARITY_F32_ELEMENT_BYTES: usize = std::mem::size_of::<f32>();
 // This identifies the schema-v1 flat closure used to calibrate the component envelope. It is
 // provenance only, not a runtime-accepted canonical artifact identity. The schema-v2 modular
 // composition must be requalified before its full-chain result is described as current evidence.
@@ -288,6 +415,18 @@ pub enum BrowserBooguResidencyPolicy {
     /// Eagerly verify and materialize every model stage, then keep dense-F32 WebGPU handles resident.
     #[default]
     HighVramResidentDenseF32,
+    /// Exact-fixture F32 qualification: stream Qwen/VAE per request and retain the denoiser only.
+    QualificationPerRequestF32DenoiserRetained,
+    /// Production-artifact mode with a request-scoped runtime-Q8 denoiser and streamed Qwen/VAE.
+    LowVramRuntimeQ8Denoiser,
+    /// Retired Turbo diagnostic that materialized a dense-F32 clone from runtime Q8.
+    ///
+    /// The released Turbo checkpoint produced non-finite first-step predictions under this
+    /// policy. Construction now fails closed; the variant remains only so older callers receive a
+    /// precise compatibility error rather than silently selecting a different execution policy.
+    LowVramRetainedQ8DenseF32PerStageDenoiser,
+    /// Turbo policy: retain packed-F16 raw weights and widen one semantic stage to F32 at a time.
+    LowVramPreloadedPackedF16Denoiser,
     /// Explicit low-memory diagnostic that reloads one verified semantic stage at a time.
     LayerStreamedDiagnostic,
 }
@@ -297,6 +436,16 @@ impl BrowserBooguResidencyPolicy {
     pub const fn label(self) -> &'static str {
         match self {
             Self::HighVramResidentDenseF32 => "browser-high-vram-resident-dense-f32",
+            Self::QualificationPerRequestF32DenoiserRetained => {
+                "browser-qualification-per-request-f32-denoiser-retained"
+            }
+            Self::LowVramRuntimeQ8Denoiser => "browser-low-vram-runtime-q8-denoiser",
+            Self::LowVramRetainedQ8DenseF32PerStageDenoiser => {
+                "browser-low-vram-retained-q8-dense-f32-per-stage-denoiser"
+            }
+            Self::LowVramPreloadedPackedF16Denoiser => {
+                "browser-low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser"
+            }
             Self::LayerStreamedDiagnostic => "browser-layer-streamed-diagnostic",
         }
     }
@@ -305,9 +454,41 @@ impl BrowserBooguResidencyPolicy {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "resident" | "high-vram-resident-dense-f32" => Some(Self::HighVramResidentDenseF32),
+            "qualification-f32"
+            | "qualification-per-request-f32-denoiser-retained"
+            | "browser-qualification-per-request-f32-denoiser-retained" => {
+                Some(Self::QualificationPerRequestF32DenoiserRetained)
+            }
+            // The generic `low-vram` selector is variant-aware and is resolved by
+            // `default_browser_low_vram_residency`. Keep this variant-free parser
+            // restricted to exact policy names so Turbo can never be silently
+            // routed onto its unqualified direct-Q8 path.
+            "low-vram-runtime-q8-denoiser" => Some(Self::LowVramRuntimeQ8Denoiser),
+            "low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser" => {
+                Some(Self::LowVramPreloadedPackedF16Denoiser)
+            }
             "layer-streamed-diagnostic" => Some(Self::LayerStreamedDiagnostic),
             _ => None,
         }
+    }
+
+    const fn is_low_vram(self) -> bool {
+        matches!(
+            self,
+            Self::LowVramRuntimeQ8Denoiser
+                | Self::LowVramRetainedQ8DenseF32PerStageDenoiser
+                | Self::LowVramPreloadedPackedF16Denoiser
+        )
+    }
+}
+
+pub(crate) const fn default_browser_low_vram_residency(
+    variant: BooguVariant,
+) -> BrowserBooguResidencyPolicy {
+    if matches!(variant, BooguVariant::Image01Turbo) {
+        BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+    } else {
+        BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser
     }
 }
 
@@ -328,12 +509,188 @@ enum BrowserRuntimeEvent {
         activation_reserve_bytes: u64,
         conservative_planned_device_bytes: u64,
     },
+    LowVramResourcePlan {
+        denoiser_quantized_load_policy: &'static str,
+        denoiser_runtime_q8_scope: &'static str,
+        denoiser_quantized_linear_execution_policy: &'static str,
+        audited_retained_q8_denoiser_bytes: u64,
+        expected_q8s_block32_f32_tensor_count: usize,
+        expected_f32_tensor_count: usize,
+        expected_q8s_block32_f32_elements: u64,
+        expected_f32_elements: u64,
+        expected_q8s_block32_f32_payload_bytes: u64,
+        expected_f32_payload_bytes: u64,
+        audited_max_streamed_qwen_stage_f32_bytes: u64,
+        audited_loaded_vae_module_f32_bytes: u64,
+        audited_max_dense_denoiser_stage_f32_bytes: u64,
+        audited_max_phase_local_f32_stage_bytes: u64,
+        runtime_quantization_workspace_bytes: u64,
+        activation_reserve_bytes: u64,
+        conservative_planned_device_bytes: u64,
+        strict_device_cap_bytes: u64,
+    },
+    PackedF16ResourcePlan {
+        qwen_text_layer_allocation_policy: &'static str,
+        qwen_text_block_load_synchronization_policy: &'static str,
+        qwen_text_layer_submission_policy: &'static str,
+        qwen_text_layer_persistent_pool_requires_measured_gpu_gate: bool,
+        authenticated_artifact_bytes: u64,
+        canonical_compact_f16_payload_bytes: u64,
+        retained_packed_f16_denoiser_bytes: u64,
+        inserted_padding_elements: u64,
+        padded_f16_elements: u64,
+        expected_stage_count: usize,
+        expected_object_count: usize,
+        expected_tensor_count: usize,
+        max_packed_stage_bytes: u64,
+        max_materialized_stage_f32_bytes: u64,
+        max_packed_object_bytes: u64,
+        max_materialized_object_f32_bytes: u64,
+        materialized_f32_bytes_per_dmd_step: u64,
+        preload_workspace_bytes: u64,
+        preload_peak_bytes: u64,
+        activation_reserve_bytes: u64,
+        conservative_planned_device_bytes: u64,
+        strict_device_cap_bytes: u64,
+        expected_stage_materializations_per_request: u64,
+        expected_object_unpacks_per_request: u64,
+        expected_packed_read_bytes_per_request: u64,
+        expected_f32_write_bytes_per_request: u64,
+        on_device_quantized_execution_claimed: bool,
+    },
+    PackedF16DenoiserPreload {
+        traffic: BrowserArtifactTrafficReport,
+        cached_stages: usize,
+        cached_objects: usize,
+        cached_tensors: usize,
+        cached_bytes: u64,
+        previous_preload_attempt_count: u64,
+        preload_attempt_count: u64,
+        request_scoped_rehydration: bool,
+        rehydration_policy: &'static str,
+    },
+    PackedF16DenoiserLifecycle {
+        lifecycle: BrowserPackedF16DenoiserLifecycleReport,
+    },
+    PackedF16DmdVaeHandoff {
+        run_id: RunId,
+        report: Box<BrowserPackedF16DmdVaeHandoffReport>,
+    },
+    PackedF16QwenHostEmbedding {
+        run_id: RunId,
+        report: Box<HostRoutedEmbeddingReport>,
+    },
+    PackedF16QwenBlock0ExecutionDiagnostics {
+        run_id: RunId,
+        diagnostics: Box<BrowserPackedF16QwenBlock0ExecutionDiagnostics>,
+    },
+    PackedF16QwenBlock0PostSyncDiagnostic {
+        run_id: RunId,
+        diagnostic: Box<BrowserPackedF16QwenBlock0PostSyncDiagnostic>,
+    },
+    PackedF16QwenPreHandoffDiagnostics {
+        run_id: RunId,
+        diagnostics: Box<BrowserPackedF16QwenPreHandoffDiagnostics>,
+    },
+    PackedF16QwenPostHandoffDiagnostics {
+        run_id: RunId,
+        diagnostics: Box<BrowserPackedF16QwenPostHandoffDiagnostics>,
+    },
+    PackedF16PreDmdInputDiagnostics {
+        run_id: RunId,
+        diagnostics: Box<BrowserPackedF16PreDmdInputDiagnostics>,
+    },
+    ArtifactTraffic {
+        traffic: BrowserArtifactTrafficReport,
+    },
     Ready {
         model: String,
+        block0_execution_mode: &'static str,
+        qwen_text_layer_allocation_policy: &'static str,
+        qwen_text_block_load_synchronization_policy: &'static str,
+        qwen_text_layer_submission_policy: &'static str,
     },
     Failed {
         message: String,
     },
+    SurfaceInferenceSuspended {
+        run_id: RunId,
+        policy: &'static str,
+        primary_window_camera_count: usize,
+        saved_camera_state_count: usize,
+        previously_active_camera_count: usize,
+        inactive_camera_count: usize,
+        active_job_count: usize,
+        suspended_before_runtime_submit: bool,
+        all_primary_window_cameras_inactive: bool,
+    },
+    SurfaceInferenceResumed {
+        run_id: RunId,
+        policy: &'static str,
+        terminal: &'static str,
+        primary_window_camera_count: usize,
+        saved_camera_state_count: usize,
+        restored_camera_state_count: usize,
+        restored_active_camera_count: usize,
+        active_job_count: usize,
+        resumed_after_runtime_terminal: bool,
+        resumed_before_output_ready: bool,
+        exact_saved_states_restored: bool,
+        all_primary_window_cameras_restored: bool,
+    },
+    SurfaceInferenceGateFailed {
+        run_id: RunId,
+        policy: &'static str,
+        phase: &'static str,
+        message: String,
+        exact_saved_states_restored: bool,
+    },
+}
+
+/// Exact per-request logical, Cache Storage, and network artifact traffic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserArtifactTrafficReport {
+    pub object_reads: u64,
+    pub object_read_bytes: u64,
+    pub range_reads: u64,
+    pub range_read_bytes: u64,
+    pub verified_objects: u64,
+    pub cache_lookups: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub cache_read_bytes: u64,
+    pub network_requests: u64,
+    pub network_response_bytes: u64,
+    pub cache_writes: u64,
+    pub cache_write_bytes: u64,
+    pub cache_evictions: u64,
+    pub cache_evicted_entries: u64,
+    pub cache_invalid_entries: u64,
+    pub integrity_refetches: u64,
+}
+
+impl From<BrowserArtifactTrafficSnapshot> for BrowserArtifactTrafficReport {
+    fn from(snapshot: BrowserArtifactTrafficSnapshot) -> Self {
+        Self {
+            object_reads: snapshot.object_reads,
+            object_read_bytes: snapshot.object_read_bytes,
+            range_reads: snapshot.range_fetch_requests,
+            range_read_bytes: snapshot.range_response_bytes,
+            verified_objects: snapshot.verified_objects,
+            cache_lookups: snapshot.cache_lookup_requests,
+            cache_hits: snapshot.cache_hits,
+            cache_misses: snapshot.cache_misses,
+            cache_read_bytes: snapshot.cache_read_bytes,
+            network_requests: snapshot.network_fetch_requests,
+            network_response_bytes: snapshot.network_response_bytes,
+            cache_writes: snapshot.cache_write_requests,
+            cache_write_bytes: snapshot.cache_write_bytes,
+            cache_evictions: snapshot.cache_eviction_requests,
+            cache_evicted_entries: snapshot.cache_evicted_entries,
+            cache_invalid_entries: snapshot.cache_invalid_entries,
+            integrity_refetches: snapshot.integrity_refetches,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,6 +699,1395 @@ struct BrowserResidentResourcePlan {
     conservative_f32_weight_bytes: u64,
     activation_reserve_bytes: u64,
     conservative_planned_device_bytes: u64,
+}
+
+fn browser_low_vram_resource_plan_event(
+    plan: BrowserLowVramResourcePlan,
+    runtime_q8_scope: BooguRuntimeQ8Scope,
+    quantized_linear_execution_policy: BooguQuantizedLinearExecutionPolicy,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::LowVramResourcePlan {
+        denoiser_quantized_load_policy: denoiser_quantized_policy_name(
+            BooguQuantizedLoadPolicy::Preserve,
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            runtime_q8_scope,
+        ),
+        denoiser_runtime_q8_scope: runtime_q8_scope.label(),
+        denoiser_quantized_linear_execution_policy: quantized_linear_execution_policy_name(
+            quantized_linear_execution_policy,
+        ),
+        audited_retained_q8_denoiser_bytes: plan.audited_retained_q8_denoiser_bytes,
+        expected_q8s_block32_f32_tensor_count: plan.expected_q8s_block32_f32_tensor_count,
+        expected_f32_tensor_count: plan.expected_f32_tensor_count,
+        expected_q8s_block32_f32_elements: plan.expected_q8s_block32_f32_elements,
+        expected_f32_elements: plan.expected_f32_elements,
+        expected_q8s_block32_f32_payload_bytes: plan.expected_q8s_block32_f32_payload_bytes,
+        expected_f32_payload_bytes: plan.expected_f32_payload_bytes,
+        audited_max_streamed_qwen_stage_f32_bytes: plan.audited_max_streamed_qwen_stage_f32_bytes,
+        audited_loaded_vae_module_f32_bytes: plan.audited_loaded_vae_module_f32_bytes,
+        audited_max_dense_denoiser_stage_f32_bytes: plan.audited_max_dense_denoiser_stage_f32_bytes,
+        audited_max_phase_local_f32_stage_bytes: plan.audited_max_phase_local_f32_stage_bytes,
+        runtime_quantization_workspace_bytes: plan.runtime_quantization_workspace_bytes,
+        activation_reserve_bytes: plan.activation_reserve_bytes,
+        conservative_planned_device_bytes: plan.conservative_planned_device_bytes,
+        strict_device_cap_bytes: plan.strict_device_cap_bytes,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserLowVramResourcePlan {
+    /// Inventory-derived packed-Q8 plus F32 denoiser parameter bytes.
+    pub audited_retained_q8_denoiser_bytes: u64,
+    /// Expected inventory-qualified Q8S parameter tensor count.
+    pub expected_q8s_block32_f32_tensor_count: usize,
+    /// Expected non-quantized F32 parameter tensor count.
+    pub expected_f32_tensor_count: usize,
+    /// Expected values carried by Q8S parameter tensors.
+    pub expected_q8s_block32_f32_elements: u64,
+    /// Expected values carried by F32 parameter tensors.
+    pub expected_f32_elements: u64,
+    /// Expected packed Q8S values and block-scale bytes.
+    pub expected_q8s_block32_f32_payload_bytes: u64,
+    /// Expected ordinary F32 parameter bytes.
+    pub expected_f32_payload_bytes: u64,
+    /// Largest audited one-stage F32 Qwen payload used by the streaming policy.
+    pub audited_max_streamed_qwen_stage_f32_bytes: u64,
+    /// Full initialized F32 VAE module returned by the current verified source.
+    ///
+    /// The source applies only the selected encoder or decoder half, but currently
+    /// initializes the complete autoencoder before that selection.
+    pub audited_loaded_vae_module_f32_bytes: u64,
+    /// Largest canonical F32 denoiser source stage present during runtime quantization/preload.
+    pub audited_max_dense_denoiser_stage_f32_bytes: u64,
+    /// Maximum F32 stage residency across the mutually exclusive Qwen, DMD, and VAE phases.
+    pub audited_max_phase_local_f32_stage_bytes: u64,
+    /// Conservative source/destination/transient quantizer and materialization workspace reserve.
+    pub runtime_quantization_workspace_bytes: u64,
+    /// Conservative released-shape activation and kernel-workspace reserve.
+    pub activation_reserve_bytes: u64,
+    /// Conservative sum used for fail-closed admission; not a measured peak.
+    pub conservative_planned_device_bytes: u64,
+    /// Exclusive public device-memory ceiling.
+    pub strict_device_cap_bytes: u64,
+}
+
+/// Exact admission envelope for Turbo's retained packed-F16 production execution policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserPackedF16ResourcePlan {
+    /// Streamed Qwen activation allocator used while the packed denoiser cache is resident.
+    pub qwen_text_layer_allocation_policy: &'static str,
+    /// Explicit queue barrier after each text-block load and before its forward submission.
+    pub qwen_text_block_load_synchronization_policy: &'static str,
+    /// Combined upload/forward submission contract with bounded task batches and scoped submits.
+    pub qwen_text_layer_submission_policy: &'static str,
+    /// Persistent-pool residency is not covered by a derived byte bound in this static plan.
+    /// Rendered qualification must therefore enforce the aggregate measured-GPU-memory gate.
+    pub qwen_text_layer_persistent_pool_requires_measured_gpu_gate: bool,
+    /// Exact 106 authenticated Burnpack object bytes, including framing.
+    pub authenticated_artifact_bytes: u64,
+    /// Canonical compact F16 tensor payload transferred and authenticated from the artifact.
+    pub canonical_compact_f16_payload_bytes: u64,
+    /// Deterministically padded F16 payload retained as packed U32 WebGPU buffers.
+    pub retained_packed_f16_denoiser_bytes: u64,
+    /// Logical zero elements inserted so every F32 tensor view starts on 256-byte alignment.
+    pub inserted_padding_elements: u64,
+    /// Canonical plus padding elements retained by the packed object arenas.
+    pub padded_f16_elements: u64,
+    /// Semantic stages authenticated and retained before inference requests begin.
+    pub expected_stage_count: usize,
+    /// Immutable content-addressed objects authenticated and retained before every request.
+    pub expected_object_count: usize,
+    /// Canonical tensors covered by the retained objects.
+    pub expected_tensor_count: usize,
+    /// Largest packed-F16 semantic stage.
+    pub max_packed_stage_bytes: u64,
+    /// Largest one-stage dense-F32 materialization.
+    pub max_materialized_stage_f32_bytes: u64,
+    /// Largest one-object packed arena.
+    pub max_packed_object_bytes: u64,
+    /// Largest one-object F32 arena.
+    pub max_materialized_object_f32_bytes: u64,
+    /// Aggregate padded F32 bytes written while materializing all stages once.
+    pub materialized_f32_bytes_per_dmd_step: u64,
+    /// Conservative two-buffer upload workspace used only during preload.
+    pub preload_workspace_bytes: u64,
+    /// Peak retained packed payload plus preload workspace.
+    pub preload_peak_bytes: u64,
+    /// Four maximum-size activation/kernel buffers reserved during inference.
+    pub activation_reserve_bytes: u64,
+    /// Retained packed payload plus maximum F32 stage and activation reserve.
+    pub conservative_planned_device_bytes: u64,
+    /// Exclusive public device-memory ceiling.
+    pub strict_device_cap_bytes: u64,
+    /// Four DMD steps times all 46 semantic stages.
+    pub expected_stage_materializations_per_request: u64,
+    /// Four DMD steps times all 106 retained objects.
+    pub expected_object_unpacks_per_request: u64,
+    /// Packed-F16 bytes read by widening kernels across four DMD steps.
+    pub expected_packed_read_bytes_per_request: u64,
+    /// Dense-F32 bytes written by widening kernels across four DMD steps.
+    pub expected_f32_write_bytes_per_request: u64,
+    /// Always false: this is storage compression followed by exact dense-F32 execution.
+    pub on_device_quantized_execution_claimed: bool,
+}
+
+/// Exact manifest-derived contract for Turbo's host-routed Qwen embedding objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserPackedF16QwenEmbeddingPlan {
+    pub expected_chunk_count: usize,
+    pub expected_object_count: usize,
+    pub authenticated_object_bytes: u64,
+    pub authenticated_f16_payload_bytes: u64,
+}
+
+/// DMD-scoped proof that Turbo had the complete raw cache through four bounded predictions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserPackedF16DenoiserLifecycleReport {
+    pub cache_state: &'static str,
+    pub cache_ready: bool,
+    pub cached_stages: usize,
+    pub cached_objects: usize,
+    pub cached_tensors: usize,
+    pub cached_bytes: u64,
+    /// Cumulative authenticated artifact bytes across all preloads on this engine.
+    pub authenticated_artifact_bytes: u64,
+    /// Cumulative packed upload bytes across all preloads on this engine.
+    pub packed_upload_bytes: u64,
+    pub stage_materializations: u64,
+    pub object_unpacks: u64,
+    pub packed_read_bytes: u64,
+    pub f32_write_bytes: u64,
+    pub preload_attempt_count: u64,
+    pub failure_count: u64,
+    pub dmd_artifact_traffic: BrowserArtifactTrafficReport,
+    pub synchronization_pending: bool,
+    pub matches_plan: bool,
+}
+
+/// Exact host-readback statistics for one rendered-smoke DMD input tensor.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BrowserPackedF16TensorInputDiagnostic {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub element_count: usize,
+    pub finite_element_count: usize,
+    pub all_finite: bool,
+    pub max_abs: Option<f64>,
+    pub mean: Option<f64>,
+    pub rms: Option<f64>,
+    pub sha256: Sha256Digest,
+}
+
+const BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY: &str = "qwen-per-stage-cleanup-disabled/exact-f32-instruction-host-handoff/async-webgpu-sync/backend-memory-cleanup/async-webgpu-sync/exact-f32-reupload/post-upload-digest-verify/packed-cache-reaudit";
+const BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY: &str = "exact-f32-final-latent-host-handoff/drop-dmd-input-handles/pre-clear-async-webgpu-sync/clear-packed-source-wrapper-rope/async-webgpu-sync/backend-memory-cleanup/async-webgpu-sync/require-empty-packed-cache/exact-f32-reupload/post-upload-digest-verify";
+const BROWSER_PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY: &str =
+    "ensure-preloaded-low-vram-denoiser/verified-persistent-cache-storage/bounded-object-replay";
+const BROWSER_PACKED_F16_PROVENANCE_SUFFIX: &str = "request-scoped-packed-cache-evicted-before-vae";
+const BROWSER_SURFACE_INFERENCE_PROVENANCE_SUFFIX: &str =
+    "request-scoped-surface-acquire-suspended";
+const BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY: &str = "explicit-pre-forward-upload-barrier/explicit-post-forward-barrier/bounded-task-batches/per-submit-error-scopes";
+const BROWSER_DEFAULT_QWEN_TEXT_LAYER_SUBMISSION_POLICY: &str = "backend-default";
+const BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE: &str = "serialized-diagnostic";
+const BROWSER_QWEN_BLOCK0_ORDINARY_MODE: &str = "ordinary";
+const BROWSER_QWEN_BLOCK0_EXECUTION_MODE_QUERY: &str = "qwen-block0-execution-mode";
+const BROWSER_PACKED_F16_QWEN_PRE_HANDOFF_SCOPE: &str =
+    "rendered-model-smoke/ordinary-turbo-packed-f16/qwen-pre-handoff-readback";
+const BROWSER_PACKED_F16_QWEN_BLOCK0_EXECUTION_SCOPE: &str =
+    "rendered-model-smoke/ordinary-turbo-packed-f16/qwen-block-00-serialized-operation-readbacks";
+const BROWSER_PACKED_F16_QWEN_BLOCK0_BOUNDARIES: [Qwen3VlTextLayerDiagnosticBoundary; 9] = [
+    Qwen3VlTextLayerDiagnosticBoundary::LayerInput,
+    Qwen3VlTextLayerDiagnosticBoundary::InputLayerNormGamma,
+    Qwen3VlTextLayerDiagnosticBoundary::IdentityAddCanary,
+    Qwen3VlTextLayerDiagnosticBoundary::InputNorm,
+    Qwen3VlTextLayerDiagnosticBoundary::AttentionOutput,
+    Qwen3VlTextLayerDiagnosticBoundary::FirstResidual,
+    Qwen3VlTextLayerDiagnosticBoundary::PostAttentionNorm,
+    Qwen3VlTextLayerDiagnosticBoundary::MlpOutput,
+    Qwen3VlTextLayerDiagnosticBoundary::FinalResidualOutput,
+];
+const BROWSER_PACKED_F16_QWEN_BLOCK0_POST_SYNC_SCOPE: &str =
+    "rendered-model-smoke/ordinary-turbo-packed-f16/qwen-block-00-immediate-post-sync-readback";
+const BROWSER_PACKED_F16_QWEN_POST_HANDOFF_SCOPE: &str =
+    "rendered-model-smoke/ordinary-turbo-packed-f16/qwen-post-handoff-readback";
+
+/// Rendered-smoke-only localization of every text-path Qwen activation before the bounded host
+/// handoff. Holding these small conditioning activations is diagnostic-only and never occurs in
+/// ordinary inference.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BrowserPackedF16QwenPreHandoffDiagnostics {
+    pub scope: String,
+    pub effective_instruction_length: usize,
+    pub expected_stage_output_count: usize,
+    pub stage_outputs: Vec<BrowserPackedF16TensorInputDiagnostic>,
+    pub stage_names_exact: bool,
+    pub qwen_last_hidden_state_before_trim: BrowserPackedF16TensorInputDiagnostic,
+    pub instruction_after_trim_cast_before_handoff: BrowserPackedF16TensorInputDiagnostic,
+    pub all_tensors_finite: bool,
+    pub no_tensor_all_zero: bool,
+    pub first_non_finite_tensor: Option<String>,
+    pub first_all_zero_tensor: Option<String>,
+    pub final_norm_matches_returned_output: bool,
+    pub block_00_immediate_post_sync: BrowserPackedF16QwenBlock0PostSyncDiagnostic,
+    pub block_00_immediate_matches_delayed_capture: bool,
+}
+
+/// Immediate readback after block 0's real per-stage WebGPU barrier.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BrowserPackedF16QwenBlock0PostSyncDiagnostic {
+    pub scope: String,
+    pub block0_execution_mode: String,
+    pub text_layer_allocation_policy: String,
+    pub text_block_load_synchronization_policy: String,
+    pub qwen_text_layer_submission_policy: String,
+    pub tensor: BrowserPackedF16TensorInputDiagnostic,
+    pub all_finite: bool,
+    pub not_all_zero: bool,
+}
+
+/// One F32 parameter or activation consumed before the next block-0 operation is submitted.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BrowserPackedF16QwenBlock0BoundaryDiagnostic {
+    pub sequence_index: usize,
+    pub boundary: String,
+    pub tensor_kind: String,
+    pub tensor: BrowserPackedF16TensorInputDiagnostic,
+    pub all_finite: bool,
+    pub not_all_zero: bool,
+}
+
+/// Cumulative rendered-smoke block-0 localization report. A failing run dispatches its captured
+/// prefix before returning the layer error; a healthy run dispatches the complete sequence.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BrowserPackedF16QwenBlock0ExecutionDiagnostics {
+    pub scope: String,
+    pub block0_execution_mode: String,
+    pub text_layer_allocation_policy: String,
+    pub text_block_load_synchronization_policy: String,
+    pub qwen_text_layer_submission_policy: String,
+    pub expected_boundary_count: usize,
+    pub captured_boundary_count: usize,
+    pub boundaries: Vec<BrowserPackedF16QwenBlock0BoundaryDiagnostic>,
+    pub boundary_names_exact: bool,
+    pub all_captured_tensors_finite: bool,
+    pub no_captured_tensor_all_zero: bool,
+    pub identity_add_canary_matches_input: Option<bool>,
+    pub complete: bool,
+    pub first_failure_boundary: Option<String>,
+    pub failure_reason: Option<String>,
+}
+
+/// Rendered-smoke proof that the exact host handoff survived allocator cleanup and F32 reupload.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BrowserPackedF16QwenPostHandoffDiagnostics {
+    pub scope: String,
+    pub handoff: BrowserPackedF16QwenInstructionHandoffReport,
+    pub instruction_after_handoff: BrowserPackedF16TensorInputDiagnostic,
+}
+
+/// Per-request production provenance for the bounded exact-F32 Qwen-to-DMD handoff.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserPackedF16QwenInstructionHandoffReport {
+    pub policy: String,
+    pub qwen_release_unused_memory_after_stage: bool,
+    pub qwen_text_layer_allocation_policy: String,
+    pub qwen_text_block_load_synchronization_policy: String,
+    pub qwen_text_layer_submission_policy: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub element_count: usize,
+    pub payload_bytes: u64,
+    pub device_to_host_readback_bytes: u64,
+    pub host_to_device_upload_bytes: u64,
+    pub total_transfer_bytes: u64,
+    pub before_sha256: Sha256Digest,
+    pub after_sha256: Sha256Digest,
+    pub all_finite: bool,
+    pub not_all_zero: bool,
+    pub digest_matches: bool,
+    pub cleanup_completed: bool,
+    pub packed_cache: BrowserPackedF16CacheEvidence,
+}
+
+/// Per-request proof that the final exact-F32 DMD latent crossed a host boundary while every
+/// packed denoiser allocation was evicted before VAE decode.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserPackedF16DmdVaeHandoffReport {
+    pub policy: String,
+    pub next_request_rehydration_policy: String,
+    pub shape: Vec<usize>,
+    pub dtype: String,
+    pub element_count: usize,
+    pub payload_bytes: u64,
+    pub device_to_host_readback_bytes: u64,
+    pub host_to_device_upload_bytes: u64,
+    pub total_transfer_bytes: u64,
+    pub before_sha256: Sha256Digest,
+    pub after_sha256: Sha256Digest,
+    pub all_finite: bool,
+    pub not_all_zero: bool,
+    pub digest_matches: bool,
+    pub wrapper_cached_stages_before_clear: usize,
+    pub wrapper_cached_stages_after_clear: usize,
+    pub synchronization_pending_before_cleanup: bool,
+    pub synchronization_pending_after_cleanup: bool,
+    pub rope_cache_cleared: bool,
+    pub cleanup_completed: bool,
+    pub packed_cache_before_cleanup: BrowserPackedF16CacheEvidence,
+    pub packed_cache_after_cleanup: BrowserPackedF16CacheEvidence,
+    pub preload_attempt_count: u64,
+    pub expected_next_request_preload_attempt_count: u64,
+}
+
+struct BrowserPackedF16QwenPreHandoffContext {
+    effective_instruction_length: usize,
+    expected_stage_output_count: usize,
+    stage_outputs: Vec<BrowserPackedF16TensorInputDiagnostic>,
+    qwen_last_hidden_state_before_trim: BrowserPackedF16TensorInputDiagnostic,
+    block_00_immediate_post_sync: BrowserPackedF16QwenBlock0PostSyncDiagnostic,
+}
+
+/// Allocator and retained-cache provenance immediately after the Qwen-to-DMD phase boundary.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserPackedF16CacheEvidence {
+    pub state: String,
+    pub cache_ready: bool,
+    pub cached_stages: usize,
+    pub cached_objects: usize,
+    pub cached_tensors: usize,
+    pub cached_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserPackedF16PreDmdPolicyEvidence {
+    pub qwen_release_unused_memory_after_stage: bool,
+    pub qwen_text_block_load_synchronization_policy: String,
+    pub qwen_text_layer_submission_policy: String,
+    pub packed_qwen_instruction_handoff_policy: String,
+    pub cleanup_completed: bool,
+    pub post_cleanup_packed_cache: BrowserPackedF16CacheEvidence,
+}
+
+/// Diagnostic-only proof of the exact inputs presented to the first ordinary Turbo DMD step.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct BrowserPackedF16PreDmdInputDiagnostics {
+    pub scope: String,
+    pub policy: BrowserPackedF16PreDmdPolicyEvidence,
+    pub dmd_steps: usize,
+    pub instruction: BrowserPackedF16TensorInputDiagnostic,
+    pub initial_latent: BrowserPackedF16TensorInputDiagnostic,
+    pub renoise: Vec<BrowserPackedF16TensorInputDiagnostic>,
+    pub first_timestep: BrowserPackedF16TensorInputDiagnostic,
+    pub all_inputs_finite: bool,
+}
+
+const fn packed_f16_cache_state_label(state: PackedF16DenoiserCacheState) -> &'static str {
+    match state {
+        PackedF16DenoiserCacheState::Empty => "empty",
+        PackedF16DenoiserCacheState::Preloading => "preloading",
+        PackedF16DenoiserCacheState::Ready => "ready",
+        PackedF16DenoiserCacheState::Failed => "failed",
+    }
+}
+
+fn packed_f16_cache_evidence(audit: PackedF16DenoiserCacheAudit) -> BrowserPackedF16CacheEvidence {
+    BrowserPackedF16CacheEvidence {
+        state: packed_f16_cache_state_label(audit.state).into(),
+        cache_ready: audit.packed_cache_ready,
+        cached_stages: audit.cached_stage_count,
+        cached_objects: audit.cached_object_count,
+        cached_tensors: audit.cached_tensor_count,
+        cached_bytes: audit.retained_packed_bytes,
+    }
+}
+
+fn packed_f16_lifecycle_report(
+    variant: BooguVariant,
+    before_dmd: PackedF16DenoiserCacheAudit,
+    after_dmd: PackedF16DenoiserCacheAudit,
+    dmd_artifact_traffic: BrowserArtifactTrafficReport,
+    synchronization_pending: bool,
+) -> Result<BrowserPackedF16DenoiserLifecycleReport, RuntimeError> {
+    let delta = |name: &str, after: u64, before: u64| {
+        after.checked_sub(before).ok_or_else(|| {
+            execution_error(
+                variant,
+                format!("packed-F16 {name} counter moved backwards"),
+            )
+        })
+    };
+    Ok(BrowserPackedF16DenoiserLifecycleReport {
+        cache_state: packed_f16_cache_state_label(after_dmd.state),
+        cache_ready: after_dmd.packed_cache_ready,
+        cached_stages: after_dmd.cached_stage_count,
+        cached_objects: after_dmd.cached_object_count,
+        cached_tensors: after_dmd.cached_tensor_count,
+        cached_bytes: after_dmd.retained_packed_bytes,
+        authenticated_artifact_bytes: after_dmd.packed_read_bytes,
+        packed_upload_bytes: after_dmd.packed_upload_bytes,
+        stage_materializations: delta(
+            "stage materialization",
+            after_dmd.materialized_stage_count,
+            before_dmd.materialized_stage_count,
+        )?,
+        object_unpacks: delta(
+            "object unpack",
+            after_dmd.object_unpack_count,
+            before_dmd.object_unpack_count,
+        )?,
+        packed_read_bytes: delta(
+            "materialization packed-read byte",
+            after_dmd.materialization_packed_read_bytes,
+            before_dmd.materialization_packed_read_bytes,
+        )?,
+        f32_write_bytes: delta(
+            "F32 write byte",
+            after_dmd.f32_write_bytes,
+            before_dmd.f32_write_bytes,
+        )?,
+        preload_attempt_count: after_dmd.preload_attempt_count,
+        failure_count: after_dmd.failure_count,
+        dmd_artifact_traffic,
+        synchronization_pending,
+        matches_plan: false,
+    })
+}
+
+fn validate_packed_f16_denoiser_lifecycle(
+    variant: BooguVariant,
+    plan: BrowserPackedF16ResourcePlan,
+    completed_dmd_steps: u64,
+    mut observed: BrowserPackedF16DenoiserLifecycleReport,
+) -> Result<BrowserPackedF16DenoiserLifecycleReport, RuntimeError> {
+    let expected_stage_materializations = (plan.expected_stage_count as u64)
+        .checked_mul(completed_dmd_steps)
+        .ok_or_else(|| execution_error(variant, "packed-F16 stage count overflowed"))?;
+    let expected_object_unpacks = (plan.expected_object_count as u64)
+        .checked_mul(completed_dmd_steps)
+        .ok_or_else(|| execution_error(variant, "packed-F16 object count overflowed"))?;
+    let expected_packed_read_bytes = plan
+        .retained_packed_f16_denoiser_bytes
+        .checked_mul(completed_dmd_steps)
+        .ok_or_else(|| execution_error(variant, "packed-F16 read-byte count overflowed"))?;
+    let expected_f32_write_bytes = plan
+        .materialized_f32_bytes_per_dmd_step
+        .checked_mul(completed_dmd_steps)
+        .ok_or_else(|| execution_error(variant, "packed-F16 write-byte count overflowed"))?;
+    let expected_cumulative_artifact_bytes = plan
+        .authenticated_artifact_bytes
+        .checked_mul(observed.preload_attempt_count)
+        .ok_or_else(|| execution_error(variant, "packed-F16 artifact-byte count overflowed"))?;
+    let expected_cumulative_upload_bytes = plan
+        .retained_packed_f16_denoiser_bytes
+        .checked_mul(observed.preload_attempt_count)
+        .ok_or_else(|| execution_error(variant, "packed-F16 upload-byte count overflowed"))?;
+    observed.matches_plan = observed.cache_ready
+        && observed.cache_state == "ready"
+        && observed.cached_stages == plan.expected_stage_count
+        && observed.cached_objects == plan.expected_object_count
+        && observed.cached_tensors == plan.expected_tensor_count
+        && observed.cached_bytes == plan.retained_packed_f16_denoiser_bytes
+        && observed.preload_attempt_count > 0
+        && observed.authenticated_artifact_bytes == expected_cumulative_artifact_bytes
+        && observed.packed_upload_bytes == expected_cumulative_upload_bytes
+        && observed.stage_materializations == expected_stage_materializations
+        && observed.object_unpacks == expected_object_unpacks
+        && observed.packed_read_bytes == expected_packed_read_bytes
+        && observed.f32_write_bytes == expected_f32_write_bytes
+        && observed.dmd_artifact_traffic == BrowserArtifactTrafficReport::default()
+        && !observed.synchronization_pending;
+    if !observed.matches_plan {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser packed-F16 denoiser lifecycle differs from its admitted plan: {observed:?}"
+            ),
+        ));
+    }
+    Ok(observed)
+}
+
+fn validate_packed_f16_dmd_vae_handoff_report(
+    variant: BooguVariant,
+    plan: BrowserPackedF16ResourcePlan,
+    expected_shape: [usize; 4],
+    report: &BrowserPackedF16DmdVaeHandoffReport,
+) -> Result<(), RuntimeError> {
+    let expected_elements = expected_shape
+        .into_iter()
+        .try_fold(1_usize, |total, dimension| total.checked_mul(dimension))
+        .ok_or_else(|| execution_error(variant, "DMD-to-VAE latent element count overflowed"))?;
+    let expected_payload_bytes = u64::try_from(expected_elements)
+        .ok()
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or_else(|| execution_error(variant, "DMD-to-VAE latent byte count overflowed"))?;
+    let expected_device_to_host_bytes = expected_payload_bytes
+        .checked_mul(2)
+        .ok_or_else(|| execution_error(variant, "DMD-to-VAE readback byte count overflowed"))?;
+    let expected_total_transfer_bytes = expected_payload_bytes
+        .checked_mul(3)
+        .ok_or_else(|| execution_error(variant, "DMD-to-VAE transfer byte count overflowed"))?;
+    let before = &report.packed_cache_before_cleanup;
+    let after = &report.packed_cache_after_cleanup;
+    let next_attempt_exact = report.preload_attempt_count.checked_add(1)
+        == Some(report.expected_next_request_preload_attempt_count);
+    let exact = report.policy == BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY
+        && report.next_request_rehydration_policy
+            == BROWSER_PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY
+        && report.shape == expected_shape
+        && report.dtype == "f32"
+        && report.element_count == expected_elements
+        && report.payload_bytes == expected_payload_bytes
+        && report.device_to_host_readback_bytes == expected_device_to_host_bytes
+        && report.host_to_device_upload_bytes == expected_payload_bytes
+        && report.total_transfer_bytes == expected_total_transfer_bytes
+        && report.before_sha256 == report.after_sha256
+        && report.all_finite
+        && report.not_all_zero
+        && report.digest_matches
+        && report.wrapper_cached_stages_before_clear == 0
+        && report.wrapper_cached_stages_after_clear == 0
+        && !report.synchronization_pending_before_cleanup
+        && !report.synchronization_pending_after_cleanup
+        && report.rope_cache_cleared
+        && report.cleanup_completed
+        && before.state == "ready"
+        && before.cache_ready
+        && before.cached_stages == plan.expected_stage_count
+        && before.cached_objects == plan.expected_object_count
+        && before.cached_tensors == plan.expected_tensor_count
+        && before.cached_bytes == plan.retained_packed_f16_denoiser_bytes
+        && after.state == "empty"
+        && !after.cache_ready
+        && after.cached_stages == 0
+        && after.cached_objects == 0
+        && after.cached_tensors == 0
+        && after.cached_bytes == 0
+        && report.preload_attempt_count > 0
+        && next_attempt_exact;
+    if !exact {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser packed-F16 DMD-to-VAE handoff differs from its exact request-scoped eviction contract: {report:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_packed_f16_denoiser_preload(
+    variant: BooguVariant,
+    plan: BrowserPackedF16ResourcePlan,
+    before: PackedF16DenoiserCacheAudit,
+    after: PackedF16DenoiserCacheAudit,
+) -> Result<(), RuntimeError> {
+    let exact = after.state == PackedF16DenoiserCacheState::Ready
+        && after.packed_cache_ready
+        && after.cached_stage_count == plan.expected_stage_count
+        && after.cached_object_count == plan.expected_object_count
+        && after.cached_tensor_count == plan.expected_tensor_count
+        && after.retained_packed_bytes == plan.retained_packed_f16_denoiser_bytes
+        && after
+            .packed_read_bytes
+            .checked_sub(before.packed_read_bytes)
+            == Some(plan.authenticated_artifact_bytes)
+        && after
+            .packed_upload_bytes
+            .checked_sub(before.packed_upload_bytes)
+            == Some(plan.retained_packed_f16_denoiser_bytes)
+        && after.materialization_packed_read_bytes == before.materialization_packed_read_bytes
+        && after.materialized_stage_count == before.materialized_stage_count
+        && after.object_unpack_count == before.object_unpack_count
+        && after.f32_write_bytes == before.f32_write_bytes
+        && after
+            .preload_attempt_count
+            .checked_sub(before.preload_attempt_count)
+            == Some(1)
+        && after.failure_count == before.failure_count;
+    if !exact {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser packed-F16 preload audit differs from its admitted plan: before={before:?}, after={after:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn browser_packed_f16_resource_plan_event(
+    plan: BrowserPackedF16ResourcePlan,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16ResourcePlan {
+        qwen_text_layer_allocation_policy: plan.qwen_text_layer_allocation_policy,
+        qwen_text_block_load_synchronization_policy: plan
+            .qwen_text_block_load_synchronization_policy,
+        qwen_text_layer_submission_policy: plan.qwen_text_layer_submission_policy,
+        qwen_text_layer_persistent_pool_requires_measured_gpu_gate: plan
+            .qwen_text_layer_persistent_pool_requires_measured_gpu_gate,
+        authenticated_artifact_bytes: plan.authenticated_artifact_bytes,
+        canonical_compact_f16_payload_bytes: plan.canonical_compact_f16_payload_bytes,
+        retained_packed_f16_denoiser_bytes: plan.retained_packed_f16_denoiser_bytes,
+        inserted_padding_elements: plan.inserted_padding_elements,
+        padded_f16_elements: plan.padded_f16_elements,
+        expected_stage_count: plan.expected_stage_count,
+        expected_object_count: plan.expected_object_count,
+        expected_tensor_count: plan.expected_tensor_count,
+        max_packed_stage_bytes: plan.max_packed_stage_bytes,
+        max_materialized_stage_f32_bytes: plan.max_materialized_stage_f32_bytes,
+        max_packed_object_bytes: plan.max_packed_object_bytes,
+        max_materialized_object_f32_bytes: plan.max_materialized_object_f32_bytes,
+        materialized_f32_bytes_per_dmd_step: plan.materialized_f32_bytes_per_dmd_step,
+        preload_workspace_bytes: plan.preload_workspace_bytes,
+        preload_peak_bytes: plan.preload_peak_bytes,
+        activation_reserve_bytes: plan.activation_reserve_bytes,
+        conservative_planned_device_bytes: plan.conservative_planned_device_bytes,
+        strict_device_cap_bytes: plan.strict_device_cap_bytes,
+        expected_stage_materializations_per_request: plan
+            .expected_stage_materializations_per_request,
+        expected_object_unpacks_per_request: plan.expected_object_unpacks_per_request,
+        expected_packed_read_bytes_per_request: plan.expected_packed_read_bytes_per_request,
+        expected_f32_write_bytes_per_request: plan.expected_f32_write_bytes_per_request,
+        on_device_quantized_execution_claimed: plan.on_device_quantized_execution_claimed,
+    }
+}
+
+fn browser_packed_f16_denoiser_lifecycle_event(
+    lifecycle: BrowserPackedF16DenoiserLifecycleReport,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16DenoiserLifecycle { lifecycle }
+}
+
+fn browser_packed_f16_dmd_vae_handoff_event(
+    run_id: RunId,
+    report: BrowserPackedF16DmdVaeHandoffReport,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16DmdVaeHandoff {
+        run_id,
+        report: Box::new(report),
+    }
+}
+
+fn browser_packed_f16_pre_dmd_input_diagnostics_event(
+    run_id: RunId,
+    diagnostics: BrowserPackedF16PreDmdInputDiagnostics,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16PreDmdInputDiagnostics {
+        run_id,
+        diagnostics: Box::new(diagnostics),
+    }
+}
+
+fn browser_packed_f16_qwen_pre_handoff_diagnostics_event(
+    run_id: RunId,
+    diagnostics: BrowserPackedF16QwenPreHandoffDiagnostics,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16QwenPreHandoffDiagnostics {
+        run_id,
+        diagnostics: Box::new(diagnostics),
+    }
+}
+
+fn browser_packed_f16_qwen_host_embedding_event(
+    run_id: RunId,
+    report: HostRoutedEmbeddingReport,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16QwenHostEmbedding {
+        run_id,
+        report: Box::new(report),
+    }
+}
+
+fn browser_packed_f16_qwen_block0_post_sync_diagnostic_event(
+    run_id: RunId,
+    diagnostic: BrowserPackedF16QwenBlock0PostSyncDiagnostic,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16QwenBlock0PostSyncDiagnostic {
+        run_id,
+        diagnostic: Box::new(diagnostic),
+    }
+}
+
+fn browser_packed_f16_qwen_block0_execution_diagnostics_event(
+    run_id: RunId,
+    diagnostics: BrowserPackedF16QwenBlock0ExecutionDiagnostics,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16QwenBlock0ExecutionDiagnostics {
+        run_id,
+        diagnostics: Box::new(diagnostics),
+    }
+}
+
+fn browser_packed_f16_qwen_post_handoff_diagnostics_event(
+    run_id: RunId,
+    diagnostics: BrowserPackedF16QwenPostHandoffDiagnostics,
+) -> BrowserRuntimeEvent {
+    BrowserRuntimeEvent::PackedF16QwenPostHandoffDiagnostics {
+        run_id,
+        diagnostics: Box::new(diagnostics),
+    }
+}
+
+/// Lazy snapshot audit proving the retained denoiser modules carry the planned runtime dtypes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserLowVramDenoiserDTypeAudit {
+    /// Total retained parameter tensors inspected.
+    pub tensor_count: usize,
+    /// Tensors carrying exact Q8S block-32/F32 snapshots.
+    pub q8s_block32_f32_tensor_count: usize,
+    /// Tensors carrying ordinary F32 snapshots.
+    pub f32_tensor_count: usize,
+    /// Tensors carrying an unplanned dtype or quantization scheme.
+    pub unexpected_dtype_tensor_count: usize,
+    /// Values carried by Q8S snapshots.
+    pub q8s_block32_f32_elements: u64,
+    /// Values carried by F32 snapshots.
+    pub f32_elements: u64,
+    /// Derived packed Q8S values plus scale bytes.
+    pub q8s_block32_f32_payload_bytes: u64,
+    /// Derived F32 parameter bytes.
+    pub f32_payload_bytes: u64,
+    /// Whether counts, shapes, dtypes, and derived bytes match the release inventory.
+    pub matches_inventory: bool,
+}
+
+fn validate_low_vram_denoiser_dtype_audit(
+    variant: BooguVariant,
+    plan: BrowserLowVramResourcePlan,
+    observed: RetainedDenoiserDTypeAudit,
+) -> Result<BrowserLowVramDenoiserDTypeAudit, RuntimeError> {
+    let q8s_block32_f32_payload_bytes = observed
+        .q8s_block32_f32_elements
+        .checked_add(observed.q8s_block32_f32_elements / 32 * 4)
+        .ok_or_else(|| execution_error(variant, "observed Q8S payload count overflowed"))?;
+    let f32_payload_bytes = observed
+        .f32_elements
+        .checked_mul(4)
+        .ok_or_else(|| execution_error(variant, "observed F32 payload count overflowed"))?;
+    let matches_inventory = observed.unexpected_dtype_tensor_count == 0
+        && observed.tensor_count
+            == plan.expected_q8s_block32_f32_tensor_count + plan.expected_f32_tensor_count
+        && observed.tensor_count
+            == observed.q8s_block32_f32_tensor_count + observed.f32_tensor_count
+        && observed.q8s_block32_f32_tensor_count == plan.expected_q8s_block32_f32_tensor_count
+        && observed.f32_tensor_count == plan.expected_f32_tensor_count
+        && observed.q8s_block32_f32_elements == plan.expected_q8s_block32_f32_elements
+        && observed.f32_elements == plan.expected_f32_elements
+        && q8s_block32_f32_payload_bytes == plan.expected_q8s_block32_f32_payload_bytes
+        && f32_payload_bytes == plan.expected_f32_payload_bytes
+        && q8s_block32_f32_payload_bytes.checked_add(f32_payload_bytes)
+            == Some(plan.audited_retained_q8_denoiser_bytes);
+    let audit = BrowserLowVramDenoiserDTypeAudit {
+        tensor_count: observed.tensor_count,
+        q8s_block32_f32_tensor_count: observed.q8s_block32_f32_tensor_count,
+        f32_tensor_count: observed.f32_tensor_count,
+        unexpected_dtype_tensor_count: observed.unexpected_dtype_tensor_count,
+        q8s_block32_f32_elements: observed.q8s_block32_f32_elements,
+        f32_elements: observed.f32_elements,
+        q8s_block32_f32_payload_bytes,
+        f32_payload_bytes,
+        matches_inventory,
+    };
+    if !matches_inventory {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser low-vram retained denoiser dtype audit differs from inventory: {audit:?}"
+            ),
+        ));
+    }
+    Ok(audit)
+}
+
+fn validate_low_vram_denoiser_lifecycle(
+    variant: BooguVariant,
+    completed_steps: usize,
+    expected_retained_stages: usize,
+    retained_stages_before_clear: usize,
+    synchronization_pending: bool,
+    expected_retained_stages_after_request: usize,
+    retained_stages_after_request: usize,
+) -> Result<(), RuntimeError> {
+    if completed_steps != 4 {
+        return Err(execution_error(
+            variant,
+            format!("browser low-vram denoiser completed {completed_steps}/4 DMD steps"),
+        ));
+    }
+    if synchronization_pending {
+        return Err(execution_error(
+            variant,
+            "browser low-vram denoiser still has pending GPU work before cache clear",
+        ));
+    }
+    if retained_stages_before_clear != expected_retained_stages {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser low-vram denoiser retained {retained_stages_before_clear}/{expected_retained_stages} verified stages"
+            ),
+        ));
+    }
+    if retained_stages_after_request != expected_retained_stages_after_request {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser low-vram denoiser retained {retained_stages_after_request}/{expected_retained_stages_after_request} stages after request finalization"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_low_vram_streamed_stage_lifecycle(
+    variant: BooguVariant,
+    qwen_retained_stages: usize,
+    qwen_synchronization_pending: bool,
+    vae_retained_stages: usize,
+) -> Result<(), RuntimeError> {
+    if qwen_synchronization_pending {
+        return Err(execution_error(
+            variant,
+            "browser low-vram Qwen still has pending GPU work after its streamed forward",
+        ));
+    }
+    if qwen_retained_stages != 0 || vae_retained_stages != 0 {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser low-vram requires streamed Qwen/VAE caches to stay empty; qwen={qwen_retained_stages}, vae={vae_retained_stages}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+// Decimal GB is intentional: accepting below 32,000,000,000 bytes is stricter than accepting
+// below 32 GiB, so the public "under 32 GB" contract is unambiguous.
+const BROWSER_LOW_VRAM_STRICT_DEVICE_CAP_BYTES: u64 = 32_000_000_000;
+const BROWSER_LOW_VRAM_ACTIVATION_BUFFER_RESERVE_COUNT: u64 = 12;
+const BROWSER_LOW_VRAM_RUNTIME_QUANTIZATION_BUFFER_RESERVE_COUNT: u64 = 2;
+const BROWSER_TURBO_MAIN_CORE_FFN_GATE_UP_Q8_ACTIVATION_BUFFER_RESERVE_COUNT: u64 = 3;
+const BROWSER_TURBO_COMPACT_F16_PAYLOAD_BYTES: u64 = 19_869_996_096;
+const BROWSER_TURBO_PACKED_F16_ARTIFACT_BYTES: u64 = 19_870_166_528;
+const BROWSER_TURBO_PACKED_F16_RETAINED_BYTES: u64 = 19_870_010_624;
+const BROWSER_TURBO_PACKED_F16_INSERTED_PADDING_ELEMENTS: u64 = 7_264;
+const BROWSER_TURBO_PACKED_F16_PADDED_ELEMENTS: u64 = 9_935_005_312;
+const BROWSER_TURBO_PACKED_F16_STAGE_COUNT: usize = 46;
+const BROWSER_TURBO_PACKED_F16_OBJECT_COUNT: usize = 106;
+const BROWSER_TURBO_PACKED_F16_TENSOR_COUNT: usize = 912;
+const BROWSER_TURBO_PACKED_F16_MAX_STAGE_BYTES: u64 = 876_827_328;
+const BROWSER_TURBO_PACKED_F16_MAX_F32_STAGE_BYTES: u64 = 1_753_654_656;
+const BROWSER_TURBO_PACKED_F16_MAX_OBJECT_BYTES: u64 = 254_251_904;
+const BROWSER_TURBO_PACKED_F16_MAX_F32_OBJECT_BYTES: u64 = 508_503_808;
+const BROWSER_TURBO_PACKED_F16_F32_BYTES_PER_DMD_STEP: u64 = 39_740_021_248;
+const BROWSER_TURBO_PACKED_F16_PRELOAD_WORKSPACE_BYTES: u64 = 2_434_252_800;
+const BROWSER_TURBO_PACKED_F16_PRELOAD_PEAK_BYTES: u64 = 22_304_263_424;
+const BROWSER_TURBO_PACKED_F16_ACTIVATION_RESERVE_BYTES: u64 = 4_868_505_600;
+const BROWSER_TURBO_PACKED_F16_CONSERVATIVE_DEVICE_BYTES: u64 = 26_492_170_880;
+const BROWSER_TURBO_PACKED_F16_STAGE_MATERIALIZATIONS_PER_REQUEST: u64 = 184;
+const BROWSER_TURBO_PACKED_F16_OBJECT_UNPACKS_PER_REQUEST: u64 = 424;
+const BROWSER_TURBO_PACKED_F16_READ_BYTES_PER_REQUEST: u64 = 79_480_042_496;
+const BROWSER_TURBO_PACKED_F16_WRITE_BYTES_PER_REQUEST: u64 = 158_960_084_992;
+
+fn validate_browser_packed_f16_qwen_embedding_plan(
+    variant: BooguVariant,
+    manifest: &ArtifactManifest,
+    qwen_plan: &Qwen3VlStreamingPlan,
+) -> Result<BrowserPackedF16QwenEmbeddingPlan, RuntimeError> {
+    if variant != BooguVariant::Image01Turbo || qwen_plan.embedding_rows.chunks.len() != 6 {
+        return Err(execution_error(
+            variant,
+            "browser packed-F16 host-routed Qwen embedding requires the six-chunk released Turbo plan",
+        ));
+    }
+    let mut authenticated_object_bytes = 0_u64;
+    let mut authenticated_f16_payload_bytes = 0_u64;
+    let mut expected_object_count = 0_usize;
+    for spec in &qwen_plan.embedding_rows.chunks {
+        let component = format!("qwen-embedding-rows-{:02}", spec.chunk_index);
+        let files = manifest
+            .files
+            .iter()
+            .filter(|file| {
+                file.role == burn_image::ArtifactFileRole::Weights
+                    && file.component.as_ref().map(|value| value.as_str())
+                        == Some(component.as_str())
+            })
+            .collect::<Vec<_>>();
+        if files.len() != 1 {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "browser host-routed Qwen component {component} has {} physical objects, expected exactly one",
+                    files.len()
+                ),
+            ));
+        }
+        authenticated_object_bytes = authenticated_object_bytes
+            .checked_add(files[0].size)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "browser host-routed Qwen object byte count overflowed",
+                )
+            })?;
+        authenticated_f16_payload_bytes = authenticated_f16_payload_bytes
+            .checked_add(u64::try_from(spec.byte_len()).map_err(|_| {
+                execution_error(
+                    variant,
+                    "browser host-routed Qwen F16 payload byte count does not fit u64",
+                )
+            })?)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "browser host-routed Qwen F16 payload byte count overflowed",
+                )
+            })?;
+        expected_object_count = expected_object_count.checked_add(1).ok_or_else(|| {
+            execution_error(variant, "browser host-routed Qwen object count overflowed")
+        })?;
+    }
+    if authenticated_object_bytes <= authenticated_f16_payload_bytes {
+        return Err(execution_error(
+            variant,
+            "browser host-routed Qwen objects do not include authenticated Burnpack framing",
+        ));
+    }
+    Ok(BrowserPackedF16QwenEmbeddingPlan {
+        expected_chunk_count: qwen_plan.embedding_rows.chunks.len(),
+        expected_object_count,
+        authenticated_object_bytes,
+        authenticated_f16_payload_bytes,
+    })
+}
+
+fn validate_browser_packed_f16_qwen_embedding_report(
+    variant: BooguVariant,
+    plan: BrowserPackedF16QwenEmbeddingPlan,
+    report: &HostRoutedEmbeddingReport,
+) -> Result<(), RuntimeError> {
+    let expected_device_transfer_bytes =
+        report
+            .host_f32_payload_bytes
+            .checked_mul(2)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "browser host-routed Qwen device transfer byte count overflowed",
+                )
+            })?;
+    let exact = report.plan_chunk_count == plan.expected_chunk_count
+        && report.authenticated_object_count == plan.expected_object_count
+        && report.authenticated_object_bytes == plan.authenticated_object_bytes
+        && report.authenticated_f16_payload_bytes == plan.authenticated_f16_payload_bytes
+        && report.selected_row_occurrences == report.input_token_count
+        && report.selected_unique_rows == report.unique_token_count
+        && report.selected_f16_bytes.checked_mul(2) == Some(report.host_f32_payload_bytes)
+        && report.host_to_device_upload_bytes == report.host_f32_payload_bytes
+        && report.immediate_device_to_host_readback_bytes == report.host_f32_payload_bytes
+        && report.total_device_transfer_bytes == expected_device_transfer_bytes
+        && report.device_f32_sha256.as_deref() == Some(report.host_f32_sha256.as_str())
+        && report.device_roundtrip_verified_before_text
+        && report.device_roundtrip_digest_matches
+        && report.all_finite
+        && report.not_all_zero
+        && report.coverage_complete;
+    if !exact {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser packed-F16 Qwen host embedding differs from its exact manifest/transfer plan: plan={plan:?}, report={report:?}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_browser_packed_f16_resource_plan(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+) -> Result<BrowserPackedF16ResourcePlan, RuntimeError> {
+    validate_browser_packed_f16_resource_plan_with_cap(
+        variant,
+        profile,
+        BROWSER_LOW_VRAM_STRICT_DEVICE_CAP_BYTES,
+    )
+}
+
+fn validate_browser_packed_f16_resource_plan_with_cap(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+    strict_device_cap_bytes: u64,
+) -> Result<BrowserPackedF16ResourcePlan, RuntimeError> {
+    if variant != BooguVariant::Image01Turbo {
+        return Err(execution_error(
+            variant,
+            "browser packed-F16 denoiser residency is restricted to ordinary Turbo",
+        ));
+    }
+    if profile != BooguStorageProfile::F16QwenVisionF32 {
+        return Err(execution_error(
+            variant,
+            "browser packed-F16 denoiser residency requires profile=production",
+        ));
+    }
+    let exact_arithmetic = BROWSER_TURBO_COMPACT_F16_PAYLOAD_BYTES
+        .checked_add(BROWSER_TURBO_PACKED_F16_INSERTED_PADDING_ELEMENTS * 2)
+        == Some(BROWSER_TURBO_PACKED_F16_RETAINED_BYTES)
+        && BROWSER_TURBO_PACKED_F16_PADDED_ELEMENTS.checked_mul(2)
+            == Some(BROWSER_TURBO_PACKED_F16_RETAINED_BYTES)
+        && BROWSER_TURBO_PACKED_F16_PADDED_ELEMENTS.checked_mul(4)
+            == Some(BROWSER_TURBO_PACKED_F16_F32_BYTES_PER_DMD_STEP)
+        && BROWSER_TURBO_PACKED_F16_RETAINED_BYTES
+            .checked_add(BROWSER_TURBO_PACKED_F16_PRELOAD_WORKSPACE_BYTES)
+            == Some(BROWSER_TURBO_PACKED_F16_PRELOAD_PEAK_BYTES)
+        && BROWSER_TURBO_PACKED_F16_RETAINED_BYTES
+            .checked_add(BROWSER_TURBO_PACKED_F16_MAX_F32_STAGE_BYTES)
+            .and_then(|bytes| bytes.checked_add(BROWSER_TURBO_PACKED_F16_ACTIVATION_RESERVE_BYTES))
+            == Some(BROWSER_TURBO_PACKED_F16_CONSERVATIVE_DEVICE_BYTES)
+        && BROWSER_TURBO_PACKED_F16_RETAINED_BYTES.checked_mul(4)
+            == Some(BROWSER_TURBO_PACKED_F16_READ_BYTES_PER_REQUEST)
+        && BROWSER_TURBO_PACKED_F16_F32_BYTES_PER_DMD_STEP.checked_mul(4)
+            == Some(BROWSER_TURBO_PACKED_F16_WRITE_BYTES_PER_REQUEST);
+    if !exact_arithmetic {
+        return Err(execution_error(
+            variant,
+            "browser packed-F16 aligned resource constants are internally inconsistent",
+        ));
+    }
+    if BROWSER_TURBO_PACKED_F16_MAX_OBJECT_BYTES
+        > crate::boogu::BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES
+        || BROWSER_TURBO_PACKED_F16_MAX_F32_OBJECT_BYTES
+            > crate::boogu::BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES
+    {
+        return Err(execution_error(
+            variant,
+            "browser packed-F16 object arena exceeds the admitted per-buffer limit",
+        ));
+    }
+    if BROWSER_TURBO_PACKED_F16_PRELOAD_PEAK_BYTES >= strict_device_cap_bytes
+        || BROWSER_TURBO_PACKED_F16_CONSERVATIVE_DEVICE_BYTES >= strict_device_cap_bytes
+    {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser packed-F16 plan requires preload={} and inference={} bytes, which are not both strictly below the {strict_device_cap_bytes}-byte cap",
+                BROWSER_TURBO_PACKED_F16_PRELOAD_PEAK_BYTES,
+                BROWSER_TURBO_PACKED_F16_CONSERVATIVE_DEVICE_BYTES,
+            ),
+        ));
+    }
+    let plan = BrowserPackedF16ResourcePlan {
+        qwen_text_layer_allocation_policy: Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent
+            .label(),
+        qwen_text_block_load_synchronization_policy:
+            Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward.label(),
+        qwen_text_layer_submission_policy: BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
+        // CubeCL does not expose a bound for this exact-size persistent pool here. Keep the
+        // static estimate explicitly conservative/unmeasured and require the rendered aggregate
+        // GPU-memory gate to prove the public cap.
+        qwen_text_layer_persistent_pool_requires_measured_gpu_gate: true,
+        authenticated_artifact_bytes: BROWSER_TURBO_PACKED_F16_ARTIFACT_BYTES,
+        canonical_compact_f16_payload_bytes: BROWSER_TURBO_COMPACT_F16_PAYLOAD_BYTES,
+        retained_packed_f16_denoiser_bytes: BROWSER_TURBO_PACKED_F16_RETAINED_BYTES,
+        inserted_padding_elements: BROWSER_TURBO_PACKED_F16_INSERTED_PADDING_ELEMENTS,
+        padded_f16_elements: BROWSER_TURBO_PACKED_F16_PADDED_ELEMENTS,
+        expected_stage_count: BROWSER_TURBO_PACKED_F16_STAGE_COUNT,
+        expected_object_count: BROWSER_TURBO_PACKED_F16_OBJECT_COUNT,
+        expected_tensor_count: BROWSER_TURBO_PACKED_F16_TENSOR_COUNT,
+        max_packed_stage_bytes: BROWSER_TURBO_PACKED_F16_MAX_STAGE_BYTES,
+        max_materialized_stage_f32_bytes: BROWSER_TURBO_PACKED_F16_MAX_F32_STAGE_BYTES,
+        max_packed_object_bytes: BROWSER_TURBO_PACKED_F16_MAX_OBJECT_BYTES,
+        max_materialized_object_f32_bytes: BROWSER_TURBO_PACKED_F16_MAX_F32_OBJECT_BYTES,
+        materialized_f32_bytes_per_dmd_step: BROWSER_TURBO_PACKED_F16_F32_BYTES_PER_DMD_STEP,
+        preload_workspace_bytes: BROWSER_TURBO_PACKED_F16_PRELOAD_WORKSPACE_BYTES,
+        preload_peak_bytes: BROWSER_TURBO_PACKED_F16_PRELOAD_PEAK_BYTES,
+        activation_reserve_bytes: BROWSER_TURBO_PACKED_F16_ACTIVATION_RESERVE_BYTES,
+        conservative_planned_device_bytes: BROWSER_TURBO_PACKED_F16_CONSERVATIVE_DEVICE_BYTES,
+        strict_device_cap_bytes,
+        expected_stage_materializations_per_request:
+            BROWSER_TURBO_PACKED_F16_STAGE_MATERIALIZATIONS_PER_REQUEST,
+        expected_object_unpacks_per_request: BROWSER_TURBO_PACKED_F16_OBJECT_UNPACKS_PER_REQUEST,
+        expected_packed_read_bytes_per_request: BROWSER_TURBO_PACKED_F16_READ_BYTES_PER_REQUEST,
+        expected_f32_write_bytes_per_request: BROWSER_TURBO_PACKED_F16_WRITE_BYTES_PER_REQUEST,
+        on_device_quantized_execution_claimed: false,
+    };
+    set_browser_factory_progress(format!(
+        "Model setup: packed-F16 Turbo GPU plan accepted at {:.1} GiB (conservative, not measured)",
+        plan.conservative_planned_device_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    ));
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &browser_packed_f16_resource_plan_event(plan),
+    );
+    Ok(plan)
+}
+
+fn max_streamed_qwen_stage_f32_bytes(
+    variant: BooguVariant,
+    qwen_plan: &Qwen3VlStreamingPlan,
+) -> Result<u64, RuntimeError> {
+    let bytes = qwen_plan
+        .stages
+        .iter()
+        .filter(|descriptor| !matches!(descriptor.stage, Qwen3VlStage::LmHeadRows { .. }))
+        .map(|descriptor| {
+            descriptor.byte_len(size_of::<f32>()).ok_or_else(|| {
+                execution_error(
+                    variant,
+                    format!(
+                        "browser low-vram F32 byte count overflowed for Qwen stage {:?}",
+                        descriptor.stage
+                    ),
+                )
+            })
+        })
+        .try_fold(0_usize, |maximum, bytes| {
+            bytes.map(|bytes| maximum.max(bytes))
+        })?;
+    if bytes == 0 {
+        return Err(execution_error(
+            variant,
+            "browser low-vram Qwen semantic-stage plan is empty",
+        ));
+    }
+    u64::try_from(bytes).map_err(|_| {
+        execution_error(
+            variant,
+            "browser low-vram Qwen semantic-stage byte count does not fit u64",
+        )
+    })
+}
+
+fn validate_browser_low_vram_resource_plan(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+    qwen_plan: &Qwen3VlStreamingPlan,
+    inventory: &BooguArtifactInventory,
+    denoiser_runtime_q8_scope: BooguRuntimeQ8Scope,
+    quantized_linear_execution_policy: BooguQuantizedLinearExecutionPolicy,
+) -> Result<BrowserLowVramResourcePlan, RuntimeError> {
+    validate_browser_low_vram_resource_plan_with_cap(
+        variant,
+        profile,
+        qwen_plan,
+        inventory,
+        denoiser_runtime_q8_scope,
+        quantized_linear_execution_policy,
+        BROWSER_LOW_VRAM_STRICT_DEVICE_CAP_BYTES,
+    )
+}
+
+fn validate_browser_low_vram_resource_plan_with_cap(
+    variant: BooguVariant,
+    profile: BooguStorageProfile,
+    qwen_plan: &Qwen3VlStreamingPlan,
+    inventory: &BooguArtifactInventory,
+    denoiser_runtime_q8_scope: BooguRuntimeQ8Scope,
+    quantized_linear_execution_policy: BooguQuantizedLinearExecutionPolicy,
+    strict_device_cap_bytes: u64,
+) -> Result<BrowserLowVramResourcePlan, RuntimeError> {
+    let turbo_main_core_ffn_gate_up_q8 = variant == BooguVariant::Image01Turbo
+        && denoiser_runtime_q8_scope == BooguRuntimeQ8Scope::TurboMainCoreFfnGateUpQ8;
+    let preload_denoiser_before_request = turbo_main_core_ffn_gate_up_q8;
+    if profile != BooguStorageProfile::F16QwenVisionF32 {
+        return Err(execution_error(
+            variant,
+            "browser low-vram mode requires the unchanged canonical profile=production artifacts",
+        ));
+    }
+    if quantized_linear_execution_policy
+        == BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
+        && variant != BooguVariant::Image01Turbo
+    {
+        return Err(execution_error(
+            variant,
+            "bounded dense-F32 retained-Q8 execution is restricted to Turbo",
+        ));
+    }
+    let footprint = inventory
+        .denoiser_runtime_q8s_block32_f32_footprint_with_scope(variant, denoiser_runtime_q8_scope)
+        .map_err(|error| execution_error(variant, error))?;
+    let audited_retained_q8_denoiser_bytes = footprint.total_payload_bytes;
+    // The exact verified Qwen source plan is itself derived from the validated model inventory.
+    // Count every semantic module at the browser execution dtype, including the row-sliced
+    // embedding chunks, instead of relying on a hand-maintained stage-size constant.
+    let audited_max_streamed_qwen_stage_f32_bytes =
+        max_streamed_qwen_stage_f32_bytes(variant, qwen_plan)?;
+    let audited_loaded_vae_module_f32_bytes =
+        inventory_stage_f32_payloads(variant, inventory, TensorOwner::FluxVae)?
+            .into_values()
+            .try_fold(0_u64, |total, bytes| total.checked_add(bytes))
+            .ok_or_else(|| {
+                execution_error(variant, "browser loaded VAE module byte count overflowed")
+            })?;
+    let audited_max_dense_denoiser_stage_f32_bytes = if preload_denoiser_before_request
+        || quantized_linear_execution_policy
+            == BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
+    {
+        max_inventory_stage_f32_bytes(variant, inventory, TensorOwner::BooguDenoiser)?
+    } else {
+        0
+    };
+    let audited_max_phase_local_f32_stage_bytes = audited_max_streamed_qwen_stage_f32_bytes
+        .max(audited_loaded_vae_module_f32_bytes)
+        .max(audited_max_dense_denoiser_stage_f32_bytes);
+    // Two maximum-size buffers cover the verified F16 source stage, packed Q8 destination, and
+    // transient loader/quantizer workspace. Edit policies retain the historical twelve-buffer
+    // activation reserve. The retired Turbo main-core gate/up-Q8 candidate keeps its historical
+    // three-buffer envelope only so its rejected resource evidence remains reproducible.
+    let runtime_quantization_workspace_bytes =
+        crate::boogu::BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES
+            .checked_mul(BROWSER_LOW_VRAM_RUNTIME_QUANTIZATION_BUFFER_RESERVE_COUNT)
+            .ok_or_else(|| execution_error(variant, "low-vram quantization plan overflowed"))?;
+    let activation_reserve_bytes = if turbo_main_core_ffn_gate_up_q8 {
+        crate::boogu::BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES
+            .checked_mul(BROWSER_TURBO_MAIN_CORE_FFN_GATE_UP_Q8_ACTIVATION_BUFFER_RESERVE_COUNT)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "Turbo main-core gate/up-Q8 activation plan overflowed",
+                )
+            })?
+    } else {
+        crate::boogu::BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES
+            .checked_mul(BROWSER_LOW_VRAM_ACTIVATION_BUFFER_RESERVE_COUNT)
+            .ok_or_else(|| execution_error(variant, "low-vram activation plan overflowed"))?
+    };
+    let conservative_planned_device_bytes = if preload_denoiser_before_request {
+        // Preload and synchronize every denoiser stage before allocating the DMD workset. This
+        // makes quantization workspace and request activations mutually exclusive phases.
+        let preload_peak = audited_retained_q8_denoiser_bytes
+            .checked_add(audited_max_dense_denoiser_stage_f32_bytes)
+            .and_then(|bytes| bytes.checked_add(runtime_quantization_workspace_bytes));
+        // The retained denoiser remains live while Qwen and VAE stream one F32 module at a time.
+        // Charge that larger non-denoiser module alongside the released-shape activation reserve.
+        let inference_streamed_module_bytes =
+            audited_max_streamed_qwen_stage_f32_bytes.max(audited_loaded_vae_module_f32_bytes);
+        let inference_peak = audited_retained_q8_denoiser_bytes
+            .checked_add(inference_streamed_module_bytes)
+            .and_then(|bytes| bytes.checked_add(activation_reserve_bytes));
+        preload_peak
+            .zip(inference_peak)
+            .map(|(preload, inference)| preload.max(inference))
+            .ok_or_else(|| execution_error(variant, "low-vram device-byte plan overflowed"))?
+    } else {
+        audited_retained_q8_denoiser_bytes
+            .checked_add(audited_max_phase_local_f32_stage_bytes)
+            .and_then(|bytes| bytes.checked_add(runtime_quantization_workspace_bytes))
+            .and_then(|bytes| bytes.checked_add(activation_reserve_bytes))
+            .ok_or_else(|| execution_error(variant, "low-vram device-byte plan overflowed"))?
+    };
+    if conservative_planned_device_bytes >= strict_device_cap_bytes {
+        return Err(execution_error(
+            variant,
+            format!(
+                "browser low-vram plan requires {conservative_planned_device_bytes} bytes, which is not strictly below the {}-byte cap",
+                strict_device_cap_bytes
+            ),
+        ));
+    }
+    let plan = BrowserLowVramResourcePlan {
+        audited_retained_q8_denoiser_bytes,
+        expected_q8s_block32_f32_tensor_count: footprint.quantized_tensor_count,
+        expected_f32_tensor_count: footprint.f32_tensor_count,
+        expected_q8s_block32_f32_elements: footprint.quantized_elements,
+        expected_f32_elements: footprint.f32_elements,
+        expected_q8s_block32_f32_payload_bytes: footprint.quantized_payload_bytes,
+        expected_f32_payload_bytes: footprint.f32_payload_bytes,
+        audited_max_streamed_qwen_stage_f32_bytes,
+        audited_loaded_vae_module_f32_bytes,
+        audited_max_dense_denoiser_stage_f32_bytes,
+        audited_max_phase_local_f32_stage_bytes,
+        runtime_quantization_workspace_bytes,
+        activation_reserve_bytes,
+        conservative_planned_device_bytes,
+        strict_device_cap_bytes,
+    };
+    set_browser_factory_progress(format!(
+        "Model setup: low-VRAM GPU plan accepted at {:.1} GiB (conservative, not measured)",
+        plan.conservative_planned_device_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    ));
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &browser_low_vram_resource_plan_event(
+            plan,
+            denoiser_runtime_q8_scope,
+            quantized_linear_execution_policy,
+        ),
+    );
+    Ok(plan)
+}
+
+fn inventory_stage_f32_payloads(
+    variant: BooguVariant,
+    inventory: &BooguArtifactInventory,
+    owner: TensorOwner,
+) -> Result<BTreeMap<String, u64>, RuntimeError> {
+    let mut stages = BTreeMap::<String, u64>::new();
+    for spec in inventory
+        .tensors()
+        .iter()
+        .filter(|spec| spec.owner == owner)
+    {
+        if owner == TensorOwner::BooguDenoiser
+            && !variant.is_edit()
+            && spec.stage.starts_with("boogu-reference-refiner-")
+        {
+            continue;
+        }
+        let elements = spec
+            .target_shape
+            .iter()
+            .try_fold(1_u64, |total, &dimension| {
+                total.checked_mul(dimension as u64)
+            })
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    format!("F32 element count overflowed for {}", spec.target_name),
+                )
+            })?;
+        let bytes = elements
+            .checked_mul(size_of::<f32>() as u64)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    format!("F32 byte count overflowed for {}", spec.target_name),
+                )
+            })?;
+        let stage = stages.entry(spec.stage.clone()).or_default();
+        *stage = stage.checked_add(bytes).ok_or_else(|| {
+            execution_error(
+                variant,
+                format!(
+                    "F32 semantic-stage byte count overflowed for {}",
+                    spec.stage
+                ),
+            )
+        })?;
+    }
+    if stages.is_empty() {
+        return Err(execution_error(
+            variant,
+            format!("browser F32 inventory has no {owner:?} semantic stages"),
+        ));
+    }
+    Ok(stages)
+}
+
+fn max_inventory_stage_f32_bytes(
+    variant: BooguVariant,
+    inventory: &BooguArtifactInventory,
+    owner: TensorOwner,
+) -> Result<u64, RuntimeError> {
+    inventory_stage_f32_payloads(variant, inventory, owner)?
+        .into_values()
+        .max()
+        .ok_or_else(|| execution_error(variant, "browser F32 stage plan is empty"))
 }
 
 const BROWSER_RESIDENT_MAX_SIMULTANEOUS_ACTIVATION_BUFFERS: u64 = 8;
@@ -370,8 +2116,8 @@ fn validate_browser_resident_resource_plan(
     }
     // The production bundle mixes F16 and F32 storage. Doubling the complete physical Burnpack
     // weight payload is a conservative bound for dense-F32 materialization, including headers and
-    // alignment. The ordinary browser surface supports 256 square, whose largest qualified applied
-    // buffer is bounded below; eight simultaneous buffers conservatively cover the fused workset.
+    // alignment. Activation residency is reported separately from the shape-aware single-buffer
+    // gate; eight simultaneous maximum model buffers remain a conservative fused-workset reserve.
     let conservative_f32_weight_bytes = stored_weight_bytes.checked_mul(2).ok_or_else(|| {
         execution_error(variant, "resident browser F32 weight-byte plan overflowed")
     })?;
@@ -460,11 +2206,20 @@ fn report_browser_manifest_verified(manifest: &ArtifactManifest) {
     );
 }
 
-fn report_browser_runtime_ready(variant: BooguVariant) {
+fn report_browser_runtime_ready(
+    variant: BooguVariant,
+    qwen_text_layer_allocation_policy: &'static str,
+    qwen_text_block_load_synchronization_policy: &'static str,
+    qwen_text_layer_submission_policy: &'static str,
+) {
     dispatch_browser_event(
         BROWSER_RUNTIME_EVENT_NAME,
         &BrowserRuntimeEvent::Ready {
             model: boogu_model_descriptor(variant).id.to_string(),
+            block0_execution_mode: browser_qwen_block0_execution_mode(),
+            qwen_text_layer_allocation_policy,
+            qwen_text_block_load_synchronization_policy,
+            qwen_text_layer_submission_policy,
         },
     );
 }
@@ -474,6 +2229,79 @@ pub(crate) fn report_browser_runtime_failure(message: impl Into<String>) {
         BROWSER_RUNTIME_EVENT_NAME,
         &BrowserRuntimeEvent::Failed {
             message: message.into(),
+        },
+    );
+}
+
+pub(crate) fn report_browser_surface_inference_suspended(
+    run_id: u64,
+    primary_window_camera_count: usize,
+    saved_camera_state_count: usize,
+    previously_active_camera_count: usize,
+    inactive_camera_count: usize,
+    active_job_count: usize,
+) {
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::SurfaceInferenceSuspended {
+            run_id: RunId(run_id),
+            policy: crate::boogu::BROWSER_SURFACE_INFERENCE_POLICY,
+            primary_window_camera_count,
+            saved_camera_state_count,
+            previously_active_camera_count,
+            inactive_camera_count,
+            active_job_count,
+            suspended_before_runtime_submit: true,
+            all_primary_window_cameras_inactive: true,
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn report_browser_surface_inference_resumed(
+    run_id: u64,
+    terminal: &'static str,
+    primary_window_camera_count: usize,
+    saved_camera_state_count: usize,
+    restored_camera_state_count: usize,
+    restored_active_camera_count: usize,
+    active_job_count: usize,
+    exact_saved_states_restored: bool,
+    all_primary_window_cameras_restored: bool,
+) {
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::SurfaceInferenceResumed {
+            run_id: RunId(run_id),
+            policy: crate::boogu::BROWSER_SURFACE_INFERENCE_POLICY,
+            terminal,
+            primary_window_camera_count,
+            saved_camera_state_count,
+            restored_camera_state_count,
+            restored_active_camera_count,
+            active_job_count,
+            resumed_after_runtime_terminal: true,
+            resumed_before_output_ready: true,
+            exact_saved_states_restored,
+            all_primary_window_cameras_restored,
+        },
+    );
+}
+
+pub(crate) fn report_browser_surface_inference_gate_failure(
+    run_id: u64,
+    phase: &'static str,
+    message: &str,
+    exact_saved_states_restored: bool,
+) {
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::SurfaceInferenceGateFailed {
+            run_id: RunId(run_id),
+            policy: crate::boogu::BROWSER_SURFACE_INFERENCE_POLICY,
+            phase,
+            message: message.into(),
+            exact_saved_states_restored,
         },
     );
 }
@@ -533,6 +2361,13 @@ struct BrowserBuildInputs {
     base_url: burn_image::RemoteBaseUrl,
     settings: crate::BooguAdapterSettings,
     device: burn_wgpu::WgpuDevice,
+    applied_buffer_limits: BrowserAppliedBufferLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BrowserAppliedBufferLimits {
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
 }
 
 #[derive(Clone, Default)]
@@ -794,6 +2629,13 @@ impl BrowserParityControl {
             .expect("browser parity metric queue poisoned")
             .clone()
     }
+
+    fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("browser parity pending tensor queue poisoned")
+            .len()
+    }
 }
 
 async fn compare_browser_tensor<const D: usize>(
@@ -803,24 +2645,103 @@ async fn compare_browser_tensor<const D: usize>(
     oracle: String,
     tensor: Tensor<BrowserBackend, D>,
 ) -> Result<BrowserParityTensorMetric, BooguError> {
+    let elements = tensor.dims().iter().copied().product::<usize>();
+    browser_parity_readback_milestone("start", &name, elements, 0, 0);
     let (shape, actual_dtype, actual) = read_browser_tensor_f32(tensor).await?;
-    let actual = actual
-        .as_slice::<f32>()
-        .map_err(|error| BooguError::Artifact(error.to_string()))?;
-    compare_browser_f32_values(fixture, ledger, name, oracle, &shape, &actual_dtype, actual).await
+    browser_parity_readback_milestone("complete", &name, elements, 0, 0);
+    compare_browser_f32_values(
+        fixture,
+        ledger,
+        name,
+        oracle,
+        &shape,
+        &actual_dtype,
+        &actual,
+    )
+    .await
 }
 
 async fn read_browser_tensor_f32<const D: usize>(
     tensor: Tensor<BrowserBackend, D>,
-) -> Result<(Vec<usize>, String, TensorData), BooguError> {
+) -> Result<(Vec<usize>, String, Vec<f32>), BooguError> {
     let shape = tensor.dims().to_vec();
     let actual_dtype = tensor.dtype().name().to_owned();
-    let data = tensor
-        .into_data_async()
-        .await
-        .map_err(|error| BooguError::Artifact(format!("WebGPU parity readback failed: {error}")))?
-        .convert_dtype(DType::F32);
-    Ok((shape, actual_dtype, data))
+    let elements = shape.iter().try_fold(1_usize, |total, dimension| {
+        total.checked_mul(*dimension).ok_or_else(|| {
+            BooguError::Artifact("WebGPU parity readback element count overflowed".into())
+        })
+    })?;
+    let ranges = browser_parity_readback_ranges(elements);
+    if ranges.len() == 1 {
+        let data = tensor
+            .into_data_async()
+            .await
+            .map_err(|error| {
+                BooguError::Artifact(format!("WebGPU parity readback failed: {error}"))
+            })?
+            .convert_dtype(DType::F32);
+        let values = data
+            .as_slice::<f32>()
+            .map_err(|error| BooguError::Artifact(error.to_string()))?
+            .to_vec();
+        return Ok((shape, actual_dtype, values));
+    }
+
+    let flattened: Tensor<BrowserBackend, 1> = tensor.flatten(0, D.saturating_sub(1));
+    let mut values = Vec::with_capacity(elements);
+    let chunk_count = ranges.len();
+    for (chunk_index, (start, end)) in ranges.into_iter().enumerate() {
+        browser_parity_readback_milestone(
+            "chunk-start",
+            "bounded-map",
+            elements,
+            chunk_index,
+            chunk_count,
+        );
+        let data = flattened
+            .clone()
+            .slice(start..end)
+            .into_data_async()
+            .await
+            .map_err(|error| {
+                BooguError::Artifact(format!(
+                    "WebGPU parity readback chunk {}/{chunk_count} failed: {error}",
+                    chunk_index + 1
+                ))
+            })?
+            .convert_dtype(DType::F32);
+        values.extend_from_slice(
+            data.as_slice::<f32>()
+                .map_err(|error| BooguError::Artifact(error.to_string()))?,
+        );
+        browser_parity_readback_milestone(
+            "chunk-complete",
+            "bounded-map",
+            elements,
+            chunk_index,
+            chunk_count,
+        );
+    }
+    if values.len() != elements {
+        return Err(BooguError::Artifact(format!(
+            "WebGPU parity bounded readback produced {} F32 values, expected {elements}",
+            values.len()
+        )));
+    }
+    Ok((shape, actual_dtype, values))
+}
+
+fn browser_parity_readback_ranges(elements: usize) -> Vec<(usize, usize)> {
+    let chunk_elements =
+        (BROWSER_PARITY_MAX_READBACK_CHUNK_BYTES / BROWSER_PARITY_F32_ELEMENT_BYTES).max(1);
+    let mut ranges = Vec::with_capacity(elements.div_ceil(chunk_elements));
+    let mut start = 0;
+    while start < elements {
+        let end = start.saturating_add(chunk_elements).min(elements);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -854,6 +2775,33 @@ async fn compare_browser_f32_values(
     })
 }
 
+async fn compare_turbo_first_dmd_tensor<const D: usize>(
+    fixture: &BrowserTurboFirstDmdFixture,
+    name: String,
+    oracle: &str,
+    tensor: Tensor<BrowserBackend, D>,
+) -> Result<BrowserParityTensorMetric, BooguError> {
+    let (shape, actual_dtype, actual) = read_browser_tensor_f32(tensor).await?;
+    let (expected_shape, expected) = fixture
+        .f32(oracle)
+        .await
+        .map_err(|error| BooguError::Artifact(error.to_string()))?;
+    if shape != expected_shape {
+        return Err(BooguError::InvalidShape(format!(
+            "Turbo first-DMD oracle {oracle} has shape {expected_shape:?}, WebGPU produced {shape:?}"
+        )));
+    }
+    let comparison = compare_float(&actual, &expected)
+        .map_err(|error| BooguError::Artifact(error.to_string()))?;
+    Ok(BrowserParityTensorMetric {
+        name,
+        oracle: oracle.into(),
+        shape,
+        actual_dtype,
+        comparison,
+    })
+}
+
 /// Replaces only the verified source's blocking backend barrier; all loads still delegate to the
 /// same digest-verifying bounded source.
 struct BrowserAsyncStageSource<S> {
@@ -883,6 +2831,14 @@ impl<S> BrowserAsyncStageSource<S> {
         self.denoiser_query_chunk_size = Some(query_chunk_size);
     }
 
+    fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
     async fn synchronize_with_parity(&self, stage: &str) -> Result<(), BooguError> {
         self.synchronizer.synchronize(stage).await?;
         if let Some(parity) = &self.parity {
@@ -903,6 +2859,16 @@ where
         spec: &RowChunkSpec,
     ) -> Result<EmbeddingRowChunk<BrowserBackend>, Self::Error> {
         self.inner.load_embedding_rows(spec).await
+    }
+
+    async fn load_host_routed_f16_embedding_f32(
+        &mut self,
+        input_ids: &[Vec<i64>],
+        device: &burn_wgpu::WgpuDevice,
+    ) -> Result<Option<HostRoutedEmbedding<BrowserBackend>>, Self::Error> {
+        self.inner
+            .load_host_routed_f16_embedding_f32(input_ids, device)
+            .await
     }
 
     async fn load_vision_prelude(
@@ -962,8 +2928,212 @@ where
 /// Marks the exact point after a Qwen stage forward has been queued and before its source barrier.
 /// Together with the source wrapper milestones this distinguishes load/apply, forward submission,
 /// and asynchronous WebGPU synchronization without forcing a readback.
+struct PendingBrowserQwenInstructionDiagnostic {
+    name: String,
+    tensor: Tensor<BrowserBackend, 3>,
+}
+
+/// Rendered-smoke-only retention of the compact text conditioning activations. Packed production
+/// inference leaves this control absent, so its ordinary path never retains or reads stage output.
+#[derive(Clone, Default)]
+struct BrowserQwenInstructionDiagnosticControl {
+    pending: Arc<Mutex<Vec<PendingBrowserQwenInstructionDiagnostic>>>,
+    immediate_post_sync_block0: Arc<Mutex<Option<BrowserPackedF16QwenBlock0PostSyncDiagnostic>>>,
+    block0_boundaries: Arc<Mutex<Vec<BrowserPackedF16QwenBlock0BoundaryDiagnostic>>>,
+}
+
+struct BrowserQwenBlock0BoundaryRecordOutcome {
+    report: Option<BrowserPackedF16QwenBlock0ExecutionDiagnostics>,
+    failure_message: Option<String>,
+}
+
+impl BrowserQwenInstructionDiagnosticControl {
+    fn capture(&self, name: String, tensor: Tensor<BrowserBackend, 3>) {
+        self.pending
+            .lock()
+            .expect("browser Qwen diagnostic pending queue poisoned")
+            .push(PendingBrowserQwenInstructionDiagnostic { name, tensor });
+    }
+
+    async fn read_all(
+        &self,
+        variant: BooguVariant,
+    ) -> Result<Vec<BrowserPackedF16TensorInputDiagnostic>, RuntimeError> {
+        let pending = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .expect("browser Qwen diagnostic pending queue poisoned"),
+        );
+        let mut diagnostics = Vec::with_capacity(pending.len());
+        for pending in pending {
+            diagnostics.push(
+                read_packed_f16_tensor_input_diagnostic(variant, &pending.name, &pending.tensor)
+                    .await?,
+            );
+        }
+        Ok(diagnostics)
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("browser Qwen diagnostic pending queue poisoned")
+            .len()
+    }
+
+    fn record_immediate_post_sync_block0(
+        &self,
+        diagnostic: BrowserPackedF16QwenBlock0PostSyncDiagnostic,
+    ) -> burn_qwen3_vl::Result<()> {
+        let mut slot = self
+            .immediate_post_sync_block0
+            .lock()
+            .expect("browser Qwen immediate block-0 diagnostic slot poisoned");
+        if slot.replace(diagnostic).is_some() {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(
+                "browser Qwen immediate post-sync block-0 diagnostic was recorded twice".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn take_immediate_post_sync_block0(
+        &self,
+    ) -> Option<BrowserPackedF16QwenBlock0PostSyncDiagnostic> {
+        self.immediate_post_sync_block0
+            .lock()
+            .expect("browser Qwen immediate block-0 diagnostic slot poisoned")
+            .take()
+    }
+
+    fn record_block0_boundary(
+        &self,
+        allocation_policy: Qwen3VlTextLayerAllocationPolicy,
+        synchronization_policy: Qwen3VlTextBlockLoadSynchronizationPolicy,
+        submission_policy: &'static str,
+        boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        tensor: BrowserPackedF16TensorInputDiagnostic,
+    ) -> burn_qwen3_vl::Result<BrowserQwenBlock0BoundaryRecordOutcome> {
+        let mut boundaries = self
+            .block0_boundaries
+            .lock()
+            .expect("browser Qwen block-0 boundary diagnostic queue poisoned");
+        let sequence_index = boundaries.len();
+        let Some(expected_boundary) = BROWSER_PACKED_F16_QWEN_BLOCK0_BOUNDARIES
+            .get(sequence_index)
+            .copied()
+        else {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(
+                "browser Qwen block-0 boundary diagnostic exceeded its exact sequence".into(),
+            ));
+        };
+        if boundary != expected_boundary {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(format!(
+                "browser Qwen block-0 boundary {} arrived at index {sequence_index}, expected {}",
+                boundary.label(),
+                expected_boundary.label(),
+            )));
+        }
+        let all_finite = tensor.all_finite;
+        let not_all_zero = !packed_f16_tensor_diagnostic_is_all_zero(&tensor);
+        boundaries.push(BrowserPackedF16QwenBlock0BoundaryDiagnostic {
+            sequence_index,
+            boundary: boundary.label().into(),
+            tensor_kind: boundary.tensor_kind().into(),
+            tensor,
+            all_finite,
+            not_all_zero,
+        });
+
+        let layer_input = boundaries
+            .first()
+            .filter(|diagnostic| {
+                diagnostic.boundary == Qwen3VlTextLayerDiagnosticBoundary::LayerInput.label()
+            })
+            .map(|diagnostic| &diagnostic.tensor);
+        let identity_canary = boundaries
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.boundary == Qwen3VlTextLayerDiagnosticBoundary::IdentityAddCanary.label()
+            })
+            .map(|diagnostic| &diagnostic.tensor);
+        let identity_add_canary_matches_input = identity_canary.map(|canary| {
+            layer_input.is_some_and(|input| {
+                canary.shape == input.shape
+                    && canary.dtype == input.dtype
+                    && canary.element_count == input.element_count
+                    && canary.sha256 == input.sha256
+            })
+        });
+        let failure_reason = if !all_finite {
+            Some("non-finite")
+        } else if !not_all_zero {
+            Some("all-zero")
+        } else if boundary == Qwen3VlTextLayerDiagnosticBoundary::IdentityAddCanary
+            && identity_add_canary_matches_input != Some(true)
+        {
+            Some("identity-add-canary-mismatch")
+        } else {
+            None
+        };
+        let is_final = boundary == Qwen3VlTextLayerDiagnosticBoundary::FinalResidualOutput;
+        let should_dispatch = failure_reason.is_some() || is_final;
+        let report = should_dispatch.then(|| {
+            let boundary_names_exact = boundaries.iter().enumerate().all(|(index, diagnostic)| {
+                BROWSER_PACKED_F16_QWEN_BLOCK0_BOUNDARIES
+                    .get(index)
+                    .is_some_and(|expected| diagnostic.boundary == expected.label())
+            });
+            let complete = failure_reason.is_none()
+                && is_final
+                && boundaries.len() == BROWSER_PACKED_F16_QWEN_BLOCK0_BOUNDARIES.len()
+                && boundary_names_exact
+                && identity_add_canary_matches_input == Some(true);
+            BrowserPackedF16QwenBlock0ExecutionDiagnostics {
+                scope: BROWSER_PACKED_F16_QWEN_BLOCK0_EXECUTION_SCOPE.into(),
+                block0_execution_mode: BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE.into(),
+                text_layer_allocation_policy: allocation_policy.label().into(),
+                text_block_load_synchronization_policy: synchronization_policy.label().into(),
+                qwen_text_layer_submission_policy: submission_policy.into(),
+                expected_boundary_count: BROWSER_PACKED_F16_QWEN_BLOCK0_BOUNDARIES.len(),
+                captured_boundary_count: boundaries.len(),
+                boundaries: boundaries.clone(),
+                boundary_names_exact,
+                all_captured_tensors_finite: boundaries
+                    .iter()
+                    .all(|diagnostic| diagnostic.all_finite),
+                no_captured_tensor_all_zero: boundaries
+                    .iter()
+                    .all(|diagnostic| diagnostic.not_all_zero),
+                identity_add_canary_matches_input,
+                complete,
+                first_failure_boundary: failure_reason.map(|_| boundary.label().into()),
+                failure_reason: failure_reason.map(str::to_owned),
+            }
+        });
+        Ok(BrowserQwenBlock0BoundaryRecordOutcome {
+            report,
+            failure_message: failure_reason.map(|reason| {
+                format!(
+                    "browser Qwen block 0 boundary {} failed immediate readback: {reason}",
+                    boundary.label()
+                )
+            }),
+        })
+    }
+}
+
 struct BrowserQwenStageObserver {
     parity: Option<BrowserParityControl>,
+    instruction_diagnostics: Option<BrowserQwenInstructionDiagnosticControl>,
+    instruction_diagnostic_variant: Option<BooguVariant>,
+    instruction_diagnostic_run_id: Option<RunId>,
+    instruction_diagnostic_text_layer_allocation_policy: Option<Qwen3VlTextLayerAllocationPolicy>,
+    instruction_diagnostic_text_block_load_synchronization_policy:
+        Option<Qwen3VlTextBlockLoadSynchronizationPolicy>,
+    instruction_diagnostic_text_layer_submission_policy: Option<&'static str>,
+    instruction_diagnostic_block0_execution_mode: Option<&'static str>,
     multimodal: bool,
     deepstack_count: usize,
 }
@@ -972,6 +3142,13 @@ impl BrowserQwenStageObserver {
     fn milestones_only() -> Self {
         Self {
             parity: None,
+            instruction_diagnostics: None,
+            instruction_diagnostic_variant: None,
+            instruction_diagnostic_run_id: None,
+            instruction_diagnostic_text_layer_allocation_policy: None,
+            instruction_diagnostic_text_block_load_synchronization_policy: None,
+            instruction_diagnostic_text_layer_submission_policy: None,
+            instruction_diagnostic_block0_execution_mode: None,
             multimodal: false,
             deepstack_count: 0,
         }
@@ -980,9 +3157,39 @@ impl BrowserQwenStageObserver {
     fn parity(control: BrowserParityControl, multimodal: bool, deepstack_count: usize) -> Self {
         Self {
             parity: Some(control),
+            instruction_diagnostics: None,
+            instruction_diagnostic_variant: None,
+            instruction_diagnostic_run_id: None,
+            instruction_diagnostic_text_layer_allocation_policy: None,
+            instruction_diagnostic_text_block_load_synchronization_policy: None,
+            instruction_diagnostic_text_layer_submission_policy: None,
+            instruction_diagnostic_block0_execution_mode: None,
             multimodal,
             deepstack_count,
         }
+    }
+
+    fn with_instruction_diagnostics(
+        mut self,
+        control: BrowserQwenInstructionDiagnosticControl,
+        variant: BooguVariant,
+        run_id: RunId,
+        text_layer_allocation_policy: Qwen3VlTextLayerAllocationPolicy,
+        text_block_load_synchronization_policy: Qwen3VlTextBlockLoadSynchronizationPolicy,
+        text_layer_submission_policy: &'static str,
+    ) -> Self {
+        self.instruction_diagnostics = Some(control);
+        self.instruction_diagnostic_variant = Some(variant);
+        self.instruction_diagnostic_run_id = Some(run_id);
+        self.instruction_diagnostic_text_layer_allocation_policy =
+            Some(text_layer_allocation_policy);
+        self.instruction_diagnostic_text_block_load_synchronization_policy =
+            Some(text_block_load_synchronization_policy);
+        self.instruction_diagnostic_text_layer_submission_policy =
+            Some(text_layer_submission_policy);
+        self.instruction_diagnostic_block0_execution_mode =
+            Some(browser_qwen_block0_execution_mode());
+        self
     }
 
     fn oracle(&self, stage: &Qwen3VlStage) -> Option<String> {
@@ -1019,9 +3226,124 @@ impl BrowserQwenStageObserver {
             Qwen3VlStage::LmHeadRows { chunk } => format!("lm_head.rows.{chunk}"),
         }
     }
+
+    fn instruction_diagnostic_name(stage: &Qwen3VlStage) -> Option<String> {
+        match stage {
+            Qwen3VlStage::EmbeddingRows { .. } => Some("qwen_embedding_output".into()),
+            Qwen3VlStage::TextBlock { index } => Some(format!("qwen_text_block_{index:02}_output")),
+            Qwen3VlStage::TextFinalNorm => Some("qwen_final_norm_output".into()),
+            _ => None,
+        }
+    }
+
+    async fn record_block0_boundary<const D: usize>(
+        &mut self,
+        index: usize,
+        boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        tensor: Tensor<BrowserBackend, D>,
+    ) -> burn_qwen3_vl::Result<()> {
+        if index != 0 {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(format!(
+                "browser serialized Qwen diagnostic received text layer {index}, expected 0"
+            )));
+        }
+        let (
+            Some(control),
+            Some(variant),
+            Some(run_id),
+            Some(allocation_policy),
+            Some(synchronization_policy),
+            Some(submission_policy),
+        ) = (
+            self.instruction_diagnostics.as_ref(),
+            self.instruction_diagnostic_variant,
+            self.instruction_diagnostic_run_id,
+            self.instruction_diagnostic_text_layer_allocation_policy,
+            self.instruction_diagnostic_text_block_load_synchronization_policy,
+            self.instruction_diagnostic_text_layer_submission_policy,
+        )
+        else {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(
+                "browser serialized Qwen diagnostic is missing its rendered-smoke context".into(),
+            ));
+        };
+        let name = format!(
+            "qwen_text_block_00_{}_immediate_post_sync",
+            boundary.label()
+        );
+        let tensor = read_packed_f16_tensor_input_diagnostic(variant, &name, &tensor)
+            .await
+            .map_err(|error| {
+                burn_qwen3_vl::Qwen3VlError::InvalidInput(format!(
+                    "browser Qwen block-0 boundary {} readback failed: {error:?}",
+                    boundary.label()
+                ))
+            })?;
+        let outcome = control.record_block0_boundary(
+            allocation_policy,
+            synchronization_policy,
+            submission_policy,
+            boundary,
+            tensor,
+        )?;
+        if let Some(report) = outcome.report {
+            dispatch_browser_event(
+                BROWSER_RUNTIME_EVENT_NAME,
+                &browser_packed_f16_qwen_block0_execution_diagnostics_event(run_id, report),
+            );
+        }
+        if let Some(message) = outcome.failure_message {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(message));
+        }
+        Ok(())
+    }
 }
 
 impl Qwen3VlStageObserver<BrowserBackend> for BrowserQwenStageObserver {
+    fn text_layer_boundary_diagnostics_requested(&self, index: usize) -> bool {
+        index == 0
+            && self.instruction_diagnostics.is_some()
+            && self.instruction_diagnostic_variant == Some(BooguVariant::Image01Turbo)
+            && self.instruction_diagnostic_text_layer_allocation_policy
+                == Some(Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent)
+            && self.instruction_diagnostic_text_block_load_synchronization_policy
+                == Some(Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward)
+            && self.instruction_diagnostic_block0_execution_mode
+                == Some(BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE)
+    }
+
+    async fn text_layer_parameter_after_synchronize(
+        &mut self,
+        index: usize,
+        boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        parameter: Tensor<BrowserBackend, 1>,
+    ) -> burn_qwen3_vl::Result<()> {
+        if boundary.tensor_kind() != "parameter-sentinel" {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(format!(
+                "browser Qwen parameter diagnostic received activation boundary {}",
+                boundary.label()
+            )));
+        }
+        self.record_block0_boundary(index, boundary, parameter)
+            .await
+    }
+
+    async fn text_layer_activation_after_synchronize(
+        &mut self,
+        index: usize,
+        boundary: Qwen3VlTextLayerDiagnosticBoundary,
+        activation: Tensor<BrowserBackend, 3>,
+    ) -> burn_qwen3_vl::Result<()> {
+        if boundary.tensor_kind() != "activation" {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(format!(
+                "browser Qwen activation diagnostic received parameter boundary {}",
+                boundary.label()
+            )));
+        }
+        self.record_block0_boundary(index, boundary, activation)
+            .await
+    }
+
     fn rank2(
         &mut self,
         stage: &Qwen3VlStage,
@@ -1041,8 +3363,83 @@ impl Qwen3VlStageObserver<BrowserBackend> for BrowserQwenStageObserver {
         if let Qwen3VlStage::TextBlock { index } = stage {
             browser_stage_milestone(&format!("qwen-text-block-{index:02}-forward-submitted"));
         }
+        if let (Some(control), Some(name)) = (
+            &self.instruction_diagnostics,
+            Self::instruction_diagnostic_name(stage),
+        ) {
+            control.capture(name, activation.clone());
+        }
         if let (Some(control), Some(oracle)) = (&self.parity, self.oracle(stage)) {
             control.rank3(Self::stage_name(stage), oracle, activation);
+        }
+        Ok(())
+    }
+
+    async fn rank3_after_synchronize(
+        &mut self,
+        stage: &Qwen3VlStage,
+        activation: Tensor<BrowserBackend, 3>,
+    ) -> burn_qwen3_vl::Result<()> {
+        if !matches!(stage, Qwen3VlStage::TextBlock { index: 0 }) {
+            return Ok(());
+        }
+        let (
+            Some(control),
+            Some(variant),
+            Some(run_id),
+            Some(allocation_policy),
+            Some(synchronization_policy),
+            Some(submission_policy),
+            Some(block0_execution_mode),
+        ) = (
+            self.instruction_diagnostics.as_ref(),
+            self.instruction_diagnostic_variant,
+            self.instruction_diagnostic_run_id,
+            self.instruction_diagnostic_text_layer_allocation_policy,
+            self.instruction_diagnostic_text_block_load_synchronization_policy,
+            self.instruction_diagnostic_text_layer_submission_policy,
+            self.instruction_diagnostic_block0_execution_mode,
+        )
+        else {
+            return Ok(());
+        };
+        let tensor = read_packed_f16_tensor_input_diagnostic(
+            variant,
+            "qwen_text_block_00_output_immediate_post_sync",
+            &activation,
+        )
+        .await
+        .map_err(|error| {
+            burn_qwen3_vl::Qwen3VlError::InvalidInput(format!(
+                "browser Qwen immediate post-sync block-0 readback failed: {error:?}"
+            ))
+        })?;
+        let diagnostic = BrowserPackedF16QwenBlock0PostSyncDiagnostic {
+            scope: BROWSER_PACKED_F16_QWEN_BLOCK0_POST_SYNC_SCOPE.into(),
+            block0_execution_mode: block0_execution_mode.into(),
+            text_layer_allocation_policy: allocation_policy.label().into(),
+            text_block_load_synchronization_policy: synchronization_policy.label().into(),
+            qwen_text_layer_submission_policy: submission_policy.into(),
+            all_finite: tensor.all_finite,
+            not_all_zero: !packed_f16_tensor_diagnostic_is_all_zero(&tensor),
+            tensor,
+        };
+        let all_finite = diagnostic.all_finite;
+        let not_all_zero = diagnostic.not_all_zero;
+        control.record_immediate_post_sync_block0(diagnostic.clone())?;
+        dispatch_browser_event(
+            BROWSER_RUNTIME_EVENT_NAME,
+            &browser_packed_f16_qwen_block0_post_sync_diagnostic_event(run_id, diagnostic),
+        );
+        if !all_finite {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(
+                "browser Qwen block 0 is non-finite immediately after its WebGPU barrier".into(),
+            ));
+        }
+        if !not_all_zero {
+            return Err(burn_qwen3_vl::Qwen3VlError::InvalidInput(
+                "browser Qwen block 0 is all zero immediately after its WebGPU barrier".into(),
+            ));
         }
         Ok(())
     }
@@ -1196,7 +3593,10 @@ pub struct BrowserBooguBootstrapReport {
     pub qwen_quantized_load_policy: String,
     pub vae_float_load_policy: String,
     pub denoiser_float_load_policy: String,
+    pub denoiser_storage_policy: String,
     pub denoiser_quantized_load_policy: String,
+    pub denoiser_quantized_linear_execution_policy: String,
+    pub denoiser_linear_execution_policy: String,
     pub qwen_visual_execution_dtype: String,
     pub vae_execution_dtype: String,
     pub denoiser_execution_dtype: String,
@@ -1234,10 +3634,33 @@ pub struct BrowserBooguInferenceReport {
     pub qwen_quantized_load_policy: String,
     pub vae_float_load_policy: String,
     pub denoiser_float_load_policy: String,
+    pub denoiser_storage_policy: String,
     pub denoiser_quantized_load_policy: String,
+    pub denoiser_quantized_linear_execution_policy: String,
+    pub denoiser_linear_execution_policy: String,
     pub qwen_visual_execution_dtype: String,
     pub vae_execution_dtype: String,
     pub denoiser_execution_dtype: String,
+    pub qwen_release_unused_memory_after_stage: bool,
+    pub block0_execution_mode: String,
+    pub qwen_embedding_execution_policy: String,
+    pub qwen_text_layer_allocation_policy: String,
+    pub qwen_text_block_load_synchronization_policy: String,
+    pub qwen_text_layer_submission_policy: String,
+    pub packed_qwen_instruction_handoff_policy: String,
+    pub packed_f16_dmd_vae_handoff_policy: String,
+    pub low_vram_resource_plan: Option<BrowserLowVramResourcePlan>,
+    pub packed_f16_resource_plan: Option<BrowserPackedF16ResourcePlan>,
+    pub packed_f16_qwen_embedding_plan: Option<BrowserPackedF16QwenEmbeddingPlan>,
+    pub packed_f16_qwen_host_embedding: Option<HostRoutedEmbeddingReport>,
+    pub packed_f16_qwen_instruction_handoff: Option<BrowserPackedF16QwenInstructionHandoffReport>,
+    pub packed_f16_denoiser_lifecycle: Option<BrowserPackedF16DenoiserLifecycleReport>,
+    pub packed_f16_dmd_vae_handoff: Option<BrowserPackedF16DmdVaeHandoffReport>,
+    pub low_vram_denoiser_dtype_audit: Option<BrowserLowVramDenoiserDTypeAudit>,
+    pub dense_f32_materialized_stage_clones: usize,
+    pub artifact_traffic: BrowserArtifactTrafficReport,
+    pub weight_traffic_contract: String,
+    pub on_device_quantized_execution_claimed: bool,
     pub prompt: String,
     pub dimensions: Dimensions,
     pub seed: u64,
@@ -1392,6 +3815,61 @@ pub(crate) struct BrowserBooguVaeReferenceDiagnosticReport {
     pub numerical_parity_claimed: bool,
 }
 
+/// Bounded first-step localization for the current Turbo low-VRAM browser policy.
+///
+/// The route injects five tensors from the release-pinned BF16 fixture and executes exactly one
+/// denoiser prediction plus one DMD prediction update. Its comparisons are diagnostic until a
+/// browser/adapter-specific numerical envelope is calibrated, so this report can never claim full
+/// numerical parity.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct BrowserTurboFirstDmdDiagnosticReport {
+    pub report_schema_version: u32,
+    pub mode: String,
+    pub model_backend: String,
+    pub adapter_name: String,
+    pub adapter_backend: String,
+    pub adapter_device_type: String,
+    pub adapter_shader_f16: bool,
+    pub device_shader_f16: bool,
+    pub actual_storage_buffer_binding_size: u64,
+    pub actual_max_buffer_size: u64,
+    pub model: String,
+    pub model_revision: String,
+    pub artifact_content_digest: Sha256Digest,
+    pub artifact_profile: String,
+    pub residency_policy: String,
+    pub denoiser_storage_policy: String,
+    pub denoiser_float_load_policy: String,
+    pub denoiser_quantized_load_policy: String,
+    pub denoiser_quantized_linear_execution_policy: String,
+    pub denoiser_linear_execution_policy: String,
+    pub denoiser_execution_dtype: String,
+    pub packed_f16_resource_plan: BrowserPackedF16ResourcePlan,
+    pub packed_f16_denoiser_lifecycle: BrowserPackedF16DenoiserLifecycleReport,
+    pub expected_cached_stages: usize,
+    pub cached_stages_before_predict: usize,
+    pub cached_stages_after_predict: usize,
+    pub synchronization_pending_before_predict: bool,
+    pub synchronization_pending_after_predict: bool,
+    pub dmd_artifact_traffic: BrowserArtifactTrafficReport,
+    pub fixture: BrowserTurboFirstDmdFixtureIdentity,
+    pub fixture_verification: BrowserTurboFirstDmdVerificationSnapshot,
+    pub fixture_dtype: String,
+    pub injected_qwen_shape: Vec<usize>,
+    pub injected_dmd_input_shape: Vec<usize>,
+    pub execution_sigma_source: String,
+    pub fixture_bf16_sigma_widened_f32: f32,
+    pub production_f32_sigma: f32,
+    pub production_minus_fixture_sigma: f32,
+    pub velocity: BrowserParityTensorMetric,
+    pub prediction: BrowserParityTensorMetric,
+    pub fixture_required_inputs_authenticated: bool,
+    pub artifacts_verified: bool,
+    pub diagnostic_passed: bool,
+    pub on_device_quantized_execution_claimed: bool,
+    pub numerical_parity_claimed: bool,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct BrowserParityDmdStepReport {
     pub index: usize,
@@ -1540,9 +4018,14 @@ pub(crate) struct BrowserBooguParityReport {
     pub artifact_content_digest: Sha256Digest,
     pub numeric_format: burn_image::NumericFormat,
     pub artifact_profile: String,
+    pub residency_policy: String,
     pub qwen_float_load_policy: String,
     pub vae_float_load_policy: String,
     pub denoiser_float_load_policy: String,
+    pub denoiser_storage_policy: String,
+    pub denoiser_quantized_load_policy: String,
+    pub denoiser_quantized_linear_execution_policy: String,
+    pub denoiser_linear_execution_policy: String,
     pub qwen_execution_dtype: String,
     pub vae_execution_dtype: String,
     pub denoiser_execution_dtype: String,
@@ -1555,6 +4038,10 @@ pub(crate) struct BrowserBooguParityReport {
     pub denoiser_expected_retained_stages: usize,
     pub denoiser_retained_stages_before_clear: usize,
     pub denoiser_cache_cleared_before_decode: bool,
+    pub low_vram_resource_plan: Option<BrowserLowVramResourcePlan>,
+    pub low_vram_denoiser_dtype_audit: Option<BrowserLowVramDenoiserDTypeAudit>,
+    pub weight_traffic_contract: String,
+    pub on_device_quantized_execution_claimed: bool,
     pub fixture: BrowserParityFixtureIdentity,
     pub fixture_verification: BrowserParityVerificationSnapshot,
     pub tensor_coverage: BrowserParityTensorCoverageReport,
@@ -1581,6 +4068,10 @@ pub(crate) struct BrowserBooguParityReport {
 
 struct BrowserNoSurfaceEngine {
     engine: BrowserBooguEngine,
+    // `init_setup_async` also registers a cloned setup with CubeCL. Retain this complete external
+    // setup for the enclosing diagnostic future as an additional browser-lifetime guard and to
+    // keep the device diagnostics below installed until the report is complete.
+    _setup_guard: burn_wgpu::WgpuSetup,
     adapter: wgpu::AdapterInfo,
     backend: wgpu::Backend,
     limits: wgpu::Limits,
@@ -1593,6 +4084,9 @@ enum BrowserNoSurfacePolicy {
     CompatibleF32,
     PreserveQwenF16,
     ResidentDenseF32,
+    LowVramRuntimeQ8Denoiser,
+    LowVramRetainedQ8DenseF32PerStageDenoiser,
+    LowVramPreloadedPackedF16Denoiser,
 }
 
 /// Asynchronously builds one pinned browser release from a remote sealed artifact directory.
@@ -1608,7 +4102,7 @@ impl BrowserBooguFactory {
     pub const fn new(variant: BooguVariant) -> Self {
         Self {
             variant,
-            residency: BrowserBooguResidencyPolicy::HighVramResidentDenseF32,
+            residency: default_browser_low_vram_residency(variant),
             pending: None,
             started: false,
         }
@@ -1654,23 +4148,11 @@ impl BrowserBooguFactory {
             .settings
             .validate_concrete_cache_policy()
             .map_err(|error| execution_error(variant, error))?;
-        for (name, actual) in [
-            (
-                "max_storage_buffer_binding_size",
-                context.max_storage_buffer_binding_size,
-            ),
-            ("max_buffer_size", context.max_buffer_size),
-        ] {
-            if actual < crate::boogu::BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES {
-                return Err(execution_error(
-                    variant,
-                    format!(
-                        "browser {name} is {actual} bytes; post-load model tensor requires {} bytes",
-                        crate::boogu::BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES
-                    ),
-                ));
-            }
-        }
+        crate::boogu::validate_browser_variant_buffer_limits(
+            variant,
+            context.max_storage_buffer_binding_size,
+            context.max_buffer_size,
+        )?;
         let base_url = match &context.settings.artifact_source {
             burn_image::ArtifactSource::Remote { base_url } => base_url.clone(),
             burn_image::ArtifactSource::LocalDirectory { .. } => {
@@ -1692,6 +4174,10 @@ impl BrowserBooguFactory {
             base_url,
             settings: context.settings,
             device: context.device,
+            applied_buffer_limits: BrowserAppliedBufferLimits {
+                max_storage_buffer_binding_size: context.max_storage_buffer_binding_size,
+                max_buffer_size: context.max_buffer_size,
+            },
         })
     }
 
@@ -1735,6 +4221,7 @@ impl BrowserBooguFactory {
     ) -> Result<BrowserBooguBootstrapReport, RuntimeError> {
         let BrowserNoSurfaceEngine {
             mut engine,
+            _setup_guard,
             adapter,
             backend,
             limits,
@@ -1750,6 +4237,15 @@ impl BrowserBooguFactory {
                 }
                 BrowserNoSurfacePolicy::ResidentDenseF32 => {
                     "no-surface-browser-high-vram-resident-dense-f32"
+                }
+                BrowserNoSurfacePolicy::LowVramRuntimeQ8Denoiser => {
+                    "no-surface-browser-low-vram-runtime-q8-denoiser"
+                }
+                BrowserNoSurfacePolicy::LowVramRetainedQ8DenseF32PerStageDenoiser => {
+                    "no-surface-browser-low-vram-retained-q8-dense-f32-per-stage-denoiser"
+                }
+                BrowserNoSurfacePolicy::LowVramPreloadedPackedF16Denoiser => {
+                    "no-surface-browser-low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser"
                 }
             }
             .into(),
@@ -1772,10 +4268,19 @@ impl BrowserBooguFactory {
                 .into(),
             vae_float_load_policy: float_policy_name(engine.policies.vae_float).into(),
             denoiser_float_load_policy: float_policy_name(engine.policies.denoiser_float).into(),
-            denoiser_quantized_load_policy: quantized_policy_name(
-                engine.policies.denoiser_quantized,
-            )
-            .into(),
+            denoiser_storage_policy: engine.policies.denoiser_storage_policy().into(),
+            denoiser_quantized_load_policy: engine
+                .policies
+                .denoiser_quantized_load_policy_report()
+                .into(),
+            denoiser_quantized_linear_execution_policy: engine
+                .policies
+                .denoiser_quantized_linear_execution_policy_report()
+                .into(),
+            denoiser_linear_execution_policy: engine
+                .policies
+                .denoiser_linear_execution_policy()
+                .into(),
             qwen_visual_execution_dtype: engine.dtypes.qwen_visual.name().into(),
             vae_execution_dtype: engine.dtypes.vae.name().into(),
             denoiser_execution_dtype: engine.dtypes.denoiser.name().into(),
@@ -1790,7 +4295,7 @@ impl BrowserBooguFactory {
         })
     }
 
-    /// Execute one complete, validated 256 by 256 Turbo request without creating a surface.
+    /// Execute one complete validated browser request without creating a surface.
     ///
     /// The request is resolved by the same adapter path as the production UI. The returned PNG is
     /// a real model output; the report deliberately does not claim upstream fixture parity.
@@ -1802,7 +4307,7 @@ impl BrowserBooguFactory {
         Self::infer_no_surface_with_residency(
             variant,
             settings,
-            BrowserBooguResidencyPolicy::HighVramResidentDenseF32,
+            default_browser_low_vram_residency(variant),
             request,
         )
         .await
@@ -1816,18 +4321,11 @@ impl BrowserBooguFactory {
         request: ImageRequest,
     ) -> Result<BrowserBooguInferenceResult, RuntimeError> {
         let job = crate::boogu::prepare_runtime_job(ImageJobId(1), variant, request, &settings)?;
-        if job.resolved.dimensions
-            != Dimensions::new(256, 256).expect("fixed diagnostic dimensions are valid")
-        {
-            return Err(execution_error(
-                variant,
-                "surface-free full inference is restricted to 256 by 256",
-            ));
-        }
         let prompt = job.resolved.prompt.clone();
         let dimensions = job.resolved.dimensions;
         let BrowserNoSurfaceEngine {
             mut engine,
+            _setup_guard,
             adapter,
             backend,
             limits,
@@ -1839,6 +4337,21 @@ impl BrowserBooguFactory {
             match residency {
                 BrowserBooguResidencyPolicy::HighVramResidentDenseF32 => {
                     BrowserNoSurfacePolicy::ResidentDenseF32
+                }
+                BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained => {
+                    return Err(execution_error(
+                        variant,
+                        "the per-request F32 denoiser-retained policy is reserved for exact-fixture qualification",
+                    ));
+                }
+                BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser => {
+                    BrowserNoSurfacePolicy::LowVramRuntimeQ8Denoiser
+                }
+                BrowserBooguResidencyPolicy::LowVramRetainedQ8DenseF32PerStageDenoiser => {
+                    BrowserNoSurfacePolicy::LowVramRetainedQ8DenseF32PerStageDenoiser
+                }
+                BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser => {
+                    BrowserNoSurfacePolicy::LowVramPreloadedPackedF16Denoiser
                 }
                 BrowserBooguResidencyPolicy::LayerStreamedDiagnostic => {
                     BrowserNoSurfacePolicy::CompatibleF32
@@ -1911,13 +4424,68 @@ impl BrowserBooguFactory {
                 vae_float_load_policy: float_policy_name(engine.policies.vae_float).into(),
                 denoiser_float_load_policy: float_policy_name(engine.policies.denoiser_float)
                     .into(),
-                denoiser_quantized_load_policy: quantized_policy_name(
-                    engine.policies.denoiser_quantized,
-                )
-                .into(),
+                denoiser_storage_policy: engine.policies.denoiser_storage_policy().into(),
+                denoiser_quantized_load_policy: engine
+                    .policies
+                    .denoiser_quantized_load_policy_report()
+                    .into(),
+                denoiser_quantized_linear_execution_policy: engine
+                    .policies
+                    .denoiser_quantized_linear_execution_policy_report()
+                    .into(),
+                denoiser_linear_execution_policy: engine
+                    .policies
+                    .denoiser_linear_execution_policy()
+                    .into(),
                 qwen_visual_execution_dtype: engine.dtypes.qwen_visual.name().into(),
                 vae_execution_dtype: engine.dtypes.vae.name().into(),
                 denoiser_execution_dtype: engine.dtypes.denoiser.name().into(),
+                qwen_release_unused_memory_after_stage: engine
+                    .qwen
+                    .releases_unused_memory_after_stage(),
+                block0_execution_mode: browser_qwen_block0_execution_mode().into(),
+                qwen_embedding_execution_policy: engine
+                    .policies
+                    .qwen_embedding_execution_policy()
+                    .into(),
+                qwen_text_layer_allocation_policy: engine
+                    .policies
+                    .qwen_text_layer_allocation_policy()
+                    .into(),
+                qwen_text_block_load_synchronization_policy: engine
+                    .policies
+                    .qwen_text_block_load_synchronization_policy()
+                    .into(),
+                qwen_text_layer_submission_policy: engine
+                    .policies
+                    .qwen_text_layer_submission_policy()
+                    .into(),
+                packed_qwen_instruction_handoff_policy: engine
+                    .policies
+                    .packed_qwen_instruction_handoff_policy()
+                    .into(),
+                packed_f16_dmd_vae_handoff_policy: engine
+                    .policies
+                    .packed_f16_dmd_vae_handoff_policy()
+                    .into(),
+                low_vram_resource_plan: engine.low_vram_resource_plan,
+                packed_f16_resource_plan: engine.packed_f16_resource_plan,
+                packed_f16_qwen_embedding_plan: engine.packed_f16_qwen_embedding_plan,
+                packed_f16_qwen_host_embedding: engine.last_packed_f16_qwen_host_embedding.clone(),
+                packed_f16_qwen_instruction_handoff: engine
+                    .last_packed_f16_qwen_instruction_handoff
+                    .clone(),
+                packed_f16_denoiser_lifecycle: engine.last_packed_f16_denoiser_lifecycle,
+                packed_f16_dmd_vae_handoff: engine.last_packed_f16_dmd_vae_handoff.clone(),
+                low_vram_denoiser_dtype_audit: engine.last_low_vram_denoiser_dtype_audit,
+                dense_f32_materialized_stage_clones: engine
+                    .last_dense_f32_materialized_stage_clones,
+                artifact_traffic: engine.last_artifact_traffic,
+                weight_traffic_contract: engine.policies.weight_traffic_contract().into(),
+                // Packed F16 is storage compression followed by dense F32 execution, so it can
+                // never make a quantized-execution claim. Edit's distinct runtime-Q8 route also
+                // withholds that claim until measured kernel evidence exists.
+                on_device_quantized_execution_claimed: false,
                 prompt,
                 dimensions,
                 seed: output.seed,
@@ -1932,6 +4500,86 @@ impl BrowserBooguFactory {
             },
             png,
         })
+    }
+
+    /// Run one authenticated Turbo prediction under the packed-F16 dense-F32-per-stage policy.
+    ///
+    /// This is a bounded localization diagnostic, not a full-chain qualification. It injects the
+    /// release fixture's BF16 Qwen output, first DMD input, and captured BF16 sigma (widened to
+    /// F32), then compares exactly one velocity and prediction update. The production F32 sigma is
+    /// reported separately and the result always keeps `numerical_parity_claimed` false.
+    pub(crate) async fn turbo_first_dmd_no_surface(
+        variant: BooguVariant,
+        settings: crate::BooguAdapterSettings,
+        fixture_base: RemoteBaseUrl,
+        fixture_profile: BrowserTurboFirstDmdFixtureProfile,
+    ) -> Result<BrowserTurboFirstDmdDiagnosticReport, RuntimeError> {
+        if variant != BooguVariant::Image01Turbo {
+            return Err(execution_error(
+                variant,
+                "browser Turbo first-DMD diagnostic requires variant=turbo",
+            ));
+        }
+        if settings.storage_profile != BooguStorageProfile::F16QwenVisionF32 {
+            return Err(execution_error(
+                variant,
+                "browser Turbo first-DMD diagnostic requires profile=production",
+            ));
+        }
+        if settings.integrity != burn_image::IntegrityPolicy::RequireSha256 {
+            return Err(execution_error(
+                variant,
+                "browser Turbo first-DMD diagnostic requires SHA-256 verification",
+            ));
+        }
+        settings
+            .validate_concrete_cache_policy()
+            .map_err(|error| execution_error(variant, error))?;
+        if !matches!(
+            &settings.artifact_source,
+            burn_image::ArtifactSource::Remote { .. }
+        ) {
+            return Err(execution_error(
+                variant,
+                "browser Turbo first-DMD diagnostic requires a remote artifact base URL",
+            ));
+        }
+
+        let profile = settings.storage_profile;
+        let BrowserNoSurfaceEngine {
+            mut engine,
+            _setup_guard,
+            adapter,
+            backend,
+            limits,
+            adapter_shader_f16,
+            device_shader_f16,
+        } = build_no_surface_engine(
+            variant,
+            settings,
+            BrowserNoSurfacePolicy::LowVramPreloadedPackedF16Denoiser,
+        )
+        .await?;
+        validate_canonical_release_artifact_digest(
+            variant,
+            profile,
+            engine.artifact_content_digest,
+        )
+        .map_err(|error| execution_error(variant, error))?;
+
+        let fixture = BrowserTurboFirstDmdFixture::open(fixture_base, fixture_profile).await?;
+        engine
+            .turbo_first_dmd(
+                fixture,
+                BrowserParityAdapterEvidence {
+                    adapter,
+                    backend,
+                    limits,
+                    adapter_shader_f16,
+                    device_shader_f16,
+                },
+            )
+            .await
     }
 
     /// Run only the exact 1.5K fixture's VAE reference encoder surface three times.
@@ -1974,6 +4622,7 @@ impl BrowserBooguFactory {
 
         let BrowserNoSurfaceEngine {
             mut engine,
+            _setup_guard,
             adapter,
             backend,
             limits,
@@ -2014,13 +4663,28 @@ impl BrowserBooguFactory {
 
     /// Replay the one pinned exhaustive 1536-square fixture on real browser WebGPU.
     ///
-    /// This is intentionally a separate, surface-free qualification route. It bypasses only the
-    /// ordinary browser support advertisement that restricts interactive inference to 256 square;
-    /// release identity, profile, remote transport, SHA-256, non-CPU adapter, device limits, exact
-    /// request shape, exact noise injection, and every numerical gate remain fail closed.
+    /// This is intentionally a separate, surface-free qualification route. Release identity,
+    /// profile, remote transport, SHA-256, non-CPU adapter, device limits, exact request shape,
+    /// exact noise injection, and every numerical gate remain fail closed.
     pub(crate) async fn parity_no_surface(
         variant: BooguVariant,
         settings: crate::BooguAdapterSettings,
+        fixture_base: RemoteBaseUrl,
+    ) -> Result<BrowserBooguParityReport, RuntimeError> {
+        Self::parity_no_surface_with_residency(
+            variant,
+            settings,
+            BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained,
+            fixture_base,
+        )
+        .await
+    }
+
+    /// Replay the exact 1.5K fixture under an explicitly selected supported residency policy.
+    pub(crate) async fn parity_no_surface_with_residency(
+        variant: BooguVariant,
+        settings: crate::BooguAdapterSettings,
+        residency: BrowserBooguResidencyPolicy,
         fixture_base: RemoteBaseUrl,
     ) -> Result<BrowserBooguParityReport, RuntimeError> {
         if variant != BooguVariant::Image01EditTurbo1k5 {
@@ -2052,12 +4716,13 @@ impl BrowserBooguFactory {
 
         let BrowserNoSurfaceEngine {
             mut engine,
+            _setup_guard,
             adapter,
             backend,
             limits,
             adapter_shader_f16,
             device_shader_f16,
-        } = build_no_surface_parity_engine(settings).await?;
+        } = build_no_surface_parity_engine_with_residency(settings, residency).await?;
         validate_canonical_release_artifact_digest(
             variant,
             profile,
@@ -2098,17 +4763,134 @@ struct BrowserParityAdapterEvidence {
     device_shader_f16: bool,
 }
 
+fn install_no_surface_device_diagnostics(setup: &burn_wgpu::WgpuSetup) {
+    setup.device.set_device_lost_callback(|reason, message| {
+        web_sys::console::error_1(
+            &format!("BURN_IMAGE_WEBGPU_DEVICE_LOST reason={reason:?} message={message}").into(),
+        );
+    });
+    setup.device.on_uncaptured_error(Arc::new(|error| {
+        web_sys::console::error_1(&format!("BURN_IMAGE_WEBGPU_UNCAPTURED_ERROR {error}").into());
+    }));
+}
+
+async fn no_surface_adapter_retry_delay(variant: BooguVariant) -> Result<(), RuntimeError> {
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen_futures::JsFuture;
+
+    let window = web_sys::window()
+        .ok_or_else(|| execution_error(variant, "WebGPU adapter retry requires Window"))?;
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        if let Err(error) =
+            window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 250)
+        {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+        }
+    });
+    JsFuture::from(promise).await.map(|_| ()).map_err(|error| {
+        execution_error(
+            variant,
+            format!("WebGPU adapter retry timer failed: {error:?}"),
+        )
+    })
+}
+
+async fn init_no_surface_wgpu_setup(
+    variant: BooguVariant,
+) -> Result<(burn_wgpu::WgpuDevice, burn_wgpu::WgpuSetup), RuntimeError> {
+    const MAX_ADAPTER_ATTEMPTS: usize = 8;
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::BROWSER_WEBGPU,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let options = wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    };
+    let mut selected_adapter = None;
+    for attempt in 1..=MAX_ADAPTER_ATTEMPTS {
+        match instance.request_adapter(&options).await {
+            Ok(adapter) => {
+                selected_adapter = Some(adapter);
+                break;
+            }
+            Err(error) if attempt < MAX_ADAPTER_ATTEMPTS => {
+                report_browser_runtime_preparing(format!(
+                    "WebGPU high-performance adapter request {attempt}/{MAX_ADAPTER_ATTEMPTS} was unavailable ({error}); retrying the same hardware-only request"
+                ));
+                no_surface_adapter_retry_delay(variant).await?;
+            }
+            Err(error) => {
+                return Err(execution_error(
+                    variant,
+                    format!(
+                        "WebGPU high-performance adapter remained unavailable after {MAX_ADAPTER_ATTEMPTS} attempts: {error}"
+                    ),
+                ));
+            }
+        }
+    }
+    let adapter = selected_adapter.ok_or_else(|| {
+        execution_error(
+            variant,
+            "WebGPU high-performance adapter selection ended without an adapter",
+        )
+    })?;
+    let adapter_info = adapter.get_info();
+    if adapter_info.device_type == wgpu::DeviceType::Cpu {
+        return Err(execution_error(
+            variant,
+            "no-surface browser diagnostic refuses a CPU WebGPU adapter",
+        ));
+    }
+    let required_features = adapter
+        .features()
+        .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
+    let required_limits = adapter.limits();
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("burn-image-no-surface-webgpu"),
+            required_features,
+            required_limits,
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        })
+        .await
+        .map_err(|error| {
+            execution_error(
+                variant,
+                format!(
+                    "requesting the no-surface WebGPU device on {adapter_info:?} failed: {error}"
+                ),
+            )
+        })?;
+    let setup = burn_wgpu::WgpuSetup {
+        instance,
+        adapter,
+        device,
+        queue,
+        backend: adapter_info.backend,
+    };
+    let cube_device = burn_wgpu::init_device(setup.clone(), burn_wgpu::RuntimeOptions::default());
+    Ok((cube_device, setup))
+}
+
 async fn build_no_surface_engine(
     variant: BooguVariant,
     settings: crate::BooguAdapterSettings,
     policy: BrowserNoSurfacePolicy,
 ) -> Result<BrowserNoSurfaceEngine, RuntimeError> {
-    let device = burn_wgpu::WgpuDevice::DefaultDevice;
-    let setup = burn_wgpu::init_setup_async::<burn_wgpu::graphics::WebGpu>(
-        &device,
-        burn_wgpu::RuntimeOptions::default(),
-    )
-    .await;
+    report_browser_runtime_preparing(
+        "Requesting the WebGPU adapter, device, queue, and CubeCL no-surface runtime",
+    );
+    let (device, setup) = init_no_surface_wgpu_setup(variant).await?;
+    report_browser_runtime_preparing(
+        "WebGPU adapter, device, queue, and CubeCL runtime initialized for the no-surface diagnostic",
+    );
+    install_no_surface_device_diagnostics(&setup);
     let adapter = setup.adapter.get_info();
     let limits = setup.device.limits();
     let adapter_shader_f16 = setup
@@ -2143,6 +4925,9 @@ async fn build_no_surface_engine(
             releases: vec![BooguReleaseIdentity::canonical(variant)],
         },
     )?;
+    report_browser_runtime_preparing(
+        "No-surface browser context admitted; resolving the exact execution policy",
+    );
     let policies = match policy {
         BrowserNoSurfacePolicy::CompatibleF32 => {
             BrowserExecutionPolicies::layer_streamed_diagnostic(&inputs.settings)
@@ -2154,17 +4939,43 @@ async fn build_no_surface_engine(
             BrowserExecutionPolicies::resident_dense_f32(&inputs.settings)
                 .map_err(|error| execution_error(variant, error))?
         }
+        BrowserNoSurfacePolicy::LowVramRuntimeQ8Denoiser => {
+            BrowserExecutionPolicies::low_vram_runtime_q8_denoiser(variant, &inputs.settings)
+                .map_err(|error| execution_error(variant, error))?
+        }
+        BrowserNoSurfacePolicy::LowVramRetainedQ8DenseF32PerStageDenoiser => {
+            BrowserExecutionPolicies::low_vram_retained_q8_dense_f32_denoiser(
+                variant,
+                &inputs.settings,
+            )
+            .map_err(|error| execution_error(variant, error))?
+        }
+        BrowserNoSurfacePolicy::LowVramPreloadedPackedF16Denoiser => {
+            BrowserExecutionPolicies::low_vram_preloaded_packed_f16_denoiser(
+                variant,
+                &inputs.settings,
+            )
+            .map_err(|error| execution_error(variant, error))?
+        }
     };
+    report_browser_runtime_preparing(
+        "No-surface execution policy admitted; constructing verified model stage sources",
+    );
     let engine = BrowserBooguEngine::build(
         inputs.identity,
         inputs.base_url,
         inputs.settings,
         policies,
         inputs.device,
+        inputs.applied_buffer_limits,
     )
     .await?;
+    report_browser_runtime_preparing(
+        "Verified no-surface model engine constructed; starting the requested diagnostic",
+    );
     Ok(BrowserNoSurfaceEngine {
         engine,
+        _setup_guard: setup.clone(),
         adapter,
         backend: setup.backend,
         limits,
@@ -2176,13 +4987,20 @@ async fn build_no_surface_engine(
 async fn build_no_surface_parity_engine(
     settings: crate::BooguAdapterSettings,
 ) -> Result<BrowserNoSurfaceEngine, RuntimeError> {
-    let variant = BooguVariant::Image01EditTurbo1k5;
-    let device = burn_wgpu::WgpuDevice::DefaultDevice;
-    let setup = burn_wgpu::init_setup_async::<burn_wgpu::graphics::WebGpu>(
-        &device,
-        burn_wgpu::RuntimeOptions::default(),
+    build_no_surface_parity_engine_with_residency(
+        settings,
+        BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained,
     )
-    .await;
+    .await
+}
+
+async fn build_no_surface_parity_engine_with_residency(
+    settings: crate::BooguAdapterSettings,
+    residency: BrowserBooguResidencyPolicy,
+) -> Result<BrowserNoSurfaceEngine, RuntimeError> {
+    let variant = BooguVariant::Image01EditTurbo1k5;
+    let (device, setup) = init_no_surface_wgpu_setup(variant).await?;
+    install_no_surface_device_diagnostics(&setup);
     let adapter = setup.adapter.get_info();
     let limits = setup.device.limits();
     let adapter_shader_f16 = setup
@@ -2190,8 +5008,7 @@ async fn build_no_surface_parity_engine(
         .features()
         .contains(wgpu::Features::SHADER_F16);
     let device_shader_f16 = setup.device.features().contains(wgpu::Features::SHADER_F16);
-    if adapter.device_type == wgpu::DeviceType::Cpu || matches!(device, burn_wgpu::WgpuDevice::Cpu)
-    {
+    if adapter.device_type == wgpu::DeviceType::Cpu {
         return Err(execution_error(
             variant,
             "browser 1.5K parity refuses a CPU WebGPU adapter/device",
@@ -2211,10 +5028,42 @@ async fn build_no_surface_parity_engine(
         }
     };
     let identity = BooguReleaseIdentity::canonical(variant);
-    let policies = BrowserExecutionPolicies::exact_1k5_parity(&settings);
-    let engine = BrowserBooguEngine::build(identity, base_url, settings, policies, device).await?;
+    let policies = match residency {
+        BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained => {
+            Ok(BrowserExecutionPolicies::exact_1k5_parity(&settings))
+        }
+        BrowserBooguResidencyPolicy::HighVramResidentDenseF32 => Err(
+            "exact browser parity uses the qualification-per-request F32 denoiser-retained policy, not production all-stage residency",
+        ),
+        BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser => {
+            BrowserExecutionPolicies::exact_1k5_low_vram_parity(&settings)
+        }
+        BrowserBooguResidencyPolicy::LowVramRetainedQ8DenseF32PerStageDenoiser => {
+            Err("the Turbo-only retained-Q8 dense-F32 fallback is not an Edit-Turbo 1.5K parity policy")
+        }
+        BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser => {
+            Err("the Turbo-only preloaded packed-F16 dense-F32-per-stage policy is not an Edit-Turbo 1.5K parity policy")
+        }
+        BrowserBooguResidencyPolicy::LayerStreamedDiagnostic => {
+            Err("exhaustive browser parity does not accept the layer-streamed diagnostic residency")
+        }
+    }
+    .map_err(|error| execution_error(variant, error))?;
+    let engine = BrowserBooguEngine::build(
+        identity,
+        base_url,
+        settings,
+        policies,
+        device,
+        BrowserAppliedBufferLimits {
+            max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+            max_buffer_size: limits.max_buffer_size,
+        },
+    )
+    .await?;
     Ok(BrowserNoSurfaceEngine {
         engine,
+        _setup_guard: setup.clone(),
         adapter,
         backend: setup.backend,
         limits,
@@ -2245,6 +5094,33 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
                     BrowserExecutionPolicies::resident_dense_f32(&inputs.settings)
                         .map_err(|error| execution_error(inputs.identity.variant, error))
                 }
+                BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained => {
+                    Err(execution_error(
+                        inputs.identity.variant,
+                        "the per-request F32 denoiser-retained policy is reserved for exact-fixture qualification",
+                    ))
+                }
+                BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser => {
+                    BrowserExecutionPolicies::low_vram_runtime_q8_denoiser(
+                        inputs.identity.variant,
+                        &inputs.settings,
+                    )
+                    .map_err(|error| execution_error(inputs.identity.variant, error))
+                }
+                BrowserBooguResidencyPolicy::LowVramRetainedQ8DenseF32PerStageDenoiser => {
+                    BrowserExecutionPolicies::low_vram_retained_q8_dense_f32_denoiser(
+                        inputs.identity.variant,
+                        &inputs.settings,
+                    )
+                    .map_err(|error| execution_error(inputs.identity.variant, error))
+                }
+                BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser => {
+                    BrowserExecutionPolicies::low_vram_preloaded_packed_f16_denoiser(
+                        inputs.identity.variant,
+                        &inputs.settings,
+                    )
+                    .map_err(|error| execution_error(inputs.identity.variant, error))
+                }
                 BrowserBooguResidencyPolicy::LayerStreamedDiagnostic => Ok(
                     BrowserExecutionPolicies::layer_streamed_diagnostic(&inputs.settings),
                 ),
@@ -2255,15 +5131,23 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
                         inputs.identity,
                         inputs.base_url,
                         inputs.settings,
-                        policies,
+                        policies.for_ordinary_browser_factory(),
                         inputs.device,
+                        inputs.applied_buffer_limits,
                     )
                     .await
                 }
                 Err(error) => Err(error),
             };
             match &result {
-                Ok(engine) => report_browser_runtime_ready(engine.identity.variant),
+                Ok(engine) => report_browser_runtime_ready(
+                    engine.identity.variant,
+                    engine.policies.qwen_text_layer_allocation_policy(),
+                    engine
+                        .policies
+                        .qwen_text_block_load_synchronization_policy(),
+                    engine.policies.qwen_text_layer_submission_policy(),
+                ),
                 Err(error) => report_browser_runtime_failure(error.to_string()),
             }
             *result_slot
@@ -2310,37 +5194,249 @@ struct BrowserStageProbe {
     verified_objects: usize,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrowserDenoiserExecutionKind {
+    VerifiedBurnModule,
+    PackedF16DeviceWidenDenseF32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BrowserExecutionPolicies {
     qwen_float: BooguFloatLoadPolicy,
     qwen_quantized: BooguQuantizedLoadPolicy,
+    qwen_embedding_execution: Qwen3VlEmbeddingExecutionPolicy,
+    qwen_text_layer_allocation: Qwen3VlTextLayerAllocationPolicy,
+    qwen_text_block_load_synchronization: Qwen3VlTextBlockLoadSynchronizationPolicy,
+    qwen_text_layer_submission_policy: &'static str,
     vae_float: BooguFloatLoadPolicy,
     denoiser_float: BooguFloatLoadPolicy,
     denoiser_quantized: BooguQuantizedLoadPolicy,
+    denoiser_runtime_quantization: BooguDenoiserRuntimeQuantizationPolicy,
+    denoiser_runtime_q8_scope: BooguRuntimeQ8Scope,
+    /// Adapter setting for the outer retained-module wrapper. Packed-F16 source execution is
+    /// represented separately by `denoiser_execution_kind`; its adapter must stay direct so the
+    /// wrapper does not attempt a second Q8-to-F32 mapping.
+    denoiser_retaining_wrapper_adapter: BooguQuantizedLinearExecutionPolicy,
+    denoiser_execution_kind: BrowserDenoiserExecutionKind,
     residency: BrowserBooguResidencyPolicy,
     retain_qwen_stages: bool,
     retain_vae_stages: bool,
     retain_denoiser_stages: bool,
     eager_preload: bool,
-    defer_retained_synchronization: bool,
+    preload_denoiser_before_request: bool,
+    defer_retained_qwen_synchronization: bool,
+    defer_retained_denoiser_synchronization: bool,
+    require_persistent_range_cache: bool,
+    release_unused_qwen_memory_after_stage: bool,
+    packed_qwen_instruction_handoff: bool,
+    request_scoped_surface_acquire_suspended: bool,
 }
 
 impl BrowserExecutionPolicies {
+    fn uses_packed_f16_denoiser_source(self) -> bool {
+        self.denoiser_execution_kind == BrowserDenoiserExecutionKind::PackedF16DeviceWidenDenseF32
+    }
+
+    fn packed_qwen_instruction_handoff_policy(self) -> &'static str {
+        if self.packed_qwen_instruction_handoff {
+            BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY
+        } else {
+            "disabled"
+        }
+    }
+
+    fn packed_f16_dmd_vae_handoff_policy(self) -> &'static str {
+        if self.uses_packed_f16_denoiser_source() {
+            BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY
+        } else {
+            "disabled"
+        }
+    }
+
+    fn provenance_backend(self) -> String {
+        let backend = if self.uses_packed_f16_denoiser_source() {
+            format!(
+                "burn-webgpu/{}/{}",
+                self.residency.label(),
+                BROWSER_PACKED_F16_PROVENANCE_SUFFIX
+            )
+        } else {
+            format!("burn-webgpu/{}", self.residency.label())
+        };
+        if self.request_scoped_surface_acquire_suspended {
+            format!("{backend}/{BROWSER_SURFACE_INFERENCE_PROVENANCE_SUFFIX}")
+        } else {
+            backend
+        }
+    }
+
+    fn packed_allocator_policy_is_exact(self) -> bool {
+        !self.release_unused_qwen_memory_after_stage
+            && self.packed_qwen_instruction_handoff == self.uses_packed_f16_denoiser_source()
+            && self.qwen_text_layer_allocation
+                == if self.uses_packed_f16_denoiser_source() {
+                    Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent
+                } else {
+                    Qwen3VlTextLayerAllocationPolicy::BackendDefault
+                }
+            && self.qwen_text_block_load_synchronization
+                == if self.uses_packed_f16_denoiser_source() {
+                    Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward
+                } else {
+                    Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly
+                }
+            && self.qwen_text_layer_submission_policy
+                == if self.uses_packed_f16_denoiser_source() {
+                    BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY
+                } else {
+                    BROWSER_DEFAULT_QWEN_TEXT_LAYER_SUBMISSION_POLICY
+                }
+            && (!self.uses_packed_f16_denoiser_source()
+                || (!self.retain_qwen_stages && !self.defer_retained_qwen_synchronization))
+            && matches!(
+                (
+                    self.uses_packed_f16_denoiser_source(),
+                    self.qwen_embedding_execution
+                ),
+                (
+                    true,
+                    Qwen3VlEmbeddingExecutionPolicy::ExactHostRoutedF16ToF32 {
+                        verify_device_roundtrip_before_text: true
+                    }
+                ) | (false, Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks)
+            )
+    }
+
+    fn qwen_embedding_execution_policy(self) -> &'static str {
+        match self.qwen_embedding_execution {
+            Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks => "device-routed-row-chunks",
+            Qwen3VlEmbeddingExecutionPolicy::ExactHostRoutedF16ToF32 {
+                verify_device_roundtrip_before_text: true,
+            } => {
+                "authenticated-full-f16-row-objects/host-token-row-select/f16-to-f32/one-compact-upload/immediate-device-readback-before-text"
+            }
+            Qwen3VlEmbeddingExecutionPolicy::ExactHostRoutedF16ToF32 {
+                verify_device_roundtrip_before_text: false,
+            } => {
+                "authenticated-full-f16-row-objects/host-token-row-select/f16-to-f32/one-compact-upload/no-device-readback"
+            }
+        }
+    }
+
+    fn qwen_text_layer_allocation_policy(self) -> &'static str {
+        self.qwen_text_layer_allocation.label()
+    }
+
+    fn qwen_text_block_load_synchronization_policy(self) -> &'static str {
+        self.qwen_text_block_load_synchronization.label()
+    }
+
+    fn qwen_text_layer_submission_policy(self) -> &'static str {
+        self.qwen_text_layer_submission_policy
+    }
+
+    fn for_ordinary_browser_factory(mut self) -> Self {
+        self.require_persistent_range_cache =
+            self.residency == BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser;
+        self.request_scoped_surface_acquire_suspended = true;
+        self
+    }
+
+    fn weight_traffic_contract(self) -> &'static str {
+        if self.eager_preload {
+            "eager-preload/qwen+vae+denoiser/zero-inference-artifact-transfers"
+        } else if self.require_persistent_range_cache
+            && self.denoiser_retaining_wrapper_adapter
+                == BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
+        {
+            "persistent-range-cache/qwen+vae+denoiser-first-request/zero-repeat-network-required/retained-q8-denoiser-cache-hits-dmd-steps-2-through-4/dense-f32-materialized-per-semantic-stage"
+        } else if self.require_persistent_range_cache
+            && self.preload_denoiser_before_request
+            && self.residency == BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+        {
+            "persistent-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage"
+        } else if self.require_persistent_range_cache && self.residency.is_low_vram() {
+            "persistent-range-cache/qwen+vae+denoiser-first-request/zero-repeat-network-required/retained-q8-direct-matmul-denoiser-cache-hits-dmd-steps-2-through-4"
+        } else if self.preload_denoiser_before_request
+            && self.residency == BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+        {
+            "diagnostic-per-request/qwen+vae/packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/no-persistent-cache-claim/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage"
+        } else if self.residency.is_low_vram() {
+            "per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4"
+        } else if self.retain_denoiser_stages {
+            "qualification-per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4"
+        } else {
+            "diagnostic-per-request/qwen+vae/denoiser-reloaded-every-dmd-step"
+        }
+    }
+
+    fn denoiser_linear_execution_policy(self) -> &'static str {
+        if self.uses_packed_f16_denoiser_source() {
+            "packed-f16-storage/device-widen-f32-per-semantic-stage/dense-f32-matmul"
+        } else {
+            quantized_linear_execution_policy_name(self.denoiser_retaining_wrapper_adapter)
+        }
+    }
+
+    fn denoiser_storage_policy(self) -> &'static str {
+        if self.uses_packed_f16_denoiser_source() {
+            "authenticated-compact-f16/padded-u32-retained/dense-f32-per-semantic-stage"
+        } else {
+            "standard-verified-burn-module-snapshots"
+        }
+    }
+
+    fn denoiser_quantized_load_policy_report(self) -> &'static str {
+        if self.uses_packed_f16_denoiser_source() {
+            "not-applicable-packed-f16-storage"
+        } else {
+            denoiser_quantized_policy_name(
+                self.denoiser_quantized,
+                self.denoiser_runtime_quantization,
+                self.denoiser_runtime_q8_scope,
+            )
+        }
+    }
+
+    fn denoiser_quantized_linear_execution_policy_report(self) -> &'static str {
+        if self.uses_packed_f16_denoiser_source() {
+            "not-applicable-packed-f16-storage"
+        } else {
+            quantized_linear_execution_policy_name(self.denoiser_retaining_wrapper_adapter)
+        }
+    }
+
     fn layer_streamed_diagnostic(settings: &crate::BooguAdapterSettings) -> Self {
         Self {
             // Chrome WebGPU currently rejects Burn/CubeCL F16 kernels. The async verified sources
             // adapt each bounded floating stage before upload, so storage remains unchanged.
             qwen_float: BooguFloatLoadPolicy::AdaptToF32,
             qwen_quantized: settings.qwen_quantized_load_policy(),
+            qwen_embedding_execution: Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks,
+            qwen_text_layer_allocation: Qwen3VlTextLayerAllocationPolicy::BackendDefault,
+            qwen_text_block_load_synchronization:
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly,
+            qwen_text_layer_submission_policy: BROWSER_DEFAULT_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
             vae_float: BooguFloatLoadPolicy::AdaptToF32,
             denoiser_float: BooguFloatLoadPolicy::AdaptToF32,
             denoiser_quantized: settings.denoiser_quantized_load_policy(),
+            denoiser_runtime_quantization: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+            denoiser_runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
+            denoiser_retaining_wrapper_adapter:
+                BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            denoiser_execution_kind: BrowserDenoiserExecutionKind::VerifiedBurnModule,
             residency: BrowserBooguResidencyPolicy::LayerStreamedDiagnostic,
             retain_qwen_stages: false,
             retain_vae_stages: false,
             retain_denoiser_stages: false,
             eager_preload: false,
-            defer_retained_synchronization: false,
+            preload_denoiser_before_request: false,
+            defer_retained_qwen_synchronization: false,
+            defer_retained_denoiser_synchronization: false,
+            require_persistent_range_cache: false,
+            release_unused_qwen_memory_after_stage: false,
+            packed_qwen_instruction_handoff: false,
+            request_scoped_surface_acquire_suspended: false,
         }
     }
 
@@ -2356,14 +5452,143 @@ impl BrowserExecutionPolicies {
         policies.retain_vae_stages = true;
         policies.retain_denoiser_stages = true;
         policies.eager_preload = true;
-        policies.defer_retained_synchronization = true;
+        policies.preload_denoiser_before_request = true;
+        policies.defer_retained_qwen_synchronization = true;
+        policies.defer_retained_denoiser_synchronization = true;
         Ok(policies)
+    }
+
+    fn low_vram_runtime_q8_denoiser(
+        variant: BooguVariant,
+        settings: &crate::BooguAdapterSettings,
+    ) -> Result<Self, &'static str> {
+        if variant == BooguVariant::Image01Turbo {
+            return Err(
+                "Turbo all-eligible direct Q8 matmul is not numerically qualified; use the variant-aware default low-vram policy",
+            );
+        }
+        if settings.storage_profile != BooguStorageProfile::F16QwenVisionF32 {
+            return Err(
+                "browser low-vram production requires profile=production; stored Q8 profiles remain explicit diagnostics",
+            );
+        }
+        Ok(Self {
+            // Canonical storage remains unchanged. Chrome's current production path adapts one
+            // verified Qwen/VAE F16 stage to F32 at a time. Only inventory-qualified row-layout
+            // denoiser matrices are runtime-quantized by the verified denoiser source.
+            qwen_float: BooguFloatLoadPolicy::AdaptToF32,
+            qwen_quantized: BooguQuantizedLoadPolicy::Preserve,
+            qwen_embedding_execution: Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks,
+            qwen_text_layer_allocation: Qwen3VlTextLayerAllocationPolicy::BackendDefault,
+            qwen_text_block_load_synchronization:
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly,
+            qwen_text_layer_submission_policy: BROWSER_DEFAULT_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
+            vae_float: BooguFloatLoadPolicy::AdaptToF32,
+            denoiser_float: BooguFloatLoadPolicy::AdaptToF32,
+            denoiser_quantized: BooguQuantizedLoadPolicy::Preserve,
+            denoiser_runtime_quantization: BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            denoiser_runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
+            denoiser_retaining_wrapper_adapter:
+                BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            denoiser_execution_kind: BrowserDenoiserExecutionKind::VerifiedBurnModule,
+            residency: BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser,
+            retain_qwen_stages: false,
+            retain_vae_stages: false,
+            retain_denoiser_stages: true,
+            eager_preload: false,
+            preload_denoiser_before_request: false,
+            // Qwen is not retained in this policy, so every stage must complete before its
+            // module handle is dropped and the following verified shard is fetched. Keep the
+            // denoiser on the same per-stage barrier contract: deferred browser execution has
+            // not been qualified for every released denoiser and can accumulate an entire
+            // semantic graph before the step boundary.
+            defer_retained_qwen_synchronization: false,
+            defer_retained_denoiser_synchronization: false,
+            require_persistent_range_cache: false,
+            release_unused_qwen_memory_after_stage: false,
+            packed_qwen_instruction_handoff: false,
+            request_scoped_surface_acquire_suspended: false,
+        })
+    }
+
+    fn low_vram_retained_q8_dense_f32_denoiser(
+        variant: BooguVariant,
+        settings: &crate::BooguAdapterSettings,
+    ) -> Result<Self, &'static str> {
+        let _ = (variant, settings);
+        Err(
+            "the retained-Q8 dense-F32-per-stage Turbo policy is retired after repeated real-browser first-step non-finite failures; use the default preloaded packed-F16 dense-F32-per-stage policy",
+        )
+    }
+
+    fn low_vram_preloaded_packed_f16_denoiser(
+        variant: BooguVariant,
+        settings: &crate::BooguAdapterSettings,
+    ) -> Result<Self, &'static str> {
+        if variant != BooguVariant::Image01Turbo {
+            return Err(
+                "browser preloaded packed-F16 dense-F32-per-stage low-VRAM policy is restricted to Turbo",
+            );
+        }
+        if settings.storage_profile != BooguStorageProfile::F16QwenVisionF32 {
+            return Err(
+                "browser preloaded packed-F16 dense-F32-per-stage low-VRAM policy requires profile=production",
+            );
+        }
+        Ok(Self {
+            qwen_float: BooguFloatLoadPolicy::AdaptToF32,
+            qwen_quantized: BooguQuantizedLoadPolicy::Preserve,
+            qwen_embedding_execution: Qwen3VlEmbeddingExecutionPolicy::ExactHostRoutedF16ToF32 {
+                verify_device_roundtrip_before_text: true,
+            },
+            qwen_text_layer_allocation: Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent,
+            qwen_text_block_load_synchronization:
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward,
+            qwen_text_layer_submission_policy: BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
+            vae_float: BooguFloatLoadPolicy::AdaptToF32,
+            denoiser_float: BooguFloatLoadPolicy::AdaptToF32,
+            denoiser_quantized: BooguQuantizedLoadPolicy::Preserve,
+            denoiser_runtime_quantization: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+            denoiser_runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
+            denoiser_retaining_wrapper_adapter:
+                BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            denoiser_execution_kind: BrowserDenoiserExecutionKind::PackedF16DeviceWidenDenseF32,
+            residency: BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser,
+            retain_qwen_stages: false,
+            retain_vae_stages: false,
+            retain_denoiser_stages: false,
+            eager_preload: false,
+            preload_denoiser_before_request: true,
+            defer_retained_qwen_synchronization: false,
+            defer_retained_denoiser_synchronization: false,
+            require_persistent_range_cache: false,
+            // Browser Qwen's internal per-stage allocator cleanup can reclaim its live
+            // zero-initialized embedding accumulator. Keep it disabled and cross the phase with
+            // the bounded exact-F32 host handoff admitted below instead.
+            release_unused_qwen_memory_after_stage: false,
+            packed_qwen_instruction_handoff: true,
+            request_scoped_surface_acquire_suspended: false,
+        })
     }
 
     fn exact_1k5_parity(settings: &crate::BooguAdapterSettings) -> Self {
         let mut policies = Self::layer_streamed_diagnostic(settings);
+        policies.residency =
+            BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained;
         policies.retain_denoiser_stages = true;
         policies
+    }
+
+    fn exact_1k5_low_vram_parity(
+        settings: &crate::BooguAdapterSettings,
+    ) -> Result<Self, &'static str> {
+        let mut policies =
+            Self::low_vram_runtime_q8_denoiser(BooguVariant::Image01EditTurbo1k5, settings)?;
+        // Exact parity attaches an observer that clones each semantic activation until the
+        // matching source barrier compares and drops it. Preserve the production per-stage
+        // synchronization contract so the fixture qualifies the same execution ordering.
+        policies.defer_retained_denoiser_synchronization = false;
+        Ok(policies)
     }
 
     fn preserve_qwen_f16(settings: &crate::BooguAdapterSettings) -> Self {
@@ -2372,15 +5597,31 @@ impl BrowserExecutionPolicies {
             // denoiser remain on the production-compatible F32 policy and are not executed.
             qwen_float: BooguFloatLoadPolicy::Preserve,
             qwen_quantized: settings.qwen_quantized_load_policy(),
+            qwen_embedding_execution: Qwen3VlEmbeddingExecutionPolicy::DeviceRoutedChunks,
+            qwen_text_layer_allocation: Qwen3VlTextLayerAllocationPolicy::BackendDefault,
+            qwen_text_block_load_synchronization:
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly,
+            qwen_text_layer_submission_policy: BROWSER_DEFAULT_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
             vae_float: BooguFloatLoadPolicy::AdaptToF32,
             denoiser_float: BooguFloatLoadPolicy::AdaptToF32,
             denoiser_quantized: settings.denoiser_quantized_load_policy(),
+            denoiser_runtime_quantization: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+            denoiser_runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
+            denoiser_retaining_wrapper_adapter:
+                BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            denoiser_execution_kind: BrowserDenoiserExecutionKind::VerifiedBurnModule,
             residency: BrowserBooguResidencyPolicy::LayerStreamedDiagnostic,
             retain_qwen_stages: false,
             retain_vae_stages: false,
             retain_denoiser_stages: false,
             eager_preload: false,
-            defer_retained_synchronization: false,
+            preload_denoiser_before_request: false,
+            defer_retained_qwen_synchronization: false,
+            defer_retained_denoiser_synchronization: false,
+            require_persistent_range_cache: false,
+            release_unused_qwen_memory_after_stage: false,
+            packed_qwen_instruction_handoff: false,
+            request_scoped_surface_acquire_suspended: false,
         }
     }
 
@@ -2545,6 +5786,17 @@ struct BrowserBooguEngine {
     policies: BrowserExecutionPolicies,
     dtypes: BooguRuntimeDTypes,
     device: burn_wgpu::WgpuDevice,
+    applied_buffer_limits: BrowserAppliedBufferLimits,
+    low_vram_resource_plan: Option<BrowserLowVramResourcePlan>,
+    packed_f16_resource_plan: Option<BrowserPackedF16ResourcePlan>,
+    packed_f16_qwen_embedding_plan: Option<BrowserPackedF16QwenEmbeddingPlan>,
+    last_packed_f16_qwen_host_embedding: Option<HostRoutedEmbeddingReport>,
+    last_packed_f16_qwen_instruction_handoff: Option<BrowserPackedF16QwenInstructionHandoffReport>,
+    last_packed_f16_denoiser_lifecycle: Option<BrowserPackedF16DenoiserLifecycleReport>,
+    last_packed_f16_dmd_vae_handoff: Option<BrowserPackedF16DmdVaeHandoffReport>,
+    last_low_vram_denoiser_dtype_audit: Option<BrowserLowVramDenoiserDTypeAudit>,
+    last_dense_f32_materialized_stage_clones: usize,
+    last_artifact_traffic: BrowserArtifactTrafficReport,
     artifact_control: BrowserArtifactControl,
     expected_weight_artifacts: BTreeMap<String, u64>,
     expected_vae_encoder_weight_artifacts: BTreeMap<String, u64>,
@@ -2558,8 +5810,15 @@ impl BrowserBooguEngine {
         settings: crate::BooguAdapterSettings,
         policies: BrowserExecutionPolicies,
         device: burn_wgpu::WgpuDevice,
+        applied_buffer_limits: BrowserAppliedBufferLimits,
     ) -> Result<Self, RuntimeError> {
         let variant = identity.variant;
+        if !policies.packed_allocator_policy_is_exact() {
+            return Err(execution_error(
+                variant,
+                "browser packed-F16 policy requires Qwen per-stage cleanup disabled and the exact host-F32 instruction handoff enabled; every non-packed policy requires both cleanup mechanisms disabled",
+            ));
+        }
         let stream_config = ArtifactStreamConfig::default();
         let manifest_path =
             ArtifactPath::new("manifest.json").map_err(|error| execution_error(variant, error))?;
@@ -2585,6 +5844,16 @@ impl BrowserBooguEngine {
             execution_error(variant, "sealed browser manifest omits its content digest")
         })?;
         if browser_source_requires_canonical_digest(variant, settings.storage_profile, &base_url) {
+            validate_canonical_release_artifact_digest(
+                variant,
+                settings.storage_profile,
+                artifact_content_digest,
+            )
+            .map_err(|error| execution_error(variant, error))?;
+        }
+        if policies.residency.is_low_vram() {
+            // The memory audit and runtime quantization quality evidence are bound to the exact
+            // canonical production manifest, even when a caller mirrors it behind artifacts=.
             validate_canonical_release_artifact_digest(
                 variant,
                 settings.storage_profile,
@@ -2650,7 +5919,7 @@ impl BrowserBooguEngine {
             dispatch_browser_progress(&progress);
         })));
         let make_reader = |base_url, bundle| {
-            if composition.legacy_monolith {
+            let reader = if composition.legacy_monolith {
                 BrowserStageShardReader::with_control(
                     base_url,
                     stream_config,
@@ -2663,6 +5932,11 @@ impl BrowserBooguEngine {
                     stream_config,
                     bootstrap_control.clone(),
                 )
+            };
+            if policies.require_persistent_range_cache {
+                reader.with_required_range_cache()
+            } else {
+                reader
             }
         };
         let reader = make_reader(
@@ -2775,18 +6049,66 @@ impl BrowserBooguEngine {
                     .with_float_policy(float_policy);
             (BrowserVerifiedQwenSource::Component(source), plan)
         };
+        let low_vram_resource_plan =
+            if policies.residency.is_low_vram() && !policies.uses_packed_f16_denoiser_source() {
+                Some(validate_browser_low_vram_resource_plan(
+                    variant,
+                    settings.storage_profile,
+                    &qwen_plan,
+                    &inventory,
+                    policies.denoiser_runtime_q8_scope,
+                    policies.denoiser_retaining_wrapper_adapter,
+                )?)
+            } else {
+                None
+            };
+        let packed_f16_resource_plan = if policies.uses_packed_f16_denoiser_source() {
+            Some(validate_browser_packed_f16_resource_plan(
+                variant,
+                settings.storage_profile,
+            )?)
+        } else {
+            None
+        };
+        let packed_f16_qwen_embedding_plan = if policies.uses_packed_f16_denoiser_source() {
+            Some(validate_browser_packed_f16_qwen_embedding_plan(
+                variant,
+                &composition.qwen_manifest,
+                &qwen_plan,
+            )?)
+        } else {
+            None
+        };
         let qwen_source = BrowserAsyncStageSource::new(verified_qwen_source, synchronizer.clone());
         let qwen_source = if policies.retain_qwen_stages {
             RetainingAsyncQwen3VlStageSource::new(qwen_source)
         } else {
             RetainingAsyncQwen3VlStageSource::passthrough(qwen_source)
         };
-        let qwen_source = if policies.defer_retained_synchronization {
+        let qwen_source = if policies.defer_retained_qwen_synchronization {
             qwen_source.with_synchronization_policy(AsyncRetainingSynchronizationPolicy::Deferred)
         } else {
             qwen_source
         };
-        let mut qwen = StreamingQwen3Vl::new(qwen_plan, qwen_source);
+        let mut qwen = StreamingQwen3Vl::new(qwen_plan, qwen_source)
+            .with_release_unused_memory_after_stage(policies.release_unused_qwen_memory_after_stage)
+            .with_embedding_execution_policy(policies.qwen_embedding_execution)
+            .with_text_layer_allocation_policy(policies.qwen_text_layer_allocation)
+            .with_text_block_load_synchronization_policy(
+                policies.qwen_text_block_load_synchronization,
+            );
+        if qwen.releases_unused_memory_after_stage()
+            != policies.release_unused_qwen_memory_after_stage
+            || qwen.embedding_execution_policy() != policies.qwen_embedding_execution
+            || qwen.text_layer_allocation_policy() != policies.qwen_text_layer_allocation
+            || qwen.text_block_load_synchronization_policy()
+                != policies.qwen_text_block_load_synchronization
+        {
+            return Err(execution_error(
+                variant,
+                "streaming Qwen allocator/embedding/synchronization provenance differs from the admitted browser policy",
+            ));
+        }
         if variant == BooguVariant::Image01EditTurbo1k5 {
             qwen.set_query_chunk_size(BROWSER_1K5_QWEN_QUERY_CHUNK_SIZE);
         }
@@ -2824,25 +6146,45 @@ impl BrowserBooguEngine {
         } else {
             RetainingAsyncBooguVaeStageSource::passthrough(vae_source)
         };
-        let verified_denoiser_source = VerifiedAsyncBurnpackDenoiserStageSource::new(
-            &identity,
-            composition.pipeline_manifest,
-            inventory,
-            denoiser_config.clone(),
-            profile,
-            device.clone(),
-            reader.clone(),
-        )
-        .await
-        .map_err(|error| execution_error(variant, error))?
-        .with_float_load_policy(policies.denoiser_float)
-        .with_quantized_load_policy(policies.denoiser_quantized);
+        let verified_denoiser_source = if policies.uses_packed_f16_denoiser_source() {
+            BrowserVerifiedDenoiserSource::PackedF16(
+                VerifiedAsyncPackedF16DenoiserStageSource::new(
+                    &identity,
+                    composition.pipeline_manifest,
+                    inventory,
+                    denoiser_config.clone(),
+                    profile,
+                    device.clone(),
+                    reader.clone(),
+                )
+                .await
+                .map_err(|error| execution_error(variant, error))?,
+            )
+        } else {
+            BrowserVerifiedDenoiserSource::Standard(
+                VerifiedAsyncBurnpackDenoiserStageSource::new(
+                    &identity,
+                    composition.pipeline_manifest,
+                    inventory,
+                    denoiser_config.clone(),
+                    profile,
+                    device.clone(),
+                    reader.clone(),
+                )
+                .await
+                .map_err(|error| execution_error(variant, error))?
+                .with_float_load_policy(policies.denoiser_float)
+                .with_quantized_load_policy(policies.denoiser_quantized)
+                .with_runtime_quantization_policy(policies.denoiser_runtime_quantization)
+                .with_runtime_q8_scope(policies.denoiser_runtime_q8_scope),
+            )
+        };
         let mut denoiser_source =
             BrowserAsyncStageSource::new(verified_denoiser_source, synchronizer);
         // The 1.5K fixture-qualified path uses q1024 while remaining far below its full joint
-        // sequence. Ordinary 256px production keeps the model's q128 default: using q1024 there
-        // can cover the entire short sequence and accidentally materialize a dense seq^2 score
-        // tensor. GPU residency never relaxes the bounded-attention contract.
+        // sequence. The 1K releases keep the model's q128 default: at small shapes q1024 could
+        // cover the entire sequence and accidentally materialize a dense seq^2 score tensor. GPU
+        // residency and output resolution never relax the bounded-attention contract.
         denoiser_source.set_denoiser_query_chunk_size(
             if variant == BooguVariant::Image01EditTurbo1k5 {
                 BROWSER_1K5_DENOISER_QUERY_CHUNK_SIZE
@@ -2855,12 +6197,14 @@ impl BrowserBooguEngine {
         } else {
             RetainingAsyncBooguDenoiserStageSource::passthrough(denoiser_source)
         };
-        let denoiser_source = if policies.defer_retained_synchronization {
+        let denoiser_source = if policies.defer_retained_denoiser_synchronization {
             denoiser_source
                 .with_synchronization_policy(AsyncRetainingDenoiserSynchronizationPolicy::Deferred)
         } else {
             denoiser_source
         };
+        let denoiser_source = denoiser_source
+            .with_quantized_linear_execution_policy(policies.denoiser_retaining_wrapper_adapter);
         let denoiser = StreamingBooguDenoiser::new(denoiser_config, denoiser_source)
             .map_err(|error| execution_error(variant, error))?;
 
@@ -2893,6 +6237,17 @@ impl BrowserBooguEngine {
             policies,
             dtypes,
             device,
+            applied_buffer_limits,
+            low_vram_resource_plan,
+            packed_f16_resource_plan,
+            packed_f16_qwen_embedding_plan,
+            last_packed_f16_qwen_host_embedding: None,
+            last_packed_f16_qwen_instruction_handoff: None,
+            last_packed_f16_denoiser_lifecycle: None,
+            last_packed_f16_dmd_vae_handoff: None,
+            last_low_vram_denoiser_dtype_audit: None,
+            last_dense_f32_materialized_stage_clones: 0,
+            last_artifact_traffic: BrowserArtifactTrafficReport::default(),
             artifact_control,
             expected_weight_artifacts,
             expected_vae_encoder_weight_artifacts,
@@ -2905,6 +6260,13 @@ impl BrowserBooguEngine {
                     format!(
                         "browser resident-dense preload failed without fallback: {error}; use residency=layer-streamed-diagnostic only for explicit low-memory diagnosis"
                     ),
+                )
+            })?;
+        } else if policies.preload_denoiser_before_request {
+            engine.preload_low_vram_denoiser().await.map_err(|error| {
+                execution_error(
+                    variant,
+                    format!("browser low-vram denoiser preload failed without fallback: {error}"),
                 )
             })?;
         }
@@ -2942,6 +6304,39 @@ impl BrowserBooguEngine {
             + config.num_double_stream_layers
             + config.num_single_stream_layers()
             + 1
+    }
+
+    fn packed_f16_denoiser_source(
+        &self,
+    ) -> Result<&BrowserPackedVerifiedDenoiserSource, RuntimeError> {
+        self.denoiser
+            .source()
+            .source()
+            .inner()
+            .packed_f16()
+            .ok_or_else(|| {
+                execution_error(
+                    self.identity.variant,
+                    "browser policy requires the packed-F16 denoiser source",
+                )
+            })
+    }
+
+    fn packed_f16_denoiser_source_mut(
+        &mut self,
+    ) -> Result<&mut BrowserPackedVerifiedDenoiserSource, RuntimeError> {
+        let variant = self.identity.variant;
+        self.denoiser
+            .source_mut()
+            .source_mut()
+            .inner_mut()
+            .packed_f16_mut()
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "browser policy requires the packed-F16 denoiser source",
+                )
+            })
     }
 
     async fn synchronize_preloaded_qwen_stage(&mut self) -> Result<(), RuntimeError> {
@@ -3151,6 +6546,704 @@ impl BrowserBooguEngine {
         self.validate_resident_caches()
     }
 
+    async fn preload_low_vram_denoiser(&mut self) -> Result<(), RuntimeError> {
+        let variant = self.identity.variant;
+        if self.policies.residency != BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+            || self.denoiser.source().retention_enabled()
+            || !self.policies.uses_packed_f16_denoiser_source()
+            || self.policies.denoiser_retaining_wrapper_adapter
+                != BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul
+        {
+            return Err(execution_error(
+                variant,
+                "low-vram denoiser preload requires the exact Turbo packed-F16 passthrough policy",
+            ));
+        }
+        report_browser_runtime_preparing(
+            "Verifying and preloading all 46 Turbo packed-F16 denoiser stages before inference",
+        );
+        let traffic_before = self.artifact_control.traffic_snapshot();
+        let audit_before = self.packed_f16_denoiser_source()?.audit();
+        let audit = self
+            .packed_f16_denoiser_source_mut()?
+            .preload_turbo_raw()
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+        let plan = self.packed_f16_resource_plan.ok_or_else(|| {
+            execution_error(variant, "browser packed-F16 resource plan is absent")
+        })?;
+        validate_packed_f16_denoiser_preload(variant, plan, audit_before, audit)?;
+        let traffic = self
+            .artifact_control
+            .traffic_snapshot()
+            .checked_delta(traffic_before)
+            .ok_or_else(|| {
+                execution_error(variant, "denoiser preload traffic counters moved backwards")
+            })?;
+        dispatch_browser_event(
+            BROWSER_RUNTIME_EVENT_NAME,
+            &BrowserRuntimeEvent::PackedF16DenoiserPreload {
+                traffic: traffic.into(),
+                cached_stages: audit.cached_stage_count,
+                cached_objects: audit.cached_object_count,
+                cached_tensors: audit.cached_tensor_count,
+                cached_bytes: audit.retained_packed_bytes,
+                previous_preload_attempt_count: audit_before.preload_attempt_count,
+                preload_attempt_count: audit.preload_attempt_count,
+                request_scoped_rehydration: audit_before.preload_attempt_count > 0,
+                rehydration_policy: BROWSER_PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY,
+            },
+        );
+        Ok(())
+    }
+
+    async fn ensure_preloaded_low_vram_denoiser(&mut self) -> Result<(), RuntimeError> {
+        if !self.policies.preload_denoiser_before_request {
+            return Ok(());
+        }
+        let plan = self.packed_f16_resource_plan.ok_or_else(|| {
+            execution_error(
+                self.identity.variant,
+                "browser packed-F16 resource plan is absent",
+            )
+        })?;
+        let audit = self.packed_f16_denoiser_source()?.audit();
+        if audit.state == PackedF16DenoiserCacheState::Ready
+            && audit.packed_cache_ready
+            && audit.cached_stage_count == plan.expected_stage_count
+            && audit.cached_object_count == plan.expected_object_count
+            && audit.cached_tensor_count == plan.expected_tensor_count
+            && audit.retained_packed_bytes == plan.retained_packed_f16_denoiser_bytes
+            && !self.denoiser.source().has_pending_synchronization()
+        {
+            return Ok(());
+        }
+
+        // A failed/cancelled DMD request invalidates the retained cache after an unconditional
+        // queue barrier. Recover the next request from the verified persistent range cache rather
+        // than silently running with a partial semantic graph.
+        self.denoiser
+            .source_mut()
+            .synchronize()
+            .await
+            .map_err(|error| map_boogu(self.identity.variant, error))?;
+        self.denoiser.source_mut().clear();
+        self.packed_f16_denoiser_source_mut()?.clear();
+        self.denoiser.clear_rope_cache();
+        let synchronizer = BrowserAsyncSynchronizer::new(&self.device);
+        synchronizer
+            .synchronize("packed-F16 request rehydration (before allocator cleanup)")
+            .await
+            .map_err(|error| map_boogu(self.identity.variant, error))?;
+        <BrowserBackend as Backend>::memory_cleanup(&self.device);
+        synchronizer
+            .synchronize("packed-F16 request rehydration (after allocator cleanup)")
+            .await
+            .map_err(|error| map_boogu(self.identity.variant, error))?;
+        let empty_audit = self.packed_f16_denoiser_source()?.audit();
+        self.require_empty_packed_f16_cache_audit(
+            "next-request rehydration before preload",
+            empty_audit,
+        )?;
+        self.preload_low_vram_denoiser().await
+    }
+
+    fn require_exact_packed_f16_cache_audit(
+        &self,
+        boundary: &str,
+        audit: PackedF16DenoiserCacheAudit,
+    ) -> Result<(), RuntimeError> {
+        let variant = self.identity.variant;
+        let plan = self.packed_f16_resource_plan.ok_or_else(|| {
+            execution_error(variant, "browser packed-F16 resource plan is absent")
+        })?;
+        let exact = audit.state == PackedF16DenoiserCacheState::Ready
+            && audit.packed_cache_ready
+            && audit.cached_stage_count == plan.expected_stage_count
+            && audit.cached_object_count == plan.expected_object_count
+            && audit.cached_tensor_count == plan.expected_tensor_count
+            && audit.retained_packed_bytes == plan.retained_packed_f16_denoiser_bytes
+            && audit.packed_read_bytes >= plan.authenticated_artifact_bytes
+            && audit.packed_upload_bytes >= plan.retained_packed_f16_denoiser_bytes;
+        if !exact {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "browser packed-F16 cache differs from its exact plan at {boundary}: {audit:?}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_empty_packed_f16_cache_audit(
+        &self,
+        boundary: &str,
+        audit: PackedF16DenoiserCacheAudit,
+    ) -> Result<(), RuntimeError> {
+        let exact = audit.state == PackedF16DenoiserCacheState::Empty
+            && !audit.packed_cache_ready
+            && audit.cached_stage_count == 0
+            && audit.cached_object_count == 0
+            && audit.cached_tensor_count == 0
+            && audit.retained_packed_bytes == 0;
+        if !exact {
+            return Err(execution_error(
+                self.identity.variant,
+                format!("browser packed-F16 cache is not exactly empty at {boundary}: {audit:?}"),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn packed_f16_dmd_vae_handoff(
+        &mut self,
+        latents: Tensor<BrowserBackend, 4>,
+        expected_shape: [usize; 4],
+        run_id: RunId,
+    ) -> Result<Tensor<BrowserBackend, 4>, RuntimeError> {
+        let variant = self.identity.variant;
+        if variant != BooguVariant::Image01Turbo
+            || self.policies.residency
+                != BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+            || !self.policies.uses_packed_f16_denoiser_source()
+            || self.dtypes.denoiser != DType::F32
+            || self.dtypes.vae != DType::F32
+        {
+            return Err(execution_error(
+                variant,
+                "packed-F16 DMD-to-VAE handoff requires the exact Turbo F32 low-VRAM policy",
+            ));
+        }
+
+        let shape = latents.dims();
+        if shape != expected_shape || latents.dtype() != DType::F32 {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "packed-F16 final DMD latent must be exact F32 {expected_shape:?}, got {shape:?} {}",
+                    latents.dtype().name()
+                ),
+            ));
+        }
+        let wrapper_cached_stages_before_clear = self.denoiser.source().cached_stage_count();
+        let synchronization_pending_before_cleanup =
+            self.denoiser.source().has_pending_synchronization();
+        let audit_before = self.packed_f16_denoiser_source()?.audit();
+        self.require_exact_packed_f16_cache_audit("DMD-to-VAE handoff entry", audit_before)?;
+        if wrapper_cached_stages_before_clear != 0 || synchronization_pending_before_cleanup {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "packed-F16 DMD-to-VAE handoff entered with live wrapper stages or pending work: cached_stages={wrapper_cached_stages_before_clear}, synchronization_pending={synchronization_pending_before_cleanup}"
+                ),
+            ));
+        }
+
+        // Consume the only final-latent device handle. This readback is the exact value that will
+        // be reuploaded after the 19.87 GB request-scoped packed cache has been released.
+        let latent_data = latents.into_data_async().await.map_err(|error| {
+            execution_error(
+                variant,
+                format!("packed-F16 final DMD latent readback failed: {error}"),
+            )
+        })?;
+        let latent_before = packed_f16_tensor_data_input_diagnostic(
+            variant,
+            "final_dmd_latent_before_vae_handoff",
+            expected_shape.to_vec(),
+            &latent_data,
+        )?;
+        require_finite_nonzero_packed_f16_diagnostic(variant, &latent_before)?;
+        let payload_bytes = u64::try_from(latent_data.bytes.len()).map_err(|_| {
+            execution_error(
+                variant,
+                "packed-F16 final DMD latent payload byte count does not fit u64",
+            )
+        })?;
+        let expected_payload_bytes = u64::try_from(latent_before.element_count)
+            .ok()
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "packed-F16 final DMD latent payload byte count overflowed",
+                )
+            })?;
+        if payload_bytes != expected_payload_bytes {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "packed-F16 final DMD latent has {payload_bytes} host bytes, expected exact F32 size {expected_payload_bytes}"
+                ),
+            ));
+        }
+
+        // The DMD loop already crossed its real per-step barriers. One explicit boundary barrier
+        // after the final-latent map makes the subsequent cache-handle destruction independently
+        // auditable and protects this helper if its caller's lifecycle changes later.
+        let synchronizer = BrowserAsyncSynchronizer::new(&self.device);
+        synchronizer
+            .synchronize("packed-F16 DMD-to-VAE handoff (before cache clear)")
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+
+        // Drop every cache layer before forcing the allocator boundary so VAE cannot overlap the
+        // raw packed arena.
+        self.denoiser.source_mut().clear();
+        self.denoiser.clear_rope_cache();
+        self.packed_f16_denoiser_source_mut()?.clear();
+        synchronizer
+            .synchronize("packed-F16 DMD-to-VAE handoff (before allocator cleanup)")
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+        <BrowserBackend as Backend>::memory_cleanup(&self.device);
+        synchronizer
+            .synchronize("packed-F16 DMD-to-VAE handoff (after allocator cleanup)")
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+
+        let wrapper_cached_stages_after_clear = self.denoiser.source().cached_stage_count();
+        let synchronization_pending_after_cleanup =
+            self.denoiser.source().has_pending_synchronization();
+        let audit_after = self.packed_f16_denoiser_source()?.audit();
+        self.require_empty_packed_f16_cache_audit("DMD-to-VAE handoff exit", audit_after)?;
+        if wrapper_cached_stages_after_clear != 0 || synchronization_pending_after_cleanup {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "packed-F16 DMD-to-VAE cleanup retained wrapper stages or pending work: cached_stages={wrapper_cached_stages_after_clear}, synchronization_pending={synchronization_pending_after_cleanup}"
+                ),
+            ));
+        }
+
+        let latents =
+            Tensor::<BrowserBackend, 4>::from_data(latent_data, (&self.device, DType::F32));
+        let latent_after = read_packed_f16_tensor_input_diagnostic(
+            variant,
+            "final_dmd_latent_after_vae_handoff",
+            &latents,
+        )
+        .await?;
+        require_finite_nonzero_packed_f16_diagnostic(variant, &latent_after)?;
+        let digest_matches = latent_after.shape == latent_before.shape
+            && latent_after.dtype == latent_before.dtype
+            && latent_after.element_count == latent_before.element_count
+            && latent_after.sha256 == latent_before.sha256;
+        let device_to_host_readback_bytes = payload_bytes.checked_mul(2).ok_or_else(|| {
+            execution_error(
+                variant,
+                "packed-F16 DMD-to-VAE readback byte count overflowed",
+            )
+        })?;
+        let total_transfer_bytes = device_to_host_readback_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "packed-F16 DMD-to-VAE total transfer byte count overflowed",
+                )
+            })?;
+        let expected_next_request_preload_attempt_count = audit_after
+            .preload_attempt_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "packed-F16 preload-attempt counter overflowed at the VAE boundary",
+                )
+            })?;
+        let report = BrowserPackedF16DmdVaeHandoffReport {
+            policy: BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY.into(),
+            next_request_rehydration_policy: BROWSER_PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY
+                .into(),
+            shape: latent_after.shape.clone(),
+            dtype: latent_after.dtype.clone(),
+            element_count: latent_after.element_count,
+            payload_bytes,
+            device_to_host_readback_bytes,
+            host_to_device_upload_bytes: payload_bytes,
+            total_transfer_bytes,
+            before_sha256: latent_before.sha256,
+            after_sha256: latent_after.sha256,
+            all_finite: latent_before.all_finite && latent_after.all_finite,
+            not_all_zero: !packed_f16_tensor_diagnostic_is_all_zero(&latent_before)
+                && !packed_f16_tensor_diagnostic_is_all_zero(&latent_after),
+            digest_matches,
+            wrapper_cached_stages_before_clear,
+            wrapper_cached_stages_after_clear,
+            synchronization_pending_before_cleanup,
+            synchronization_pending_after_cleanup,
+            rope_cache_cleared: true,
+            cleanup_completed: true,
+            packed_cache_before_cleanup: packed_f16_cache_evidence(audit_before),
+            packed_cache_after_cleanup: packed_f16_cache_evidence(audit_after),
+            preload_attempt_count: audit_after.preload_attempt_count,
+            expected_next_request_preload_attempt_count,
+        };
+        validate_packed_f16_dmd_vae_handoff_report(
+            variant,
+            self.packed_f16_resource_plan.ok_or_else(|| {
+                execution_error(variant, "browser packed-F16 resource plan is absent")
+            })?,
+            expected_shape,
+            &report,
+        )?;
+        dispatch_browser_event(
+            BROWSER_RUNTIME_EVENT_NAME,
+            &browser_packed_f16_dmd_vae_handoff_event(run_id, report.clone()),
+        );
+        self.last_packed_f16_dmd_vae_handoff = Some(report);
+        Ok(latents)
+    }
+
+    async fn fail_closed_packed_f16_request_cleanup(&mut self) -> Result<(), RuntimeError> {
+        let variant = self.identity.variant;
+        let synchronizer = BrowserAsyncSynchronizer::new(&self.device);
+        let before_clear = synchronizer
+            .synchronize("failed packed-F16 request (before cache clear)")
+            .await
+            .map_err(|error| map_boogu(variant, error));
+
+        self.denoiser.source_mut().clear();
+        self.denoiser.clear_rope_cache();
+        let source_result = self.packed_f16_denoiser_source_mut().map(|source| {
+            source.fail_and_clear();
+        });
+        let after_clear = synchronizer
+            .synchronize("failed packed-F16 request (before allocator cleanup)")
+            .await
+            .map_err(|error| map_boogu(variant, error));
+        <BrowserBackend as Backend>::memory_cleanup(&self.device);
+        let after_cleanup = synchronizer
+            .synchronize("failed packed-F16 request (after allocator cleanup)")
+            .await
+            .map_err(|error| map_boogu(variant, error));
+
+        let local_state_result = self.packed_f16_denoiser_source().and_then(|source| {
+            let audit = source.audit();
+            if audit.state != PackedF16DenoiserCacheState::Ready
+                && !audit.packed_cache_ready
+                && audit.cached_stage_count == 0
+                && audit.cached_object_count == 0
+                && audit.cached_tensor_count == 0
+                && audit.retained_packed_bytes == 0
+                && self.denoiser.source().cached_stage_count() == 0
+                && !self.denoiser.source().has_pending_synchronization()
+            {
+                Ok(())
+            } else {
+                Err(execution_error(
+                    variant,
+                    format!(
+                        "failed packed-F16 request cleanup left ambiguous local state: {audit:?}"
+                    ),
+                ))
+            }
+        });
+        source_result
+            .and(local_state_result)
+            .and(before_clear)
+            .and(after_clear)
+            .and(after_cleanup)
+    }
+
+    async fn packed_f16_qwen_instruction_handoff(
+        &mut self,
+        instruction: Tensor<BrowserBackend, 3>,
+        run_id: RunId,
+        rendered_context: Option<BrowserPackedF16QwenPreHandoffContext>,
+    ) -> Result<
+        (
+            Tensor<BrowserBackend, 3>,
+            Option<PackedF16DenoiserCacheAudit>,
+            Option<BrowserPackedF16QwenInstructionHandoffReport>,
+        ),
+        RuntimeError,
+    > {
+        if !self.policies.uses_packed_f16_denoiser_source() {
+            if self.policies.release_unused_qwen_memory_after_stage
+                || self.policies.packed_qwen_instruction_handoff
+                || self.qwen.releases_unused_memory_after_stage()
+                || rendered_context.is_some()
+            {
+                return Err(execution_error(
+                    self.identity.variant,
+                    "a non-packed browser policy enabled the packed-F16 Qwen handoff",
+                ));
+            }
+            return Ok((instruction, None, None));
+        }
+        if !self.policies.packed_allocator_policy_is_exact()
+            || self.qwen.releases_unused_memory_after_stage()
+        {
+            return Err(execution_error(
+                self.identity.variant,
+                "packed-F16 Qwen handoff requires per-stage allocator cleanup to remain disabled",
+            ));
+        }
+        if self.qwen.source.cached_stage_count() != 0
+            || self.qwen.source.has_pending_synchronization()
+        {
+            return Err(execution_error(
+                self.identity.variant,
+                "packed-F16 Qwen handoff requires every streamed Qwen module to be dropped and synchronized",
+            ));
+        }
+
+        let variant = self.identity.variant;
+        let instruction_shape = instruction.dims().to_vec();
+        if instruction_shape.len() != 3
+            || instruction_shape[0] != 1
+            || instruction_shape[1] == 0
+            || instruction_shape[2] != 4096
+            || instruction.dtype() != DType::F32
+        {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "packed-F16 Qwen handoff requires one nonempty 4096-wide F32 instruction, got shape {instruction_shape:?} dtype {}",
+                    instruction.dtype().name()
+                ),
+            ));
+        }
+
+        // Consume the only device instruction handle into a bounded exact-F32 host payload before
+        // allocator cleanup. The released ordinary Turbo request is about 737 KiB (45*4096*4),
+        // and arbitrary valid prompt lengths remain shape/count checked rather than rounded.
+        let instruction_data = instruction.into_data_async().await.map_err(|error| {
+            execution_error(
+                variant,
+                format!("packed-F16 Qwen instruction handoff readback failed: {error}"),
+            )
+        })?;
+        let instruction_before = packed_f16_tensor_data_input_diagnostic(
+            variant,
+            "instruction_after_trim_cast_before_handoff",
+            instruction_shape.clone(),
+            &instruction_data,
+        )?;
+        let payload_bytes = u64::try_from(instruction_data.bytes.len()).map_err(|_| {
+            execution_error(
+                variant,
+                "packed-F16 Qwen instruction host payload byte count does not fit u64",
+            )
+        })?;
+        let expected_payload_bytes = u64::try_from(instruction_before.element_count)
+            .ok()
+            .and_then(|elements| elements.checked_mul(4))
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "packed-F16 Qwen instruction handoff byte count overflowed",
+                )
+            })?;
+        if payload_bytes != expected_payload_bytes {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "packed-F16 Qwen instruction host payload has {payload_bytes} bytes, expected exact F32 size {expected_payload_bytes}"
+                ),
+            ));
+        }
+
+        let emit_rendered_diagnostics = rendered_context.is_some();
+        if let Some(context) = rendered_context {
+            let block_00_immediate_matches_delayed_capture = context
+                .stage_outputs
+                .iter()
+                .find(|diagnostic| diagnostic.name == "qwen_text_block_00_output")
+                .is_some_and(|delayed| {
+                    let immediate = &context.block_00_immediate_post_sync.tensor;
+                    delayed.shape == immediate.shape
+                        && delayed.dtype == immediate.dtype
+                        && delayed.sha256 == immediate.sha256
+                });
+            let final_norm_matches_returned_output =
+                context.stage_outputs.last().is_some_and(|diagnostic| {
+                    diagnostic.name == "qwen_final_norm_output"
+                        && diagnostic.shape == context.qwen_last_hidden_state_before_trim.shape
+                        && diagnostic.dtype == context.qwen_last_hidden_state_before_trim.dtype
+                        && diagnostic.sha256 == context.qwen_last_hidden_state_before_trim.sha256
+                });
+            let first_non_finite_tensor = context
+                .stage_outputs
+                .iter()
+                .chain(std::iter::once(&context.qwen_last_hidden_state_before_trim))
+                .chain(std::iter::once(&instruction_before))
+                .find(|diagnostic| !diagnostic.all_finite)
+                .map(|diagnostic| diagnostic.name.clone());
+            let first_all_zero_tensor = context
+                .stage_outputs
+                .iter()
+                .chain(std::iter::once(&context.qwen_last_hidden_state_before_trim))
+                .chain(std::iter::once(&instruction_before))
+                .find(|diagnostic| packed_f16_tensor_diagnostic_is_all_zero(diagnostic))
+                .map(|diagnostic| diagnostic.name.clone());
+            let stage_count_matches =
+                context.stage_outputs.len() == context.expected_stage_output_count;
+            let stage_names_exact = packed_f16_qwen_stage_diagnostic_names_are_exact(
+                &context.stage_outputs,
+                context.expected_stage_output_count,
+            );
+            let diagnostics = BrowserPackedF16QwenPreHandoffDiagnostics {
+                scope: BROWSER_PACKED_F16_QWEN_PRE_HANDOFF_SCOPE.into(),
+                effective_instruction_length: context.effective_instruction_length,
+                expected_stage_output_count: context.expected_stage_output_count,
+                stage_outputs: context.stage_outputs,
+                stage_names_exact,
+                qwen_last_hidden_state_before_trim: context.qwen_last_hidden_state_before_trim,
+                instruction_after_trim_cast_before_handoff: instruction_before.clone(),
+                all_tensors_finite: first_non_finite_tensor.is_none(),
+                no_tensor_all_zero: first_all_zero_tensor.is_none(),
+                first_non_finite_tensor: first_non_finite_tensor.clone(),
+                first_all_zero_tensor: first_all_zero_tensor.clone(),
+                final_norm_matches_returned_output,
+                block_00_immediate_post_sync: context.block_00_immediate_post_sync,
+                block_00_immediate_matches_delayed_capture,
+            };
+            dispatch_browser_event(
+                BROWSER_RUNTIME_EVENT_NAME,
+                &browser_packed_f16_qwen_pre_handoff_diagnostics_event(run_id, diagnostics),
+            );
+            if !stage_count_matches {
+                return Err(execution_error(
+                    variant,
+                    "rendered-smoke Qwen diagnostics captured the wrong stage count before handoff",
+                ));
+            }
+            if !stage_names_exact {
+                return Err(execution_error(
+                    variant,
+                    "rendered-smoke Qwen diagnostic stage names or order differ from the released text path",
+                ));
+            }
+            if !final_norm_matches_returned_output {
+                return Err(execution_error(
+                    variant,
+                    "rendered-smoke Qwen final-norm observer differs from the returned hidden state",
+                ));
+            }
+            if !block_00_immediate_matches_delayed_capture {
+                return Err(execution_error(
+                    variant,
+                    "rendered-smoke Qwen block-0 delayed capture differs from its immediate post-sync readback",
+                ));
+            }
+            if let Some(name) = first_non_finite_tensor {
+                return Err(execution_error(
+                    variant,
+                    format!("rendered-smoke Qwen tensor {name} is non-finite before handoff"),
+                ));
+            }
+            if let Some(name) = first_all_zero_tensor {
+                return Err(execution_error(
+                    variant,
+                    format!("rendered-smoke Qwen tensor {name} is all-zero before handoff"),
+                ));
+            }
+        }
+        require_finite_nonzero_packed_f16_diagnostic(variant, &instruction_before)?;
+
+        // `Backend::sync` is blocking and cannot be called from the single-threaded Wasm event
+        // loop. The runtime-client barriers drain the same BrowserBackend queue without blocking:
+        // exact host handoff -> async sync -> backend allocator cleanup -> async sync -> exact F32
+        // reupload. No live Qwen activation handle crosses the allocator boundary; packed-cache
+        // handles remain rooted throughout.
+        let synchronizer = BrowserAsyncSynchronizer::new(&self.device);
+        synchronizer
+            .synchronize("packed-F16 Qwen instruction handoff (before cleanup)")
+            .await
+            .map_err(|error| map_boogu(self.identity.variant, error))?;
+        <BrowserBackend as Backend>::memory_cleanup(&self.device);
+        synchronizer
+            .synchronize("packed-F16 Qwen instruction handoff (after cleanup)")
+            .await
+            .map_err(|error| map_boogu(self.identity.variant, error))?;
+
+        let audit = self.packed_f16_denoiser_source()?.audit();
+        self.require_exact_packed_f16_cache_audit("post-Qwen instruction handoff", audit)?;
+
+        let instruction =
+            Tensor::<BrowserBackend, 3>::from_data(instruction_data, (&self.device, DType::F32));
+        let instruction_after = read_packed_f16_tensor_input_diagnostic(
+            variant,
+            "instruction_after_handoff",
+            &instruction,
+        )
+        .await?;
+        let digest_matches = instruction_after.shape == instruction_before.shape
+            && instruction_after.dtype == instruction_before.dtype
+            && instruction_after.element_count == instruction_before.element_count
+            && instruction_after.sha256 == instruction_before.sha256;
+        let device_to_host_readback_bytes = payload_bytes.checked_mul(2).ok_or_else(|| {
+            execution_error(
+                variant,
+                "packed-F16 Qwen instruction verification readback byte count overflowed",
+            )
+        })?;
+        let total_transfer_bytes = device_to_host_readback_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| {
+                execution_error(
+                    variant,
+                    "packed-F16 Qwen instruction total transfer byte count overflowed",
+                )
+            })?;
+        let report = BrowserPackedF16QwenInstructionHandoffReport {
+            policy: BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY.into(),
+            qwen_release_unused_memory_after_stage: false,
+            qwen_text_layer_allocation_policy: self
+                .qwen
+                .text_layer_allocation_policy()
+                .label()
+                .into(),
+            qwen_text_block_load_synchronization_policy: self
+                .qwen
+                .text_block_load_synchronization_policy()
+                .label()
+                .into(),
+            qwen_text_layer_submission_policy: self
+                .policies
+                .qwen_text_layer_submission_policy()
+                .into(),
+            shape: instruction_after.shape.clone(),
+            dtype: instruction_after.dtype.clone(),
+            element_count: instruction_after.element_count,
+            payload_bytes,
+            device_to_host_readback_bytes,
+            host_to_device_upload_bytes: payload_bytes,
+            total_transfer_bytes,
+            before_sha256: instruction_before.sha256,
+            after_sha256: instruction_after.sha256,
+            all_finite: instruction_before.all_finite && instruction_after.all_finite,
+            not_all_zero: !packed_f16_tensor_diagnostic_is_all_zero(&instruction_before)
+                && !packed_f16_tensor_diagnostic_is_all_zero(&instruction_after),
+            digest_matches,
+            cleanup_completed: true,
+            packed_cache: packed_f16_cache_evidence(audit),
+        };
+        if emit_rendered_diagnostics {
+            let diagnostics = BrowserPackedF16QwenPostHandoffDiagnostics {
+                scope: BROWSER_PACKED_F16_QWEN_POST_HANDOFF_SCOPE.into(),
+                handoff: report.clone(),
+                instruction_after_handoff: instruction_after.clone(),
+            };
+            dispatch_browser_event(
+                BROWSER_RUNTIME_EVENT_NAME,
+                &browser_packed_f16_qwen_post_handoff_diagnostics_event(run_id, diagnostics),
+            );
+        }
+        require_finite_nonzero_packed_f16_diagnostic(variant, &instruction_after)?;
+        if !digest_matches {
+            return Err(execution_error(
+                variant,
+                "packed-F16 Qwen instruction changed across exact host handoff and allocator cleanup",
+            ));
+        }
+        Ok((instruction, Some(audit), Some(report)))
+    }
+
     fn validate_resident_caches(&self) -> Result<(), RuntimeError> {
         if self.policies.residency != BrowserBooguResidencyPolicy::HighVramResidentDenseF32 {
             return Ok(());
@@ -3259,6 +7352,370 @@ impl BrowserBooguEngine {
             elements,
             finite_elements,
             verified_objects,
+        })
+    }
+
+    async fn turbo_first_dmd(
+        &mut self,
+        fixture: BrowserTurboFirstDmdFixture,
+        adapter: BrowserParityAdapterEvidence,
+    ) -> Result<BrowserTurboFirstDmdDiagnosticReport, RuntimeError> {
+        let variant = self.identity.variant;
+        let diagnostic_result = self.turbo_first_dmd_inner(fixture, adapter).await;
+
+        // This diagnostic intentionally exercises only one DMD step, but failures can occur after
+        // the packed widening kernel or dense forward has been submitted. Always drain both the
+        // source and its deferred browser barrier before dropping request-local module/RoPE
+        // handles. Preserve the immutable raw packed cache only after a fully validated report.
+        let source_synchronization_result = self
+            .denoiser
+            .source_mut()
+            .synchronize()
+            .await
+            .map_err(|error| map_boogu(variant, error));
+        let pending_synchronization_result = self
+            .denoiser
+            .source_mut()
+            .synchronize_pending()
+            .await
+            .map_err(|error| map_boogu(variant, error));
+        let synchronization_pending = self.denoiser.source().has_pending_synchronization();
+        self.denoiser.source_mut().clear();
+        self.denoiser.clear_rope_cache();
+
+        let cleanup_result = source_synchronization_result
+            .and(pending_synchronization_result)
+            .and_then(|()| {
+                if synchronization_pending {
+                    Err(execution_error(
+                        variant,
+                        "Turbo first-DMD cleanup left a source synchronization pending",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        let preserve_packed_cache = diagnostic_result.is_ok() && cleanup_result.is_ok();
+        if !preserve_packed_cache && self.policies.uses_packed_f16_denoiser_source() {
+            match self.packed_f16_denoiser_source_mut() {
+                Ok(source) if source.audit().state == PackedF16DenoiserCacheState::Failed => {
+                    source.clear();
+                }
+                Ok(source) => source.fail_and_clear(),
+                Err(error) => {
+                    return match diagnostic_result {
+                        Ok(_) => Err(error),
+                        Err(diagnostic_error) => Err(execution_error(
+                            variant,
+                            format!(
+                                "{diagnostic_error}; packed-F16 diagnostic cleanup also failed: {error}"
+                            ),
+                        )),
+                    };
+                }
+            }
+        }
+
+        match (diagnostic_result, cleanup_result) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Ok(_), Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Err(diagnostic_error), Err(cleanup_error)) => Err(execution_error(
+                variant,
+                format!(
+                    "{diagnostic_error}; Turbo first-DMD cleanup barrier also failed: {cleanup_error}"
+                ),
+            )),
+        }
+    }
+
+    async fn turbo_first_dmd_inner(
+        &mut self,
+        fixture: BrowserTurboFirstDmdFixture,
+        adapter: BrowserParityAdapterEvidence,
+    ) -> Result<BrowserTurboFirstDmdDiagnosticReport, RuntimeError> {
+        let variant = self.identity.variant;
+        if variant != BooguVariant::Image01Turbo
+            || self.policies.residency
+                != BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+            || !self.policies.uses_packed_f16_denoiser_source()
+            || self.denoiser.source().retention_enabled()
+            || self.policies.denoiser_retaining_wrapper_adapter
+                != BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul
+            || !self.policies.preload_denoiser_before_request
+        {
+            return Err(execution_error(
+                variant,
+                "Turbo first-DMD diagnostic requires the exact current preloaded packed-F16 dense-F32-per-stage policy",
+            ));
+        }
+        if fixture.metadata().model_revision != self.identity.model_revision
+            || fixture.metadata().upstream_source_revision != self.identity.upstream_source_revision
+        {
+            return Err(execution_error(
+                variant,
+                "Turbo first-DMD fixture revisions differ from the sealed model release",
+            ));
+        }
+        if adapter.adapter.device_type == wgpu::DeviceType::Cpu
+            || matches!(self.device, burn_wgpu::WgpuDevice::Cpu)
+        {
+            return Err(execution_error(
+                variant,
+                "Turbo first-DMD diagnostic refuses a CPU WebGPU adapter/device",
+            ));
+        }
+
+        let packed_f16_resource_plan = self.packed_f16_resource_plan.ok_or_else(|| {
+            execution_error(
+                variant,
+                "Turbo first-DMD packed-F16 resource plan is absent",
+            )
+        })?;
+        let audit_before_predict = self.packed_f16_denoiser_source()?.audit();
+        let expected_cached_stages = packed_f16_resource_plan.expected_stage_count;
+        let cached_stages_before_predict = audit_before_predict.cached_stage_count;
+        let synchronization_pending_before_predict =
+            self.denoiser.source().has_pending_synchronization();
+        if expected_cached_stages != 46
+            || cached_stages_before_predict != expected_cached_stages
+            || audit_before_predict.cached_object_count
+                != packed_f16_resource_plan.expected_object_count
+            || audit_before_predict.cached_tensor_count
+                != packed_f16_resource_plan.expected_tensor_count
+            || audit_before_predict.retained_packed_bytes
+                != packed_f16_resource_plan.retained_packed_f16_denoiser_bytes
+            || !audit_before_predict.packed_cache_ready
+            || audit_before_predict.state != PackedF16DenoiserCacheState::Ready
+            || self.denoiser.source().cached_stage_count() != 0
+            || synchronization_pending_before_predict
+        {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "Turbo first-DMD entry has {cached_stages_before_predict}/{expected_cached_stages} packed stages, pending={synchronization_pending_before_predict}"
+                ),
+            ));
+        }
+
+        let (injected_qwen_shape, injected_qwen_values) = fixture.f32(TURBO_FIRST_DMD_QWEN).await?;
+        let injected_qwen_shape_array: [usize; 3] = injected_qwen_shape
+            .clone()
+            .try_into()
+            .map_err(|shape: Vec<usize>| {
+                execution_error(
+                    variant,
+                    format!("Turbo first-DMD Qwen tensor must be rank three, got {shape:?}"),
+                )
+            })?;
+        let instruction = Tensor::<BrowserBackend, 3>::from_data(
+            TensorData::new(injected_qwen_values, injected_qwen_shape_array),
+            &self.device,
+        )
+        .cast(self.dtypes.denoiser);
+        let (injected_dmd_input_shape, injected_dmd_input_values) =
+            fixture.f32(TURBO_FIRST_DMD_INPUT).await?;
+        let injected_dmd_input_shape_array: [usize; 4] = injected_dmd_input_shape
+            .clone()
+            .try_into()
+            .map_err(|shape: Vec<usize>| {
+                execution_error(
+                    variant,
+                    format!("Turbo first-DMD input must be rank four, got {shape:?}"),
+                )
+            })?;
+        let latents = Tensor::<BrowserBackend, 4>::from_data(
+            TensorData::new(injected_dmd_input_values, injected_dmd_input_shape_array),
+            &self.device,
+        )
+        .cast(self.dtypes.denoiser);
+        let (sigma_shape, sigma_values) = fixture.f32(TURBO_FIRST_DMD_SIGMA).await?;
+        let fixture_bf16_sigma_widened_f32 = match sigma_values.as_slice() {
+            [value] if value.is_finite() && (sigma_shape.is_empty() || sigma_shape == [1]) => {
+                *value
+            }
+            _ => {
+                return Err(execution_error(
+                    variant,
+                    "Turbo first-DMD sigma must contain one finite BF16 scalar",
+                ));
+            }
+        };
+        let captured_bf16_sigma =
+            DmdSchedule::upstream_for_dtype(BooguTask::Generate, DType::BF16).sigmas()[0];
+        let production_f32_sigma =
+            DmdSchedule::upstream_for_dtype(BooguTask::Generate, DType::F32).sigmas()[0];
+        if fixture_bf16_sigma_widened_f32.to_bits() != captured_bf16_sigma.to_bits()
+            || production_f32_sigma.to_bits() != 0.001_f32.to_bits()
+        {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "Turbo first-DMD sigma contract differs: fixture={fixture_bf16_sigma_widened_f32}, BF16 schedule={captured_bf16_sigma}, production F32={production_f32_sigma}"
+                ),
+            ));
+        }
+        let timestep = Tensor::<BrowserBackend, 1>::from_data(
+            TensorData::new(vec![fixture_bf16_sigma_widened_f32], [1]),
+            &self.device,
+        )
+        .cast(self.dtypes.denoiser);
+
+        let dmd_traffic_before = self.artifact_control.traffic_snapshot();
+        let velocity = self
+            .denoiser
+            .predict_async(BooguDenoiserInput {
+                latent: latents.clone(),
+                timestep,
+                instruction,
+                reference: None,
+            })
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+        self.denoiser
+            .source_mut()
+            .synchronize_pending()
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+        let prediction = dmd_prediction(latents, velocity.clone(), fixture_bf16_sigma_widened_f32);
+        self.denoiser
+            .source_mut()
+            .synchronize()
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+        self.denoiser
+            .source_mut()
+            .synchronize_pending()
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
+
+        let dmd_artifact_traffic: BrowserArtifactTrafficReport = self
+            .artifact_control
+            .traffic_snapshot()
+            .checked_delta(dmd_traffic_before)
+            .ok_or_else(|| execution_error(variant, "DMD artifact counters moved backwards"))?
+            .into();
+        if dmd_artifact_traffic != BrowserArtifactTrafficReport::default() {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "preloaded Turbo first-DMD prediction performed artifact I/O: {dmd_artifact_traffic:?}"
+                ),
+            ));
+        }
+        let audit_after_predict = self.packed_f16_denoiser_source()?.audit();
+        let synchronization_pending_after_predict =
+            self.denoiser.source().has_pending_synchronization();
+        let packed_f16_denoiser_lifecycle = validate_packed_f16_denoiser_lifecycle(
+            variant,
+            packed_f16_resource_plan,
+            1,
+            packed_f16_lifecycle_report(
+                variant,
+                audit_before_predict,
+                audit_after_predict,
+                dmd_artifact_traffic,
+                synchronization_pending_after_predict,
+            )?,
+        )?;
+
+        let velocity = compare_turbo_first_dmd_tensor(
+            &fixture,
+            "trajectory.step.0.velocity".into(),
+            TURBO_FIRST_DMD_VELOCITY,
+            velocity,
+        )
+        .await
+        .map_err(|error| map_boogu(variant, error))?;
+        let prediction = compare_turbo_first_dmd_tensor(
+            &fixture,
+            "trajectory.step.0.prediction".into(),
+            TURBO_FIRST_DMD_PREDICTION,
+            prediction,
+        )
+        .await
+        .map_err(|error| map_boogu(variant, error))?;
+
+        let cached_stages_after_predict = audit_after_predict.cached_stage_count;
+        if cached_stages_after_predict != expected_cached_stages
+            || self.denoiser.source().cached_stage_count() != 0
+            || synchronization_pending_after_predict
+        {
+            return Err(execution_error(
+                variant,
+                format!(
+                    "Turbo first-DMD exit has {cached_stages_after_predict}/{expected_cached_stages} packed stages, pending={synchronization_pending_after_predict}"
+                ),
+            ));
+        }
+        let fixture_verification = fixture.snapshot()?;
+        let fixture_required_inputs_authenticated =
+            fixture_verification.required_inputs_authenticated_for(&fixture.identity());
+        if !fixture_required_inputs_authenticated {
+            return Err(execution_error(
+                variant,
+                "Turbo first-DMD fixture did not authenticate all five required tensor ranges",
+            ));
+        }
+
+        Ok(BrowserTurboFirstDmdDiagnosticReport {
+            report_schema_version: 2,
+            mode: "diagnostic-no-surface-turbo-first-dmd-packed-f16-dense-f32-per-stage-policy"
+                .into(),
+            model_backend: "raw-cubecl-no-fusion".into(),
+            adapter_name: adapter.adapter.name,
+            adapter_backend: format!("{:?}", adapter.backend),
+            adapter_device_type: format!("{:?}", adapter.adapter.device_type),
+            adapter_shader_f16: adapter.adapter_shader_f16,
+            device_shader_f16: adapter.device_shader_f16,
+            actual_storage_buffer_binding_size: adapter.limits.max_storage_buffer_binding_size,
+            actual_max_buffer_size: adapter.limits.max_buffer_size,
+            model: boogu_model_descriptor(variant).id.to_string(),
+            model_revision: self.identity.model_revision.clone(),
+            artifact_content_digest: self.artifact_content_digest,
+            artifact_profile: "f16-qwen-vision-f32".into(),
+            residency_policy: self.policies.residency.label().into(),
+            denoiser_storage_policy: self.policies.denoiser_storage_policy().into(),
+            denoiser_float_load_policy: float_policy_name(self.policies.denoiser_float).into(),
+            denoiser_quantized_load_policy: self
+                .policies
+                .denoiser_quantized_load_policy_report()
+                .into(),
+            denoiser_quantized_linear_execution_policy: self
+                .policies
+                .denoiser_quantized_linear_execution_policy_report()
+                .into(),
+            denoiser_linear_execution_policy: self
+                .policies
+                .denoiser_linear_execution_policy()
+                .into(),
+            denoiser_execution_dtype: self.dtypes.denoiser.name().into(),
+            packed_f16_resource_plan,
+            packed_f16_denoiser_lifecycle,
+            expected_cached_stages,
+            cached_stages_before_predict,
+            cached_stages_after_predict,
+            synchronization_pending_before_predict,
+            synchronization_pending_after_predict,
+            dmd_artifact_traffic,
+            fixture: fixture.identity(),
+            fixture_verification,
+            fixture_dtype: fixture.metadata().dtype.clone(),
+            injected_qwen_shape,
+            injected_dmd_input_shape,
+            execution_sigma_source: "authenticated-fixture-bf16-widened-to-f32".into(),
+            fixture_bf16_sigma_widened_f32,
+            production_f32_sigma,
+            production_minus_fixture_sigma: production_f32_sigma - fixture_bf16_sigma_widened_f32,
+            velocity,
+            prediction,
+            fixture_required_inputs_authenticated,
+            artifacts_verified: true,
+            diagnostic_passed: true,
+            // Packed F16 is a storage policy only; execution uses ordinary dense F32 math.
+            on_device_quantized_execution_claimed: false,
+            // Raw metrics are reported without converting a one-step localization diagnostic to
+            // full-chain parity.
+            numerical_parity_claimed: false,
         })
     }
 
@@ -3375,9 +7832,6 @@ impl BrowserBooguEngine {
                 let (shape, actual_dtype, actual_data) = read_browser_tensor_f32(actual)
                     .await
                     .map_err(|error| map_boogu(variant, error))?;
-                let actual_values = actual_data
-                    .as_slice::<f32>()
-                    .map_err(|error| execution_error(variant, error))?;
                 f32_oracle.push(
                     compare_browser_f32_values(
                         &fixture,
@@ -3386,7 +7840,7 @@ impl BrowserBooguEngine {
                         format!("vae.reference_f32_{component}"),
                         &shape,
                         &actual_dtype,
-                        actual_values,
+                        &actual_data,
                     )
                     .await
                     .map_err(|error| map_boogu(variant, error))?,
@@ -3399,14 +7853,14 @@ impl BrowserBooguEngine {
                         format!("vae.reference_{component}"),
                         &shape,
                         &actual_dtype,
-                        actual_values,
+                        &actual_data,
                     )
                     .await
                     .map_err(|error| map_boogu(variant, error))?,
                 );
 
                 if index == 0 {
-                    baseline.insert(component.into(), (shape, actual_values.to_vec()));
+                    baseline.insert(component.into(), (shape, actual_data));
                 } else {
                     let (baseline_shape, baseline_values) =
                         baseline.get(component).ok_or_else(|| {
@@ -3423,8 +7877,8 @@ impl BrowserBooguEngine {
                             ),
                         ));
                     }
-                    let comparison = compare_float(actual_values, baseline_values)?;
-                    let bitwise_exact = actual_values
+                    let comparison = compare_float(&actual_data, baseline_values)?;
+                    let bitwise_exact = actual_data
                         .iter()
                         .zip(baseline_values)
                         .all(|(actual, expected)| actual.to_bits() == expected.to_bits());
@@ -3555,7 +8009,23 @@ impl BrowserBooguEngine {
         if !self.policies.retain_denoiser_stages || !self.denoiser.source().retention_enabled() {
             return Err(execution_error(
                 variant,
-                "exact browser 1.5K parity requires the high-VRAM retained-denoiser source",
+                "exact browser 1.5K parity requires a retained-denoiser source",
+            ));
+        }
+        if self.denoiser.source().cached_stage_count() != 0 {
+            return Err(execution_error(
+                variant,
+                "exact browser 1.5K parity requires an initially empty denoiser cache",
+            ));
+        }
+        if self.qwen.source.synchronization_policy()
+            != AsyncRetainingSynchronizationPolicy::PerStage
+            || self.denoiser.source().synchronization_policy()
+                != AsyncRetainingDenoiserSynchronizationPolicy::PerStage
+        {
+            return Err(execution_error(
+                variant,
+                "exact browser 1.5K parity requires per-stage Qwen and denoiser barriers so observer activations are compared and released before the next stage",
             ));
         }
         let metadata = fixture.metadata().clone();
@@ -3691,6 +8161,20 @@ impl BrowserBooguEngine {
             .forward_base_async(&self.qwen_config, prepared.model_input, &mut qwen_observer)
             .await
             .map_err(|error| execution_error(variant, format!("{error:?}")))?;
+        if parity_control.pending_count() != 0 {
+            return Err(execution_error(
+                variant,
+                "browser Qwen parity observer still retains tensors after the final stage barrier",
+            ));
+        }
+        if self.policies.residency == BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser {
+            validate_low_vram_streamed_stage_lifecycle(
+                variant,
+                self.qwen.source.cached_stage_count(),
+                self.qwen.source.has_pending_synchronization(),
+                self.vae.cached_stage_count(),
+            )?;
+        }
         let aligned_stages = parity_control.metrics()[qwen_metric_start..].to_vec();
         let final_hidden_state = compare_browser_tensor(
             &fixture,
@@ -3824,6 +8308,14 @@ impl BrowserBooguEngine {
         let reference = Some(scaled_latent.cast(self.dtypes.denoiser));
 
         parity_milestone("dmd-start");
+        if self.policies.residency == BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser {
+            validate_low_vram_streamed_stage_lifecycle(
+                variant,
+                self.qwen.source.cached_stage_count(),
+                self.qwen.source.has_pending_synchronization(),
+                self.vae.cached_stage_count(),
+            )?;
+        }
         let mut latents = tensor4_from_fixture(
             &fixture,
             &ledger,
@@ -3877,6 +8369,11 @@ impl BrowserBooguEngine {
                     },
                     &mut observer,
                 )
+                .await
+                .map_err(|error| map_boogu(variant, error))?;
+            self.denoiser
+                .source_mut()
+                .synchronize_pending()
                 .await
                 .map_err(|error| map_boogu(variant, error))?;
             let velocity_metric = compare_browser_tensor(
@@ -3959,23 +8456,56 @@ impl BrowserBooguEngine {
         )
         .await
         .map_err(|error| map_boogu(variant, error))?;
+        if parity_control.pending_count() != 0 {
+            return Err(execution_error(
+                variant,
+                "browser denoiser parity observer still retains tensors after the final stage barrier",
+            ));
+        }
         let denoiser_boundaries = parity_control.metrics()[denoiser_metric_start..].to_vec();
+        self.denoiser
+            .source_mut()
+            .synchronize_pending()
+            .await
+            .map_err(|error| map_boogu(variant, error))?;
         let denoiser_retained_stages_before_clear = self.denoiser.source().cached_stage_count();
-        if denoiser_retained_stages_before_clear != BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT {
+        let denoiser_synchronization_pending = self.denoiser.source().has_pending_synchronization();
+        let low_vram_denoiser_dtype_audit =
+            if self.policies.residency == BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser {
+                Some(validate_low_vram_denoiser_dtype_audit(
+                    variant,
+                    self.low_vram_resource_plan.ok_or_else(|| {
+                        execution_error(variant, "browser low-vram resource plan is absent")
+                    })?,
+                    self.denoiser.source().retained_dtype_audit(),
+                )?)
+            } else {
+                None
+            };
+        self.denoiser.source_mut().clear();
+        self.denoiser.clear_rope_cache();
+        let denoiser_retained_stages_after_clear = self.denoiser.source().cached_stage_count();
+        let denoiser_cache_cleared_before_decode = denoiser_retained_stages_after_clear == 0;
+        if self.policies.residency == BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser {
+            validate_low_vram_denoiser_lifecycle(
+                variant,
+                steps.len(),
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                denoiser_retained_stages_before_clear,
+                denoiser_synchronization_pending,
+                0,
+                denoiser_retained_stages_after_clear,
+            )?;
+        } else if denoiser_retained_stages_before_clear != BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT
+            || denoiser_synchronization_pending
+            || !denoiser_cache_cleared_before_decode
+        {
             return Err(execution_error(
                 variant,
                 format!(
-                    "high-VRAM browser parity retained {denoiser_retained_stages_before_clear}/{} exact denoiser stages",
+                    "browser parity denoiser lifecycle failed: retained={denoiser_retained_stages_before_clear}/{}, synchronization_pending={denoiser_synchronization_pending}, cleared={denoiser_cache_cleared_before_decode}",
                     BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT
                 ),
-            ));
-        }
-        self.denoiser.source_mut().clear();
-        let denoiser_cache_cleared_before_decode = self.denoiser.source().cached_stage_count() == 0;
-        if !denoiser_cache_cleared_before_decode {
-            return Err(execution_error(
-                variant,
-                "high-VRAM browser parity could not release denoiser handles before VAE decode",
             ));
         }
         parity_milestone("dmd-resident-denoiser-cache-cleared");
@@ -4025,9 +8555,6 @@ impl BrowserBooguEngine {
                 .await
                 .map_err(|error| map_boogu(variant, error))?;
         parity_milestone("vae-output-readback-complete");
-        let decoded_values = decoded_data
-            .as_slice::<f32>()
-            .map_err(|error| execution_error(variant, error))?;
         parity_milestone("vae-output-parity-start");
         let decoded_tensor = compare_browser_f32_values(
             &fixture,
@@ -4036,14 +8563,15 @@ impl BrowserBooguEngine {
             "vae.decode_output".into(),
             &decoded_shape,
             &decoded_dtype,
-            decoded_values,
+            &decoded_data,
         )
         .await
         .map_err(|error| map_boogu(variant, error))?;
         parity_milestone("vae-output-parity-complete");
         parity_milestone("vae-output-rgb-conversion-start");
         let HostImage::Pixels(actual_rgb) =
-            decoder_output_data_to_host(decoded_data).map_err(|error| map_boogu(variant, error))?
+            decoder_output_data_to_host(TensorData::new(decoded_data, decoded_shape.clone()))
+                .map_err(|error| map_boogu(variant, error))?
         else {
             return Err(execution_error(
                 variant,
@@ -4108,6 +8636,7 @@ impl BrowserBooguEngine {
         self.artifact_control.set_observer(None);
         let artifacts_verified = artifact_verification.passed;
         let mut gates = evaluate_browser_1k5_gates(
+            self.policies.residency,
             &processing,
             &qwen,
             &vae_reference,
@@ -4168,9 +8697,23 @@ impl BrowserBooguEngine {
             artifact_content_digest: self.artifact_content_digest,
             numeric_format: self.numeric_format.clone(),
             artifact_profile: "f16-qwen-vision-f32".into(),
+            residency_policy: self.policies.residency.label().into(),
             qwen_float_load_policy: float_policy_name(self.policies.qwen_float).into(),
             vae_float_load_policy: float_policy_name(self.policies.vae_float).into(),
             denoiser_float_load_policy: float_policy_name(self.policies.denoiser_float).into(),
+            denoiser_storage_policy: self.policies.denoiser_storage_policy().into(),
+            denoiser_quantized_load_policy: self
+                .policies
+                .denoiser_quantized_load_policy_report()
+                .into(),
+            denoiser_quantized_linear_execution_policy: self
+                .policies
+                .denoiser_quantized_linear_execution_policy_report()
+                .into(),
+            denoiser_linear_execution_policy: self
+                .policies
+                .denoiser_linear_execution_policy()
+                .into(),
             qwen_execution_dtype: self.dtypes.qwen_visual.name().into(),
             vae_execution_dtype: self.dtypes.vae.name().into(),
             denoiser_execution_dtype: self.dtypes.denoiser.name().into(),
@@ -4180,10 +8723,36 @@ impl BrowserBooguEngine {
             vae_decode_max_planned_buffer_bytes:
                 crate::boogu::BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES,
             denoiser_query_chunk_size: BROWSER_1K5_DENOISER_QUERY_CHUNK_SIZE,
-            denoiser_residency: "lazy-resident-first-pass-through-four-dmd-steps".into(),
+            denoiser_residency: match self.policies.residency {
+                BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser => {
+                    "request-scoped-runtime-q8-policy-retained-through-four-dmd-steps"
+                }
+                BrowserBooguResidencyPolicy::LowVramRetainedQ8DenseF32PerStageDenoiser => {
+                    "turbo-only-retained-q8-dense-f32-policy-not-valid-for-1k5-parity"
+                }
+                BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser => {
+                    "turbo-only-preloaded-packed-f16-dense-f32-policy-not-valid-for-1k5-parity"
+                }
+                BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained => {
+                    "request-scoped-f32-policy-retained-through-four-dmd-steps"
+                }
+                BrowserBooguResidencyPolicy::HighVramResidentDenseF32 => {
+                    "all-stages-preloaded-dense-f32"
+                }
+                BrowserBooguResidencyPolicy::LayerStreamedDiagnostic => {
+                    "diagnostic-denoiser-reloaded-every-dmd-step"
+                }
+            }
+            .into(),
             denoiser_expected_retained_stages: BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
             denoiser_retained_stages_before_clear,
             denoiser_cache_cleared_before_decode,
+            low_vram_resource_plan: self.low_vram_resource_plan,
+            low_vram_denoiser_dtype_audit,
+            weight_traffic_contract: self.policies.weight_traffic_contract().into(),
+            // Runtime Q8 policy is observable here; a measured packed-kernel execution claim is
+            // deliberately withheld until the qualification harness captures that evidence.
+            on_device_quantized_execution_claimed: false,
             fixture: fixture.identity(),
             fixture_verification,
             tensor_coverage,
@@ -4215,7 +8784,14 @@ impl BrowserBooguEngine {
         cancellation: &CancellationToken,
         shared: &Arc<Mutex<BrowserRuntimeShared>>,
     ) -> Result<ImageOutput, RuntimeError> {
-        self.validate_resident_caches()?;
+        self.last_low_vram_denoiser_dtype_audit = None;
+        self.last_packed_f16_qwen_host_embedding = None;
+        self.last_packed_f16_qwen_instruction_handoff = None;
+        self.last_packed_f16_denoiser_lifecycle = None;
+        self.last_packed_f16_dmd_vae_handoff = None;
+        self.last_dense_f32_materialized_stage_clones = 0;
+        self.last_artifact_traffic = BrowserArtifactTrafficReport::default();
+        let artifact_traffic_before = self.artifact_control.traffic_snapshot();
         let id = job.id;
         let run_id = RunId(id.0);
         let total_started = now_micros();
@@ -4228,6 +8804,15 @@ impl BrowserBooguEngine {
                 task: task_kind(job.task),
             },
         );
+        check_cancelled(cancellation)?;
+        self.ensure_preloaded_low_vram_denoiser().await?;
+        self.validate_resident_caches()?;
+        let buffer_plan = crate::boogu::validate_browser_buffer_limits_for_dimensions(
+            job.variant,
+            job.resolved.dimensions,
+            self.applied_buffer_limits.max_storage_buffer_binding_size,
+            self.applied_buffer_limits.max_buffer_size,
+        )?;
         check_cancelled(cancellation)?;
         let source = job
             .resolved
@@ -4252,29 +8837,204 @@ impl BrowserBooguEngine {
 
         check_cancelled(cancellation)?;
         let started = start_stage(shared, id, run_id, "qwen", Some(1));
+        let packed_rendered_diagnostics_requested =
+            self.policies.uses_packed_f16_denoiser_source() && rendered_model_smoke_requested();
+        let block0_execution_mode = browser_qwen_block0_execution_mode();
+        if packed_rendered_diagnostics_requested
+            && !matches!(
+                block0_execution_mode,
+                BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE | BROWSER_QWEN_BLOCK0_ORDINARY_MODE
+            )
+        {
+            return Err(execution_error(
+                job.variant,
+                format!(
+                    "rendered-smoke query {BROWSER_QWEN_BLOCK0_EXECUTION_MODE_QUERY} must be {} or {}",
+                    BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE,
+                    BROWSER_QWEN_BLOCK0_ORDINARY_MODE,
+                ),
+            ));
+        }
+        let qwen_instruction_diagnostic_control = packed_rendered_diagnostics_requested
+            .then(BrowserQwenInstructionDiagnosticControl::default);
         let mut qwen_observer = BrowserQwenStageObserver::milestones_only();
-        let qwen_output = self
-            .qwen
-            .forward_base_async(&self.qwen_config, prepared.model_input, &mut qwen_observer)
-            .await
-            .map_err(|error| {
-                if cancellation.is_cancelled() {
-                    RuntimeError::Cancelled
-                } else {
-                    execution_error(job.variant, format!("{error:?}"))
-                }
-            })?;
+        if let Some(control) = qwen_instruction_diagnostic_control.as_ref() {
+            qwen_observer = qwen_observer.with_instruction_diagnostics(
+                control.clone(),
+                job.variant,
+                run_id,
+                self.qwen.text_layer_allocation_policy(),
+                self.qwen.text_block_load_synchronization_policy(),
+                self.policies.qwen_text_layer_submission_policy(),
+            );
+        }
+        let qwen_host_input_ids = prepared.encoding.input_ids.clone();
+        let qwen_output_result = if self.policies.uses_packed_f16_denoiser_source() {
+            self.qwen
+                .forward_base_async_with_host_input_ids(
+                    &self.qwen_config,
+                    prepared.model_input,
+                    &qwen_host_input_ids,
+                    &mut qwen_observer,
+                )
+                .await
+        } else {
+            self.qwen
+                .forward_base_async(&self.qwen_config, prepared.model_input, &mut qwen_observer)
+                .await
+        };
+        // The host-routed embedding report is produced before the streamed text layers. Take and
+        // dispatch it before propagating a later layer failure so rendered-smoke failure evidence
+        // still binds the healthy host/device embedding to the same run as the immediate block-0
+        // diagnostic. This is provenance only; it does not turn a failed Qwen stage into success.
+        let host_embedding_report = self.qwen.take_last_host_routed_embedding_report();
+        match (
+            self.policies.uses_packed_f16_denoiser_source(),
+            self.packed_f16_qwen_embedding_plan,
+            host_embedding_report,
+        ) {
+            (true, Some(plan), Some(report)) => {
+                validate_browser_packed_f16_qwen_embedding_report(job.variant, plan, &report)?;
+                dispatch_browser_event(
+                    BROWSER_RUNTIME_EVENT_NAME,
+                    &browser_packed_f16_qwen_host_embedding_event(run_id, report.clone()),
+                );
+                self.last_packed_f16_qwen_host_embedding = Some(report);
+            }
+            (false, None, None) => {}
+            // A streamed artifact/load error can happen before the host-routed embedding has
+            // been assembled and reported. In that case there is no embedding evidence to
+            // validate, so preserve the underlying Qwen error below instead of replacing it
+            // with a misleading policy-admission failure. Later-layer failures still take the
+            // Some(report) arm above and retain the same-run embedding provenance.
+            (true, Some(_), None) if qwen_output_result.is_err() => {}
+            _ => {
+                return Err(execution_error(
+                    job.variant,
+                    "browser Qwen host-embedding evidence differs from the admitted execution policy",
+                ));
+            }
+        }
+        let qwen_output = qwen_output_result.map_err(|error| {
+            if cancellation.is_cancelled() {
+                RuntimeError::Cancelled
+            } else {
+                execution_error(job.variant, format!("{error:?}"))
+            }
+        })?;
         self.qwen
             .source
             .synchronize_pending()
             .await
             .map_err(|error| map_boogu(job.variant, error))?;
+        let burn_qwen3_vl::Qwen3VlModelOutput {
+            last_hidden_state: qwen_last_hidden_state,
+            hidden_states: qwen_hidden_states,
+            vision_output: qwen_vision_output,
+            position_deltas: qwen_position_deltas,
+        } = qwen_output;
+        if self.policies.uses_packed_f16_denoiser_source()
+            && (qwen_hidden_states.is_some() || qwen_vision_output.is_some())
+        {
+            return Err(execution_error(
+                job.variant,
+                "ordinary Turbo Qwen unexpectedly retained hidden-state or vision-output tensors",
+            ));
+        }
+        // Only the final hidden state crosses into conditioning. Release all optional Qwen tensor
+        // roots explicitly before the later DMD-to-VAE allocator boundary.
+        drop(qwen_hidden_states);
+        drop(qwen_vision_output);
+        drop(qwen_position_deltas);
+        if self.policies.residency.is_low_vram() {
+            validate_low_vram_streamed_stage_lifecycle(
+                job.variant,
+                self.qwen.source.cached_stage_count(),
+                self.qwen.source.has_pending_synchronization(),
+                self.vae.cached_stage_count(),
+            )?;
+        }
+        let qwen_stage_diagnostics =
+            if let Some(control) = qwen_instruction_diagnostic_control.as_ref() {
+                let diagnostics = control.read_all(job.variant).await?;
+                if control.pending_count() != 0 {
+                    return Err(execution_error(
+                        job.variant,
+                        "rendered-smoke Qwen diagnostic tensors remain pending after readback",
+                    ));
+                }
+                Some(diagnostics)
+            } else {
+                None
+            };
+        let qwen_block_00_immediate_post_sync =
+            if let Some(control) = qwen_instruction_diagnostic_control.as_ref() {
+                Some(control.take_immediate_post_sync_block0().ok_or_else(|| {
+                    execution_error(
+                        job.variant,
+                        "rendered-smoke Qwen immediate post-sync block-0 diagnostic is absent",
+                    )
+                })?)
+            } else {
+                None
+            };
+        let qwen_last_hidden_state_before_trim = if packed_rendered_diagnostics_requested {
+            Some(
+                read_packed_f16_tensor_input_diagnostic(
+                    job.variant,
+                    "qwen_last_hidden_state_before_trim",
+                    &qwen_last_hidden_state,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let instruction =
-            trim_instruction_features(qwen_output.last_hidden_state, prepared.effective_length)
+            trim_instruction_features(qwen_last_hidden_state, prepared.effective_length)
                 .map_err(|error| map_boogu(job.variant, error))?
                 .cast(self.dtypes.denoiser);
+        let qwen_pre_handoff_context = match (
+            qwen_stage_diagnostics,
+            qwen_last_hidden_state_before_trim,
+            qwen_block_00_immediate_post_sync,
+        ) {
+            (
+                Some(stage_outputs),
+                Some(qwen_last_hidden_state_before_trim),
+                Some(block_00_immediate_post_sync),
+            ) => Some(BrowserPackedF16QwenPreHandoffContext {
+                effective_instruction_length: prepared.effective_length,
+                expected_stage_output_count: self
+                    .qwen_config
+                    .text_config
+                    .num_hidden_layers
+                    .checked_add(2)
+                    .ok_or_else(|| {
+                        execution_error(
+                            job.variant,
+                            "rendered-smoke Qwen diagnostic stage count overflowed",
+                        )
+                    })?,
+                stage_outputs,
+                qwen_last_hidden_state_before_trim,
+                block_00_immediate_post_sync,
+            }),
+            (None, None, None) => None,
+            _ => {
+                return Err(execution_error(
+                    job.variant,
+                    "rendered-smoke Qwen diagnostic capture is internally incomplete",
+                ));
+            }
+        };
         check_cancelled(cancellation)?;
         finish_stage(shared, id, run_id, &mut timings, "qwen", started);
+        let (instruction, packed_audit_after_qwen_handoff, qwen_handoff_report) = self
+            .packed_f16_qwen_instruction_handoff(instruction, run_id, qwen_pre_handoff_context)
+            .await?;
+        self.last_packed_f16_qwen_instruction_handoff = qwen_handoff_report;
+        check_cancelled(cancellation)?;
 
         let reference = if let Some(source) = source.as_ref() {
             let started = start_stage(shared, id, run_id, "vae-encode", Some(1));
@@ -4320,7 +9080,7 @@ impl BrowserBooguEngine {
             job.resolved.dimensions.height() as usize / 8,
             job.resolved.dimensions.width() as usize / 8,
         ];
-        let mut latents = normal_tensor::<4>(
+        let latents = normal_tensor::<4>(
             latent_shape,
             domain_seed(job.resolved.seed, 0x444d_442d_494e_4954),
             self.dtypes.denoiser,
@@ -4354,67 +9114,641 @@ impl BrowserBooguEngine {
         check_cancelled(cancellation)?;
         let started = start_stage(shared, id, run_id, "dmd", Some(4));
         let schedule = DmdSchedule::upstream_for_dtype(job.task, self.dtypes.denoiser);
-        let mut noises = renoise.into_iter();
-        for (index, &sigma) in schedule.sigmas().iter().enumerate() {
-            check_cancelled(cancellation)?;
-            require_dtype(
-                job.variant,
-                "DMD latent",
-                latents.dtype(),
-                self.dtypes.denoiser,
+        let packed_input_diagnostics_requested = packed_rendered_diagnostics_requested;
+        let mut first_dmd_timestep = None;
+        if packed_input_diagnostics_requested {
+            let audit = packed_audit_after_qwen_handoff.ok_or_else(|| {
+                execution_error(
+                    job.variant,
+                    "rendered-smoke packed-F16 input diagnostics lack the post-Qwen cache audit",
+                )
+            })?;
+            self.require_exact_packed_f16_cache_audit(
+                "rendered-smoke pre-DMD input readback",
+                audit,
             )?;
+            let first_sigma = *schedule.sigmas().first().ok_or_else(|| {
+                execution_error(job.variant, "the DMD schedule contains no timestep")
+            })?;
             let timestep = Tensor::<BrowserBackend, 1>::from_data(
-                TensorData::new(vec![sigma], [1]),
+                TensorData::new(vec![first_sigma], [1]),
                 &self.device,
             )
             .cast(self.dtypes.denoiser);
-            let prediction = self
-                .denoiser
-                .predict_async(BooguDenoiserInput {
-                    latent: latents.clone(),
-                    timestep,
-                    instruction: instruction.clone(),
-                    reference: reference.clone(),
-                })
-                .await
-                .map_err(|error| {
-                    if cancellation.is_cancelled() {
-                        RuntimeError::Cancelled
-                    } else {
-                        map_boogu(job.variant, error)
-                    }
+            let instruction_diagnostic =
+                read_packed_f16_tensor_input_diagnostic(job.variant, "instruction", &instruction)
+                    .await?;
+            let initial_latent_diagnostic =
+                read_packed_f16_tensor_input_diagnostic(job.variant, "initial_latent", &latents)
+                    .await?;
+            let mut renoise_diagnostics = Vec::with_capacity(renoise.len());
+            for (index, noise) in renoise.iter().enumerate() {
+                renoise_diagnostics.push(
+                    read_packed_f16_tensor_input_diagnostic(
+                        job.variant,
+                        &format!("renoise_{index}"),
+                        noise,
+                    )
+                    .await?,
+                );
+            }
+            let first_timestep_diagnostic =
+                read_packed_f16_tensor_input_diagnostic(job.variant, "first_timestep", &timestep)
+                    .await?;
+            let all_inputs_finite = instruction_diagnostic.all_finite
+                && initial_latent_diagnostic.all_finite
+                && renoise_diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.all_finite)
+                && first_timestep_diagnostic.all_finite;
+            let diagnostics = BrowserPackedF16PreDmdInputDiagnostics {
+                scope: "rendered-model-smoke/ordinary-turbo-packed-f16/pre-dmd-input-readback"
+                    .into(),
+                policy: BrowserPackedF16PreDmdPolicyEvidence {
+                    qwen_release_unused_memory_after_stage: self
+                        .qwen
+                        .releases_unused_memory_after_stage(),
+                    qwen_text_block_load_synchronization_policy: self
+                        .qwen
+                        .text_block_load_synchronization_policy()
+                        .label()
+                        .into(),
+                    qwen_text_layer_submission_policy: self
+                        .policies
+                        .qwen_text_layer_submission_policy()
+                        .into(),
+                    packed_qwen_instruction_handoff_policy: self
+                        .policies
+                        .packed_qwen_instruction_handoff_policy()
+                        .into(),
+                    cleanup_completed: true,
+                    post_cleanup_packed_cache: packed_f16_cache_evidence(audit),
+                },
+                dmd_steps: schedule.sigmas().len(),
+                instruction: instruction_diagnostic,
+                initial_latent: initial_latent_diagnostic,
+                renoise: renoise_diagnostics,
+                first_timestep: first_timestep_diagnostic,
+                all_inputs_finite,
+            };
+            dispatch_browser_event(
+                BROWSER_RUNTIME_EVENT_NAME,
+                &browser_packed_f16_pre_dmd_input_diagnostics_event(run_id, diagnostics.clone()),
+            );
+            if !diagnostics.all_inputs_finite {
+                let invalid = std::iter::once(&diagnostics.instruction)
+                    .chain(std::iter::once(&diagnostics.initial_latent))
+                    .chain(diagnostics.renoise.iter())
+                    .chain(std::iter::once(&diagnostics.first_timestep))
+                    .filter(|diagnostic| !diagnostic.all_finite)
+                    .map(|diagnostic| diagnostic.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(execution_error(
+                    job.variant,
+                    format!(
+                        "rendered-smoke packed-F16 pre-DMD inputs contain non-finite values: {invalid}"
+                    ),
+                ));
+            }
+            let all_zero = std::iter::once(&diagnostics.instruction)
+                .chain(std::iter::once(&diagnostics.initial_latent))
+                .chain(diagnostics.renoise.iter())
+                .chain(std::iter::once(&diagnostics.first_timestep))
+                .find(|diagnostic| packed_f16_tensor_diagnostic_is_all_zero(diagnostic));
+            if let Some(diagnostic) = all_zero {
+                return Err(execution_error(
+                    job.variant,
+                    format!(
+                        "rendered-smoke packed-F16 pre-DMD input {} is all-zero",
+                        diagnostic.name
+                    ),
+                ));
+            }
+            let handoff = self
+                .last_packed_f16_qwen_instruction_handoff
+                .as_ref()
+                .ok_or_else(|| {
+                    execution_error(
+                        job.variant,
+                        "rendered-smoke packed-F16 input diagnostics lack Qwen handoff provenance",
+                    )
                 })?;
-            self.denoiser
+            if diagnostics.instruction.sha256 != handoff.after_sha256
+                || diagnostics.instruction.shape != handoff.shape
+                || diagnostics.instruction.element_count != handoff.element_count
+            {
+                return Err(execution_error(
+                    job.variant,
+                    "packed-F16 instruction changed after the verified Qwen handoff and before DMD",
+                ));
+            }
+            first_dmd_timestep = Some(timestep);
+        }
+        let mut noises = renoise.into_iter();
+        let low_vram = self.policies.residency.is_low_vram();
+        let dmd_artifact_traffic_before = self.artifact_control.traffic_snapshot();
+        let dense_stage_clones_before_dmd =
+            self.denoiser.source().dense_f32_materialized_stage_clones();
+        let packed_audit_before_dmd = if self.policies.uses_packed_f16_denoiser_source() {
+            let audit = match self
+                .packed_f16_denoiser_source()
+                .map(|source| source.audit())
+                .and_then(|audit| {
+                    self.require_exact_packed_f16_cache_audit("DMD entry", audit)?;
+                    Ok(audit)
+                }) {
+                Ok(audit) => audit,
+                Err(primary_error) => {
+                    return match self.fail_closed_packed_f16_request_cleanup().await {
+                        Ok(()) => Err(primary_error),
+                        Err(cleanup_error) => Err(execution_error(
+                            job.variant,
+                            format!(
+                                "{primary_error}; fail-closed packed-F16 DMD-entry cleanup also failed: {cleanup_error}"
+                            ),
+                        )),
+                    };
+                }
+            };
+            if packed_audit_after_qwen_handoff != Some(audit) {
+                let primary_error = execution_error(
+                    job.variant,
+                    "packed-F16 cache audit changed after the Qwen instruction handoff and before DMD",
+                );
+                return match self.fail_closed_packed_f16_request_cleanup().await {
+                    Ok(()) => Err(primary_error),
+                    Err(cleanup_error) => Err(execution_error(
+                        job.variant,
+                        format!(
+                            "{primary_error}; fail-closed packed-F16 DMD-entry cleanup also failed: {cleanup_error}"
+                        ),
+                    )),
+                };
+            }
+            Some(audit)
+        } else {
+            None
+        };
+        if low_vram {
+            let streamed_lifecycle = validate_low_vram_streamed_stage_lifecycle(
+                job.variant,
+                self.qwen.source.cached_stage_count(),
+                self.qwen.source.has_pending_synchronization(),
+                self.vae.cached_stage_count(),
+            );
+            let denoiser_cache = self.denoiser.source().cached_stage_count();
+            let expected_entry_cache = if self.policies.preload_denoiser_before_request
+                && !self.policies.uses_packed_f16_denoiser_source()
+            {
+                self.expected_denoiser_resident_stage_count()
+            } else {
+                0
+            };
+            let packed_cache_valid = packed_audit_before_dmd.is_none_or(|audit| {
+                let Some(plan) = self.packed_f16_resource_plan else {
+                    return false;
+                };
+                audit.state == PackedF16DenoiserCacheState::Ready
+                    && audit.packed_cache_ready
+                    && audit.cached_stage_count == plan.expected_stage_count
+                    && audit.cached_object_count == plan.expected_object_count
+                    && audit.cached_tensor_count == plan.expected_tensor_count
+                    && audit.retained_packed_bytes == plan.retained_packed_f16_denoiser_bytes
+            });
+            let retention_valid = self.denoiser.source().retention_enabled()
+                != self.policies.uses_packed_f16_denoiser_source();
+            if !retention_valid
+                || streamed_lifecycle.is_err()
+                || denoiser_cache != expected_entry_cache
+                || !packed_cache_valid
+            {
+                let primary_error = streamed_lifecycle.err().unwrap_or_else(|| {
+                    execution_error(
+                        job.variant,
+                        format!(
+                            "browser low-vram request entered DMD with invalid caches: retained={denoiser_cache}/{expected_entry_cache}, packed_valid={packed_cache_valid}"
+                        ),
+                    )
+                });
+                if self.policies.uses_packed_f16_denoiser_source() {
+                    return match self.fail_closed_packed_f16_request_cleanup().await {
+                        Ok(()) => Err(primary_error),
+                        Err(cleanup_error) => Err(execution_error(
+                            job.variant,
+                            format!(
+                                "{primary_error}; fail-closed packed-F16 DMD-entry cleanup also failed: {cleanup_error}"
+                            ),
+                        )),
+                    };
+                }
+                self.denoiser.source_mut().clear();
+                return Err(primary_error);
+            }
+        }
+        let mut completed_dmd_steps = 0_usize;
+        let dmd_result: Result<Tensor<BrowserBackend, 4>, RuntimeError> = async {
+            let mut dmd_latents = latents;
+            for (index, &sigma) in schedule.sigmas().iter().enumerate() {
+                check_cancelled(cancellation)?;
+                require_dtype(
+                    job.variant,
+                    "DMD latent",
+                    dmd_latents.dtype(),
+                    self.dtypes.denoiser,
+                )?;
+                let timestep = if index == 0 {
+                    first_dmd_timestep.take().unwrap_or_else(|| {
+                        Tensor::<BrowserBackend, 1>::from_data(
+                            TensorData::new(vec![sigma], [1]),
+                            &self.device,
+                        )
+                        .cast(self.dtypes.denoiser)
+                    })
+                } else {
+                    Tensor::<BrowserBackend, 1>::from_data(
+                        TensorData::new(vec![sigma], [1]),
+                        &self.device,
+                    )
+                    .cast(self.dtypes.denoiser)
+                };
+                let prediction = self
+                    .denoiser
+                    .predict_async(BooguDenoiserInput {
+                        latent: dmd_latents.clone(),
+                        timestep,
+                        instruction: instruction.clone(),
+                        reference: reference.clone(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        if cancellation.is_cancelled() {
+                            RuntimeError::Cancelled
+                        } else {
+                            map_boogu(job.variant, error)
+                        }
+                    })?;
+                self.denoiser
+                    .source_mut()
+                    .synchronize_pending()
+                    .await
+                    .map_err(|error| map_boogu(job.variant, error))?;
+                require_finite_browser_tensor(
+                    job.variant,
+                    &format!("DMD step {} denoiser prediction", index + 1),
+                    &prediction,
+                )
+                .await?;
+                require_dtype(
+                    job.variant,
+                    "denoiser prediction",
+                    prediction.dtype(),
+                    self.dtypes.denoiser,
+                )?;
+                dmd_latents = dmd_prediction(dmd_latents, prediction, sigma);
+                require_finite_browser_tensor(
+                    job.variant,
+                    &format!("DMD step {} prediction update", index + 1),
+                    &dmd_latents,
+                )
+                .await?;
+                if let Some(&next_sigma) = schedule.sigmas().get(index + 1) {
+                    let noise = noises
+                        .next()
+                        .expect("the fixed four-step schedule has three renoise tensors");
+                    dmd_latents = dmd_renoise(dmd_latents, noise, next_sigma);
+                    require_finite_browser_tensor(
+                        job.variant,
+                        &format!("DMD step {} renoised latent", index + 1),
+                        &dmd_latents,
+                    )
+                    .await?;
+                }
+                // The semantic-stage barrier covers the denoiser tail, but the DMD update above
+                // is queued afterward. Flush that update explicitly before the next step and,
+                // critically, before request-scoped weight and RoPE handles are cleared after
+                // the final step.
+                self.denoiser
+                    .source_mut()
+                    .synchronize()
+                    .await
+                    .map_err(|error| map_boogu(job.variant, error))?;
+                self.denoiser
+                    .source_mut()
+                    .synchronize_pending()
+                    .await
+                    .map_err(|error| map_boogu(job.variant, error))?;
+                completed_dmd_steps = index + 1;
+                queue_progress(
+                    shared,
+                    id,
+                    ProgressEvent::Step {
+                        run_id,
+                        stage: "dmd".into(),
+                        step: index as u32 + 1,
+                        total_steps: 4,
+                        elapsed_micros: now_micros().saturating_sub(started),
+                    },
+                );
+            }
+            Ok(dmd_latents)
+        }
+        .await;
+        let preloaded_dmd_traffic_result = if self.policies.preload_denoiser_before_request {
+            self.artifact_control
+                .traffic_snapshot()
+                .checked_delta(dmd_artifact_traffic_before)
+                .ok_or_else(|| {
+                    execution_error(job.variant, "DMD artifact traffic counters moved backwards")
+                })
+                .and_then(|traffic| {
+                    let report = BrowserArtifactTrafficReport::from(traffic);
+                    if report == BrowserArtifactTrafficReport::default() {
+                        Ok(report)
+                    } else {
+                        Err(execution_error(
+                            job.variant,
+                            format!(
+                                "preloaded Turbo denoiser performed artifact I/O during DMD: {traffic:?}"
+                            ),
+                        ))
+                    }
+                })
+        } else {
+            Ok(BrowserArtifactTrafficReport::default())
+        };
+        let low_vram_cleanup_result = if low_vram {
+            // Dense-stage materialization can submit dequantization work during
+            // `load_*`, before the executor reaches its ordinary per-stage
+            // barrier. Always issue a real source barrier on cleanup, including
+            // error paths, before any retained Q8 or RoPE handle is cleared.
+            let synchronization_result = self
+                .denoiser
+                .source_mut()
+                .synchronize()
+                .await
+                .map_err(|error| map_boogu(job.variant, error));
+            let pending_synchronization_result = self
+                .denoiser
                 .source_mut()
                 .synchronize_pending()
                 .await
-                .map_err(|error| map_boogu(job.variant, error))?;
-            require_dtype(
-                job.variant,
-                "denoiser prediction",
-                prediction.dtype(),
-                self.dtypes.denoiser,
-            )?;
-            latents = dmd_prediction(latents, prediction, sigma);
-            if let Some(&next_sigma) = schedule.sigmas().get(index + 1) {
-                let noise = noises
-                    .next()
-                    .expect("the fixed four-step schedule has three renoise tensors");
-                latents = dmd_renoise(latents, noise, next_sigma);
+                .map_err(|error| map_boogu(job.variant, error));
+            let synchronization_result = synchronization_result.and(pending_synchronization_result);
+            if self.policies.uses_packed_f16_denoiser_source() {
+                // Keep every validation/downcast failure inside the cleanup result. The caller
+                // combines this with the primary DMD result and always executes the async
+                // fail-closed allocator cleanup before returning.
+                (|| -> Result<(), RuntimeError> {
+                    let synchronization_pending =
+                        self.denoiser.source().has_pending_synchronization();
+                    let audit_before = packed_audit_before_dmd.ok_or_else(|| {
+                        execution_error(job.variant, "packed-F16 DMD entry audit is absent")
+                    })?;
+                    let audit_after = self.packed_f16_denoiser_source()?.audit();
+                    let traffic = preloaded_dmd_traffic_result
+                        .as_ref()
+                        .copied()
+                        .unwrap_or_default();
+                    let report = packed_f16_lifecycle_report(
+                        job.variant,
+                        audit_before,
+                        audit_after,
+                        traffic,
+                        synchronization_pending,
+                    )
+                    .and_then(|report| {
+                        if dmd_result.is_ok() && completed_dmd_steps == 4 {
+                            validate_packed_f16_denoiser_lifecycle(
+                                job.variant,
+                                self.packed_f16_resource_plan.ok_or_else(|| {
+                                    execution_error(
+                                        job.variant,
+                                        "browser packed-F16 resource plan is absent",
+                                    )
+                                })?,
+                                completed_dmd_steps as u64,
+                                report,
+                            )
+                        } else {
+                            Ok(report)
+                        }
+                    });
+                    let mut preserve_packed_cache = dmd_result.is_ok()
+                        && completed_dmd_steps == 4
+                        && synchronization_result.is_ok()
+                        && preloaded_dmd_traffic_result.is_ok()
+                        && report.as_ref().is_ok_and(|report| report.matches_plan)
+                        && self.denoiser.source().cached_stage_count() == 0
+                        && !synchronization_pending;
+                    self.denoiser.source_mut().clear();
+                    self.denoiser.clear_rope_cache();
+                    if preserve_packed_cache {
+                        if let Ok(lifecycle) = report.as_ref().copied() {
+                            self.last_packed_f16_denoiser_lifecycle = Some(lifecycle);
+                            // This DMD-scoped evidence is emitted only after all four steps, queue
+                            // barriers, zero-I/O checks, lifecycle counters, and cache readiness have
+                            // passed. The separate DMD-to-VAE event must subsequently attest Empty/0
+                            // retained bytes; partial DMD requests cannot emit either success pair.
+                            dispatch_browser_event(
+                                BROWSER_RUNTIME_EVENT_NAME,
+                                &browser_packed_f16_denoiser_lifecycle_event(lifecycle),
+                            );
+                        } else {
+                            preserve_packed_cache = false;
+                        }
+                    }
+                    let packed_clear_result = if preserve_packed_cache {
+                        Ok(())
+                    } else {
+                        self.packed_f16_denoiser_source_mut().map(|source| {
+                            if source.audit().state == PackedF16DenoiserCacheState::Failed {
+                                source.clear();
+                            } else {
+                                source.fail_and_clear();
+                            }
+                        })
+                    };
+                    synchronization_result
+                    .and(preloaded_dmd_traffic_result.map(|_| ()))
+                    .and(report.map(|_| ()))
+                    .and(packed_clear_result)
+                    .and_then(|()| {
+                        if dmd_result.is_err() || preserve_packed_cache {
+                            Ok(())
+                        } else {
+                            Err(execution_error(
+                                job.variant,
+                                "browser packed-F16 denoiser cache was not safe to retain after DMD",
+                            ))
+                        }
+                    })
+                })()
+            } else {
+                let retained_stages_before_clear = self.denoiser.source().cached_stage_count();
+                let synchronization_pending = self.denoiser.source().has_pending_synchronization();
+                let dense_f32_materialized_stage_clones = self
+                    .denoiser
+                    .source()
+                    .dense_f32_materialized_stage_clones()
+                    .checked_sub(dense_stage_clones_before_dmd)
+                    .ok_or_else(|| {
+                        execution_error(
+                            job.variant,
+                            "dense-F32 stage-clone counter moved backwards",
+                        )
+                    });
+                let dtype_audit = if dmd_result.is_ok() {
+                    validate_low_vram_denoiser_dtype_audit(
+                        job.variant,
+                        self.low_vram_resource_plan.ok_or_else(|| {
+                            execution_error(job.variant, "browser low-vram resource plan is absent")
+                        })?,
+                        self.denoiser.source().retained_dtype_audit(),
+                    )
+                    .map(Some)
+                } else {
+                    Ok(None)
+                };
+                let expected_dense_stage_clones =
+                    if self.policies.denoiser_retaining_wrapper_adapter
+                        == BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
+                    {
+                        self.expected_denoiser_resident_stage_count() * completed_dmd_steps
+                    } else {
+                        0
+                    };
+                let preserve_preloaded_cache = self.policies.preload_denoiser_before_request
+                    && dmd_result.is_ok()
+                    && synchronization_result.is_ok()
+                    && dtype_audit.is_ok()
+                    && dense_f32_materialized_stage_clones
+                        .as_ref()
+                        .is_ok_and(|observed| *observed == expected_dense_stage_clones)
+                    && preloaded_dmd_traffic_result.is_ok()
+                    && completed_dmd_steps == 4
+                    && retained_stages_before_clear
+                        == self.expected_denoiser_resident_stage_count()
+                    && !synchronization_pending;
+                if !preserve_preloaded_cache {
+                    self.denoiser.source_mut().clear();
+                }
+                // RoPE geometry is request-shape-local and deliberately not part of the immutable
+                // preloaded parameter cache.
+                self.denoiser.clear_rope_cache();
+                let retained_stages_after_request = self.denoiser.source().cached_stage_count();
+                synchronization_result
+                .and(preloaded_dmd_traffic_result)
+                .and(dtype_audit)
+                .and_then(|audit| {
+                    dense_f32_materialized_stage_clones
+                        .map(|dense_f32_materialized_stage_clones| {
+                            (audit, dense_f32_materialized_stage_clones)
+                        })
+                })
+                .and_then(|(audit, dense_f32_materialized_stage_clones)| {
+                self.last_low_vram_denoiser_dtype_audit = audit;
+                self.last_dense_f32_materialized_stage_clones =
+                    dense_f32_materialized_stage_clones;
+                if dmd_result.is_err() {
+                    if retained_stages_after_request == 0 {
+                        Ok(())
+                    } else {
+                        Err(execution_error(
+                            job.variant,
+                            "browser low-vram denoiser cache cleanup failed after DMD error",
+                        ))
+                    }
+                } else {
+                    if dense_f32_materialized_stage_clones != expected_dense_stage_clones {
+                        return Err(execution_error(
+                            job.variant,
+                            format!(
+                                "browser low-vram denoiser materialized {dense_f32_materialized_stage_clones}/{expected_dense_stage_clones} dense-F32 semantic-stage clones"
+                            ),
+                        ));
+                    }
+                    validate_low_vram_denoiser_lifecycle(
+                        job.variant,
+                        completed_dmd_steps,
+                        self.expected_denoiser_resident_stage_count(),
+                        retained_stages_before_clear,
+                        synchronization_pending,
+                        if preserve_preloaded_cache {
+                            self.expected_denoiser_resident_stage_count()
+                        } else {
+                            0
+                        },
+                        retained_stages_after_request,
+                    )
+                }
+            })
             }
-            queue_progress(
-                shared,
-                id,
-                ProgressEvent::Step {
-                    run_id,
-                    stage: "dmd".into(),
-                    step: index as u32 + 1,
-                    total_steps: 4,
-                    elapsed_micros: now_micros().saturating_sub(started),
-                },
-            );
-        }
+        } else {
+            Ok(())
+        };
+        let latents = match (dmd_result, low_vram_cleanup_result) {
+            (Ok(latents), Ok(())) => latents,
+            (dmd_result, cleanup_result) => {
+                let primary_error = match (dmd_result, cleanup_result) {
+                    (Err(dmd_error), Ok(())) => dmd_error,
+                    (Ok(_), Err(cleanup_error)) => cleanup_error,
+                    (Err(dmd_error), Err(cleanup_error)) => execution_error(
+                        job.variant,
+                        format!(
+                            "{dmd_error}; packed/low-VRAM DMD cleanup also failed: {cleanup_error}"
+                        ),
+                    ),
+                    (Ok(_), Ok(())) => unreachable!("successful DMD handled above"),
+                };
+                if self.policies.uses_packed_f16_denoiser_source() {
+                    return match self.fail_closed_packed_f16_request_cleanup().await {
+                        Ok(()) => Err(primary_error),
+                        Err(fail_closed_error) => Err(execution_error(
+                            job.variant,
+                            format!(
+                                "{primary_error}; fail-closed packed-F16 DMD cleanup also failed: {fail_closed_error}"
+                            ),
+                        )),
+                    };
+                }
+                return Err(primary_error);
+            }
+        };
         finish_stage(shared, id, run_id, &mut timings, "dmd", started);
+        let latents = if self.policies.uses_packed_f16_denoiser_source() {
+            // The DMD loop no longer needs any conditioning, renoise, timestep, or iterator
+            // handle. Drop those roots before crossing the allocator boundary with the sole final
+            // latent value.
+            drop(instruction);
+            drop(reference);
+            drop(noises);
+            drop(first_dmd_timestep);
+            let handoff = self
+                .packed_f16_dmd_vae_handoff(latents, latent_shape, run_id)
+                .await;
+            match handoff {
+                Ok(latents) => latents,
+                Err(handoff_error) => {
+                    // Never leave a stale Ready cache after a failed/cancelled post-DMD boundary.
+                    // Preserve the primary failure while appending any best-effort barrier/cleanup
+                    // failure that can affect the next request's verified rehydration.
+                    match self.fail_closed_packed_f16_request_cleanup().await {
+                        Ok(()) => return Err(handoff_error),
+                        Err(cleanup_error) => {
+                            return Err(execution_error(
+                                job.variant,
+                                format!(
+                                    "{handoff_error}; fail-closed packed-F16 DMD-to-VAE cleanup also failed: {cleanup_error}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            latents
+        };
 
         check_cancelled(cancellation)?;
         let started = start_stage(shared, id, run_id, "vae-decode", Some(1));
@@ -4430,7 +9764,18 @@ impl BrowserBooguEngine {
             loaded_dtype,
             self.dtypes.vae,
         )?;
-        let decoded = decoder.decode_scaled(latents.cast(self.dtypes.vae));
+        let scaled_latents = latents.cast(self.dtypes.vae);
+        require_finite_browser_tensor(job.variant, "VAE scaled decode input", &scaled_latents)
+            .await?;
+        let decoded = match buffer_plan.vae_decode_policy {
+            crate::boogu::BrowserVaeDecodePolicy::FullStrictF32 => {
+                decoder.decode_scaled(scaled_latents)
+            }
+            crate::boogu::BrowserVaeDecodePolicy::StripedTailStrictF32 { split_width } => {
+                let decode_input = decoder.unscale_latents(scaled_latents);
+                decoder.decode_striped_tail_strict_f32(decode_input, split_width)
+            }
+        };
         self.vae
             .synchronize()
             .await
@@ -4440,6 +9785,9 @@ impl BrowserBooguEngine {
         finish_stage(shared, id, run_id, &mut timings, "vae-decode", started);
 
         let started = start_stage(shared, id, run_id, "output", Some(1));
+        // The unconditional full output readback below feeds `decoder_output_data_to_host`, which
+        // validates the shape and rejects every non-finite value while converting to RGB8. Avoid a
+        // redundant qualification-only device reduction and scalar-readback boundary here.
         let image = decoder_output_to_host_async(decoded)
             .await
             .map_err(|error| map_boogu(job.variant, error))?;
@@ -4462,13 +9810,27 @@ impl BrowserBooguEngine {
                 model_revision: self.identity.model_revision.clone(),
                 artifact_content_digest: Some(self.artifact_content_digest),
                 numeric_format: self.numeric_format.clone(),
-                backend: format!("burn-webgpu/{}", self.policies.residency.label()),
+                backend: self.policies.provenance_backend(),
                 artifacts_verified: true,
             },
         };
         output
             .validate()
             .map_err(|error| execution_error(job.variant, error))?;
+        let artifact_traffic = self
+            .artifact_control
+            .traffic_snapshot()
+            .checked_delta(artifact_traffic_before)
+            .ok_or_else(|| {
+                execution_error(job.variant, "artifact traffic counters moved backwards")
+            })?;
+        self.last_artifact_traffic = artifact_traffic.into();
+        dispatch_browser_event(
+            BROWSER_RUNTIME_EVENT_NAME,
+            &BrowserRuntimeEvent::ArtifactTraffic {
+                traffic: self.last_artifact_traffic,
+            },
+        );
         queue_progress(
             shared,
             id,
@@ -4665,6 +10027,7 @@ async fn fixture_scalar(
     reason = "the gate evaluates each independently reported parity surface"
 )]
 fn evaluate_browser_1k5_gates(
+    residency: BrowserBooguResidencyPolicy,
     processing: &BrowserParityProcessingReport,
     qwen: &BrowserParityQwenReport,
     vae: &BrowserParityVaeReferenceReport,
@@ -4699,9 +10062,16 @@ fn evaluate_browser_1k5_gates(
         maximum_relative_rmse: 0.09,
         minimum_cosine_similarity: 0.996,
     };
-    let final_rgb = BrowserParityRgbGate {
-        minimum_psnr_db: 33.5,
-        minimum_mean_block_ssim_8x8: 0.99,
+    let final_rgb = if residency == BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser {
+        BrowserParityRgbGate {
+            minimum_psnr_db: 24.0,
+            minimum_mean_block_ssim_8x8: 0.90,
+        }
+    } else {
+        BrowserParityRgbGate {
+            minimum_psnr_db: 33.5,
+            minimum_mean_block_ssim_8x8: 0.99,
+        }
     };
     let mut failures = Vec::new();
     if !processing.prompt_exact || !processing.dimensions_exact || !processing.seed_exact {
@@ -5100,7 +10470,29 @@ impl BooguRuntime for BrowserBooguRuntime {
         install_artifact_observer(&engine.artifact_control, &observer_shared, id, run_id);
         let returned_token = cancellation.clone();
         spawn_local(async move {
-            let result = engine.infer(&job, &cancellation, &shared).await;
+            let mut result = engine.infer(&job, &cancellation, &shared).await;
+            // Keep the request-wide surface gate active until every packed-F16 failure or
+            // cancellation has crossed a real queue barrier, dropped all retained denoiser/Qwen
+            // pages, run allocator cleanup, and crossed the post-cleanup barrier. Inference has
+            // returned here, so all request-local tensor handles are already out of scope. This
+            // single outer boundary covers early Qwen/artifact errors as well as DMD/VAE errors;
+            // the cleanup is deliberately idempotent when an inner boundary already ran it.
+            if result.is_err() && engine.policies.uses_packed_f16_denoiser_source() {
+                let cleanup_result = engine.fail_closed_packed_f16_request_cleanup().await;
+                if let Err(cleanup_error) = cleanup_result {
+                    let primary = match result {
+                        Err(RuntimeError::Cancelled) => "browser request was cancelled".into(),
+                        Err(ref error) => error.to_string(),
+                        Ok(_) => unreachable!("cleanup is only entered after inference failure"),
+                    };
+                    result = Err(execution_error(
+                        job.variant,
+                        format!(
+                            "{primary}; fail-closed packed-F16 terminal cleanup also failed: {cleanup_error}"
+                        ),
+                    ));
+                }
+            }
             engine.artifact_control.set_observer(None);
             engine.artifact_control.set_cancellation(None);
             let terminal = match result {
@@ -5238,6 +10630,216 @@ fn normal_tensor<const D: usize>(
         .take(shape.iter().product())
         .collect::<Vec<f32>>();
     Tensor::<BrowserBackend, D>::from_data(TensorData::new(values, shape), device).cast(dtype)
+}
+
+async fn require_finite_browser_tensor<const D: usize>(
+    variant: BooguVariant,
+    name: &str,
+    tensor: &Tensor<BrowserBackend, D>,
+) -> Result<(), RuntimeError> {
+    // These reductions intentionally synchronize and read one scalar per boundary. Keep them
+    // confined to the rendered qualification harness; ordinary production inference must not
+    // acquire diagnostic device-to-host barriers in its hot path.
+    if !rendered_model_smoke_requested() {
+        return Ok(());
+    }
+    let all_finite = tensor
+        .clone()
+        .is_finite()
+        .all()
+        .into_scalar_async()
+        .await
+        .map_err(|error| {
+            execution_error(
+                variant,
+                format!("WebGPU finiteness readback for {name} failed: {error}"),
+            )
+        })?;
+    if all_finite != 0 {
+        Ok(())
+    } else {
+        Err(execution_error(
+            variant,
+            format!("{name} contains non-finite values"),
+        ))
+    }
+}
+
+fn rendered_model_smoke_requested() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .is_some_and(|params| params.get("rendered-model-smoke").as_deref() == Some("1"))
+}
+
+/// Request-local distinction between the serialized localization branch and the ordinary model
+/// path. The query is meaningful only for rendered-model smoke; production pages always report
+/// `ordinary`. An unknown exact value reports `invalid` so the evidence contract fails closed.
+fn browser_qwen_block0_execution_mode() -> &'static str {
+    let Some(params) = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+    else {
+        return BROWSER_QWEN_BLOCK0_ORDINARY_MODE;
+    };
+    if params.get("rendered-model-smoke").as_deref() != Some("1") {
+        return BROWSER_QWEN_BLOCK0_ORDINARY_MODE;
+    }
+    match params
+        .get(BROWSER_QWEN_BLOCK0_EXECUTION_MODE_QUERY)
+        .as_deref()
+    {
+        None | Some(BROWSER_QWEN_BLOCK0_ORDINARY_MODE) => BROWSER_QWEN_BLOCK0_ORDINARY_MODE,
+        Some(BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE) => {
+            BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE
+        }
+        Some(_) => "invalid",
+    }
+}
+
+async fn read_packed_f16_tensor_input_diagnostic<const D: usize>(
+    variant: BooguVariant,
+    name: &str,
+    tensor: &Tensor<BrowserBackend, D>,
+) -> Result<BrowserPackedF16TensorInputDiagnostic, RuntimeError> {
+    let shape = tensor.dims().to_vec();
+    if tensor.dtype() != DType::F32 {
+        return Err(execution_error(
+            variant,
+            format!(
+                "rendered-smoke input {name} must be exact F32 before DMD, got {}",
+                tensor.dtype().name()
+            ),
+        ));
+    }
+    let data = tensor.clone().into_data_async().await.map_err(|error| {
+        execution_error(variant, format!("F32 {name} readback failed: {error}"))
+    })?;
+    packed_f16_tensor_data_input_diagnostic(variant, name, shape, &data)
+}
+
+fn packed_f16_tensor_data_input_diagnostic(
+    variant: BooguVariant,
+    name: &str,
+    shape: Vec<usize>,
+    data: &TensorData,
+) -> Result<BrowserPackedF16TensorInputDiagnostic, RuntimeError> {
+    let expected_elements = shape
+        .iter()
+        .try_fold(1_usize, |total, dimension| total.checked_mul(*dimension))
+        .ok_or_else(|| {
+            execution_error(
+                variant,
+                format!("F32 diagnostic {name} element count overflowed"),
+            )
+        })?;
+    if data.dtype != DType::F32 {
+        return Err(execution_error(
+            variant,
+            format!(
+                "F32 diagnostic {name} read back as {}, expected f32",
+                data.dtype.name()
+            ),
+        ));
+    }
+    let sha256 = Sha256Digest::calculate(data.bytes.as_ref());
+    let values = data
+        .to_vec::<f32>()
+        .map_err(|error| execution_error(variant, error))?;
+    if values.len() != expected_elements || values.is_empty() {
+        return Err(execution_error(
+            variant,
+            format!(
+                "F32 diagnostic {name} read back {} values for shape {shape:?}",
+                values.len()
+            ),
+        ));
+    }
+
+    let finite_element_count = values.iter().filter(|value| value.is_finite()).count();
+    let all_finite = finite_element_count == values.len();
+    let (max_abs, mean, rms) = if all_finite {
+        let mut maximum = 0.0_f64;
+        let mut sum = 0.0_f64;
+        let mut sum_squares = 0.0_f64;
+        for &value in &values {
+            let value = f64::from(value);
+            maximum = maximum.max(value.abs());
+            sum += value;
+            sum_squares += value * value;
+        }
+        let count = values.len() as f64;
+        let mean = sum / count;
+        let rms = (sum_squares / count).sqrt();
+        if !maximum.is_finite() || !mean.is_finite() || !rms.is_finite() {
+            return Err(execution_error(
+                variant,
+                format!("F32 diagnostic {name} statistics overflowed"),
+            ));
+        }
+        (Some(maximum), Some(mean), Some(rms))
+    } else {
+        (None, None, None)
+    };
+
+    Ok(BrowserPackedF16TensorInputDiagnostic {
+        name: name.into(),
+        shape,
+        dtype: "f32".into(),
+        element_count: values.len(),
+        finite_element_count,
+        all_finite,
+        max_abs,
+        mean,
+        rms,
+        sha256,
+    })
+}
+
+fn packed_f16_tensor_diagnostic_is_all_zero(
+    diagnostic: &BrowserPackedF16TensorInputDiagnostic,
+) -> bool {
+    diagnostic.all_finite && diagnostic.max_abs == Some(0.0)
+}
+
+fn packed_f16_qwen_stage_diagnostic_names_are_exact(
+    diagnostics: &[BrowserPackedF16TensorInputDiagnostic],
+    expected_count: usize,
+) -> bool {
+    if expected_count < 2 || diagnostics.len() != expected_count {
+        return false;
+    }
+    diagnostics
+        .first()
+        .is_some_and(|diagnostic| diagnostic.name == "qwen_embedding_output")
+        && diagnostics[1..expected_count - 1]
+            .iter()
+            .enumerate()
+            .all(|(index, diagnostic)| {
+                diagnostic.name == format!("qwen_text_block_{index:02}_output")
+            })
+        && diagnostics
+            .last()
+            .is_some_and(|diagnostic| diagnostic.name == "qwen_final_norm_output")
+}
+
+fn require_finite_nonzero_packed_f16_diagnostic(
+    variant: BooguVariant,
+    diagnostic: &BrowserPackedF16TensorInputDiagnostic,
+) -> Result<(), RuntimeError> {
+    if !diagnostic.all_finite {
+        return Err(execution_error(
+            variant,
+            format!("packed-F16 {} is non-finite", diagnostic.name),
+        ));
+    }
+    if packed_f16_tensor_diagnostic_is_all_zero(diagnostic) {
+        return Err(execution_error(
+            variant,
+            format!("packed-F16 {} is all-zero", diagnostic.name),
+        ));
+    }
+    Ok(())
 }
 
 fn domain_seed(seed: u64, domain: u64) -> u64 {
@@ -5387,6 +10989,26 @@ fn parity_milestone(milestone: &str) {
     }
 }
 
+fn browser_parity_readback_milestone(
+    phase: &str,
+    tensor: &str,
+    elements: usize,
+    chunk_index: usize,
+    chunk_count: usize,
+) {
+    let chunk = if chunk_count == 0 {
+        "whole".to_owned()
+    } else {
+        format!("{}/{}", chunk_index + 1, chunk_count)
+    };
+    web_sys::console::info_1(
+        &format!(
+            "BURN_IMAGE_HEADLESS_PARITY_READBACK phase={phase} tensor={tensor} elements={elements} chunk={chunk}"
+        )
+        .into(),
+    );
+}
+
 fn vae_reference_milestone(milestone: &str) {
     web_sys::console::info_1(
         &format!("BURN_IMAGE_HEADLESS_VAE_REFERENCE_PROGRESS {milestone}").into(),
@@ -5502,8 +11124,6 @@ const fn variant_slug(variant: BooguVariant) -> &'static str {
     match variant {
         BooguVariant::Image01Turbo => "turbo",
         BooguVariant::Image01EditTurbo => "edit-turbo",
-        // Kept exhaustive for provenance/file naming, although factory validation rejects this
-        // native-only release before browser artifact loading or inference can begin.
         BooguVariant::Image01EditTurbo1k5 => "edit-turbo-1k5",
     }
 }
@@ -5519,6 +11139,48 @@ const fn quantized_policy_name(policy: BooguQuantizedLoadPolicy) -> &'static str
     match policy {
         BooguQuantizedLoadPolicy::Preserve => "preserve",
         BooguQuantizedLoadPolicy::DequantizeF16 => "dequantize-f16",
+    }
+}
+
+const fn denoiser_quantized_policy_name(
+    stored_policy: BooguQuantizedLoadPolicy,
+    runtime_policy: BooguDenoiserRuntimeQuantizationPolicy,
+    runtime_q8_scope: BooguRuntimeQ8Scope,
+) -> &'static str {
+    match (runtime_policy, runtime_q8_scope) {
+        (
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            BooguRuntimeQ8Scope::TurboCaptionAndTailF32,
+        ) => "runtime-quantize-q8s-block32-f32/turbo-caption-tail-f32",
+        (
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8,
+        ) => "runtime-quantize-q8s-block32-f32/turbo-attention-ffn-core-q8",
+        (
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            BooguRuntimeQ8Scope::TurboFfnCoreQ8,
+        ) => "runtime-quantize-q8s-block32-f32/turbo-ffn-core-q8",
+        (
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            BooguRuntimeQ8Scope::TurboFfnGateUpQ8,
+        ) => "runtime-quantize-q8s-block32-f32/turbo-ffn-gate-up-q8",
+        (
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            BooguRuntimeQ8Scope::TurboMainCoreFfnGateUpQ8,
+        ) => "runtime-quantize-q8s-block32-f32/turbo-main-core-ffn-gate-up-q8",
+        (BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32, _) => runtime_policy.label(),
+        _ => quantized_policy_name(stored_policy),
+    }
+}
+
+const fn quantized_linear_execution_policy_name(
+    policy: BooguQuantizedLinearExecutionPolicy,
+) -> &'static str {
+    match policy {
+        BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul => "direct-quantized-matmul",
+        BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage => {
+            "retained-q8-dense-f32-per-semantic-stage"
+        }
     }
 }
 
@@ -5546,11 +11208,79 @@ mod browser_source_tests {
 
     use burn_image::{
         ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_MANIFEST_SCHEMA_V2, ArtifactBundleId,
-        ArtifactComponentId, ArtifactDependency, ArtifactFileRole, ArtifactProfileId, ModelId,
-        NumericFormat,
+        ArtifactComponentId, ArtifactDependency, ArtifactFileRole, ArtifactProfileId,
+        ArtifactSource, ModelId, NumericFormat, RemoteBaseUrl,
     };
 
     use super::*;
+
+    fn released_qwen_config() -> Qwen3VlConfig {
+        Qwen3VlConfig::from_json(
+            r#"{
+              "text_config": {
+                "vocab_size":151936,"hidden_size":4096,"intermediate_size":12288,
+                "num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,
+                "head_dim":128,"hidden_act":"silu","rms_norm_eps":1e-6,
+                "max_position_embeddings":262144,"rope_theta":5000000,
+                "rope_scaling":{"mrope_section":[24,20,20],"mrope_interleaved":true,"rope_type":"default"}
+              },
+              "vision_config": {
+                "depth":27,"hidden_size":1152,"intermediate_size":4304,"num_heads":16,
+                "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+                "out_hidden_size":4096,"in_channels":3,"num_position_embeddings":2304,
+                "deepstack_visual_indexes":[8,16,24],"hidden_act":"gelu_pytorch_tanh",
+                "layer_norm_eps":1e-6
+              },
+              "tie_word_embeddings":false,"image_token_id":151655,"video_token_id":151656,
+              "vision_start_token_id":151652,"vision_end_token_id":151653
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn released_qwen_streaming_plan() -> Qwen3VlStreamingPlan {
+        Qwen3VlStreamingPlan::released_f16(&released_qwen_config(), false).unwrap()
+    }
+
+    fn released_flux_vae_config() -> AutoencoderKlConfig {
+        AutoencoderKlConfig::from_diffusers_json(
+            r#"{
+              "act_fn":"silu","block_out_channels":[128,256,512,512],
+              "down_block_types":["DownEncoderBlock2D","DownEncoderBlock2D","DownEncoderBlock2D","DownEncoderBlock2D"],
+              "force_upcast":true,"in_channels":3,"latent_channels":16,
+              "layers_per_block":2,"mid_block_add_attention":true,"norm_num_groups":32,
+              "out_channels":3,"sample_size":1024,"scaling_factor":0.3611,
+              "shift_factor":0.1159,
+              "up_block_types":["UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D","UpDecoderBlock2D"],
+              "use_post_quant_conv":false,"use_quant_conv":false
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parity_readback_ranges_bound_every_map_and_cover_exact_values_correctness() {
+        let chunk_elements =
+            BROWSER_PARITY_MAX_READBACK_CHUNK_BYTES / BROWSER_PARITY_F32_ELEMENT_BYTES;
+        assert!(browser_parity_readback_ranges(0).is_empty());
+        assert_eq!(
+            browser_parity_readback_ranges(chunk_elements),
+            vec![(0, chunk_elements)]
+        );
+
+        let elements = chunk_elements * 3 + 17;
+        let ranges = browser_parity_readback_ranges(elements);
+        assert_eq!(ranges.first(), Some(&(0, chunk_elements)));
+        assert_eq!(ranges.last(), Some(&(chunk_elements * 3, elements)));
+        assert_eq!(ranges.len(), 4);
+        for (index, (start, end)) in ranges.iter().copied().enumerate() {
+            assert!(start < end);
+            assert!(end - start <= chunk_elements);
+            if let Some((_, previous_end)) = index.checked_sub(1).map(|index| ranges[index]) {
+                assert_eq!(start, previous_end);
+            }
+        }
+    }
 
     fn tiny_manifest(bundle: &str, schema_version: u32) -> ArtifactManifest {
         let bytes = b"tiny";
@@ -5603,15 +11333,1483 @@ mod browser_source_tests {
             BrowserBooguResidencyPolicy::parse("layer-streamed-diagnostic"),
             Some(BrowserBooguResidencyPolicy::LayerStreamedDiagnostic)
         );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::parse("qualification-f32"),
+            Some(BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained)
+        );
+        assert_eq!(BrowserBooguResidencyPolicy::parse("low-vram"), None);
+        assert_eq!(
+            BrowserBooguResidencyPolicy::parse("low-vram-runtime-q8-denoiser"),
+            Some(BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser)
+        );
         assert_eq!(BrowserBooguResidencyPolicy::parse("streamed"), None);
+        assert_eq!(
+            BrowserBooguResidencyPolicy::parse("low-vram-retained-q8-dense-f32-per-stage-denoiser"),
+            None
+        );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::parse(
+                "low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser"
+            ),
+            Some(BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser)
+        );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::parse(
+                "browser-low-vram-preloaded-main-core-ffn-gate-up-q8-denoiser"
+            ),
+            None
+        );
+        for retired in [
+            "low-vram-preloaded-main-core-ffn-gate-up-q8-denoiser",
+            "low-vram-preloaded-ffn-gate-up-q8-denoiser",
+            "browser-low-vram-preloaded-ffn-gate-up-q8-denoiser",
+            "low-vram-preloaded-ffn-core-q8-denoiser",
+            "browser-low-vram-preloaded-ffn-core-q8-denoiser",
+            "low-vram-preloaded-attention-ffn-core-q8-denoiser",
+            "browser-low-vram-preloaded-attention-ffn-core-q8-denoiser",
+        ] {
+            assert_eq!(BrowserBooguResidencyPolicy::parse(retired), None);
+        }
         assert_eq!(
             BrowserBooguResidencyPolicy::HighVramResidentDenseF32.label(),
             "browser-high-vram-resident-dense-f32"
         );
         assert_eq!(
+            BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained.label(),
+            "browser-qualification-per-request-f32-denoiser-retained"
+        );
+        assert_eq!(
             BrowserBooguResidencyPolicy::LayerStreamedDiagnostic.label(),
             "browser-layer-streamed-diagnostic"
         );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser.label(),
+            "browser-low-vram-runtime-q8-denoiser"
+        );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::LowVramRetainedQ8DenseF32PerStageDenoiser.label(),
+            "browser-low-vram-retained-q8-dense-f32-per-stage-denoiser"
+        );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser.label(),
+            "browser-low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser"
+        );
+        assert_eq!(
+            default_browser_low_vram_residency(BooguVariant::Image01Turbo),
+            BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+        );
+        for edit in [
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            assert_eq!(
+                default_browser_low_vram_residency(edit),
+                BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser
+            );
+        }
+    }
+
+    #[test]
+    fn browser_turbo_low_vram_preloads_packed_f16_for_dense_f32_stages_correctness() {
+        let policy = BrowserExecutionPolicies::low_vram_preloaded_packed_f16_denoiser(
+            BooguVariant::Image01Turbo,
+            &production_settings(),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.residency,
+            BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
+        );
+        assert_eq!(
+            policy.denoiser_runtime_q8_scope,
+            BooguRuntimeQ8Scope::AllInventoryEligible
+        );
+        assert_eq!(
+            policy.denoiser_quantized,
+            BooguQuantizedLoadPolicy::Preserve
+        );
+        assert_eq!(
+            policy.denoiser_runtime_quantization,
+            BooguDenoiserRuntimeQuantizationPolicy::Disabled
+        );
+        assert_eq!(
+            policy.denoiser_retaining_wrapper_adapter,
+            BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul
+        );
+        assert!(!policy.retain_denoiser_stages);
+        assert!(policy.uses_packed_f16_denoiser_source());
+        assert_eq!(
+            policy.denoiser_execution_kind,
+            BrowserDenoiserExecutionKind::PackedF16DeviceWidenDenseF32
+        );
+        assert_eq!(
+            policy.denoiser_quantized_linear_execution_policy_report(),
+            "not-applicable-packed-f16-storage"
+        );
+        assert_eq!(
+            policy.denoiser_quantized_load_policy_report(),
+            "not-applicable-packed-f16-storage"
+        );
+        assert_eq!(
+            policy.denoiser_storage_policy(),
+            "authenticated-compact-f16/padded-u32-retained/dense-f32-per-semantic-stage"
+        );
+        assert_eq!(
+            policy.denoiser_linear_execution_policy(),
+            "packed-f16-storage/device-widen-f32-per-semantic-stage/dense-f32-matmul"
+        );
+        assert!(policy.preload_denoiser_before_request);
+        assert!(!policy.eager_preload);
+        assert!(!policy.defer_retained_denoiser_synchronization);
+        assert!(!policy.defer_retained_qwen_synchronization);
+        assert!(!policy.retain_qwen_stages);
+        assert!(!policy.release_unused_qwen_memory_after_stage);
+        assert!(policy.packed_qwen_instruction_handoff);
+        assert_eq!(
+            policy.qwen_text_block_load_synchronization,
+            Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward
+        );
+        assert!(policy.packed_allocator_policy_is_exact());
+        assert_eq!(
+            policy.packed_qwen_instruction_handoff_policy(),
+            BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY
+        );
+        assert!(!policy.request_scoped_surface_acquire_suspended);
+        assert!(
+            !policy
+                .provenance_backend()
+                .contains(BROWSER_SURFACE_INFERENCE_PROVENANCE_SUFFIX)
+        );
+        let mut unsafe_qwen_release = policy;
+        unsafe_qwen_release.release_unused_qwen_memory_after_stage = true;
+        assert!(!unsafe_qwen_release.packed_allocator_policy_is_exact());
+        let mut missing_phase_cleanup = policy;
+        missing_phase_cleanup.packed_qwen_instruction_handoff = false;
+        assert!(!missing_phase_cleanup.packed_allocator_policy_is_exact());
+        let mut deferred_qwen = policy;
+        deferred_qwen.defer_retained_qwen_synchronization = true;
+        assert!(!deferred_qwen.packed_allocator_policy_is_exact());
+        let mut retained_qwen = policy;
+        retained_qwen.retain_qwen_stages = true;
+        assert!(!retained_qwen.packed_allocator_policy_is_exact());
+        let mut missing_pre_forward_barrier = policy;
+        missing_pre_forward_barrier.qwen_text_block_load_synchronization =
+            Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly;
+        assert!(!missing_pre_forward_barrier.packed_allocator_policy_is_exact());
+        let mut submission_policy_drift = policy;
+        submission_policy_drift.qwen_text_layer_submission_policy =
+            BROWSER_DEFAULT_QWEN_TEXT_LAYER_SUBMISSION_POLICY;
+        assert!(!submission_policy_drift.packed_allocator_policy_is_exact());
+        let ordinary = policy.for_ordinary_browser_factory();
+        assert!(ordinary.require_persistent_range_cache);
+        assert!(ordinary.request_scoped_surface_acquire_suspended);
+        assert_eq!(
+            ordinary.weight_traffic_contract(),
+            "persistent-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage"
+        );
+        assert_eq!(
+            ordinary.packed_f16_dmd_vae_handoff_policy(),
+            BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY
+        );
+        assert_eq!(
+            ordinary.provenance_backend(),
+            "burn-webgpu/browser-low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser/request-scoped-packed-cache-evicted-before-vae/request-scoped-surface-acquire-suspended"
+        );
+        assert!(
+            BrowserExecutionPolicies::low_vram_preloaded_packed_f16_denoiser(
+                BooguVariant::Image01EditTurbo,
+                &production_settings(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_turbo_packed_f16_resource_and_traffic_plan_is_exact_correctness() {
+        let plan = validate_browser_packed_f16_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.qwen_text_layer_allocation_policy,
+            Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent.label()
+        );
+        assert_eq!(
+            plan.qwen_text_block_load_synchronization_policy,
+            Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward.label()
+        );
+        assert_eq!(
+            plan.qwen_text_layer_submission_policy,
+            BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY
+        );
+        assert!(plan.qwen_text_layer_persistent_pool_requires_measured_gpu_gate);
+        assert_eq!(plan.authenticated_artifact_bytes, 19_870_166_528);
+        assert_eq!(plan.canonical_compact_f16_payload_bytes, 19_869_996_096);
+        assert_eq!(plan.retained_packed_f16_denoiser_bytes, 19_870_010_624);
+        assert_eq!(plan.inserted_padding_elements, 7_264);
+        assert_eq!(plan.padded_f16_elements, 9_935_005_312);
+        assert_eq!(plan.expected_stage_count, 46);
+        assert_eq!(plan.expected_object_count, 106);
+        assert_eq!(plan.expected_tensor_count, 912);
+        assert_eq!(plan.max_packed_stage_bytes, 876_827_328);
+        assert_eq!(plan.max_materialized_stage_f32_bytes, 1_753_654_656);
+        assert_eq!(plan.max_packed_object_bytes, 254_251_904);
+        assert_eq!(plan.max_materialized_object_f32_bytes, 508_503_808);
+        assert_eq!(plan.materialized_f32_bytes_per_dmd_step, 39_740_021_248);
+        assert_eq!(plan.preload_workspace_bytes, 2_434_252_800);
+        assert_eq!(plan.preload_peak_bytes, 22_304_263_424);
+        assert_eq!(plan.activation_reserve_bytes, 4_868_505_600);
+        assert_eq!(plan.conservative_planned_device_bytes, 26_492_170_880);
+        assert_eq!(plan.strict_device_cap_bytes, 32_000_000_000);
+        assert_eq!(plan.expected_stage_materializations_per_request, 184);
+        assert_eq!(plan.expected_object_unpacks_per_request, 424);
+        assert_eq!(plan.expected_packed_read_bytes_per_request, 79_480_042_496);
+        assert_eq!(plan.expected_f32_write_bytes_per_request, 158_960_084_992);
+        assert!(!plan.on_device_quantized_execution_claimed);
+        let event = serde_json::to_value(browser_packed_f16_resource_plan_event(plan)).unwrap();
+        assert_eq!(event["event"], "packed_f16_resource_plan");
+        assert_eq!(event["authenticated_artifact_bytes"], 19_870_166_528_u64);
+        assert_eq!(
+            event["retained_packed_f16_denoiser_bytes"],
+            19_870_010_624_u64
+        );
+        assert_eq!(event["expected_stage_materializations_per_request"], 184);
+        assert_eq!(event["expected_object_unpacks_per_request"], 424);
+        assert_eq!(
+            event["expected_packed_read_bytes_per_request"],
+            79_480_042_496_u64
+        );
+        assert_eq!(
+            event["expected_f32_write_bytes_per_request"],
+            158_960_084_992_u64
+        );
+        assert_eq!(event["on_device_quantized_execution_claimed"], false);
+        assert!(
+            validate_browser_packed_f16_resource_plan_with_cap(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+                26_492_170_881,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_browser_packed_f16_resource_plan_with_cap(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+                26_492_170_880,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_turbo_packed_f16_lifecycle_requires_complete_cache_and_zero_dmd_io_correctness() {
+        let plan = validate_browser_packed_f16_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        let exact = BrowserPackedF16DenoiserLifecycleReport {
+            cache_state: "ready",
+            cache_ready: true,
+            cached_stages: 46,
+            cached_objects: 106,
+            cached_tensors: 912,
+            cached_bytes: 19_870_010_624,
+            authenticated_artifact_bytes: 19_870_166_528,
+            packed_upload_bytes: 19_870_010_624,
+            stage_materializations: 184,
+            object_unpacks: 424,
+            packed_read_bytes: 79_480_042_496,
+            f32_write_bytes: 158_960_084_992,
+            preload_attempt_count: 1,
+            failure_count: 0,
+            dmd_artifact_traffic: BrowserArtifactTrafficReport::default(),
+            synchronization_pending: false,
+            matches_plan: false,
+        };
+        assert!(
+            validate_packed_f16_denoiser_lifecycle(BooguVariant::Image01Turbo, plan, 4, exact)
+                .unwrap()
+                .matches_plan
+        );
+        let mut second_request = exact;
+        second_request.authenticated_artifact_bytes = 39_740_333_056;
+        second_request.packed_upload_bytes = 39_740_021_248;
+        second_request.preload_attempt_count = 2;
+        assert!(
+            validate_packed_f16_denoiser_lifecycle(
+                BooguVariant::Image01Turbo,
+                plan,
+                4,
+                second_request,
+            )
+            .unwrap()
+            .matches_plan
+        );
+        let mut partial = exact;
+        partial.cached_objects -= 1;
+        assert!(
+            validate_packed_f16_denoiser_lifecycle(BooguVariant::Image01Turbo, plan, 4, partial)
+                .is_err()
+        );
+        let mut reloaded = exact;
+        reloaded.dmd_artifact_traffic.object_reads = 1;
+        assert!(
+            validate_packed_f16_denoiser_lifecycle(BooguVariant::Image01Turbo, plan, 4, reloaded)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_turbo_dmd_vae_handoff_requires_exact_latent_and_empty_cache_correctness() {
+        let plan = validate_browser_packed_f16_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        let digest = Sha256Digest::calculate(b"exact-final-dmd-latent");
+        let ready = BrowserPackedF16CacheEvidence {
+            state: "ready".into(),
+            cache_ready: true,
+            cached_stages: 46,
+            cached_objects: 106,
+            cached_tensors: 912,
+            cached_bytes: 19_870_010_624,
+        };
+        let empty = BrowserPackedF16CacheEvidence {
+            state: "empty".into(),
+            cache_ready: false,
+            cached_stages: 0,
+            cached_objects: 0,
+            cached_tensors: 0,
+            cached_bytes: 0,
+        };
+        let exact = BrowserPackedF16DmdVaeHandoffReport {
+            policy: BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY.into(),
+            next_request_rehydration_policy: BROWSER_PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY
+                .into(),
+            shape: vec![1, 16, 128, 128],
+            dtype: "f32".into(),
+            element_count: 262_144,
+            payload_bytes: 1_048_576,
+            device_to_host_readback_bytes: 2_097_152,
+            host_to_device_upload_bytes: 1_048_576,
+            total_transfer_bytes: 3_145_728,
+            before_sha256: digest,
+            after_sha256: digest,
+            all_finite: true,
+            not_all_zero: true,
+            digest_matches: true,
+            wrapper_cached_stages_before_clear: 0,
+            wrapper_cached_stages_after_clear: 0,
+            synchronization_pending_before_cleanup: false,
+            synchronization_pending_after_cleanup: false,
+            rope_cache_cleared: true,
+            cleanup_completed: true,
+            packed_cache_before_cleanup: ready,
+            packed_cache_after_cleanup: empty,
+            preload_attempt_count: 1,
+            expected_next_request_preload_attempt_count: 2,
+        };
+        validate_packed_f16_dmd_vae_handoff_report(
+            BooguVariant::Image01Turbo,
+            plan,
+            [1, 16, 128, 128],
+            &exact,
+        )
+        .unwrap();
+        let event = serde_json::to_value(browser_packed_f16_dmd_vae_handoff_event(
+            RunId(31),
+            exact.clone(),
+        ))
+        .unwrap();
+        assert_eq!(event["event"], "packed_f16_dmd_vae_handoff");
+        assert_eq!(event["run_id"], 31);
+        assert_eq!(event["report"], serde_json::to_value(&exact).unwrap());
+
+        for invalid in [
+            {
+                let mut invalid = exact.clone();
+                invalid.packed_cache_after_cleanup.cached_bytes = 4;
+                invalid
+            },
+            {
+                let mut invalid = exact.clone();
+                invalid.after_sha256 = Sha256Digest::calculate(b"mutated");
+                invalid
+            },
+            {
+                let mut invalid = exact.clone();
+                invalid.all_finite = false;
+                invalid
+            },
+            {
+                let mut invalid = exact.clone();
+                invalid.wrapper_cached_stages_after_clear = 1;
+                invalid
+            },
+            {
+                let mut invalid = exact.clone();
+                invalid.expected_next_request_preload_attempt_count = 3;
+                invalid
+            },
+        ] {
+            assert!(
+                validate_packed_f16_dmd_vae_handoff_report(
+                    BooguVariant::Image01Turbo,
+                    plan,
+                    [1, 16, 128, 128],
+                    &invalid,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn browser_turbo_packed_f16_lifecycle_event_preserves_exact_report_json_correctness() {
+        let lifecycle = BrowserPackedF16DenoiserLifecycleReport {
+            cache_state: "ready",
+            cache_ready: true,
+            cached_stages: 46,
+            cached_objects: 106,
+            cached_tensors: 912,
+            cached_bytes: 19_870_010_624,
+            authenticated_artifact_bytes: 19_870_166_528,
+            packed_upload_bytes: 19_870_010_624,
+            stage_materializations: 184,
+            object_unpacks: 424,
+            packed_read_bytes: 79_480_042_496,
+            f32_write_bytes: 158_960_084_992,
+            preload_attempt_count: 1,
+            failure_count: 0,
+            dmd_artifact_traffic: BrowserArtifactTrafficReport::default(),
+            synchronization_pending: false,
+            matches_plan: true,
+        };
+        let event =
+            serde_json::to_value(browser_packed_f16_denoiser_lifecycle_event(lifecycle)).unwrap();
+        assert_eq!(
+            event,
+            serde_json::json!({
+                "event": "packed_f16_denoiser_lifecycle",
+                "lifecycle": {
+                    "cache_state": "ready",
+                    "cache_ready": true,
+                    "cached_stages": 46,
+                    "cached_objects": 106,
+                    "cached_tensors": 912,
+                    "cached_bytes": 19_870_010_624_u64,
+                    "authenticated_artifact_bytes": 19_870_166_528_u64,
+                    "packed_upload_bytes": 19_870_010_624_u64,
+                    "stage_materializations": 184,
+                    "object_unpacks": 424,
+                    "packed_read_bytes": 79_480_042_496_u64,
+                    "f32_write_bytes": 158_960_084_992_u64,
+                    "preload_attempt_count": 1,
+                    "failure_count": 0,
+                    "dmd_artifact_traffic": {
+                        "object_reads": 0,
+                        "object_read_bytes": 0,
+                        "range_reads": 0,
+                        "range_read_bytes": 0,
+                        "verified_objects": 0,
+                        "cache_lookups": 0,
+                        "cache_hits": 0,
+                        "cache_misses": 0,
+                        "cache_read_bytes": 0,
+                        "network_requests": 0,
+                        "network_response_bytes": 0,
+                        "cache_writes": 0,
+                        "cache_write_bytes": 0,
+                        "cache_evictions": 0,
+                        "cache_evicted_entries": 0,
+                        "cache_invalid_entries": 0,
+                        "integrity_refetches": 0
+                    },
+                    "synchronization_pending": false,
+                    "matches_plan": true
+                }
+            })
+        );
+        assert_eq!(event["lifecycle"], serde_json::to_value(lifecycle).unwrap());
+    }
+
+    #[test]
+    fn browser_turbo_pre_dmd_input_event_has_exact_diagnostic_provenance_correctness() {
+        let tensor = |name: &str, shape: Vec<usize>, element_count: usize| {
+            BrowserPackedF16TensorInputDiagnostic {
+                name: name.into(),
+                shape,
+                dtype: "f32".into(),
+                element_count,
+                finite_element_count: element_count,
+                all_finite: true,
+                max_abs: Some(4.0),
+                mean: Some(0.25),
+                rms: Some(1.0),
+                sha256: Sha256Digest::calculate(name.as_bytes()),
+            }
+        };
+        let diagnostics = BrowserPackedF16PreDmdInputDiagnostics {
+            scope: "rendered-model-smoke/ordinary-turbo-packed-f16/pre-dmd-input-readback".into(),
+            policy: BrowserPackedF16PreDmdPolicyEvidence {
+                qwen_release_unused_memory_after_stage: false,
+                qwen_text_block_load_synchronization_policy:
+                    Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward
+                        .label()
+                        .into(),
+                qwen_text_layer_submission_policy:
+                    BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY.into(),
+                packed_qwen_instruction_handoff_policy: BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY
+                    .into(),
+                cleanup_completed: true,
+                post_cleanup_packed_cache: BrowserPackedF16CacheEvidence {
+                    state: "ready".into(),
+                    cache_ready: true,
+                    cached_stages: 46,
+                    cached_objects: 106,
+                    cached_tensors: 912,
+                    cached_bytes: 19_870_010_624,
+                },
+            },
+            dmd_steps: 4,
+            instruction: tensor("instruction", vec![1, 45, 4096], 184_320),
+            initial_latent: tensor("initial_latent", vec![1, 16, 128, 128], 262_144),
+            renoise: (0..3)
+                .map(|index| tensor(&format!("renoise_{index}"), vec![1, 16, 128, 128], 262_144))
+                .collect(),
+            first_timestep: tensor("first_timestep", vec![1], 1),
+            all_inputs_finite: true,
+        };
+        let event = serde_json::to_value(browser_packed_f16_pre_dmd_input_diagnostics_event(
+            RunId(17),
+            diagnostics.clone(),
+        ))
+        .unwrap();
+        assert_eq!(event["event"], "packed_f16_pre_dmd_input_diagnostics");
+        assert_eq!(event["run_id"], 17);
+        assert_eq!(
+            event["diagnostics"],
+            serde_json::to_value(&diagnostics).unwrap()
+        );
+        assert_eq!(event["diagnostics"]["dmd_steps"], 4);
+        assert_eq!(event["diagnostics"]["renoise"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            event["diagnostics"]["policy"]["packed_qwen_instruction_handoff_policy"],
+            BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY
+        );
+        assert_eq!(
+            event["diagnostics"]["policy"]["post_cleanup_packed_cache"]["cached_bytes"],
+            19_870_010_624_u64
+        );
+    }
+
+    #[test]
+    fn browser_turbo_block0_boundary_report_is_prefix_fail_closed_correctness() {
+        let tensor = |boundary: Qwen3VlTextLayerDiagnosticBoundary, sha256: Sha256Digest| {
+            let shape = if boundary == Qwen3VlTextLayerDiagnosticBoundary::InputLayerNormGamma {
+                vec![4096]
+            } else {
+                vec![1, 45, 4096]
+            };
+            let element_count = shape.iter().product();
+            BrowserPackedF16TensorInputDiagnostic {
+                name: format!(
+                    "qwen_text_block_00_{}_immediate_post_sync",
+                    boundary.label()
+                ),
+                shape,
+                dtype: "f32".into(),
+                element_count,
+                finite_element_count: element_count,
+                all_finite: true,
+                max_abs: Some(4.0),
+                mean: Some(0.25),
+                rms: Some(1.0),
+                sha256,
+            }
+        };
+        let input_sha = Sha256Digest::calculate(b"layer-input");
+        let control = BrowserQwenInstructionDiagnosticControl::default();
+        let mut complete = None;
+        for boundary in BROWSER_PACKED_F16_QWEN_BLOCK0_BOUNDARIES {
+            let sha = if matches!(
+                boundary,
+                Qwen3VlTextLayerDiagnosticBoundary::LayerInput
+                    | Qwen3VlTextLayerDiagnosticBoundary::IdentityAddCanary
+            ) {
+                input_sha
+            } else {
+                Sha256Digest::calculate(boundary.label().as_bytes())
+            };
+            let outcome = control
+                .record_block0_boundary(
+                    Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent,
+                    Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward,
+                    BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
+                    boundary,
+                    tensor(boundary, sha),
+                )
+                .unwrap();
+            assert!(outcome.failure_message.is_none());
+            if outcome.report.is_some() {
+                assert_eq!(
+                    boundary,
+                    Qwen3VlTextLayerDiagnosticBoundary::FinalResidualOutput
+                );
+                complete = outcome.report;
+            }
+        }
+        let complete = complete.unwrap();
+        assert!(complete.complete);
+        assert_eq!(complete.captured_boundary_count, 9);
+        assert_eq!(complete.identity_add_canary_matches_input, Some(true));
+        let event = serde_json::to_value(
+            browser_packed_f16_qwen_block0_execution_diagnostics_event(RunId(23), complete),
+        )
+        .unwrap();
+        assert_eq!(
+            event["event"],
+            "packed_f16_qwen_block0_execution_diagnostics"
+        );
+        assert_eq!(event["run_id"], 23);
+        assert_eq!(
+            event["diagnostics"]["boundaries"].as_array().unwrap().len(),
+            9
+        );
+
+        let failing = BrowserQwenInstructionDiagnosticControl::default();
+        for boundary in [
+            Qwen3VlTextLayerDiagnosticBoundary::LayerInput,
+            Qwen3VlTextLayerDiagnosticBoundary::InputLayerNormGamma,
+        ] {
+            failing
+                .record_block0_boundary(
+                    Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent,
+                    Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward,
+                    BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
+                    boundary,
+                    tensor(boundary, input_sha),
+                )
+                .unwrap();
+        }
+        let failure = failing
+            .record_block0_boundary(
+                Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent,
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward,
+                BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY,
+                Qwen3VlTextLayerDiagnosticBoundary::IdentityAddCanary,
+                tensor(
+                    Qwen3VlTextLayerDiagnosticBoundary::IdentityAddCanary,
+                    Sha256Digest::calculate(b"alias-drift"),
+                ),
+            )
+            .unwrap();
+        assert!(failure.failure_message.is_some());
+        let report = failure.report.unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.captured_boundary_count, 3);
+        assert_eq!(report.identity_add_canary_matches_input, Some(false));
+        assert_eq!(
+            report.first_failure_boundary.as_deref(),
+            Some("identity_add_canary")
+        );
+        assert_eq!(
+            report.failure_reason.as_deref(),
+            Some("identity-add-canary-mismatch")
+        );
+    }
+
+    #[test]
+    fn browser_turbo_qwen_handoff_events_and_transfer_accounting_are_exact_correctness() {
+        let tensor = |name: String, sha256: Sha256Digest| BrowserPackedF16TensorInputDiagnostic {
+            name,
+            shape: vec![1, 45, 4096],
+            dtype: "f32".into(),
+            element_count: 184_320,
+            finite_element_count: 184_320,
+            all_finite: true,
+            max_abs: Some(24.5),
+            mean: Some(0.125),
+            rms: Some(1.0),
+            sha256,
+        };
+        let mut stages = vec![tensor(
+            "qwen_embedding_output".into(),
+            Sha256Digest::calculate(b"embedding"),
+        )];
+        stages.extend((0..36).map(|index| {
+            tensor(
+                format!("qwen_text_block_{index:02}_output"),
+                Sha256Digest::calculate(format!("block-{index}").as_bytes()),
+            )
+        }));
+        let final_sha = Sha256Digest::calculate(b"final-norm");
+        stages.push(tensor("qwen_final_norm_output".into(), final_sha));
+        assert!(packed_f16_qwen_stage_diagnostic_names_are_exact(
+            &stages, 38
+        ));
+
+        let pre_handoff_sha = Sha256Digest::calculate(b"trimmed-instruction");
+        let block_00_immediate_post_sync = BrowserPackedF16QwenBlock0PostSyncDiagnostic {
+            scope: BROWSER_PACKED_F16_QWEN_BLOCK0_POST_SYNC_SCOPE.into(),
+            block0_execution_mode: BROWSER_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE.into(),
+            text_layer_allocation_policy: Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent
+                .label()
+                .into(),
+            text_block_load_synchronization_policy:
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward
+                    .label()
+                    .into(),
+            qwen_text_layer_submission_policy: BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY
+                .into(),
+            tensor: tensor(
+                "qwen_text_block_00_output".into(),
+                Sha256Digest::calculate(b"block-0"),
+            ),
+            all_finite: true,
+            not_all_zero: true,
+        };
+        let pre = BrowserPackedF16QwenPreHandoffDiagnostics {
+            scope: BROWSER_PACKED_F16_QWEN_PRE_HANDOFF_SCOPE.into(),
+            effective_instruction_length: 45,
+            expected_stage_output_count: 38,
+            stage_outputs: stages,
+            stage_names_exact: true,
+            qwen_last_hidden_state_before_trim: tensor(
+                "qwen_last_hidden_state_before_trim".into(),
+                final_sha,
+            ),
+            instruction_after_trim_cast_before_handoff: tensor(
+                "instruction_after_trim_cast_before_handoff".into(),
+                pre_handoff_sha,
+            ),
+            all_tensors_finite: true,
+            no_tensor_all_zero: true,
+            first_non_finite_tensor: None,
+            first_all_zero_tensor: None,
+            final_norm_matches_returned_output: true,
+            block_00_immediate_post_sync,
+            block_00_immediate_matches_delayed_capture: true,
+        };
+        let pre_event = serde_json::to_value(
+            browser_packed_f16_qwen_pre_handoff_diagnostics_event(RunId(19), pre),
+        )
+        .unwrap();
+        assert_eq!(
+            pre_event["event"],
+            "packed_f16_qwen_pre_handoff_diagnostics"
+        );
+        assert_eq!(pre_event["run_id"], 19);
+        assert_eq!(
+            pre_event["diagnostics"]["stage_outputs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            38
+        );
+
+        let cache = BrowserPackedF16CacheEvidence {
+            state: "ready".into(),
+            cache_ready: true,
+            cached_stages: 46,
+            cached_objects: 106,
+            cached_tensors: 912,
+            cached_bytes: 19_870_010_624,
+        };
+        let after = tensor("instruction_after_handoff".into(), pre_handoff_sha);
+        let report = BrowserPackedF16QwenInstructionHandoffReport {
+            policy: BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY.into(),
+            qwen_release_unused_memory_after_stage: false,
+            qwen_text_layer_allocation_policy:
+                Qwen3VlTextLayerAllocationPolicy::ExactSizePersistent
+                    .label()
+                    .into(),
+            qwen_text_block_load_synchronization_policy:
+                Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward
+                    .label()
+                    .into(),
+            qwen_text_layer_submission_policy: BROWSER_PACKED_F16_QWEN_TEXT_LAYER_SUBMISSION_POLICY
+                .into(),
+            shape: after.shape.clone(),
+            dtype: after.dtype.clone(),
+            element_count: after.element_count,
+            payload_bytes: 737_280,
+            device_to_host_readback_bytes: 1_474_560,
+            host_to_device_upload_bytes: 737_280,
+            total_transfer_bytes: 2_211_840,
+            before_sha256: pre_handoff_sha,
+            after_sha256: pre_handoff_sha,
+            all_finite: true,
+            not_all_zero: true,
+            digest_matches: true,
+            cleanup_completed: true,
+            packed_cache: cache.clone(),
+        };
+        let post = BrowserPackedF16QwenPostHandoffDiagnostics {
+            scope: BROWSER_PACKED_F16_QWEN_POST_HANDOFF_SCOPE.into(),
+            handoff: report.clone(),
+            instruction_after_handoff: after,
+        };
+        let post_event = serde_json::to_value(
+            browser_packed_f16_qwen_post_handoff_diagnostics_event(RunId(19), post),
+        )
+        .unwrap();
+        assert_eq!(
+            post_event["event"],
+            "packed_f16_qwen_post_handoff_diagnostics"
+        );
+        assert_eq!(post_event["diagnostics"]["handoff"]["digest_matches"], true);
+
+        let report = serde_json::to_value(report).unwrap();
+        assert_eq!(report["payload_bytes"], 737_280);
+        assert_eq!(report["device_to_host_readback_bytes"], 1_474_560);
+        assert_eq!(report["host_to_device_upload_bytes"], 737_280);
+        assert_eq!(report["total_transfer_bytes"], 2_211_840);
+    }
+
+    #[test]
+    fn browser_turbo_packed_f16_preload_requires_all_objects_and_no_materialization_correctness() {
+        let plan = validate_browser_packed_f16_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        let before = PackedF16DenoiserCacheAudit::default();
+        let after = PackedF16DenoiserCacheAudit {
+            state: PackedF16DenoiserCacheState::Ready,
+            packed_cache_ready: true,
+            cached_stage_count: 46,
+            cached_object_count: 106,
+            cached_tensor_count: 912,
+            retained_packed_bytes: 19_870_010_624,
+            packed_read_bytes: 19_870_166_528,
+            packed_upload_bytes: 19_870_010_624,
+            materialization_packed_read_bytes: 0,
+            materialized_stage_count: 0,
+            object_unpack_count: 0,
+            f32_write_bytes: 0,
+            preload_attempt_count: 1,
+            failure_count: 0,
+        };
+        validate_packed_f16_denoiser_preload(BooguVariant::Image01Turbo, plan, before, after)
+            .unwrap();
+        let mut partial = after;
+        partial.cached_tensor_count -= 1;
+        assert!(
+            validate_packed_f16_denoiser_preload(
+                BooguVariant::Image01Turbo,
+                plan,
+                before,
+                partial,
+            )
+            .is_err()
+        );
+        let mut widened_during_preload = after;
+        widened_during_preload.materialized_stage_count = 1;
+        assert!(
+            validate_packed_f16_denoiser_preload(
+                BooguVariant::Image01Turbo,
+                plan,
+                before,
+                widened_during_preload,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_turbo_packed_f16_repeat_rehydrates_after_request_scoped_eviction_correctness() {
+        let plan = validate_browser_packed_f16_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+        )
+        .unwrap();
+        let empty_after_first_handoff = PackedF16DenoiserCacheAudit {
+            state: PackedF16DenoiserCacheState::Empty,
+            packed_cache_ready: false,
+            cached_stage_count: 0,
+            cached_object_count: 0,
+            cached_tensor_count: 0,
+            retained_packed_bytes: 0,
+            packed_read_bytes: 19_870_166_528,
+            packed_upload_bytes: 19_870_010_624,
+            materialization_packed_read_bytes: 79_480_042_496,
+            materialized_stage_count: 184,
+            object_unpack_count: 424,
+            f32_write_bytes: 158_960_084_992,
+            preload_attempt_count: 1,
+            failure_count: 0,
+        };
+        let before_second_dmd = PackedF16DenoiserCacheAudit {
+            state: PackedF16DenoiserCacheState::Ready,
+            packed_cache_ready: true,
+            cached_stage_count: 46,
+            cached_object_count: 106,
+            cached_tensor_count: 912,
+            retained_packed_bytes: 19_870_010_624,
+            packed_read_bytes: 39_740_333_056,
+            packed_upload_bytes: 39_740_021_248,
+            materialization_packed_read_bytes: 79_480_042_496,
+            materialized_stage_count: 184,
+            object_unpack_count: 424,
+            f32_write_bytes: 158_960_084_992,
+            preload_attempt_count: 2,
+            failure_count: 0,
+        };
+        validate_packed_f16_denoiser_preload(
+            BooguVariant::Image01Turbo,
+            plan,
+            empty_after_first_handoff,
+            before_second_dmd,
+        )
+        .unwrap();
+        let after_second_dmd = PackedF16DenoiserCacheAudit {
+            materialization_packed_read_bytes: 158_960_084_992,
+            materialized_stage_count: 368,
+            object_unpack_count: 848,
+            f32_write_bytes: 317_920_169_984,
+            ..before_second_dmd
+        };
+        let report = packed_f16_lifecycle_report(
+            BooguVariant::Image01Turbo,
+            before_second_dmd,
+            after_second_dmd,
+            BrowserArtifactTrafficReport::default(),
+            false,
+        )
+        .unwrap();
+        let report =
+            validate_packed_f16_denoiser_lifecycle(BooguVariant::Image01Turbo, plan, 4, report)
+                .unwrap();
+        assert!(report.matches_plan);
+        assert_eq!(report.preload_attempt_count, 2);
+        assert_eq!(report.authenticated_artifact_bytes, 39_740_333_056);
+        assert_eq!(report.packed_upload_bytes, 39_740_021_248);
+        assert_eq!(report.stage_materializations, 184);
+        assert_eq!(report.object_unpacks, 424);
+        assert_eq!(report.packed_read_bytes, 79_480_042_496);
+        assert_eq!(report.f32_write_bytes, 158_960_084_992);
+        assert_eq!(
+            report.dmd_artifact_traffic,
+            BrowserArtifactTrafficReport::default()
+        );
+
+        let empty_after_second_handoff = PackedF16DenoiserCacheAudit {
+            state: PackedF16DenoiserCacheState::Empty,
+            packed_cache_ready: false,
+            cached_stage_count: 0,
+            cached_object_count: 0,
+            cached_tensor_count: 0,
+            retained_packed_bytes: 0,
+            ..after_second_dmd
+        };
+        assert_eq!(
+            packed_f16_cache_evidence(empty_after_second_handoff),
+            BrowserPackedF16CacheEvidence {
+                state: "empty".into(),
+                cache_ready: false,
+                cached_stages: 0,
+                cached_objects: 0,
+                cached_tensors: 0,
+                cached_bytes: 0,
+            }
+        );
+    }
+
+    fn production_settings() -> crate::BooguAdapterSettings {
+        crate::BooguAdapterSettings::verified_default(ArtifactSource::Remote {
+            base_url: RemoteBaseUrl::new("https://models.example/production").unwrap(),
+        })
+    }
+
+    #[test]
+    fn browser_exact_f32_qualification_is_truthfully_labeled_and_not_eager_correctness() {
+        let policy = BrowserExecutionPolicies::exact_1k5_parity(&production_settings());
+        assert_eq!(
+            policy.residency,
+            BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained
+        );
+        assert_eq!(policy.qwen_float, BooguFloatLoadPolicy::AdaptToF32);
+        assert_eq!(policy.vae_float, BooguFloatLoadPolicy::AdaptToF32);
+        assert_eq!(policy.denoiser_float, BooguFloatLoadPolicy::AdaptToF32);
+        assert_eq!(
+            policy.denoiser_runtime_quantization,
+            BooguDenoiserRuntimeQuantizationPolicy::Disabled
+        );
+        assert!(!policy.retain_qwen_stages);
+        assert!(!policy.retain_vae_stages);
+        assert!(policy.retain_denoiser_stages);
+        assert!(!policy.eager_preload);
+        assert!(!policy.defer_retained_qwen_synchronization);
+        assert!(!policy.defer_retained_denoiser_synchronization);
+        assert!(!policy.release_unused_qwen_memory_after_stage);
+        assert!(!policy.packed_qwen_instruction_handoff);
+        assert_eq!(
+            policy.qwen_text_block_load_synchronization,
+            Qwen3VlTextBlockLoadSynchronizationPolicy::PostForwardOnly
+        );
+        assert!(policy.packed_allocator_policy_is_exact());
+        let mut unexpected_pre_forward_barrier = policy;
+        unexpected_pre_forward_barrier.qwen_text_block_load_synchronization =
+            Qwen3VlTextBlockLoadSynchronizationPolicy::PreForwardAndPostForward;
+        assert!(!unexpected_pre_forward_barrier.packed_allocator_policy_is_exact());
+        assert_eq!(
+            policy.weight_traffic_contract(),
+            "qualification-per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4"
+        );
+    }
+
+    #[test]
+    fn browser_turbo_retained_q8_dense_f32_policy_is_retired_fail_closed_correctness() {
+        let error = BrowserExecutionPolicies::low_vram_retained_q8_dense_f32_denoiser(
+            BooguVariant::Image01Turbo,
+            &production_settings(),
+        )
+        .unwrap_err();
+        assert!(error.contains("retired"), "{error}");
+        assert!(
+            BrowserExecutionPolicies::low_vram_retained_q8_dense_f32_denoiser(
+                BooguVariant::Image01EditTurbo1k5,
+                &production_settings(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_low_vram_policy_streams_qwen_vae_and_retains_only_runtime_q8_denoiser_correctness() {
+        let settings = production_settings();
+        let policy = BrowserExecutionPolicies::low_vram_runtime_q8_denoiser(
+            BooguVariant::Image01EditTurbo1k5,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.residency,
+            BrowserBooguResidencyPolicy::LowVramRuntimeQ8Denoiser
+        );
+        assert_eq!(policy.qwen_float, BooguFloatLoadPolicy::AdaptToF32);
+        assert_eq!(policy.qwen_quantized, BooguQuantizedLoadPolicy::Preserve);
+        assert_eq!(policy.vae_float, BooguFloatLoadPolicy::AdaptToF32);
+        assert_eq!(policy.denoiser_float, BooguFloatLoadPolicy::AdaptToF32);
+        assert_eq!(
+            policy.denoiser_quantized,
+            BooguQuantizedLoadPolicy::Preserve
+        );
+        assert_eq!(
+            policy.denoiser_runtime_quantization,
+            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32
+        );
+        assert_eq!(
+            policy.denoiser_runtime_q8_scope,
+            BooguRuntimeQ8Scope::AllInventoryEligible
+        );
+        assert_eq!(
+            denoiser_quantized_policy_name(
+                policy.denoiser_quantized,
+                policy.denoiser_runtime_quantization,
+                policy.denoiser_runtime_q8_scope,
+            ),
+            "runtime-quantize-q8s-block32-f32"
+        );
+        assert_eq!(
+            policy.denoiser_retaining_wrapper_adapter,
+            BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul
+        );
+        assert!(!policy.retain_qwen_stages);
+        assert!(!policy.retain_vae_stages);
+        assert!(policy.retain_denoiser_stages);
+        assert!(!policy.eager_preload);
+        assert!(!policy.defer_retained_qwen_synchronization);
+        assert!(!policy.defer_retained_denoiser_synchronization);
+        assert!(!policy.release_unused_qwen_memory_after_stage);
+        assert!(!policy.packed_qwen_instruction_handoff);
+        assert!(policy.packed_allocator_policy_is_exact());
+        assert_eq!(
+            policy.weight_traffic_contract(),
+            "per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4"
+        );
+        let ordinary = policy.for_ordinary_browser_factory();
+        assert!(!ordinary.require_persistent_range_cache);
+        assert!(ordinary.request_scoped_surface_acquire_suspended);
+        assert_eq!(
+            ordinary.weight_traffic_contract(),
+            policy.weight_traffic_contract()
+        );
+
+        let exact = BrowserExecutionPolicies::exact_1k5_low_vram_parity(&settings).unwrap();
+        assert!(!exact.request_scoped_surface_acquire_suspended);
+        assert!(
+            !exact
+                .provenance_backend()
+                .contains(BROWSER_SURFACE_INFERENCE_PROVENANCE_SUFFIX)
+        );
+        assert_eq!(exact.residency, policy.residency);
+        assert_eq!(exact.denoiser_quantized, policy.denoiser_quantized);
+        assert_eq!(
+            exact.denoiser_runtime_quantization,
+            policy.denoiser_runtime_quantization
+        );
+        assert_eq!(
+            exact.denoiser_runtime_q8_scope,
+            BooguRuntimeQ8Scope::AllInventoryEligible
+        );
+        assert_eq!(
+            denoiser_quantized_policy_name(
+                exact.denoiser_quantized,
+                exact.denoiser_runtime_quantization,
+                exact.denoiser_runtime_q8_scope,
+            ),
+            "runtime-quantize-q8s-block32-f32"
+        );
+        assert_eq!(exact.retain_denoiser_stages, policy.retain_denoiser_stages);
+        assert!(!exact.defer_retained_qwen_synchronization);
+        assert!(!exact.defer_retained_denoiser_synchronization);
+        assert!(!exact.require_persistent_range_cache);
+
+        let mut wrong_profile = settings;
+        wrong_profile.storage_profile = BooguStorageProfile::F16;
+        assert!(
+            BrowserExecutionPolicies::low_vram_runtime_q8_denoiser(
+                BooguVariant::Image01Turbo,
+                &production_settings(),
+            )
+            .unwrap_err()
+            .contains("not numerically qualified")
+        );
+        let error = BrowserExecutionPolicies::low_vram_runtime_q8_denoiser(
+            BooguVariant::Image01EditTurbo,
+            &wrong_profile,
+        )
+        .unwrap_err();
+        assert!(error.contains("profile=production"), "{error}");
+    }
+
+    #[test]
+    fn browser_artifact_traffic_report_preserves_cache_and_network_counters_correctness() {
+        let snapshot = BrowserArtifactTrafficSnapshot {
+            object_reads: 1,
+            object_read_bytes: 2,
+            range_fetch_requests: 3,
+            range_response_bytes: 4,
+            verified_objects: 5,
+            cache_lookup_requests: 6,
+            cache_hits: 7,
+            cache_misses: 8,
+            cache_read_bytes: 9,
+            network_fetch_requests: 10,
+            network_response_bytes: 11,
+            cache_write_requests: 12,
+            cache_write_bytes: 13,
+            cache_eviction_requests: 14,
+            cache_evicted_entries: 15,
+            cache_invalid_entries: 16,
+            integrity_refetches: 17,
+        };
+        let report = BrowserArtifactTrafficReport::from(snapshot);
+        assert_eq!(report.object_reads, 1);
+        assert_eq!(report.object_read_bytes, 2);
+        assert_eq!(report.range_reads, 3);
+        assert_eq!(report.range_read_bytes, 4);
+        assert_eq!(report.verified_objects, 5);
+        assert_eq!(report.cache_lookups, 6);
+        assert_eq!(report.cache_hits, 7);
+        assert_eq!(report.cache_misses, 8);
+        assert_eq!(report.cache_read_bytes, 9);
+        assert_eq!(report.network_requests, 10);
+        assert_eq!(report.network_response_bytes, 11);
+        assert_eq!(report.cache_writes, 12);
+        assert_eq!(report.cache_write_bytes, 13);
+        assert_eq!(report.cache_evictions, 14);
+        assert_eq!(report.cache_evicted_entries, 15);
+        assert_eq!(report.cache_invalid_entries, 16);
+        assert_eq!(report.integrity_refetches, 17);
+    }
+
+    #[test]
+    fn browser_low_vram_streamed_qwen_vae_lifecycle_is_fail_closed_correctness() {
+        let variant = BooguVariant::Image01EditTurbo1k5;
+        validate_low_vram_streamed_stage_lifecycle(variant, 0, false, 0).unwrap();
+        for result in [
+            validate_low_vram_streamed_stage_lifecycle(variant, 1, false, 0),
+            validate_low_vram_streamed_stage_lifecycle(variant, 0, true, 0),
+            validate_low_vram_streamed_stage_lifecycle(variant, 0, false, 1),
+        ] {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn browser_q8_resource_math_covers_edit_and_retired_turbo_candidate_correctness() {
+        let qwen_plan = released_qwen_streaming_plan();
+        let inventory = BooguArtifactInventory::new(
+            &released_qwen_config(),
+            &BooguConfig::default(),
+            &released_flux_vae_config(),
+        )
+        .unwrap();
+        assert_eq!(
+            max_streamed_qwen_stage_f32_bytes(BooguVariant::Image01Turbo, &qwen_plan).unwrap(),
+            771_785_728
+        );
+        // Retain the rejected Turbo candidate's arithmetic as historical fail-closed evidence;
+        // no public selector or ordinary Turbo policy can construct it.
+        let turbo = validate_browser_low_vram_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16QwenVisionF32,
+            &qwen_plan,
+            &inventory,
+            BooguRuntimeQ8Scope::TurboMainCoreFfnGateUpQ8,
+            BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+        )
+        .unwrap();
+        assert_eq!(turbo.audited_retained_q8_denoiser_bytes, 27_157_571_712);
+        assert_eq!(turbo.expected_q8s_block32_f32_tensor_count, 96);
+        assert_eq!(turbo.expected_f32_tensor_count, 816);
+        assert_eq!(turbo.expected_q8s_block32_f32_elements, 4_376_494_080);
+        assert_eq!(turbo.expected_f32_elements, 5_558_503_968);
+        assert_eq!(turbo.expected_q8s_block32_f32_payload_bytes, 4_923_555_840);
+        assert_eq!(turbo.expected_f32_payload_bytes, 22_234_015_872);
+        assert_eq!(turbo.audited_max_streamed_qwen_stage_f32_bytes, 771_785_728);
+        assert_eq!(turbo.audited_loaded_vae_module_f32_bytes, 335_278_732);
+        assert_eq!(
+            turbo.audited_max_dense_denoiser_stage_f32_bytes,
+            1_753_653_120
+        );
+        assert_eq!(turbo.audited_max_phase_local_f32_stage_bytes, 1_753_653_120);
+        assert_eq!(turbo.runtime_quantization_workspace_bytes, 2_434_252_800);
+        assert_eq!(turbo.activation_reserve_bytes, 3_651_379_200);
+        let preload_peak = turbo
+            .audited_retained_q8_denoiser_bytes
+            .checked_add(turbo.audited_max_dense_denoiser_stage_f32_bytes)
+            .and_then(|bytes| bytes.checked_add(turbo.runtime_quantization_workspace_bytes))
+            .unwrap();
+        assert_eq!(preload_peak, 31_345_477_632);
+        let inference_peak = turbo
+            .audited_retained_q8_denoiser_bytes
+            .checked_add(
+                turbo
+                    .audited_max_streamed_qwen_stage_f32_bytes
+                    .max(turbo.audited_loaded_vae_module_f32_bytes),
+            )
+            .and_then(|bytes| bytes.checked_add(turbo.activation_reserve_bytes))
+            .unwrap();
+        assert_eq!(inference_peak, 31_580_736_640);
+        assert_eq!(turbo.conservative_planned_device_bytes, inference_peak);
+        assert!(turbo.conservative_planned_device_bytes < 32_000_000_000);
+        assert_eq!(
+            32_000_000_000 - turbo.conservative_planned_device_bytes,
+            419_263_360
+        );
+        let turbo_event = serde_json::to_value(browser_low_vram_resource_plan_event(
+            turbo,
+            BooguRuntimeQ8Scope::TurboMainCoreFfnGateUpQ8,
+            BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+        ))
+        .unwrap();
+        assert_eq!(turbo_event["event"], "low_vram_resource_plan");
+        assert_eq!(
+            turbo_event["denoiser_quantized_load_policy"],
+            "runtime-quantize-q8s-block32-f32/turbo-main-core-ffn-gate-up-q8"
+        );
+        assert_eq!(
+            turbo_event["denoiser_runtime_q8_scope"],
+            "turbo-main-core-ffn-gate-up-q8"
+        );
+        assert_eq!(
+            turbo_event["denoiser_quantized_linear_execution_policy"],
+            "direct-quantized-matmul"
+        );
+        assert_eq!(
+            turbo_event["audited_retained_q8_denoiser_bytes"],
+            27_157_571_712_u64
+        );
+        assert_eq!(turbo_event["expected_q8s_block32_f32_tensor_count"], 96);
+        assert_eq!(turbo_event["expected_f32_tensor_count"], 816);
+        assert_eq!(
+            turbo_event["expected_q8s_block32_f32_elements"],
+            4_376_494_080_u64
+        );
+        assert_eq!(turbo_event["expected_f32_elements"], 5_558_503_968_u64);
+        assert_eq!(
+            turbo_event["expected_q8s_block32_f32_payload_bytes"],
+            4_923_555_840_u64
+        );
+        assert_eq!(
+            turbo_event["expected_f32_payload_bytes"],
+            22_234_015_872_u64
+        );
+        assert_eq!(
+            turbo_event["conservative_planned_device_bytes"],
+            31_580_736_640_u64
+        );
+
+        for variant in [
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            let plan = validate_browser_low_vram_resource_plan(
+                variant,
+                BooguStorageProfile::F16QwenVisionF32,
+                &qwen_plan,
+                &inventory,
+                BooguRuntimeQ8Scope::AllInventoryEligible,
+                BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            )
+            .unwrap();
+            assert_eq!(plan.audited_retained_q8_denoiser_bytes, 12_590_785_792);
+            assert_eq!(plan.audited_max_streamed_qwen_stage_f32_bytes, 771_785_728);
+            assert_eq!(plan.audited_loaded_vae_module_f32_bytes, 335_278_732);
+            assert_eq!(plan.audited_max_dense_denoiser_stage_f32_bytes, 0);
+            assert_eq!(plan.audited_max_phase_local_f32_stage_bytes, 771_785_728);
+            assert_eq!(plan.runtime_quantization_workspace_bytes, 2_434_252_800);
+            assert_eq!(plan.activation_reserve_bytes, 14_605_516_800);
+            assert_eq!(plan.conservative_planned_device_bytes, 30_402_341_120);
+            assert_eq!(plan.expected_q8s_block32_f32_tensor_count, 377);
+            assert_eq!(plan.expected_f32_tensor_count, 565);
+            assert!(plan.conservative_planned_device_bytes < plan.strict_device_cap_bytes);
+            let event = serde_json::to_value(browser_low_vram_resource_plan_event(
+                plan,
+                BooguRuntimeQ8Scope::AllInventoryEligible,
+                BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            ))
+            .unwrap();
+            assert_eq!(
+                event["denoiser_quantized_load_policy"],
+                "runtime-quantize-q8s-block32-f32"
+            );
+            assert_eq!(event["denoiser_runtime_q8_scope"], "all-inventory-eligible");
+            assert_eq!(
+                event["denoiser_quantized_linear_execution_policy"],
+                "direct-quantized-matmul"
+            );
+            assert_eq!(
+                serde_json::to_value(plan).unwrap()["strict_device_cap_bytes"],
+                BROWSER_LOW_VRAM_STRICT_DEVICE_CAP_BYTES
+            );
+        }
+
+        let error = validate_browser_low_vram_resource_plan(
+            BooguVariant::Image01Turbo,
+            BooguStorageProfile::F16,
+            &qwen_plan,
+            &inventory,
+            BooguRuntimeQ8Scope::TurboCaptionAndTailF32,
+            BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unchanged canonical profile=production"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn browser_low_vram_resource_plan_fails_closed_at_cap_correctness() {
+        let qwen_plan = released_qwen_streaming_plan();
+        let inventory = BooguArtifactInventory::new(
+            &released_qwen_config(),
+            &BooguConfig::default(),
+            &released_flux_vae_config(),
+        )
+        .unwrap();
+        let accepted = validate_browser_low_vram_resource_plan(
+            BooguVariant::Image01EditTurbo1k5,
+            BooguStorageProfile::F16QwenVisionF32,
+            &qwen_plan,
+            &inventory,
+            BooguRuntimeQ8Scope::AllInventoryEligible,
+            BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+        )
+        .unwrap();
+        let error = validate_browser_low_vram_resource_plan_with_cap(
+            BooguVariant::Image01EditTurbo1k5,
+            BooguStorageProfile::F16QwenVisionF32,
+            &qwen_plan,
+            &inventory,
+            BooguRuntimeQ8Scope::AllInventoryEligible,
+            BooguQuantizedLinearExecutionPolicy::DirectQuantizedMatmul,
+            accepted.conservative_planned_device_bytes,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not strictly below"), "{error}");
+    }
+
+    #[test]
+    fn browser_low_vram_harness_peaks_interval_totals_not_individual_rows_correctness() {
+        let harness = include_str!("../tests/wasm_browser_1k5_parity.mjs");
+        assert!(harness.contains(
+            "const totalFramebufferMib = rows.reduce(\n    (total, row) => total + (row.framebuffer_mib ?? 0),"
+        ));
+        assert!(harness.contains(
+            "evidence.max_framebuffer_mib = Math.max(evidence.max_framebuffer_mib, totalFramebufferMib);"
+        ));
+        assert!(harness.contains("total_framebuffer_mib: totalFramebufferMib"));
+        assert!(!harness.contains(
+            "evidence.max_framebuffer_mib = Math.max(evidence.max_framebuffer_mib, row.framebuffer_mib"
+        ));
+    }
+
+    #[test]
+    fn browser_edit_q8_denoiser_lifecycle_is_exactly_four_steps_correctness() {
+        let variant = BooguVariant::Image01EditTurbo1k5;
+        // Request-scoped Edit/1.5K residency clears all stages before VAE decode.
+        validate_low_vram_denoiser_lifecycle(
+            variant,
+            4,
+            BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+            BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+            false,
+            0,
+            0,
+        )
+        .unwrap();
+        for error in [
+            validate_low_vram_denoiser_lifecycle(
+                variant,
+                3,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                false,
+                0,
+                0,
+            ),
+            validate_low_vram_denoiser_lifecycle(
+                variant,
+                4,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT - 1,
+                false,
+                0,
+                0,
+            ),
+            validate_low_vram_denoiser_lifecycle(
+                variant,
+                4,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                true,
+                0,
+                0,
+            ),
+            validate_low_vram_denoiser_lifecycle(
+                variant,
+                4,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
+                false,
+                0,
+                1,
+            ),
+        ] {
+            assert!(error.is_err());
+        }
     }
 
     #[test]

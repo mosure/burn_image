@@ -1,5 +1,9 @@
 // Opt-in real-hardware qualification harness. Build the boogu-web Wasm output into
 // crates/bevy_image/www/out first, then run with BURN_IMAGE_BROWSER_1K5_PARITY=1.
+// The release gate requires BURN_IMAGE_BROWSER_1K5_RESIDENCY=low-vram. The optional non-blocking
+// F32 control diagnostic uses BURN_IMAGE_BROWSER_1K5_RESIDENCY=qualification-f32; it does not
+// replace the required low-VRAM numerical or memory gate. The former high-vram value remains an
+// input-only alias; F32-control reports serialize the truthful per-request denoiser-retained policy.
 // Set BURN_IMAGE_BROWSER_1K5_VAE_REFERENCE=1 instead for the diagnostic-only compact-fixture
 // three-repeat VAE encoder probe; the two workload selectors are mutually exclusive.
 // Set BURN_IMAGE_BROWSER_1K5_PARITY_VALIDATE_ONLY=1 to test only the mounted files,
@@ -22,6 +26,7 @@ import {
   realpath,
   rm,
   stat,
+  statfs,
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -38,10 +43,24 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  BROWSER_1K5_CHROME_SHARED_MEMORY_MIN_HEADROOM_BYTES,
+  BROWSER_1K5_F32_QUALIFICATION_DENOISER_RESIDENCY,
+  BROWSER_1K5_LOW_VRAM_DENOISER_RESIDENCY,
+  BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES,
+  attestBrowser1k5RuntimeAdapter,
+  browser1k5ChromeLaunchEvidence,
+  collectBrowserPackageIdentity,
+  denoiserResidencyPolicyForMode,
+  selectBrowser1k5ChromeSharedMemoryPolicy,
+  validateBrowser1k5LowVramResourcePlan,
+  validateDenoiserResidencyPolicy,
+} from "./wasm_browser_1k5_contract.mjs";
 import { attestCalibratedBrowserWebGpuScope } from "./wasm_browser_1k5_scope.mjs";
 
 const ENABLE_ENV = "BURN_IMAGE_BROWSER_1K5_PARITY";
 const VAE_REFERENCE_ENV = "BURN_IMAGE_BROWSER_1K5_VAE_REFERENCE";
+const RESIDENCY_ENV = "BURN_IMAGE_BROWSER_1K5_RESIDENCY";
 const CHROME_ENV = "BURN_IMAGE_BROWSER_1K5_PARITY_CHROME";
 const TIMEOUT_ENV = "BURN_IMAGE_BROWSER_1K5_PARITY_TIMEOUT_MS";
 const ARTIFACT_DIR_ENV = "BURN_IMAGE_BROWSER_1K5_PARITY_ARTIFACT_DIR";
@@ -67,6 +86,21 @@ if (vaeReferenceMode === fullParityMode) {
   }
   throw new Error(`${ENABLE_ENV} and ${VAE_REFERENCE_ENV} are mutually exclusive`);
 }
+const requestedResidencySelector = process.env[RESIDENCY_ENV];
+const residencySelector =
+  requestedResidencySelector === "high-vram" ? "qualification-f32" : requestedResidencySelector;
+if (vaeReferenceMode && requestedResidencySelector !== undefined) {
+  throw new Error(`${RESIDENCY_ENV} is valid only with ${ENABLE_ENV}=1`);
+}
+if (fullParityMode && !["qualification-f32", "low-vram"].includes(residencySelector)) {
+  throw new Error(
+    `${ENABLE_ENV}=1 requires ${RESIDENCY_ENV}=qualification-f32 or ${RESIDENCY_ENV}=low-vram`,
+  );
+}
+if (fullParityMode && requestedResidencySelector === "high-vram") {
+  console.warn(`${RESIDENCY_ENV}=high-vram is a legacy alias for qualification-f32`);
+}
+const lowVramMode = fullParityMode && residencySelector === "low-vram";
 const WORKLOAD_NAME = vaeReferenceMode ? "vae-reference" : "parity";
 const WORKLOAD_TEST = vaeReferenceMode
   ? "burn_image_browser_1k5_vae_reference"
@@ -100,8 +134,13 @@ const BROWSER_1K5_QWEN_QUERY_CHUNK_SIZE = 128;
 const BROWSER_1K5_VAE_QUERY_CHUNK_SIZE = 4_096;
 const BROWSER_1K5_VAE_DECODE_POLICY = "exact-two-width-slabs-global-groupnorm";
 const BROWSER_1K5_DENOISER_QUERY_CHUNK_SIZE = 1_024;
-const BROWSER_1K5_DENOISER_RESIDENCY =
-  "lazy-resident-first-pass-through-four-dmd-steps";
+const BROWSER_F32_QUALIFICATION_RESIDENCY_POLICY =
+  "browser-qualification-per-request-f32-denoiser-retained";
+const BROWSER_LOW_VRAM_RESIDENCY_POLICY = "browser-low-vram-runtime-q8-denoiser";
+const BROWSER_LOW_VRAM_WEIGHT_TRAFFIC_CONTRACT =
+  "per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4";
+const BROWSER_F32_QUALIFICATION_WEIGHT_TRAFFIC_CONTRACT =
+  "qualification-per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4";
 const BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT = 48;
 const BROWSER_1K5_QWEN_ALIGNED_STAGE_COUNT = 70;
 const BROWSER_1K5_DENOISER_BOUNDARY_COUNT = 236;
@@ -194,7 +233,7 @@ const HOST_RESOURCE_SAMPLE_INTERVAL_MS = vaeReferenceMode ? 1_000 : 5_000;
 const MIN_GPU_MATCHED_SAMPLE_INTERVALS = vaeReferenceMode ? 2 : 3;
 const MIN_GPU_ACTIVE_SAMPLE_INTERVALS = vaeReferenceMode ? 2 : 3;
 const MIN_GPU_CONSECUTIVE_ACTIVE_SAMPLE_INTERVALS = vaeReferenceMode ? 1 : 2;
-const MIN_RESIDENT_DENOISER_FRAMEBUFFER_MIB = 30 * 1024;
+const MIN_F32_RETAINED_DENOISER_FRAMEBUFFER_MIB = 30 * 1024;
 const MAX_RECORDED_GPU_SAMPLES = 4_096;
 const MAX_RECORDED_HOST_RESOURCE_SAMPLES = 512;
 const MAX_TRACKED_MILESTONES = 1_024;
@@ -204,6 +243,7 @@ const MAX_RECORDED_MONITOR_ERRORS = 20;
 const MAX_CAPTURED_MONITOR_BYTES = 64 * 1024;
 const MAX_RECORDED_BROWSER_ERRORS = 512;
 const MAX_CAPTURED_PROCESS_COMMAND_CHARS = 4_096;
+const CHROME_SHARED_MEMORY_PROBE_CHUNK_BYTES = 8 * 1024 * 1024;
 
 if (typeof WebSocket === "undefined") {
   throw new Error("this harness requires Node 22 or newer (global WebSocket is unavailable)");
@@ -370,7 +410,7 @@ function isFatalConsoleMessage(type, message) {
   );
 }
 
-function createWorkloadTelemetry() {
+function createWorkloadTelemetry(denoiserResidencyPolicy) {
   let currentParityMilestone = "pre-parity";
   const milestoneCounts = new Map();
   const byRoute = new Map();
@@ -563,7 +603,7 @@ function createWorkloadTelemetry() {
         );
       }
       return {
-        policy: BROWSER_1K5_DENOISER_RESIDENCY,
+        policy: denoiserResidencyPolicy,
         first_pass: { ...step0 },
         reused_steps: [1, 2, 3].map((index) => ({
           step: index,
@@ -1218,6 +1258,247 @@ function appendBounded(current, chunk) {
     : combined;
 }
 
+function exactIntegerForJson(value) {
+  if (typeof value !== "bigint") {
+    throw new Error(`expected bigint for exact JSON integer, got ${typeof value}`);
+  }
+  if (
+    value >= BigInt(Number.MIN_SAFE_INTEGER) &&
+    value <= BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    return Number(value);
+  }
+  return value.toString();
+}
+
+function nonNegativeBigInt(value) {
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  if (Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  return null;
+}
+
+function systemErrorEvidence(phase, error) {
+  const errno = Number.isSafeInteger(error?.errno) ? error.errno : null;
+  const absoluteErrno = errno === null ? null : Math.abs(errno);
+  const storage_exhaustion =
+    error?.code === "EDQUOT" || absoluteErrno === 122
+      ? "per-user-or-group-quota-exhausted"
+      : error?.code === "ENOSPC" || absoluteErrno === 28
+        ? "filesystem-capacity-exhausted"
+        : null;
+  return {
+    phase,
+    code: typeof error?.code === "string" ? error.code : null,
+    errno,
+    syscall: typeof error?.syscall === "string" ? error.syscall : null,
+    storage_exhaustion,
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
+async function quotaAwareAllocationProbe(path, requestedBytes) {
+  if (!Number.isSafeInteger(requestedBytes) || requestedBytes <= 0) {
+    throw new Error("quota-aware allocation probe size must be a positive safe integer");
+  }
+  const evidence = {
+    method: "bounded-real-write-plus-fsync-and-delete",
+    attempted: true,
+    requested_bytes: requestedBytes,
+    written_bytes: 0,
+    succeeded: false,
+    cleanup_succeeded: false,
+    errors: [],
+  };
+  let probeDirectory;
+  let probeFile;
+  let allocationSucceeded = false;
+  try {
+    probeDirectory = await mkdtemp(join(path, ".burn-image-chrome-shmem-probe-"));
+    probeFile = await open(join(probeDirectory, "allocation.bin"), "wx", 0o600);
+    const chunk = Buffer.alloc(
+      Math.min(CHROME_SHARED_MEMORY_PROBE_CHUNK_BYTES, requestedBytes),
+      0xa5,
+    );
+    while (evidence.written_bytes < requestedBytes) {
+      const remaining = requestedBytes - evidence.written_bytes;
+      const requestedWrite = Math.min(chunk.length, remaining);
+      const { bytesWritten } = await probeFile.write(chunk, 0, requestedWrite, null);
+      if (!Number.isSafeInteger(bytesWritten) || bytesWritten <= 0) {
+        throw new Error(`allocation probe made no progress after ${evidence.written_bytes} bytes`);
+      }
+      evidence.written_bytes += bytesWritten;
+    }
+    await probeFile.sync();
+    allocationSucceeded = true;
+  } catch (error) {
+    evidence.errors.push(systemErrorEvidence("allocate-and-fsync", error));
+  } finally {
+    if (probeFile) {
+      try {
+        await probeFile.close();
+      } catch (error) {
+        evidence.errors.push(systemErrorEvidence("close", error));
+      }
+    }
+    if (probeDirectory) {
+      try {
+        await rm(probeDirectory, { recursive: true, force: true });
+        evidence.cleanup_succeeded = true;
+      } catch (error) {
+        evidence.errors.push(systemErrorEvidence("cleanup", error));
+      }
+    } else {
+      evidence.cleanup_succeeded = true;
+    }
+  }
+  evidence.succeeded =
+    allocationSucceeded && evidence.cleanup_succeeded && evidence.errors.length === 0;
+  return evidence;
+}
+
+async function measureChromeSharedMemoryPath(path) {
+  const measurement = {
+    path,
+    exists: false,
+    directory: false,
+    writable: false,
+    statfs: null,
+    quota_aware_allocation_probe: {
+      method: "bounded-real-write-plus-fsync-and-delete",
+      attempted: false,
+      requested_bytes: BROWSER_1K5_CHROME_SHARED_MEMORY_MIN_HEADROOM_BYTES,
+      written_bytes: 0,
+      succeeded: false,
+      cleanup_succeeded: true,
+      skipped_reason: null,
+      errors: [],
+    },
+    errors: [],
+  };
+  try {
+    const pathStat = await stat(path);
+    measurement.exists = true;
+    measurement.directory = pathStat.isDirectory();
+    if (!measurement.directory) {
+      measurement.errors.push({
+        phase: "stat",
+        code: null,
+        errno: null,
+        syscall: null,
+        storage_exhaustion: null,
+        message: `${path} is not a directory`,
+      });
+    }
+  } catch (error) {
+    measurement.errors.push(systemErrorEvidence("stat", error));
+  }
+  if (measurement.directory) {
+    try {
+      await access(path, fsConstants.W_OK | fsConstants.X_OK);
+      measurement.writable = true;
+    } catch (error) {
+      measurement.errors.push(systemErrorEvidence("access", error));
+    }
+  }
+
+  let availableBytes;
+  if (measurement.exists) {
+    try {
+      const fileSystem = await statfs(path, { bigint: true });
+      const blockSize = nonNegativeBigInt(fileSystem.bsize);
+      const blockCount = nonNegativeBigInt(fileSystem.blocks);
+      const freeBlocks = nonNegativeBigInt(fileSystem.bfree);
+      const availableBlocks = nonNegativeBigInt(fileSystem.bavail);
+      if (
+        blockSize === null ||
+        blockSize === 0n ||
+        blockCount === null ||
+        freeBlocks === null ||
+        availableBlocks === null
+      ) {
+        throw new Error("statfs returned invalid or unsafe block counters");
+      }
+      availableBytes = availableBlocks * blockSize;
+      measurement.statfs = {
+        arithmetic: "bigint-products; JSON numbers when safe, decimal strings otherwise",
+        block_size_bytes: exactIntegerForJson(blockSize),
+        blocks: exactIntegerForJson(blockCount),
+        free_blocks: exactIntegerForJson(freeBlocks),
+        available_blocks: exactIntegerForJson(availableBlocks),
+        total_bytes: exactIntegerForJson(blockCount * blockSize),
+        free_bytes: exactIntegerForJson(freeBlocks * blockSize),
+        available_bytes: exactIntegerForJson(availableBytes),
+      };
+    } catch (error) {
+      measurement.errors.push(systemErrorEvidence("statfs", error));
+    }
+  }
+
+  if (!measurement.directory) {
+    measurement.quota_aware_allocation_probe.skipped_reason = "not-a-directory";
+  } else if (!measurement.writable) {
+    measurement.quota_aware_allocation_probe.skipped_reason = "not-writable";
+  } else if (availableBytes === undefined) {
+    measurement.quota_aware_allocation_probe.skipped_reason = "statfs-unavailable";
+  } else if (
+    availableBytes < BigInt(BROWSER_1K5_CHROME_SHARED_MEMORY_MIN_HEADROOM_BYTES)
+  ) {
+    measurement.quota_aware_allocation_probe.skipped_reason =
+      "statfs-available-below-minimum";
+  } else {
+    measurement.quota_aware_allocation_probe = await quotaAwareAllocationProbe(
+      path,
+      BROWSER_1K5_CHROME_SHARED_MEMORY_MIN_HEADROOM_BYTES,
+    );
+  }
+  return measurement;
+}
+
+async function inspectChromeSharedMemory() {
+  const tempPath = tmpdir();
+  const baseEvidence = {
+    schema_version: 1,
+    platform: process.platform,
+    measurement_method:
+      "bigint-statfs-global-capacity-plus-bounded-real-write-fsync-probe-for-effective-user-quota",
+    byte_serialization:
+      "exact JSON number when within JavaScript safe-integer range, otherwise decimal string",
+    capacities: {
+      dev_shm: null,
+      temp_directory: null,
+    },
+  };
+  if (process.platform !== "linux") {
+    return {
+      ...baseEvidence,
+      ...selectBrowser1k5ChromeSharedMemoryPolicy({
+        platform: process.platform,
+        devShm: null,
+        tempPath,
+      }),
+      capacities: {
+        dev_shm: { path: "/dev/shm", measured: false, reason: "non-linux-platform" },
+        temp_directory: { path: tempPath, measured: false, reason: "non-linux-platform" },
+      },
+    };
+  }
+
+  const devShm = await measureChromeSharedMemoryPath("/dev/shm");
+  const tempDirectory = await measureChromeSharedMemoryPath(tempPath);
+  return {
+    ...baseEvidence,
+    ...selectBrowser1k5ChromeSharedMemoryPolicy({
+      platform: process.platform,
+      devShm,
+      tempPath,
+    }),
+    capacities: {
+      dev_shm: devShm,
+      temp_directory: tempDirectory,
+    },
+  };
+}
+
 async function commandOutput(executable, arguments_, timeoutMs = 10_000) {
   const child = spawn(executable, arguments_, { stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "";
@@ -1674,6 +1955,13 @@ async function recordNativeNvidiaGpuInterval(rootPid, evidence, sampleKey, pmonR
   const activeRows = rows.filter(
     (row) => (row.framebuffer_mib ?? 0) > 0 && (row.sm_percent ?? 0) > 0,
   );
+  // One pmon interval may contain multiple Chrome GPU-process rows and/or one row per GPU. The
+  // low-VRAM contract applies to their total framebuffer footprint, not the largest individual
+  // row. Sum the complete scoped interval before updating the observed peak.
+  const totalFramebufferMib = rows.reduce(
+    (total, row) => total + (row.framebuffer_mib ?? 0),
+    0,
+  );
   evidence.samples += 1;
   if (rows.length > 0) evidence.matched_sample_intervals += 1;
   if (activeRows.length > 0) {
@@ -1686,9 +1974,9 @@ async function recordNativeNvidiaGpuInterval(rootPid, evidence, sampleKey, pmonR
   } else {
     evidence.current_consecutive_active_intervals = 0;
   }
+  evidence.max_framebuffer_mib = Math.max(evidence.max_framebuffer_mib, totalFramebufferMib);
   for (const row of rows) {
     evidence.matched_samples += 1;
-    evidence.max_framebuffer_mib = Math.max(evidence.max_framebuffer_mib, row.framebuffer_mib ?? 0);
     evidence.max_sm_percent = Math.max(evidence.max_sm_percent, row.sm_percent ?? 0);
     evidence.max_memory_percent = Math.max(evidence.max_memory_percent, row.memory_percent ?? 0);
     evidence.gpu_indexes.add(row.gpu_index);
@@ -1699,6 +1987,7 @@ async function recordNativeNvidiaGpuInterval(rootPid, evidence, sampleKey, pmonR
     at_ms: sampledAt,
     native_sample_key: sampleKey,
     chrome_gpu_process_pids: Array.from(gpuProcessPids).sort((left, right) => left - right),
+    total_framebuffer_mib: totalFramebufferMib,
     matched_rows: rows,
     active_rows: activeRows.length,
   };
@@ -1711,9 +2000,19 @@ async function recordNativeNvidiaGpuInterval(rootPid, evidence, sampleKey, pmonR
 
 async function startNativeGpuMonitor(
   rootPid,
-  minimumFramebufferMib = MIN_RESIDENT_DENOISER_FRAMEBUFFER_MIB,
-  framebufferPolicy = "high-VRAM resident-denoiser policy",
+  minimumFramebufferMib = MIN_F32_RETAINED_DENOISER_FRAMEBUFFER_MIB,
+  framebufferPolicy = "F32 qualification retained-denoiser policy",
+  maximumFramebufferBytesExclusive = null,
 ) {
+  if (
+    maximumFramebufferBytesExclusive !== null &&
+    (!Number.isSafeInteger(maximumFramebufferBytesExclusive) ||
+      maximumFramebufferBytesExclusive <= 0)
+  ) {
+    throw new Error(
+      `invalid exclusive framebuffer byte ceiling ${maximumFramebufferBytesExclusive}`,
+    );
+  }
   const inventoryOutput = await commandOutput("nvidia-smi", [
     "--query-gpu=index,uuid,name,driver_version,memory.total",
     "--format=csv,noheader,nounits",
@@ -1765,6 +2064,9 @@ async function startNativeGpuMonitor(
     max_framebuffer_mib: 0,
     max_sm_percent: 0,
     max_memory_percent: 0,
+    minimum_framebuffer_mib: minimumFramebufferMib,
+    maximum_framebuffer_bytes_exclusive: maximumFramebufferBytesExclusive,
+    framebuffer_policy: framebufferPolicy,
     observed_gpu_processes: new Map(),
     dropped_observed_gpu_processes: 0,
     gpu_indexes: new Set(),
@@ -1887,6 +2189,7 @@ async function startNativeGpuMonitor(
         ),
         gpu_indexes: Array.from(evidence.gpu_indexes).sort((left, right) => left - right),
         pids: Array.from(evidence.pids).sort((left, right) => left - right),
+        observed_max_framebuffer_bytes: evidence.max_framebuffer_mib * 1024 * 1024,
       };
       delete result.current_consecutive_active_intervals;
       if (result.observed_gpu_processes.length === 0) {
@@ -1919,6 +2222,14 @@ async function startNativeGpuMonitor(
           `Chrome GPU-process framebuffer peaked at ${result.max_framebuffer_mib} MiB; the ${framebufferPolicy} requires at least ${minimumFramebufferMib} MiB`,
         );
       }
+      if (
+        maximumFramebufferBytesExclusive !== null &&
+        result.observed_max_framebuffer_bytes >= maximumFramebufferBytesExclusive
+      ) {
+        validationFailures.push(
+          `Chrome GPU-process framebuffer peaked at ${result.observed_max_framebuffer_bytes} bytes; the ${framebufferPolicy} requires a peak strictly below ${maximumFramebufferBytesExclusive} bytes`,
+        );
+      }
       if (!layout) {
         validationFailures.push("persistent nvidia-smi pmon emitted no parseable dated header");
       }
@@ -1947,10 +2258,17 @@ async function startNativeGpuMonitor(
   };
 }
 
-async function startChrome(executable, profile, url, headful) {
-  const arguments_ = [
-    "--no-sandbox",
-    "--disable-dev-shm-usage",
+function chromeLaunchArguments(profile, url, headful, sharedMemoryPolicy) {
+  const arguments_ = ["--no-sandbox"];
+  if (headful) {
+    arguments_.push("--window-size=800,600", "--ozone-platform=x11");
+  } else {
+    arguments_.push("--headless=new", "--disable-vulkan-surface");
+  }
+  if (sharedMemoryPolicy.disable_dev_shm_usage) {
+    arguments_.push("--disable-dev-shm-usage");
+  }
+  arguments_.push(
     "--enable-gpu",
     "--disable-software-rasterizer",
     "--ignore-gpu-blocklist",
@@ -1967,12 +2285,11 @@ async function startChrome(executable, profile, url, headful) {
     `--user-data-dir=${profile}`,
     "--remote-debugging-port=0",
     url,
-  ];
-  if (headful) {
-    arguments_.splice(1, 0, "--window-size=800,600", "--ozone-platform=x11");
-  } else {
-    arguments_.splice(1, 0, "--headless=new", "--disable-vulkan-surface");
-  }
+  );
+  return arguments_;
+}
+
+async function startChrome(executable, arguments_) {
   const child = spawn(executable, arguments_, {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
@@ -1989,7 +2306,7 @@ async function startChrome(executable, profile, url, headful) {
     child.once("spawn", resolveSpawn);
     child.once("error", rejectSpawn);
   });
-  return { child, arguments_, processGroupId: child.pid };
+  return { child, arguments_: [...arguments_], processGroupId: child.pid };
 }
 
 function signalPid(pid, signal, errors) {
@@ -2985,6 +3302,14 @@ function validateCompleteParityReport(report, transportValidation) {
   );
   expectReportEqual(failures, "numeric_format", report.numeric_format, { other: CANONICAL_PROFILE });
   expectReportEqual(failures, "artifact_profile", report.artifact_profile, CANONICAL_PROFILE);
+  expectReportEqual(
+    failures,
+    "residency_policy",
+    report.residency_policy,
+    lowVramMode
+      ? BROWSER_LOW_VRAM_RESIDENCY_POLICY
+      : BROWSER_F32_QUALIFICATION_RESIDENCY_POLICY,
+  );
   for (const field of [
     "qwen_float_load_policy",
     "vae_float_load_policy",
@@ -2994,6 +3319,73 @@ function validateCompleteParityReport(report, transportValidation) {
   }
   for (const field of ["qwen_execution_dtype", "vae_execution_dtype", "denoiser_execution_dtype"]) {
     expectReportEqual(failures, field, report[field], "f32");
+  }
+  expectReportEqual(
+    failures,
+    "denoiser_quantized_load_policy",
+    report.denoiser_quantized_load_policy,
+    lowVramMode ? "runtime-quantize-q8s-block32-f32" : "preserve",
+  );
+  expectReportEqual(
+    failures,
+    "weight_traffic_contract",
+    report.weight_traffic_contract,
+    lowVramMode
+      ? BROWSER_LOW_VRAM_WEIGHT_TRAFFIC_CONTRACT
+      : BROWSER_F32_QUALIFICATION_WEIGHT_TRAFFIC_CONTRACT,
+  );
+  expectReportEqual(
+    failures,
+    "on_device_quantized_execution_claimed",
+    report.on_device_quantized_execution_claimed,
+    false,
+  );
+  if (lowVramMode) {
+    const plan = report.low_vram_resource_plan ?? {};
+    failures.push(...validateBrowser1k5LowVramResourcePlan(plan));
+
+    const audit = report.low_vram_denoiser_dtype_audit ?? {};
+    expectReportEqual(
+      failures,
+      "low_vram_denoiser_dtype_audit.matches_inventory",
+      audit.matches_inventory,
+      true,
+    );
+    expectReportEqual(
+      failures,
+      "low_vram_denoiser_dtype_audit.unexpected_dtype_tensor_count",
+      audit.unexpected_dtype_tensor_count,
+      0,
+    );
+    for (const [auditField, planField] of [
+      ["q8s_block32_f32_tensor_count", "expected_q8s_block32_f32_tensor_count"],
+      ["f32_tensor_count", "expected_f32_tensor_count"],
+      ["q8s_block32_f32_elements", "expected_q8s_block32_f32_elements"],
+      ["f32_elements", "expected_f32_elements"],
+      ["q8s_block32_f32_payload_bytes", "expected_q8s_block32_f32_payload_bytes"],
+      ["f32_payload_bytes", "expected_f32_payload_bytes"],
+    ]) {
+      expectReportEqual(
+        failures,
+        `low_vram_denoiser_dtype_audit.${auditField}`,
+        audit[auditField],
+        plan[planField],
+      );
+    }
+    expectReportEqual(
+      failures,
+      "low_vram_denoiser_dtype_audit.tensor_count",
+      audit.tensor_count,
+      audit.q8s_block32_f32_tensor_count + audit.f32_tensor_count,
+    );
+  } else {
+    expectReportEqual(failures, "low_vram_resource_plan", report.low_vram_resource_plan, null);
+    expectReportEqual(
+      failures,
+      "low_vram_denoiser_dtype_audit",
+      report.low_vram_denoiser_dtype_audit,
+      null,
+    );
   }
   expectReportEqual(
     failures,
@@ -3029,7 +3421,9 @@ function validateCompleteParityReport(report, transportValidation) {
     failures,
     "denoiser_residency",
     report.denoiser_residency,
-    BROWSER_1K5_DENOISER_RESIDENCY,
+    lowVramMode
+      ? BROWSER_1K5_LOW_VRAM_DENOISER_RESIDENCY
+      : BROWSER_1K5_F32_QUALIFICATION_DENOISER_RESIDENCY,
   );
   expectReportEqual(
     failures,
@@ -3339,12 +3733,17 @@ function validateCompleteParityReport(report, transportValidation) {
     "gates.browser_webgpu_vae_f32_oracle_envelope",
     failures,
   );
-  expectReportClose(failures, "gates.final_rgb.minimum_psnr_db", gates.final_rgb?.minimum_psnr_db, 33.5);
+  expectReportClose(
+    failures,
+    "gates.final_rgb.minimum_psnr_db",
+    gates.final_rgb?.minimum_psnr_db,
+    lowVramMode ? 24.0 : 33.5,
+  );
   expectReportClose(
     failures,
     "gates.final_rgb.minimum_mean_block_ssim_8x8",
     gates.final_rgb?.minimum_mean_block_ssim_8x8,
-    0.99,
+    lowVramMode ? 0.90 : 0.99,
   );
 
   // Rust emits this metric as f32, while serde's shortest JSON representation of
@@ -3614,18 +4013,31 @@ async function main() {
 
   const requestEvents = [];
   const browserEvents = [];
-  const workloadTelemetry = createWorkloadTelemetry();
+  const denoiserResidencyPolicy = fullParityMode
+    ? denoiserResidencyPolicyForMode(residencySelector)
+    : null;
+  const workloadTelemetry = createWorkloadTelemetry(denoiserResidencyPolicy);
+  const browserPackageIdentity = await collectBrowserPackageIdentity({
+    wwwOutDir,
+    repoRoot,
+    testsDir,
+    harnessScriptPath: scriptPath,
+  });
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
   let browser;
   let gpuMonitor;
   let gpuAttestation;
   let browserWebGpuScopeAttestation;
+  let runtimeWebGpuCalls;
+  let runtimeAdapterAttestation;
   let hostResourceMonitor;
   let hostResourceAttestation;
   let httpResidencyAttestation;
   let vaeReferenceTrafficAttestation;
   let chrome;
+  let chromeArguments_;
+  let chromeSharedMemory;
   let cdp;
   let adapter;
   let browserVersion;
@@ -3642,6 +4054,11 @@ async function main() {
   let failure;
   let finalizationFailure;
   try {
+    if (!browserPackageIdentity.validated) {
+      throw new Error(
+        `browser package identity validation failed:\n${browserPackageIdentity.validation_failures.join("\n")}`,
+      );
+    }
     for (const required of [
       join(testsDir, harnessFileName),
       join(wwwOutDir, "bevy_burn_image.js"),
@@ -3693,6 +4110,8 @@ async function main() {
         test: `${WORKLOAD_TEST}_transport_validation`,
         ok: true,
         variant: "edit-turbo-1k5",
+        residency: fullParityMode ? residencySelector : null,
+        browser_package_identity: browserPackageIdentity,
         transport_validation: transportValidation,
         workload_traffic: workloadTelemetry.snapshot(),
         elapsed_ms: Date.now() - startedAt,
@@ -3712,15 +4131,20 @@ async function main() {
       headless: vaeReferenceMode ? "vae-reference" : "parity",
       variant: "edit-turbo-1k5",
       profile: "production",
+      ...(fullParityMode
+        ? { residency: lowVramMode ? "low-vram" : "qualification-f32" }
+        : {}),
       artifacts: `${baseUrl}/artifacts`,
       fixture: `${baseUrl}/fixture`,
     });
     const harnessUrl = `${baseUrl}/harness/${harnessFileName}?${query}`;
     const probeUrl = `${baseUrl}/probe`;
 
+    chromeSharedMemory = await inspectChromeSharedMemory();
     chrome = await findChrome();
     profile = await mkdtemp(join(tmpdir(), `burn-image-browser-1k5-${WORKLOAD_NAME}-profile-`));
-    browser = await startChrome(chrome, profile, probeUrl, headful);
+    chromeArguments_ = chromeLaunchArguments(profile, probeUrl, headful, chromeSharedMemory);
+    browser = await startChrome(chrome, chromeArguments_);
     const devToolsDeadline = Math.min(deadline, Date.now() + DEVTOOLS_START_TIMEOUT_MS);
     const devToolsPort = await readDevToolsPort(profile, browser, devToolsDeadline);
     const target = await findPageTarget(devToolsPort, probeUrl, browser, devToolsDeadline);
@@ -3736,14 +4160,27 @@ async function main() {
     hostResourceMonitor = await startHostResourceMonitor(browser.child.pid, workloadTelemetry);
     gpuMonitor = await startNativeGpuMonitor(
       browser.child.pid,
-      vaeReferenceMode ? 1 : MIN_RESIDENT_DENOISER_FRAMEBUFFER_MIB,
-      vaeReferenceMode ? "real VAE encoder diagnostic" : "high-VRAM resident-denoiser policy",
+      vaeReferenceMode || lowVramMode ? 1 : MIN_F32_RETAINED_DENOISER_FRAMEBUFFER_MIB,
+      vaeReferenceMode
+        ? "real VAE encoder diagnostic"
+        : lowVramMode
+          ? "low-VRAM runtime-Q8 denoiser policy"
+          : "F32 qualification retained-denoiser policy",
+      lowVramMode ? BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES : null,
     );
     const navigation = await cdp.call("Page.navigate", { url: harnessUrl });
     if (navigation?.errorText) {
       throw new Error(`Chrome could not navigate to the parity harness: ${navigation.errorText}`);
     }
     parityReport = await waitForResult(cdp, browser, deadline, transportValidation);
+    runtimeWebGpuCalls = await evaluateValue(
+      cdp,
+      "globalThis.__burnImageHeadlessParity?.webgpu_calls ?? []",
+    );
+    runtimeAdapterAttestation = attestBrowser1k5RuntimeAdapter(
+      parityReport,
+      runtimeWebGpuCalls,
+    );
     if (vaeReferenceMode) {
       vaeReferenceTrafficAttestation = validateVaeReferenceTraffic(
         requestEvents,
@@ -3764,6 +4201,9 @@ async function main() {
       CALIBRATED_BROWSER_WEBGPU_RUNTIME_SCOPE,
     );
     const resourceFailures = [
+      ...runtimeAdapterAttestation.validation_failures.map(
+        (message) => `exact runtime WebGPU adapter: ${message}`,
+      ),
       ...browserWebGpuScopeAttestation.validation_failures.map(
         (message) => `calibrated browser WebGPU scope: ${message}`,
       ),
@@ -3771,12 +4211,33 @@ async function main() {
         ? vaeReferenceTrafficAttestation.validation_failures.map(
             (message) => `VAE encoder traffic: ${message}`,
           )
-        : httpResidencyAttestation.validation_failures.map(
-            (message) => `HTTP residency: ${message}`,
-          )),
+        : [
+            ...httpResidencyAttestation.validation_failures,
+            ...validateDenoiserResidencyPolicy(httpResidencyAttestation, residencySelector),
+          ].map((message) => `HTTP residency: ${message}`)),
       ...gpuAttestation.validation_failures.map((message) => `GPU residency: ${message}`),
       ...hostResourceAttestation.validation_failures.map((message) => `host resources: ${message}`),
     ];
+    if (lowVramMode) {
+      if (
+        gpuAttestation.maximum_framebuffer_bytes_exclusive !==
+        BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES
+      ) {
+        resourceFailures.push(
+          `GPU residency: low-VRAM exclusive ceiling is ${gpuAttestation.maximum_framebuffer_bytes_exclusive}, expected ${BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES}`,
+        );
+      }
+      if (
+        !Number.isSafeInteger(gpuAttestation.observed_max_framebuffer_bytes) ||
+        gpuAttestation.observed_max_framebuffer_bytes <= 0 ||
+        gpuAttestation.observed_max_framebuffer_bytes >=
+          BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES
+      ) {
+        resourceFailures.push(
+          `GPU residency: low-VRAM observed Chrome GPU peak ${gpuAttestation.observed_max_framebuffer_bytes} is not positive and strictly below ${BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES}`,
+        );
+      }
+    }
     if (resourceFailures.length > 0) {
       const error = new Error(
         `browser resource/residency attestation failed:\n${resourceFailures.join("\n")}`,
@@ -3784,6 +4245,7 @@ async function main() {
       error.parityReport = parityReport;
       error.gpuAttestation = gpuAttestation;
       error.browserWebGpuScopeAttestation = browserWebGpuScopeAttestation;
+      error.runtimeAdapterAttestation = runtimeAdapterAttestation;
       error.hostResourceAttestation = hostResourceAttestation;
       error.httpResidencyAttestation = httpResidencyAttestation;
       error.vaeReferenceTrafficAttestation = vaeReferenceTrafficAttestation;
@@ -3802,8 +4264,18 @@ async function main() {
       test: WORKLOAD_TEST,
       ok: true,
       variant: "edit-turbo-1k5",
+      residency: fullParityMode ? residencySelector : null,
+      browser_package_identity: browserPackageIdentity,
+      ...browser1k5ChromeLaunchEvidence({
+        executable: chrome,
+        arguments: chromeArguments_,
+        profile,
+        sharedMemory: chromeSharedMemory,
+      }),
       browser: browserVersion,
       native_webgpu_adapter: adapter,
+      runtime_webgpu_calls: runtimeWebGpuCalls,
+      runtime_webgpu_adapter_attestation: runtimeAdapterAttestation,
       browser_webgpu_scope_attestation: browserWebGpuScopeAttestation,
       native_gpu_attestation: gpuAttestation,
       host_resource_attestation: hostResourceAttestation,
@@ -3824,6 +4296,14 @@ async function main() {
     pageSnapshot ??= error?.pageSnapshot;
     gpuAttestation ??= error?.gpuAttestation;
     browserWebGpuScopeAttestation ??= error?.browserWebGpuScopeAttestation;
+    runtimeWebGpuCalls ??= pageSnapshot?.exported?.webgpu_calls ?? [];
+    runtimeAdapterAttestation ??= error?.runtimeAdapterAttestation;
+    if (!runtimeAdapterAttestation && parityReport) {
+      runtimeAdapterAttestation = attestBrowser1k5RuntimeAdapter(
+        parityReport,
+        runtimeWebGpuCalls,
+      );
+    }
     hostResourceAttestation ??= error?.hostResourceAttestation;
     httpResidencyAttestation ??= error?.httpResidencyAttestation;
     vaeReferenceTrafficAttestation ??= error?.vaeReferenceTrafficAttestation;
@@ -3877,8 +4357,18 @@ async function main() {
       test: WORKLOAD_TEST,
       ok: false,
       variant: "edit-turbo-1k5",
+      residency: fullParityMode ? residencySelector : null,
+      browser_package_identity: browserPackageIdentity,
+      ...browser1k5ChromeLaunchEvidence({
+        executable: chrome,
+        arguments: chromeArguments_,
+        profile,
+        sharedMemory: chromeSharedMemory,
+      }),
       browser: browserVersion ?? null,
       native_webgpu_adapter: adapter ?? null,
+      runtime_webgpu_calls: runtimeWebGpuCalls,
+      runtime_webgpu_adapter_attestation: runtimeAdapterAttestation ?? null,
       browser_webgpu_scope_attestation: browserWebGpuScopeAttestation ?? null,
       native_gpu_attestation: gpuAttestation ?? null,
       host_resource_attestation: hostResourceAttestation ?? null,
@@ -3945,6 +4435,13 @@ async function main() {
       });
     }
     await closeServer(server);
+    const chromeLaunchEvidence = browser1k5ChromeLaunchEvidence({
+      executable: chrome,
+      arguments: chromeArguments_,
+      profile,
+      sharedMemory: chromeSharedMemory,
+    });
+    if (outcome) Object.assign(outcome, chromeLaunchEvidence);
     if (outcome?.test === WORKLOAD_TEST) {
       if (vaeReferenceMode) {
         vaeReferenceTrafficAttestation = transportValidation
@@ -3954,6 +4451,8 @@ async function main() {
         httpResidencyAttestation = workloadTelemetry.denoiserResidencyAttestation();
       }
       outcome.native_gpu_attestation = gpuAttestation ?? null;
+      outcome.runtime_webgpu_calls = runtimeWebGpuCalls ?? [];
+      outcome.runtime_webgpu_adapter_attestation = runtimeAdapterAttestation ?? null;
       outcome.browser_webgpu_scope_attestation = browserWebGpuScopeAttestation ?? null;
       outcome.host_resource_attestation = hostResourceAttestation ?? null;
       outcome.model_residency_http_attestation = httpResidencyAttestation;
@@ -3962,9 +4461,15 @@ async function main() {
       const lateTrafficAttestation = vaeReferenceMode
         ? vaeReferenceTrafficAttestation
         : httpResidencyAttestation;
-      if (outcome.ok && !lateTrafficAttestation?.validated) {
+      const lateTrafficFailures = [
+        ...(lateTrafficAttestation?.validation_failures ?? ["traffic attestation is missing"]),
+        ...(!vaeReferenceMode && lateTrafficAttestation
+          ? validateDenoiserResidencyPolicy(lateTrafficAttestation, residencySelector)
+          : []),
+      ];
+      if (outcome.ok && lateTrafficFailures.length > 0) {
         finalizationFailure = new Error(
-          `late model HTTP traffic invalidated ${WORKLOAD_NAME}:\n${lateTrafficAttestation?.validation_failures.join("\n")}`,
+          `late model HTTP traffic invalidated ${WORKLOAD_NAME}:\n${lateTrafficFailures.join("\n")}`,
         );
         failure ??= finalizationFailure;
         outcome.ok = false;
@@ -3979,7 +4484,8 @@ async function main() {
       `started_at_ms=${startedAt}`,
       `elapsed_ms=${Date.now() - startedAt}`,
       `chrome=${chrome ?? "not launched"}`,
-      `chrome_arguments=${JSON.stringify(browser?.arguments_ ?? [])}`,
+      `chrome_arguments=${JSON.stringify(chromeArguments_ ?? [])}`,
+      `chrome_shared_memory=${JSON.stringify(chromeSharedMemory ?? null)}`,
       `artifact_dir=${artifactDir}`,
       `fixture_dir=${fixtureDir}`,
       `www_out_dir=${wwwOutDir}`,

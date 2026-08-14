@@ -97,7 +97,8 @@ pub struct NativeHighVramPolicy {
     pub denoiser_qk_preparation: NativeDenoiserQkPreparationPolicy,
     /// Required VAE storage and reduction policy.
     pub vae_execution: NativeVaeExecutionPolicy,
-    /// Retained-Qwen synchronization behavior.
+    /// Retained-Qwen synchronization behavior used by high-VRAM residency. Phase-streamed
+    /// runtimes keep their independent per-stage source barrier.
     pub qwen_synchronization: NativeQwenSynchronizationPolicy,
     /// Streamed Qwen attention query rows per submission.
     pub qwen_query_chunk_size: usize,
@@ -118,8 +119,10 @@ pub type EditTurbo1k5NativePolicy = NativeHighVramPolicy;
 
 /// Parity- and performance-qualified native Turbo and Edit-Turbo 1K execution controls.
 ///
-/// This policy applies only to the native high-VRAM `f16-qwen-vision-f32` route. Browser,
-/// layer-streamed, Q8, and all-F16 execution retain their independent policies.
+/// The kernel, dtype, and query-chunk controls are shared by the native high- and low-VRAM
+/// production routes. `provenance_label` and retained-Qwen synchronization describe high-VRAM
+/// residency specifically; low-VRAM provenance supplies its own streamed-per-stage label.
+/// Browser, diagnostic layer-streamed, Q8, and all-F16 execution retain independent policies.
 pub const BOOGU_1K_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
     provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum",
     autotune: NativeAutotunePolicy::Full,

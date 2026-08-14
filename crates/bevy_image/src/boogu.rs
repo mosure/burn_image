@@ -12,6 +12,11 @@ use std::{
 };
 
 use bevy::prelude::*;
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+use bevy::{
+    camera::RenderTarget,
+    window::{PrimaryWindow, WindowRef},
+};
 use burn_boogu::{
     BooguTask, BooguVariant, ResolvedBooguRequest,
     artifacts::{
@@ -23,12 +28,11 @@ use burn_boogu::{
     resolve_request,
 };
 use burn_image::{
-    ArtifactCachePolicy, ArtifactProfileId, ArtifactSource, CancellationToken, Dimensions,
-    ImageRequest, IntegrityPolicy, ModelDescriptor, ModelId, NumericFormat, RuntimeConfig,
-    RuntimeError,
+    ArtifactCachePolicy, ArtifactProfileId, ArtifactSource, CancellationToken, ImageRequest,
+    IntegrityPolicy, ModelDescriptor, ModelId, NumericFormat, RuntimeConfig, RuntimeError,
 };
 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-use burn_image::{GenerateRequest, GenerationOptions, Prompt};
+use burn_image::{Dimensions, GenerateRequest, GenerationOptions, Prompt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -47,27 +51,46 @@ pub const BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES: u64 = 2_415_919_104;
 /// 1536-square core slab is `[1, 256, 1536, 768]`; the extra rows/columns cover its 3x3 halo and
 /// Burn's current explicit padding materialization.
 pub const BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES: u64 = 1_215_832_064;
-/// F32 denoiser feed-forward buffer required by the exact 1.5K browser parity fixture.
+/// Measured F32 denoiser feed-forward buffer from the pinned exact 1.5K browser parity fixture.
+/// Shape preflight below computes the conservative released-shape bound including the maximum
+/// allowed instruction length.
 pub const BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES: u64 = 522_042_368;
 /// Largest single runtime buffer required by the exact 1.5K browser parity fixture.
 pub const BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES: u64 =
     BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES;
-/// Device-buffer limit requested by the ordinary 256-square Boogu browser runtime.
+/// Device-buffer limit requested by the ordinary Boogu browser runtime.
 ///
-/// Exact 1.5K parity uses a separate limit contract so an unsupported qualification route cannot
-/// raise the device request for the released interactive browser surface.
-pub const BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+/// This is the maximum shape-aware buffer plan across the released Turbo/Edit 1K surface and all
+/// ten official Edit-Turbo 1.5K aspect-ratio presets. The maximum is the strict-F32 striped VAE
+/// tail for the 1392x1696 preset.
+pub const BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES: u64 = 1_217_126_400;
 /// Minimum applied device-buffer limit required by the exact 1.5K parity route.
 ///
 /// The exact two-slab decoder tail keeps this below Chrome's observed 2,147,483,644-byte WebGPU
 /// ceiling without changing the global middle attention or GroupNorm semantics.
 pub const BOOGU_BROWSER_1K5_MIN_REQUIRED_BUFFER_LIMIT_BYTES: u64 =
     BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES;
-/// Released browser execution is intentionally limited to the validated 256-square request.
+/// Legacy 256-square browser edge retained for source compatibility.
+///
+/// This is no longer the browser output ceiling. Released browser descriptors now expose their
+/// native shape presets, with Turbo and Edit defaulting to 1024 square.
+#[deprecated(
+    since = "0.1.1",
+    note = "the browser now uses descriptor-specific full-resolution presets"
+)]
 pub const BOOGU_BROWSER_OUTPUT_EDGE: u32 = 256;
-/// Pixel ceiling corresponding to [`BOOGU_BROWSER_OUTPUT_EDGE`] squared.
+/// Legacy pixel count corresponding to [`BOOGU_BROWSER_OUTPUT_EDGE`].
+///
+/// This value is retained only for source compatibility and is not a current browser limit.
+#[allow(deprecated)]
+#[deprecated(
+    since = "0.1.1",
+    note = "the browser now validates descriptor-specific full-resolution shapes"
+)]
 pub const BOOGU_BROWSER_MAX_OUTPUT_PIXELS: u64 =
     BOOGU_BROWSER_OUTPUT_EDGE as u64 * BOOGU_BROWSER_OUTPUT_EDGE as u64;
+/// Output side at which browser VAE decode switches to the bounded strict-F32 striped tail.
+pub const BOOGU_BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE: u32 = 1024;
 /// Exact output edge replayed by the dedicated 1.5K browser parity route.
 pub const BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE: u32 = 1536;
 /// Exact output pixel count replayed by the dedicated 1.5K browser parity route.
@@ -75,6 +98,33 @@ pub const BOOGU_BROWSER_1K5_PARITY_OUTPUT_PIXELS: u64 =
     BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64 * BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64;
 /// Canonical public origin for immutable Boogu artifact bundles.
 pub const BOOGU_CDN_ROOT: &str = "https://aberration.technology/model";
+
+/// Exact ordinary-browser policy attested by runtime events and output provenance.
+///
+/// Inactive primary-window cameras are removed during render extraction, which prevents Bevy from
+/// acquiring or presenting the WebGPU canvas while model inference owns the shared device/queue.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) const BROWSER_SURFACE_INFERENCE_POLICY: &str = "request-scoped-surface-acquire-suspended/primary-window-cameras-inactive-before-runtime-submit/exact-state-restored-after-terminal-before-output-ready";
+
+/// VAE decode strategy selected by the browser's shape-aware buffer plan.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BrowserVaeDecodePolicy {
+    /// Ordinary strict-F32 decode for shapes whose full final feature fits the device contract.
+    FullStrictF32,
+    /// Exact strict-F32 two-slab final tail, split at this output-width coordinate.
+    StripedTailStrictF32 { split_width: usize },
+}
+
+/// Largest individual buffers planned for one browser inference shape.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BrowserBufferPlan {
+    pub vae_decode_policy: BrowserVaeDecodePolicy,
+    pub vae_decode_max_buffer_bytes: u64,
+    pub denoiser_ffn_max_buffer_bytes: u64,
+    pub required_buffer_limit_bytes: u64,
+}
 
 /// Artifact and cache policy supplied to a concrete native or browser runtime.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +329,42 @@ struct BooguAdapterHost {
     active: BTreeMap<ImageJobId, ActiveBooguJob>,
 }
 
+/// Main-world ownership for the ordinary browser's request-scoped render-surface gate.
+///
+/// This deliberately does not derive its lifetime from `BooguAdapterHost::active`: a frontend
+/// cancellation request removes that entry immediately, while the browser task may still own the
+/// shared GPU queue until it emits its actual `Cancelled` terminal event.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+#[derive(Resource, Debug, Default)]
+struct BrowserSurfaceInferenceGate {
+    active_jobs: HashSet<ImageJobId>,
+    saved_primary_window_camera_states: BTreeMap<Entity, bool>,
+    primary_window: Option<Entity>,
+    violation: Option<String>,
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrowserSurfaceSuspendReport {
+    primary_window_camera_count: usize,
+    saved_camera_state_count: usize,
+    previously_active_camera_count: usize,
+    inactive_camera_count: usize,
+    active_job_count: usize,
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BrowserSurfaceResumeReport {
+    primary_window_camera_count: usize,
+    saved_camera_state_count: usize,
+    restored_camera_state_count: usize,
+    restored_active_camera_count: usize,
+    active_job_count: usize,
+    exact_saved_states_restored: bool,
+    all_primary_window_cameras_restored: bool,
+}
+
 /// Installs exact Boogu model routing around an injected real runtime factory.
 ///
 /// Add [`crate::BurnImageFrontendPlugin`] first so the job messages and shared
@@ -321,20 +407,310 @@ impl<F: BooguRuntimeFactory> Plugin for BooguAdapterPlugin<F> {
             runtime: None,
             phase: FactoryPhase::WaitingForSharedGpu,
             active: BTreeMap::new(),
-        })
-        .add_systems(PreUpdate, initialize_boogu_runtime)
-        .add_systems(
-            Update,
-            (
-                stop_on_backend_loss,
-                submit_boogu_jobs,
-                cancel_boogu_jobs,
-                poll_boogu_runtime,
-            )
-                .chain()
-                .in_set(ImageFrontendSet::Dispatch),
+        });
+        #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+        app.init_resource::<BrowserSurfaceInferenceGate>()
+            // `Last` still runs before render-world extraction. It catches any primary-window
+            // camera created after dispatch and forces it inactive before that frame can acquire.
+            .add_systems(Last, enforce_browser_surface_inference_gate);
+        app.add_systems(PreUpdate, initialize_boogu_runtime)
+            .add_systems(
+                Update,
+                (
+                    stop_on_backend_loss,
+                    submit_boogu_jobs,
+                    cancel_boogu_jobs,
+                    poll_boogu_runtime,
+                )
+                    .chain()
+                    .in_set(ImageFrontendSet::Dispatch),
+            );
+    }
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn render_target_is_primary_window(target: &RenderTarget, primary_window: Entity) -> bool {
+    match target {
+        RenderTarget::Window(WindowRef::Primary) => true,
+        RenderTarget::Window(WindowRef::Entity(entity)) => *entity == primary_window,
+        RenderTarget::Image(_) | RenderTarget::TextureView(_) | RenderTarget::None { .. } => false,
+    }
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn suspend_browser_surface_inference(
+    gate: &mut BrowserSurfaceInferenceGate,
+    primary_windows: &Query<Entity, With<PrimaryWindow>>,
+    cameras: &mut Query<(Entity, &mut Camera, &RenderTarget)>,
+) -> Result<BrowserSurfaceSuspendReport, String> {
+    if !gate.active_jobs.is_empty()
+        || !gate.saved_primary_window_camera_states.is_empty()
+        || gate.primary_window.is_some()
+    {
+        return Err(
+            "browser surface gate refuses a second request while a GPU request is active".into(),
         );
     }
+    let primary_window = primary_windows.single().map_err(|error| {
+        format!("browser surface gate requires exactly one primary window: {error}")
+    })?;
+    gate.primary_window = Some(primary_window);
+    gate.violation = None;
+
+    let mut primary_window_camera_count = 0;
+    let mut previously_active_camera_count = 0;
+    let mut inactive_camera_count = 0;
+    for (entity, mut camera, target) in cameras.iter_mut() {
+        if !render_target_is_primary_window(target, primary_window) {
+            continue;
+        }
+        primary_window_camera_count += 1;
+        previously_active_camera_count += usize::from(camera.is_active);
+        gate.saved_primary_window_camera_states
+            .insert(entity, camera.is_active);
+        camera.is_active = false;
+        inactive_camera_count += usize::from(!camera.is_active);
+    }
+
+    if primary_window_camera_count < 2 || inactive_camera_count != primary_window_camera_count {
+        let report = restore_pending_browser_surface_inference(gate, primary_windows, cameras);
+        return Err(format!(
+            "browser surface gate requires both primary-window cameras inactive before runtime submit; found {primary_window_camera_count}, inactive {inactive_camera_count}, rollback_exact={}",
+            report.exact_saved_states_restored
+        ));
+    }
+
+    Ok(BrowserSurfaceSuspendReport {
+        primary_window_camera_count,
+        saved_camera_state_count: gate.saved_primary_window_camera_states.len(),
+        previously_active_camera_count,
+        inactive_camera_count,
+        active_job_count: 0,
+    })
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn capture_and_deactivate_new_primary_window_cameras(
+    gate: &mut BrowserSurfaceInferenceGate,
+    primary_window: Entity,
+    cameras: &mut Query<(Entity, &mut Camera, &RenderTarget)>,
+) -> usize {
+    let mut primary_window_camera_count = 0;
+    for (entity, mut camera, target) in cameras.iter_mut() {
+        if !render_target_is_primary_window(target, primary_window) {
+            continue;
+        }
+        primary_window_camera_count += 1;
+        gate.saved_primary_window_camera_states
+            .entry(entity)
+            .or_insert(camera.is_active);
+        camera.is_active = false;
+    }
+    primary_window_camera_count
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn restore_pending_browser_surface_inference(
+    gate: &mut BrowserSurfaceInferenceGate,
+    primary_windows: &Query<Entity, With<PrimaryWindow>>,
+    cameras: &mut Query<(Entity, &mut Camera, &RenderTarget)>,
+) -> BrowserSurfaceResumeReport {
+    restore_browser_surface_camera_states(gate, primary_windows, cameras)
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn resume_browser_surface_inference(
+    gate: &mut BrowserSurfaceInferenceGate,
+    id: ImageJobId,
+    primary_windows: &Query<Entity, With<PrimaryWindow>>,
+    cameras: &mut Query<(Entity, &mut Camera, &RenderTarget)>,
+) -> BrowserSurfaceResumeReport {
+    if !gate.active_jobs.remove(&id) {
+        return BrowserSurfaceResumeReport {
+            primary_window_camera_count: 0,
+            saved_camera_state_count: gate.saved_primary_window_camera_states.len(),
+            restored_camera_state_count: 0,
+            restored_active_camera_count: 0,
+            active_job_count: gate.active_jobs.len(),
+            exact_saved_states_restored: false,
+            all_primary_window_cameras_restored: false,
+        };
+    }
+    if !gate.active_jobs.is_empty() {
+        gate.violation.get_or_insert_with(|| {
+            "browser surface gate observed unsupported concurrent active jobs".into()
+        });
+        return BrowserSurfaceResumeReport {
+            primary_window_camera_count: 0,
+            saved_camera_state_count: gate.saved_primary_window_camera_states.len(),
+            restored_camera_state_count: 0,
+            restored_active_camera_count: 0,
+            active_job_count: gate.active_jobs.len(),
+            exact_saved_states_restored: false,
+            all_primary_window_cameras_restored: false,
+        };
+    }
+
+    if let Ok(primary_window) = primary_windows.single() {
+        capture_and_deactivate_new_primary_window_cameras(gate, primary_window, cameras);
+    } else {
+        gate.violation.get_or_insert_with(|| {
+            "browser surface gate lost the unique primary window before terminal restoration".into()
+        });
+    }
+    restore_browser_surface_camera_states(gate, primary_windows, cameras)
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn restore_browser_surface_camera_states(
+    gate: &mut BrowserSurfaceInferenceGate,
+    primary_windows: &Query<Entity, With<PrimaryWindow>>,
+    cameras: &mut Query<(Entity, &mut Camera, &RenderTarget)>,
+) -> BrowserSurfaceResumeReport {
+    let current_primary_window = primary_windows.single().ok();
+    let primary_window_matches = current_primary_window == gate.primary_window;
+    let saved_camera_state_count = gate.saved_primary_window_camera_states.len();
+    let mut primary_window_camera_count = 0;
+    let mut restored_camera_state_count = 0;
+    let mut restored_active_camera_count = 0;
+    let mut every_current_primary_camera_was_saved = true;
+    let mut every_saved_camera_still_targets_primary = true;
+
+    for (entity, mut camera, target) in cameras.iter_mut() {
+        let targets_primary = current_primary_window
+            .is_some_and(|primary| render_target_is_primary_window(target, primary));
+        if targets_primary {
+            primary_window_camera_count += 1;
+            every_current_primary_camera_was_saved &= gate
+                .saved_primary_window_camera_states
+                .contains_key(&entity);
+        }
+        let Some(previously_active) = gate
+            .saved_primary_window_camera_states
+            .get(&entity)
+            .copied()
+        else {
+            continue;
+        };
+        camera.is_active = previously_active;
+        restored_camera_state_count += 1;
+        restored_active_camera_count += usize::from(previously_active);
+        every_saved_camera_still_targets_primary &= targets_primary;
+    }
+
+    let exact_saved_states_restored = gate.violation.is_none()
+        && primary_window_matches
+        && primary_window_camera_count >= 2
+        && restored_camera_state_count == saved_camera_state_count
+        && every_current_primary_camera_was_saved
+        && every_saved_camera_still_targets_primary;
+    let report = BrowserSurfaceResumeReport {
+        primary_window_camera_count,
+        saved_camera_state_count,
+        restored_camera_state_count,
+        restored_active_camera_count,
+        active_job_count: gate.active_jobs.len(),
+        exact_saved_states_restored,
+        all_primary_window_cameras_restored: exact_saved_states_restored,
+    };
+    gate.saved_primary_window_camera_states.clear();
+    gate.primary_window = None;
+    gate.violation = None;
+    report
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn enforce_browser_surface_inference_gate(
+    mut gate: ResMut<BrowserSurfaceInferenceGate>,
+    primary_windows: Query<Entity, With<PrimaryWindow>>,
+    mut cameras: Query<(Entity, &mut Camera, &RenderTarget)>,
+) {
+    if gate.active_jobs.is_empty() {
+        return;
+    }
+    let id = *gate
+        .active_jobs
+        .iter()
+        .next()
+        .expect("non-empty browser surface gate has an active job");
+    let Ok(primary_window) = primary_windows.single() else {
+        if gate.violation.is_none() {
+            let message =
+                "browser surface gate lost the unique primary window while inference was active";
+            gate.violation = Some(message.into());
+            report_browser_surface_gate_failure(id, "enforce", message, false);
+        }
+        return;
+    };
+    if gate.primary_window != Some(primary_window) && gate.violation.is_none() {
+        let message = "browser surface gate primary-window identity changed during inference";
+        gate.violation = Some(message.into());
+        report_browser_surface_gate_failure(id, "enforce", message, false);
+    }
+    let camera_count =
+        capture_and_deactivate_new_primary_window_cameras(&mut gate, primary_window, &mut cameras);
+    if camera_count < 2 && gate.violation.is_none() {
+        let message = format!(
+            "browser surface gate found only {camera_count} primary-window cameras while inference was active"
+        );
+        gate.violation = Some(message.clone());
+        report_browser_surface_gate_failure(id, "enforce", &message, false);
+    }
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn report_browser_surface_suspended(id: ImageJobId, report: BrowserSurfaceSuspendReport) {
+    #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
+    crate::browser_boogu::report_browser_surface_inference_suspended(
+        id.0,
+        report.primary_window_camera_count,
+        report.saved_camera_state_count,
+        report.previously_active_camera_count,
+        report.inactive_camera_count,
+        report.active_job_count,
+    );
+    #[cfg(test)]
+    let _ = (id, report);
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn report_browser_surface_resumed(
+    id: ImageJobId,
+    terminal: &'static str,
+    report: BrowserSurfaceResumeReport,
+) {
+    #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
+    crate::browser_boogu::report_browser_surface_inference_resumed(
+        id.0,
+        terminal,
+        report.primary_window_camera_count,
+        report.saved_camera_state_count,
+        report.restored_camera_state_count,
+        report.restored_active_camera_count,
+        report.active_job_count,
+        report.exact_saved_states_restored,
+        report.all_primary_window_cameras_restored,
+    );
+    #[cfg(test)]
+    let _ = (id, terminal, report);
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+fn report_browser_surface_gate_failure(
+    id: ImageJobId,
+    phase: &'static str,
+    message: &str,
+    exact_saved_states_restored: bool,
+) {
+    #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
+    crate::browser_boogu::report_browser_surface_inference_gate_failure(
+        id.0,
+        phase,
+        message,
+        exact_saved_states_restored,
+    );
+    #[cfg(test)]
+    let _ = (id, phase, message, exact_saved_states_restored);
 }
 
 fn initialize_boogu_runtime(
@@ -483,12 +859,27 @@ fn fail_adapter(
     runner_status.state = ImageRunnerState::Failed { error };
 }
 
+// Bevy system parameters are independently scheduled resources/queries; grouping the browser-only
+// camera gate into a custom SystemParam would obscure the exact mutable access contract here.
+#[allow(clippy::too_many_arguments)]
 fn stop_on_backend_loss(
     backend: Res<BackendStatus>,
     mut host: ResMut<BooguAdapterHost>,
     mut adapter_status: ResMut<BooguAdapterStatus>,
     mut runner_status: ResMut<ImageRunnerStatus>,
     mut failed: MessageWriter<FailImageJob>,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] primary_windows: Query<
+        Entity,
+        With<PrimaryWindow>,
+    >,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] mut cameras: Query<(
+        Entity,
+        &mut Camera,
+        &RenderTarget,
+    )>,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] mut surface_gate: ResMut<
+        BrowserSurfaceInferenceGate,
+    >,
 ) {
     if backend.is_ready() || host.runtime.is_none() {
         return;
@@ -508,6 +899,20 @@ fn stop_on_backend_loss(
             });
         }
     }
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+    if let Some(id) = surface_gate.active_jobs.iter().copied().next() {
+        let report =
+            resume_browser_surface_inference(&mut surface_gate, id, &primary_windows, &mut cameras);
+        report_browser_surface_resumed(id, "backend_loss", report);
+        if !report.exact_saved_states_restored {
+            report_browser_surface_gate_failure(
+                id,
+                "restore",
+                "browser surface gate could not restore exact camera state after backend loss",
+                false,
+            );
+        }
+    }
     fail_adapter(&mut host, &mut adapter_status, &mut runner_status, error);
 }
 
@@ -515,6 +920,18 @@ fn submit_boogu_jobs(
     mut host: ResMut<BooguAdapterHost>,
     mut dispatched: MessageReader<ImageJobDispatched>,
     mut failed: MessageWriter<FailImageJob>,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] primary_windows: Query<
+        Entity,
+        With<PrimaryWindow>,
+    >,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] mut cameras: Query<(
+        Entity,
+        &mut Camera,
+        &RenderTarget,
+    )>,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] mut surface_gate: ResMut<
+        BrowserSurfaceInferenceGate,
+    >,
 ) {
     for dispatch in dispatched.read() {
         let Some(variant) = variant_for_model(&dispatch.model) else {
@@ -547,8 +964,35 @@ fn submit_boogu_jobs(
             });
             continue;
         };
+
+        // On Wasm `spawn_local` first polls on a later microtask. Mutating the main-world cameras
+        // here is therefore synchronous-before-submit and reaches render extraction before model
+        // inference can begin on the shared queue.
+        #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+        let surface_suspend = match suspend_browser_surface_inference(
+            &mut surface_gate,
+            &primary_windows,
+            &mut cameras,
+        ) {
+            Ok(report) => report,
+            Err(message) => {
+                report_browser_surface_gate_failure(dispatch.id, "suspend", &message, false);
+                failed.write(FailImageJob {
+                    id: dispatch.id,
+                    error: FrontendError::model_runtime(message),
+                });
+                continue;
+            }
+        };
         match runtime.submit(job) {
             Ok(token) => {
+                #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+                {
+                    surface_gate.active_jobs.insert(dispatch.id);
+                    let mut report = surface_suspend;
+                    report.active_job_count = surface_gate.active_jobs.len();
+                    report_browser_surface_suspended(dispatch.id, report);
+                }
                 host.active.insert(
                     dispatch.id,
                     ActiveBooguJob {
@@ -560,6 +1004,20 @@ fn submit_boogu_jobs(
                 );
             }
             Err(error) => {
+                #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+                {
+                    let report = restore_pending_browser_surface_inference(
+                        &mut surface_gate,
+                        &primary_windows,
+                        &mut cameras,
+                    );
+                    report_browser_surface_gate_failure(
+                        dispatch.id,
+                        "runtime_submit",
+                        &error.to_string(),
+                        report.exact_saved_states_restored,
+                    );
+                }
                 failed.write(FailImageJob {
                     id: dispatch.id,
                     error: FrontendError::from(error),
@@ -588,6 +1046,18 @@ fn poll_boogu_runtime(
     mut progress: MessageWriter<ReportImageProgress>,
     mut completed: MessageWriter<CompleteImageJob>,
     mut failed: MessageWriter<FailImageJob>,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] primary_windows: Query<
+        Entity,
+        With<PrimaryWindow>,
+    >,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] mut cameras: Query<(
+        Entity,
+        &mut Camera,
+        &RenderTarget,
+    )>,
+    #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))] mut surface_gate: ResMut<
+        BrowserSurfaceInferenceGate,
+    >,
 ) {
     let Some(runtime) = host.runtime.as_mut() else {
         return;
@@ -601,9 +1071,36 @@ fn poll_boogu_runtime(
                 progress.write(ReportImageProgress { id, event });
             }
             ImageRunnerEvent::Completed { id, output } => {
+                #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+                let surface_resume = resume_browser_surface_inference(
+                    &mut surface_gate,
+                    id,
+                    &primary_windows,
+                    &mut cameras,
+                );
+                #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+                report_browser_surface_resumed(id, "completed", surface_resume);
                 let Some(active) = host.active.remove(&id) else {
                     continue;
                 };
+                #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+                if !surface_resume.exact_saved_states_restored
+                    || !surface_resume.all_primary_window_cameras_restored
+                {
+                    report_browser_surface_gate_failure(
+                        id,
+                        "restore",
+                        "browser surface gate could not restore exact camera state after completion",
+                        false,
+                    );
+                    failed.write(FailImageJob {
+                        id,
+                        error: FrontendError::model_runtime(
+                            "browser surface gate could not restore every primary-window camera to its exact pre-request active state",
+                        ),
+                    });
+                    continue;
+                }
                 if let Err(error) = validate_boogu_output(&output, &active, host.settings.integrity)
                 {
                     failed.write(FailImageJob {
@@ -614,16 +1111,54 @@ fn poll_boogu_runtime(
                     completed.write(CompleteImageJob { id, output });
                 }
             }
-            ImageRunnerEvent::Failed { id, error } if host.active.remove(&id).is_some() => {
-                failed.write(FailImageJob {
-                    id,
-                    error: FrontendError::from(error),
-                });
+            ImageRunnerEvent::Failed { id, error } => {
+                #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+                {
+                    let report = resume_browser_surface_inference(
+                        &mut surface_gate,
+                        id,
+                        &primary_windows,
+                        &mut cameras,
+                    );
+                    report_browser_surface_resumed(id, "failed", report);
+                    if !report.exact_saved_states_restored {
+                        report_browser_surface_gate_failure(
+                            id,
+                            "restore",
+                            "browser surface gate could not restore exact camera state after failure",
+                            false,
+                        );
+                    }
+                }
+                if host.active.remove(&id).is_some() {
+                    failed.write(FailImageJob {
+                        id,
+                        error: FrontendError::from(error),
+                    });
+                }
             }
             ImageRunnerEvent::Cancelled { id } => {
+                #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+                {
+                    let report = resume_browser_surface_inference(
+                        &mut surface_gate,
+                        id,
+                        &primary_windows,
+                        &mut cameras,
+                    );
+                    report_browser_surface_resumed(id, "cancelled", report);
+                    if !report.exact_saved_states_restored {
+                        report_browser_surface_gate_failure(
+                            id,
+                            "restore",
+                            "browser surface gate could not restore exact camera state after cancellation",
+                            false,
+                        );
+                    }
+                }
                 host.active.remove(&id);
             }
-            ImageRunnerEvent::Progress { .. } | ImageRunnerEvent::Failed { .. } => {}
+            ImageRunnerEvent::Progress { .. } => {}
         }
     }
 }
@@ -640,14 +1175,13 @@ pub(crate) fn prepare_runtime_job(
 fn prepare_runtime_job_for_execution(
     id: ImageJobId,
     variant: BooguVariant,
-    mut request: ImageRequest,
+    request: ImageRequest,
     settings: &BooguAdapterSettings,
     execution: WgpuExecutionKind,
 ) -> Result<BooguRuntimeJob, RuntimeError> {
     let model = boogu_model_id(variant);
     validate_execution_variant(variant, execution)?;
     validate_variant_profile(variant, settings.storage_profile)?;
-    apply_execution_defaults(&mut request, execution);
     boogu_descriptor_for_execution(variant, settings.storage_profile, execution)
         .capabilities
         .validate_request(&model, &request)?;
@@ -673,21 +1207,7 @@ fn prepare_runtime_job_for_execution(
     })
 }
 
-fn apply_execution_defaults(request: &mut ImageRequest, execution: WgpuExecutionKind) {
-    if execution != WgpuExecutionKind::BrowserWebGpu || request.options().dimensions.is_some() {
-        return;
-    }
-    let options = match request {
-        ImageRequest::Generate(request) => &mut request.options,
-        ImageRequest::Edit(request) => &mut request.options,
-    };
-    options.dimensions.get_or_insert_with(|| {
-        Dimensions::new(BOOGU_BROWSER_OUTPUT_EDGE, BOOGU_BROWSER_OUTPUT_EDGE)
-            .expect("fixed browser dimensions are valid")
-    });
-}
-
-/// Build the deliberately narrow request accepted by the surface-free full-inference diagnostic.
+/// Build the Turbo generation request accepted by the surface-free full-inference diagnostic.
 ///
 /// Keeping this parser beside ordinary request resolution makes the diagnostic reuse the same
 /// descriptor, dimensions, task, and release validation as the production UI path.
@@ -718,13 +1238,7 @@ pub(crate) fn prepare_headless_generate_request(
     let height = parse_required_query::<u32>(&model, "height", height)?;
     let dimensions = Dimensions::new(width, height)
         .map_err(|error| model_execution(&model, error.to_string()))?;
-    if dimensions != Dimensions::new(256, 256).expect("fixed diagnostic dimensions are valid") {
-        return Err(model_execution(
-            &model,
-            "headless=infer is intentionally restricted to width=256&height=256",
-        ));
-    }
-    Ok(ImageRequest::Generate(GenerateRequest {
+    let request = ImageRequest::Generate(GenerateRequest {
         prompt,
         negative_prompt: None,
         options: GenerationOptions {
@@ -734,7 +1248,11 @@ pub(crate) fn prepare_headless_generate_request(
             seed: Some(seed),
             batch_size: 1,
         },
-    }))
+    });
+    boogu_model_descriptor(variant)
+        .capabilities
+        .validate_request(&model, &request)?;
+    Ok(request)
 }
 
 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
@@ -836,16 +1354,9 @@ fn canonical_releases() -> Vec<BooguReleaseIdentity> {
 }
 
 pub(crate) fn validate_execution_variant(
-    variant: BooguVariant,
-    execution: WgpuExecutionKind,
+    _variant: BooguVariant,
+    _execution: WgpuExecutionKind,
 ) -> Result<(), RuntimeError> {
-    if execution == WgpuExecutionKind::BrowserWebGpu && variant == BooguVariant::Image01EditTurbo1k5
-    {
-        return Err(model_execution(
-            &boogu_model_id(variant),
-            "Edit-Turbo 1.5K is native-WGPU only: browser WebGPU numerical and performance parity have not been validated",
-        ));
-    }
     Ok(())
 }
 
@@ -930,11 +1441,10 @@ pub fn boogu_descriptor(variant: BooguVariant, profile: BooguStorageProfile) -> 
     boogu_descriptor_for_execution(variant, profile, current_execution_kind())
 }
 
-/// Exact descriptor used only by the surface-free 1.5K browser parity replay.
+/// Exact descriptor used by the surface-free 1.5K browser parity replay.
 ///
-/// Ordinary browser capabilities intentionally remain fixed at 256 square and reject the 1.5K
-/// release. This separate seam prevents an unfinished qualification path from being advertised by
-/// the interactive UI or accepted by normal request dispatch.
+/// The ordinary browser descriptor exposes every released shape. This narrower descriptor keeps
+/// the exhaustive fixture replay pinned to its authenticated 1536-square tensor inventory.
 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
 pub(crate) fn boogu_browser_1k5_parity_descriptor(
     variant: BooguVariant,
@@ -983,7 +1493,102 @@ pub(crate) fn validate_browser_1k5_buffer_limits(
     max_storage_buffer_binding_size: u64,
     max_buffer_size: u64,
 ) -> Result<(), RuntimeError> {
-    let model = boogu_model_id(BooguVariant::Image01EditTurbo1k5);
+    let dimensions = Dimensions::new(
+        BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE,
+        BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE,
+    )
+    .expect("fixed 1.5K parity dimensions are valid");
+    validate_browser_buffer_limits_for_dimensions(
+        BooguVariant::Image01EditTurbo1k5,
+        dimensions,
+        max_storage_buffer_binding_size,
+        max_buffer_size,
+    )
+    .map(|_| ())
+}
+
+/// Build the exact maximum-single-buffer plan for one released browser output shape.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) fn browser_buffer_plan(
+    variant: BooguVariant,
+    dimensions: Dimensions,
+) -> Result<BrowserBufferPlan, RuntimeError> {
+    let model = boogu_model_id(variant);
+    boogu_model_descriptor(variant)
+        .capabilities
+        .dimensions
+        .supports(dimensions)
+        .map_err(|error| model_execution(&model, error.to_string()))?;
+
+    let width = u64::from(dimensions.width());
+    let height = u64::from(dimensions.height());
+    let uses_striped_tail = dimensions.width() >= BOOGU_BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE
+        || dimensions.height() >= BOOGU_BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE;
+    let (vae_decode_policy, vae_decode_max_buffer_bytes) = if uses_striped_tail {
+        let split_width = dimensions.width() / 2;
+        debug_assert!(split_width >= 2 && split_width.is_multiple_of(2));
+        let largest_slab_width = u64::from(split_width.max(dimensions.width() - split_width));
+        // The first strict-F32 residual after the final upsample operates on 256 channels. Add
+        // two rows for explicit vertical padding and four columns for the split halo plus explicit
+        // horizontal padding. This reproduces the measured 1536-square [1,256,1538,772] bound.
+        let bytes = 256_u64
+            .checked_mul(
+                height
+                    .checked_add(2)
+                    .ok_or_else(|| model_execution(&model, "browser VAE height plan overflowed"))?,
+            )
+            .and_then(|value| value.checked_mul(largest_slab_width.checked_add(4)?))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| model_execution(&model, "browser striped VAE buffer plan overflowed"))?;
+        (
+            BrowserVaeDecodePolicy::StripedTailStrictF32 {
+                split_width: usize::try_from(split_width)
+                    .map_err(|error| model_execution(&model, error.to_string()))?,
+            },
+            bytes,
+        )
+    } else {
+        let bytes = 256_u64
+            .checked_mul(height)
+            .and_then(|value| value.checked_mul(width))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+            .ok_or_else(|| model_execution(&model, "browser full VAE buffer plan overflowed"))?;
+        (BrowserVaeDecodePolicy::FullStrictF32, bytes)
+    };
+    // The denoiser patches the /8 latent at 2x2, hence one image token per 16x16 output region.
+    // InstructionPolicy::upstream rejects, rather than truncates, sequences above 1280 tokens.
+    let image_tokens = width
+        .checked_div(16)
+        .and_then(|width| width.checked_mul(height / 16))
+        .ok_or_else(|| model_execution(&model, "browser denoiser token plan overflowed"))?;
+    let joint_tokens = image_tokens
+        .checked_add(1_280)
+        .ok_or_else(|| model_execution(&model, "browser denoiser sequence plan overflowed"))?;
+    let denoiser_ffn_max_buffer_bytes = joint_tokens
+        .checked_mul(burn_boogu::BooguConfig::default().ffn_inner_dim() as u64)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
+        .ok_or_else(|| model_execution(&model, "browser denoiser FFN plan overflowed"))?;
+    let required_buffer_limit_bytes = BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES
+        .max(denoiser_ffn_max_buffer_bytes)
+        .max(vae_decode_max_buffer_bytes);
+    Ok(BrowserBufferPlan {
+        vae_decode_policy,
+        vae_decode_max_buffer_bytes,
+        denoiser_ffn_max_buffer_bytes,
+        required_buffer_limit_bytes,
+    })
+}
+
+/// Fail before model execution when either applied WebGPU limit cannot cover the selected shape.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) fn validate_browser_buffer_limits_for_dimensions(
+    variant: BooguVariant,
+    dimensions: Dimensions,
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
+) -> Result<BrowserBufferPlan, RuntimeError> {
+    let plan = browser_buffer_plan(variant, dimensions)?;
+    let model = boogu_model_id(variant);
     for (name, actual) in [
         (
             "max_storage_buffer_binding_size",
@@ -991,17 +1596,53 @@ pub(crate) fn validate_browser_1k5_buffer_limits(
         ),
         ("max_buffer_size", max_buffer_size),
     ] {
-        if actual < BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES {
+        if actual < plan.required_buffer_limit_bytes {
             return Err(model_execution(
                 &model,
                 format!(
-                    "browser {name} is {actual} bytes; exact 1536-square parity requires at least {} bytes for the F32 two-slab VAE tail (an untiled [1,256,1536,1536] feature would require {} bytes; the F32 denoiser FFN requires {} bytes)",
-                    BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES,
+                    "browser {name} is {actual} bytes; {}x{} requires at least {} bytes (VAE decode plan {}, untiled 1536-square feature {} bytes, shape-aware maximum denoiser FFN {} bytes)",
+                    dimensions.width(),
+                    dimensions.height(),
+                    plan.required_buffer_limit_bytes,
+                    plan.vae_decode_max_buffer_bytes,
                     BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES,
-                    BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES,
+                    plan.denoiser_ffn_max_buffer_bytes,
                 ),
             ));
         }
+    }
+    Ok(plan)
+}
+
+/// Validate that the applied limits cover every output shape advertised by one browser release.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) fn validate_browser_variant_buffer_limits(
+    variant: BooguVariant,
+    max_storage_buffer_binding_size: u64,
+    max_buffer_size: u64,
+) -> Result<(), RuntimeError> {
+    let descriptor = boogu_model_descriptor(variant);
+    if let Some(allowed) = descriptor.capabilities.dimensions.allowed_dimensions {
+        for dimensions in allowed {
+            validate_browser_buffer_limits_for_dimensions(
+                variant,
+                dimensions,
+                max_storage_buffer_binding_size,
+                max_buffer_size,
+            )?;
+        }
+    } else {
+        let dimensions = Dimensions::new(
+            descriptor.capabilities.dimensions.max_width,
+            descriptor.capabilities.dimensions.max_height,
+        )
+        .expect("released Boogu maximum dimensions are valid");
+        validate_browser_buffer_limits_for_dimensions(
+            variant,
+            dimensions,
+            max_storage_buffer_binding_size,
+            max_buffer_size,
+        )?;
     }
     Ok(())
 }
@@ -1009,7 +1650,7 @@ pub(crate) fn validate_browser_1k5_buffer_limits(
 fn boogu_descriptor_for_execution(
     variant: BooguVariant,
     profile: BooguStorageProfile,
-    execution: WgpuExecutionKind,
+    _execution: WgpuExecutionKind,
 ) -> ModelDescriptor {
     let numeric_format = numeric_format(profile);
     let mut descriptor = boogu_model_descriptor(variant);
@@ -1022,14 +1663,6 @@ fn boogu_descriptor_for_execution(
         .contains(&numeric_format)
     {
         descriptor.capabilities.numeric_formats = [numeric_format].into_iter().collect();
-    }
-    if execution == WgpuExecutionKind::BrowserWebGpu {
-        let dimensions = &mut descriptor.capabilities.dimensions;
-        dimensions.min_width = BOOGU_BROWSER_OUTPUT_EDGE;
-        dimensions.max_width = BOOGU_BROWSER_OUTPUT_EDGE;
-        dimensions.min_height = BOOGU_BROWSER_OUTPUT_EDGE;
-        dimensions.max_height = BOOGU_BROWSER_OUTPUT_EDGE;
-        dimensions.max_pixels = Some(BOOGU_BROWSER_MAX_OUTPUT_PIXELS);
     }
     descriptor
 }
@@ -1071,7 +1704,9 @@ pub fn run_boogu_cli<F: BooguRuntimeFactory>(settings: BooguAdapterSettings, fac
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use bevy::ecs::system::SystemState;
     use bevy::prelude::*;
+    use bevy::window::PrimaryWindow;
     use burn_boogu::artifacts::{
         BooguStorageProfile, EDIT_TURBO_1K5_REVISION, EDIT_TURBO_REVISION, TURBO_REVISION,
         artifact_bundle_id_is_compatible,
@@ -1087,6 +1722,12 @@ mod tests {
     };
 
     use super::*;
+
+    type BrowserSurfaceGateTestState<'w, 's> = SystemState<(
+        ResMut<'w, BrowserSurfaceInferenceGate>,
+        Query<'w, 's, Entity, With<PrimaryWindow>>,
+        Query<'w, 's, (Entity, &'static mut Camera, &'static RenderTarget)>,
+    )>;
 
     fn settings() -> BooguAdapterSettings {
         BooguAdapterSettings::verified_f16(ArtifactSource::Remote {
@@ -1105,6 +1746,32 @@ mod tests {
                 ..GenerationOptions::default()
             },
         })
+    }
+
+    fn spawn_primary_surface(world: &mut World) -> (Entity, Entity, Entity) {
+        let window = world.spawn((Window::default(), PrimaryWindow)).id();
+        let active_camera = world
+            .spawn((Camera::default(), RenderTarget::Window(WindowRef::Primary)))
+            .id();
+        let inactive_camera = world
+            .spawn((
+                Camera {
+                    is_active: false,
+                    ..default()
+                },
+                RenderTarget::Window(WindowRef::Entity(window)),
+            ))
+            .id();
+        (window, active_camera, inactive_camera)
+    }
+
+    fn request_with_dimensions(dimensions: Dimensions) -> ImageRequest {
+        let mut request = request();
+        match &mut request {
+            ImageRequest::Generate(request) => request.options.dimensions = Some(dimensions),
+            ImageRequest::Edit(_) => unreachable!("generation helper returned an edit request"),
+        }
+        request
     }
 
     fn edit_request() -> ImageRequest {
@@ -1130,6 +1797,15 @@ mod tests {
                 ..GenerationOptions::default()
             },
         })
+    }
+
+    fn edit_request_with_dimensions(dimensions: Dimensions) -> ImageRequest {
+        let mut request = edit_request();
+        match &mut request {
+            ImageRequest::Edit(request) => request.options.dimensions = Some(dimensions),
+            ImageRequest::Generate(_) => unreachable!("edit helper returned a generation request"),
+        }
+        request
     }
 
     #[test]
@@ -1201,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_descriptor_and_default_are_exact_256_correctness() {
+    fn browser_descriptor_and_defaults_match_native_full_resolution_correctness() {
         let native = boogu_descriptor_for_execution(
             BooguVariant::Image01Turbo,
             BooguStorageProfile::F16QwenVisionF32,
@@ -1220,11 +1896,7 @@ mod tests {
             WgpuExecutionKind::BrowserWebGpu,
         );
         let dimensions = &browser.capabilities.dimensions;
-        assert_eq!(dimensions.min_width, BOOGU_BROWSER_OUTPUT_EDGE);
-        assert_eq!(dimensions.max_width, BOOGU_BROWSER_OUTPUT_EDGE);
-        assert_eq!(dimensions.min_height, BOOGU_BROWSER_OUTPUT_EDGE);
-        assert_eq!(dimensions.max_height, BOOGU_BROWSER_OUTPUT_EDGE);
-        assert_eq!(dimensions.max_pixels, Some(BOOGU_BROWSER_MAX_OUTPUT_PIXELS));
+        assert_eq!(dimensions, &native.capabilities.dimensions);
         assert!(
             dimensions
                 .supports(Dimensions::new(256, 256).unwrap())
@@ -1232,8 +1904,8 @@ mod tests {
         );
         assert!(
             dimensions
-                .supports(Dimensions::new(512, 512).unwrap())
-                .is_err()
+                .supports(Dimensions::new(1024, 1024).unwrap())
+                .is_ok()
         );
 
         let browser_job = prepare_runtime_job_for_execution(
@@ -1246,15 +1918,35 @@ mod tests {
         .unwrap();
         assert_eq!(
             browser_job.resolved.dimensions,
-            Dimensions::new(256, 256).unwrap()
+            Dimensions::new(1024, 1024).unwrap()
         );
         let ImageRequest::Generate(browser_request) = browser_job.request else {
             panic!("Turbo request must remain generation")
         };
-        assert_eq!(
-            browser_request.options.dimensions,
-            Some(Dimensions::new(256, 256).unwrap())
-        );
+        assert_eq!(browser_request.options.dimensions, None);
+
+        for edge in [256, 1024] {
+            let requested = Dimensions::new(edge, edge).unwrap();
+            let job = prepare_runtime_job_for_execution(
+                ImageJobId(100 + u64::from(edge)),
+                BooguVariant::Image01Turbo,
+                request_with_dimensions(requested),
+                &settings(),
+                WgpuExecutionKind::BrowserWebGpu,
+            )
+            .unwrap();
+            assert_eq!(job.resolved.dimensions, requested);
+        }
+        let edit_dimensions = Dimensions::new(1024, 1024).unwrap();
+        let edit_job = prepare_runtime_job_for_execution(
+            ImageJobId(2_024),
+            BooguVariant::Image01EditTurbo,
+            edit_request_with_dimensions(edit_dimensions),
+            &settings(),
+            WgpuExecutionKind::BrowserWebGpu,
+        )
+        .unwrap();
+        assert_eq!(edit_job.resolved.dimensions, edit_dimensions);
 
         let native_job = prepare_runtime_job_for_execution(
             ImageJobId(91),
@@ -1275,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_turbo_1k5_native_defaults_and_browser_rejection_are_explicit_correctness() {
+    fn edit_turbo_1k5_native_and_browser_expose_the_same_released_shapes_correctness() {
         let supported = BooguAdapterSettings::verified_default(ArtifactSource::Remote {
             base_url: RemoteBaseUrl::new("https://cdn.example/boogu").unwrap(),
         });
@@ -1295,20 +1987,40 @@ mod tests {
         );
         assert_eq!(native_job.request.options().dimensions, None);
 
-        let error = prepare_runtime_job_for_execution(
+        let browser_job = prepare_runtime_job_for_execution(
             ImageJobId(93),
             BooguVariant::Image01EditTurbo1k5,
             edit_request(),
             &supported,
             WgpuExecutionKind::BrowserWebGpu,
         )
-        .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("native-WGPU only"), "{message}");
-        assert!(
-            message.contains("parity have not been validated"),
-            "{message}"
+        .unwrap();
+        assert_eq!(browser_job.task, BooguTask::Edit);
+        assert_eq!(
+            browser_job.resolved.dimensions,
+            native_job.resolved.dimensions
         );
+        let native_descriptor = boogu_descriptor_for_execution(
+            BooguVariant::Image01EditTurbo1k5,
+            BooguStorageProfile::F16QwenVisionF32,
+            WgpuExecutionKind::NativeWgpu,
+        );
+        let browser_descriptor = boogu_descriptor_for_execution(
+            BooguVariant::Image01EditTurbo1k5,
+            BooguStorageProfile::F16QwenVisionF32,
+            WgpuExecutionKind::BrowserWebGpu,
+        );
+        assert_eq!(browser_descriptor, native_descriptor);
+        for (width, height) in burn_boogu::BOOGU_1K5_OUTPUT_PRESETS {
+            assert!(
+                browser_descriptor
+                    .capabilities
+                    .dimensions
+                    .supports(Dimensions::new(width, height).unwrap())
+                    .is_ok(),
+                "browser descriptor rejected released {width}x{height} preset"
+            );
+        }
 
         let mut unsupported = settings();
         unsupported.storage_profile = BooguStorageProfile::F16;
@@ -1406,22 +2118,14 @@ mod tests {
     }
 
     #[test]
-    fn browser_device_limit_covers_largest_post_load_tensor_correctness() {
+    fn browser_device_limit_covers_full_resolution_shape_plans_correctness() {
         // The released row plan stores 25,323 x 4,096 F16 values per embedding object. Browser
         // execution adapts that object to F32 before upload, independently of the transport cap.
         assert_eq!(
             BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES,
             25_323_u64 * 4_096 * std::mem::size_of::<f32>() as u64
         );
-        assert_eq!(
-            BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES,
-            512 * 1024 * 1024
-        );
-        assert_eq!(
-            BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES
-                .saturating_sub(BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES),
-            121_978_880
-        );
+        assert_eq!(BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES, 1_217_126_400);
         assert_eq!(
             BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES,
             256_u64
@@ -1443,6 +2147,58 @@ mod tests {
         );
         assert_eq!(BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES % 256, 0);
         assert_eq!(BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES, 522_042_368);
+
+        let one_k = Dimensions::new(1024, 1024).unwrap();
+        let one_k_plan = browser_buffer_plan(BooguVariant::Image01Turbo, one_k).unwrap();
+        assert_eq!(
+            one_k_plan.vae_decode_policy,
+            BrowserVaeDecodePolicy::StripedTailStrictF32 { split_width: 512 }
+        );
+        assert_eq!(one_k_plan.vae_decode_max_buffer_bytes, 542_121_984);
+        assert_eq!(one_k_plan.denoiser_ffn_max_buffer_bytes, 291_766_272);
+        validate_browser_variant_buffer_limits(
+            BooguVariant::Image01Turbo,
+            one_k_plan.required_buffer_limit_bytes,
+            one_k_plan.required_buffer_limit_bytes,
+        )
+        .unwrap();
+
+        let mut maximum = 0;
+        let mut maximum_shape = None;
+        for (width, height) in burn_boogu::BOOGU_1K5_OUTPUT_PRESETS {
+            let dimensions = Dimensions::new(width, height).unwrap();
+            let plan = browser_buffer_plan(BooguVariant::Image01EditTurbo1k5, dimensions).unwrap();
+            assert_eq!(
+                plan.vae_decode_policy,
+                BrowserVaeDecodePolicy::StripedTailStrictF32 {
+                    split_width: width as usize / 2,
+                }
+            );
+            validate_browser_buffer_limits_for_dimensions(
+                BooguVariant::Image01EditTurbo1k5,
+                dimensions,
+                BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES,
+                BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES,
+            )
+            .unwrap();
+            if plan.required_buffer_limit_bytes > maximum {
+                maximum = plan.required_buffer_limit_bytes;
+                maximum_shape = Some((width, height));
+            }
+        }
+        assert_eq!(maximum_shape, Some((1392, 1696)));
+        assert_eq!(maximum, BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES);
+        validate_browser_variant_buffer_limits(BooguVariant::Image01EditTurbo1k5, maximum, maximum)
+            .unwrap();
+        let error = validate_browser_variant_buffer_limits(
+            BooguVariant::Image01EditTurbo1k5,
+            maximum - 1,
+            maximum,
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("1392x1696"), "{message}");
+        assert!(message.contains("1217126400"), "{message}");
     }
 
     #[test]
@@ -1514,8 +2270,8 @@ mod tests {
             assert!(message.contains(missing), "{message}");
             assert!(message.contains("1215832064"), "{message}");
             assert!(message.contains("2415919104"), "{message}");
-            assert!(message.contains("two-slab"), "{message}");
-            assert!(message.contains("522042368"), "{message}");
+            assert!(message.contains("VAE decode plan"), "{message}");
+            assert!(message.contains("569638912"), "{message}");
         }
 
         // Chrome's qualification limit cannot cover the untiled feature but does cover the exact
@@ -1554,6 +2310,19 @@ mod tests {
             Some(Dimensions::new(256, 256).unwrap())
         );
 
+        let one_k = prepare_headless_generate_request(
+            BooguVariant::Image01Turbo,
+            Some("a lighthouse at dusk".into()),
+            Some("7".into()),
+            Some("1024".into()),
+            Some("1024".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            one_k.options().dimensions,
+            Some(Dimensions::new(1024, 1024).unwrap())
+        );
+
         for rejected in [
             prepare_headless_generate_request(
                 BooguVariant::Image01EditTurbo,
@@ -1580,8 +2349,8 @@ mod tests {
                 BooguVariant::Image01Turbo,
                 Some("cube".into()),
                 Some("1".into()),
-                Some("512".into()),
-                Some("256".into()),
+                Some("1040".into()),
+                Some("1024".into()),
             ),
         ] {
             assert!(rejected.is_err());
@@ -1671,6 +2440,150 @@ mod tests {
     }
 
     #[test]
+    fn browser_surface_gate_preserves_states_covers_new_cameras_and_waits_for_terminal_correctness()
+    {
+        let mut app = App::new();
+        app.init_resource::<BrowserSurfaceInferenceGate>();
+        let (primary_window, active_camera, inactive_camera) =
+            spawn_primary_surface(app.world_mut());
+        let id = ImageJobId(41);
+        let mut gate_state: BrowserSurfaceGateTestState<'_, '_> = SystemState::new(app.world_mut());
+
+        {
+            let (mut gate, primary_windows, mut cameras) =
+                gate_state.get_mut(app.world_mut()).unwrap();
+            let report =
+                suspend_browser_surface_inference(&mut gate, &primary_windows, &mut cameras)
+                    .unwrap();
+            assert_eq!(report.primary_window_camera_count, 2);
+            assert_eq!(report.saved_camera_state_count, 2);
+            assert_eq!(report.previously_active_camera_count, 1);
+            assert_eq!(report.inactive_camera_count, 2);
+            assert!(gate.active_jobs.insert(id));
+        }
+        gate_state.apply(app.world_mut());
+        assert!(!app.world().get::<Camera>(active_camera).unwrap().is_active);
+        assert!(
+            !app.world()
+                .get::<Camera>(inactive_camera)
+                .unwrap()
+                .is_active
+        );
+
+        // A camera created while the request is active is captured at the next Last enforcement
+        // boundary and cannot reacquire the primary surface.
+        let new_camera = app
+            .world_mut()
+            .spawn((
+                Camera::default(),
+                RenderTarget::Window(WindowRef::Entity(primary_window)),
+            ))
+            .id();
+        {
+            let (mut gate, primary_windows, mut cameras) =
+                gate_state.get_mut(app.world_mut()).unwrap();
+            let primary_window = primary_windows.single().unwrap();
+            assert_eq!(
+                capture_and_deactivate_new_primary_window_cameras(
+                    &mut gate,
+                    primary_window,
+                    &mut cameras,
+                ),
+                3
+            );
+            // This is the cancellation-request boundary: cancellation may change frontend/host
+            // state, but only an actual runtime terminal is allowed to remove this gate ID.
+            assert!(gate.active_jobs.contains(&id));
+        }
+        gate_state.apply(app.world_mut());
+        assert!(!app.world().get::<Camera>(new_camera).unwrap().is_active);
+
+        let report = {
+            let (mut gate, primary_windows, mut cameras) =
+                gate_state.get_mut(app.world_mut()).unwrap();
+            resume_browser_surface_inference(&mut gate, id, &primary_windows, &mut cameras)
+        };
+        gate_state.apply(app.world_mut());
+        assert_eq!(report.primary_window_camera_count, 3);
+        assert_eq!(report.saved_camera_state_count, 3);
+        assert_eq!(report.restored_camera_state_count, 3);
+        assert_eq!(report.restored_active_camera_count, 2);
+        assert_eq!(report.active_job_count, 0);
+        assert!(report.exact_saved_states_restored);
+        assert!(report.all_primary_window_cameras_restored);
+        assert!(app.world().get::<Camera>(active_camera).unwrap().is_active);
+        assert!(
+            !app.world()
+                .get::<Camera>(inactive_camera)
+                .unwrap()
+                .is_active
+        );
+        assert!(app.world().get::<Camera>(new_camera).unwrap().is_active);
+    }
+
+    #[test]
+    fn browser_surface_gate_fails_closed_when_saved_camera_disappears_correctness() {
+        let mut app = App::new();
+        app.init_resource::<BrowserSurfaceInferenceGate>();
+        let (_, active_camera, _) = spawn_primary_surface(app.world_mut());
+        let id = ImageJobId(42);
+        let mut gate_state: BrowserSurfaceGateTestState<'_, '_> = SystemState::new(app.world_mut());
+        {
+            let (mut gate, primary_windows, mut cameras) =
+                gate_state.get_mut(app.world_mut()).unwrap();
+            suspend_browser_surface_inference(&mut gate, &primary_windows, &mut cameras).unwrap();
+            gate.active_jobs.insert(id);
+        }
+        gate_state.apply(app.world_mut());
+        assert!(app.world_mut().despawn(active_camera));
+        let report = {
+            let (mut gate, primary_windows, mut cameras) =
+                gate_state.get_mut(app.world_mut()).unwrap();
+            resume_browser_surface_inference(&mut gate, id, &primary_windows, &mut cameras)
+        };
+        gate_state.apply(app.world_mut());
+        assert_eq!(report.saved_camera_state_count, 2);
+        assert_eq!(report.restored_camera_state_count, 1);
+        assert!(!report.exact_saved_states_restored);
+        assert!(!report.all_primary_window_cameras_restored);
+    }
+
+    #[test]
+    fn browser_surface_gate_schedule_orders_suspend_and_resume_around_runtime_correctness() {
+        let source = include_str!("boogu.rs");
+        let submit_start = source.find("fn submit_boogu_jobs(").unwrap();
+        let submit_end = source[submit_start..]
+            .find("fn cancel_boogu_jobs(")
+            .map(|offset| submit_start + offset)
+            .unwrap();
+        let submit = &source[submit_start..submit_end];
+        assert!(
+            submit.find("suspend_browser_surface_inference(").unwrap()
+                < submit.find("runtime.submit(job)").unwrap()
+        );
+        assert!(
+            submit.find("runtime.submit(job)").unwrap()
+                < submit.find("report_browser_surface_suspended(").unwrap()
+        );
+
+        let poll_start = source.find("fn poll_boogu_runtime(").unwrap();
+        let poll_end = source[poll_start..]
+            .find("pub(crate) fn prepare_runtime_job(")
+            .map(|offset| poll_start + offset)
+            .unwrap();
+        let poll = &source[poll_start..poll_end];
+        assert!(
+            poll.find("resume_browser_surface_inference(").unwrap()
+                < poll.find("completed.write(CompleteImageJob").unwrap()
+        );
+        assert!(source.contains(".add_systems(Last, enforce_browser_surface_inference_gate)"));
+        assert_eq!(
+            BROWSER_SURFACE_INFERENCE_POLICY,
+            "request-scoped-surface-acquire-suspended/primary-window-cameras-inactive-before-runtime-submit/exact-state-restored-after-terminal-before-output-ready"
+        );
+    }
+
+    #[test]
     fn plugin_initializes_on_shared_device_and_dispatches_real_job_correctness() {
         let jobs = Arc::new(Mutex::new(Vec::new()));
         let factory = ImmediateFactory {
@@ -1680,6 +2593,7 @@ mod tests {
             started: false,
         };
         let mut app = App::new();
+        spawn_primary_surface(app.world_mut());
         app.insert_resource(BackendStatus::ready(BackendDeviceInfo {
             adapter_name: "test gpu".into(),
             backend: "BrowserWebGpu".into(),

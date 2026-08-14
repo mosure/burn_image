@@ -155,6 +155,44 @@ impl<B: Backend> Decoder<B> {
         )))
     }
 
+    /// Decode with one fallible barrier before the final full-resolution residual block.
+    ///
+    /// This preserves every decoder operation and tensor value. The callback runs after the
+    /// penultimate up block has produced the final-resolution feature tensor, when all earlier
+    /// decoder intermediates are dead but before the largest final residual block allocates its
+    /// workspaces. Memory-bounded runtimes can use this boundary to synchronize deferred drops and
+    /// release unused backend allocator pages. Ordinary execution remains
+    /// [`Self::forward_with_group_norm_policy`] and pays no barrier cost.
+    pub fn forward_with_group_norm_policy_and_tail_barrier<E>(
+        &self,
+        input: Tensor<B, 4>,
+        policy: DecoderGroupNormPolicy,
+        tail_barrier: impl FnOnce(&B::Device) -> Result<(), E>,
+    ) -> Result<Tensor<B, 4>, E> {
+        let device = input.device();
+        let barrier_after_block = self
+            .up_blocks
+            .len()
+            .checked_sub(2)
+            .expect("VAE decoder tail barrier requires at least two up blocks");
+        let mut barrier = Some(tail_barrier);
+        let mut hidden = self.conv_in.forward(input);
+        hidden = self
+            .mid_block
+            .forward_with_group_norm_policy(hidden, policy);
+        for (index, block) in self.up_blocks.iter().enumerate() {
+            hidden = block.forward_with_group_norm_policy(hidden, policy);
+            if index == barrier_after_block {
+                barrier.take().expect("tail barrier runs exactly once")(&device)?;
+            }
+        }
+        Ok(self.conv_out.forward(silu(group_norm_with_policy(
+            &self.conv_norm_out,
+            hidden,
+            policy,
+        ))))
+    }
+
     /// Decode with the final full-resolution feature map split into two exact spatial slabs.
     ///
     /// This preserves the ordinary decoder through its global middle attention and every
