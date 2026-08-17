@@ -61,6 +61,76 @@ pub struct VerifiedArtifactBytes {
     verification: Option<VerifiedArtifact>,
 }
 
+/// Incrementally reconstruct one logical artifact while binding its final SHA-256 evidence.
+///
+/// Browser transports use this to hash each already-authenticated physical part while it is hot,
+/// avoiding a second full pass over a 200--256 MiB logical Burnpack after its final part arrives.
+/// The builder still owns only one logical object and exposes no way to forge verification proof.
+pub struct VerifiedArtifactBytesBuilder {
+    bytes: Vec<u8>,
+    verifier: ArtifactVerifier,
+    path: ArtifactPath,
+}
+
+impl VerifiedArtifactBytesBuilder {
+    pub fn new(file: &ArtifactFile) -> Result<Self, ArtifactReadError> {
+        let capacity = usize::try_from(file.size).map_err(|_| {
+            ArtifactReadError::transport(format!(
+                "artifact {} does not fit the process address space",
+                file.path
+            ))
+        })?;
+        Ok(Self {
+            bytes: Vec::with_capacity(capacity),
+            verifier: ArtifactVerifier::new(file, IntegrityPolicy::RequireSha256),
+            path: file.path.clone(),
+        })
+    }
+
+    pub fn extend_from_slice(&mut self, bytes: &[u8]) -> Result<(), ArtifactReadError> {
+        self.verifier
+            .update(bytes)
+            .map_err(|error| ArtifactReadError::Integrity {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn finish(self) -> Result<VerifiedArtifactBytes, (ArtifactReadError, Vec<u8>)> {
+        let Self {
+            bytes,
+            verifier,
+            path,
+        } = self;
+        let verification = match verifier.finish() {
+            Ok(verification) => verification,
+            Err(error) => {
+                return Err((
+                    ArtifactReadError::Integrity {
+                        path,
+                        message: error.to_string(),
+                    },
+                    bytes,
+                ));
+            }
+        };
+        Ok(VerifiedArtifactBytes {
+            bytes,
+            verification: Some(verification),
+        })
+    }
+}
+
 impl VerifiedArtifactBytes {
     /// Wrap bytes that still require SHA-256 verification by the model loader.
     pub fn unverified(bytes: Vec<u8>) -> Self {
@@ -72,7 +142,22 @@ impl VerifiedArtifactBytes {
 
     /// Verify exact size and SHA-256 once and bind that evidence to these bytes.
     pub fn verify_sha256(file: &ArtifactFile, bytes: Vec<u8>) -> Result<Self, ArtifactReadError> {
-        let verification = verify_bytes(file, &bytes)?;
+        Self::try_verify_sha256(file, bytes).map_err(|(error, _bytes)| error)
+    }
+
+    /// Verify exact size and SHA-256 once while returning ownership of a rejected payload.
+    ///
+    /// Cache-backed transports use the returned bytes only to report the observed digest and then
+    /// evict the failed entry. Successful reads retain private evidence exactly like
+    /// [`Self::verify_sha256`], so callers cannot pair proof from one payload with another.
+    pub fn try_verify_sha256(
+        file: &ArtifactFile,
+        bytes: Vec<u8>,
+    ) -> Result<Self, (ArtifactReadError, Vec<u8>)> {
+        let verification = match verify_bytes(file, &bytes) {
+            Ok(verification) => verification,
+            Err(error) => return Err((error, bytes)),
+        };
         Ok(Self {
             bytes,
             verification: Some(verification),
@@ -559,6 +644,29 @@ mod tests {
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
         ])
+    }
+
+    #[test]
+    fn incremental_verified_bytes_bind_exact_logical_digest_correctness() {
+        let payload = b"two authenticated transport parts";
+        let file = file("objects/incremental.bpk", payload);
+        let mut builder = VerifiedArtifactBytesBuilder::new(&file).unwrap();
+        builder.extend_from_slice(&payload[..11]).unwrap();
+        builder.extend_from_slice(&payload[11..]).unwrap();
+        assert_eq!(builder.len(), payload.len());
+        let read = builder.finish().unwrap();
+        assert_eq!(read.into_verified_bytes(&file, file.size).unwrap(), payload);
+
+        let mut corrupt = VerifiedArtifactBytesBuilder::new(&file).unwrap();
+        corrupt
+            .extend_from_slice(b"two authenticated transport partz")
+            .unwrap();
+        let (error, rejected) = match corrupt.finish() {
+            Ok(_) => panic!("corrupt incremental artifact unexpectedly verified"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ArtifactReadError::Integrity { .. }));
+        assert_eq!(rejected, b"two authenticated transport partz");
     }
 
     fn write_transport_bundle(

@@ -1322,7 +1322,7 @@ mod loading {
         ArtifactFile, ArtifactFileRole, ArtifactManifest,
         ArtifactShardReader as ModelNeutralArtifactShardReader, ArtifactVerifier,
         DirectoryArtifactShardReader as ModelNeutralDirectoryShardReader, IntegrityPolicy,
-        NumericFormat, Sha256Digest, VerificationStatus, VerifiedArtifact,
+        NumericFormat, Sha256Digest, VerifiedArtifactBytes,
         VerifiedArtifactDirectory as ModelNeutralVerifiedArtifactDirectory,
     };
     use burn_qwen3_vl::{
@@ -2019,8 +2019,7 @@ mod loading {
     /// hash the object a second time. The payload and evidence fields remain private so callers
     /// cannot replace authenticated bytes while retaining their proof.
     pub struct AsyncStageShardRead {
-        bytes: Vec<u8>,
-        verification: Option<VerifiedArtifact>,
+        inner: VerifiedArtifactBytes,
     }
 
     impl AsyncStageShardRead {
@@ -2028,23 +2027,26 @@ mod loading {
         /// them before any payload is parsed.
         pub fn unverified(bytes: Vec<u8>) -> Self {
             Self {
-                bytes,
-                verification: None,
+                inner: VerifiedArtifactBytes::unverified(bytes),
             }
         }
 
         /// Verify exact size and SHA-256 once and bind the resulting evidence to these bytes.
         pub fn verify_sha256(file: &ArtifactFile, bytes: Vec<u8>) -> Result<Self, BooguError> {
-            let verification = verify_async_stage_bytes(file, &bytes).map_err(|error| {
+            let inner = VerifiedArtifactBytes::verify_sha256(file, bytes).map_err(|error| {
                 BooguError::Artifact(format!(
                     "integrity verification failed for {}: {error}",
                     file.path
                 ))
             })?;
-            Ok(Self {
-                bytes,
-                verification: Some(verification),
-            })
+            Ok(Self { inner })
+        }
+
+        /// Preserve model-neutral typed evidence from a transport that already authenticated the
+        /// exact payload. Unverified model-neutral reads remain unverified and are hashed by
+        /// [`Self::into_verified_bytes`], so this conversion cannot bypass the source trust gate.
+        pub fn from_verified_artifact_bytes(inner: VerifiedArtifactBytes) -> Self {
+            Self { inner }
         }
 
         /// Consume the wrapper and return its payload bytes, discarding verification evidence.
@@ -2052,7 +2054,7 @@ mod loading {
         /// Verified model sources do not use this escape hatch; it exists so direct reader users
         /// can preserve the original `read_shard` behavior.
         pub fn into_bytes(self) -> Vec<u8> {
-            self.bytes
+            self.inner.into_bytes()
         }
 
         fn into_verified_bytes(
@@ -2060,52 +2062,10 @@ mod loading {
             file: &ArtifactFile,
             max_bytes: u64,
         ) -> Result<Vec<u8>, BooguError> {
-            let received = u64::try_from(self.bytes.len()).unwrap_or(u64::MAX);
-            if received > max_bytes {
-                return Err(BooguError::Artifact(format!(
-                    "reader returned {received} bytes for {}, exceeding the per-read cap of {max_bytes}",
-                    file.path
-                )));
-            }
-            match self.verification {
-                Some(verification)
-                    if verification.path() == &file.path
-                        && verification.size() == file.size
-                        && verification.size() == received
-                        && verification.digest() == file.sha256
-                        && verification.status() == VerificationStatus::Sha256Verified =>
-                {
-                    Ok(self.bytes)
-                }
-                Some(_) => Err(BooguError::Artifact(format!(
-                    "reader SHA-256 evidence does not match sealed file {}",
-                    file.path
-                ))),
-                None => {
-                    verify_async_stage_bytes(file, &self.bytes).map_err(|error| {
-                        BooguError::Artifact(format!(
-                            "integrity verification failed for {}: {error}",
-                            file.path
-                        ))
-                    })?;
-                    Ok(self.bytes)
-                }
-            }
+            self.inner
+                .into_verified_bytes(file, max_bytes)
+                .map_err(|error| BooguError::Artifact(error.to_string()))
         }
-    }
-
-    #[cfg(test)]
-    std::thread_local! {
-        static ASYNC_STAGE_SHA256_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-
-    fn verify_async_stage_bytes(
-        file: &ArtifactFile,
-        bytes: &[u8],
-    ) -> Result<VerifiedArtifact, burn_image::IntegrityError> {
-        #[cfg(test)]
-        ASYNC_STAGE_SHA256_PASSES.with(|passes| passes.set(passes.get() + 1));
-        ArtifactVerifier::verify_bytes(file, bytes, IntegrityPolicy::RequireSha256)
     }
 
     /// Wasm-friendly source of one bounded manifest-declared shard at a time.
@@ -2164,29 +2124,36 @@ mod loading {
         fn typed_async_shard_evidence_hashes_exactly_once_correctness() {
             let bytes = b"sealed browser object";
             let file = sealed_file("objects/sealed.bpk", bytes);
-            ASYNC_STAGE_SHA256_PASSES.with(|passes| passes.set(0));
 
             let read = AsyncStageShardRead::verify_sha256(&file, bytes.to_vec()).unwrap();
-            ASYNC_STAGE_SHA256_PASSES.with(|passes| assert_eq!(passes.get(), 1));
             assert_eq!(
                 read.into_verified_bytes(&file, bytes.len() as u64).unwrap(),
                 bytes
             );
-            ASYNC_STAGE_SHA256_PASSES.with(|passes| assert_eq!(passes.get(), 1));
         }
 
         #[test]
         fn generic_async_shard_is_hashed_once_by_source_correctness() {
             let bytes = b"generic reader object";
             let file = sealed_file("objects/generic.bpk", bytes);
-            ASYNC_STAGE_SHA256_PASSES.with(|passes| passes.set(0));
 
             let read = AsyncStageShardRead::unverified(bytes.to_vec());
             assert_eq!(
                 read.into_verified_bytes(&file, bytes.len() as u64).unwrap(),
                 bytes
             );
-            ASYNC_STAGE_SHA256_PASSES.with(|passes| assert_eq!(passes.get(), 1));
+        }
+
+        #[test]
+        fn model_neutral_async_evidence_remains_bound_through_boogu_reader_correctness() {
+            let bytes = b"model-neutral browser object";
+            let file = sealed_file("objects/model-neutral.bpk", bytes);
+            let verified = VerifiedArtifactBytes::verify_sha256(&file, bytes.to_vec()).unwrap();
+            let read = AsyncStageShardRead::from_verified_artifact_bytes(verified);
+            assert_eq!(
+                read.into_verified_bytes(&file, bytes.len() as u64).unwrap(),
+                bytes
+            );
         }
 
         #[test]

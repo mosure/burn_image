@@ -2298,6 +2298,18 @@ fn event_progress_presentation(prefix: &str, progress: &ProgressEvent) -> Progre
     {
         return model_switch_progress_presentation(prefix, encoded);
     }
+    if let ProgressEvent::ArtifactVerified {
+        path,
+        transfer: Some(transfer),
+        ..
+    } = progress
+        && transfer.request_activity.is_none()
+    {
+        let mut presentation = transfer_progress_presentation(prefix, transfer);
+        presentation.headline = format!("{prefix} | Applying verified model stage");
+        presentation.detail = format!("{} | {}", compact_artifact_name(path), presentation.detail);
+        return presentation;
+    }
     if let Some(transfer) = match progress {
         ProgressEvent::ArtifactStarted { transfer, .. }
         | ProgressEvent::ArtifactProgress { transfer, .. }
@@ -3230,6 +3242,38 @@ mod tests {
         assert!(presentation.detail.contains("96.0 MiB/s"));
         assert!(presentation.detail.contains("ETA 3m 12s"));
         assert!(presentation.detail.len() <= 80);
+    }
+
+    #[test]
+    fn verified_browser_object_reports_stage_application_during_upload_pause_correctness() {
+        let transfer = ArtifactTransferProgress {
+            phase: "Loading selected model from persistent cache".into(),
+            component: Some(ArtifactComponentId::new("qwen").unwrap()),
+            logical_objects_completed: 12,
+            logical_objects_total: 186,
+            physical_parts_completed: 120,
+            physical_parts_total: 1_751,
+            bounded_ranges_completed: 120,
+            bounded_ranges_total: 1_751,
+            loaded_bytes: 2 * 1024 * 1024 * 1024,
+            total_bytes: 32 * 1024 * 1024 * 1024,
+            bytes_per_second: None,
+            eta_seconds: None,
+            request_activity: None,
+        };
+        let event = ProgressEvent::ArtifactVerified {
+            run_id: RunId(9),
+            path: ArtifactPath::new("qwen/objects/text-block-3.bpk").unwrap(),
+            transfer: Some(transfer),
+        };
+        let presentation = event_progress_presentation("Model setup", &event);
+        assert_eq!(
+            presentation.headline,
+            "Model setup | Applying verified model stage"
+        );
+        assert_eq!(presentation.fraction, Some(0.0625));
+        assert!(presentation.detail.starts_with("text-block-3.bpk | "));
+        assert!(presentation.detail.contains("120/1751 parts"));
     }
 
     #[test]

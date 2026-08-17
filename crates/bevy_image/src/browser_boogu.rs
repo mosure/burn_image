@@ -2760,6 +2760,19 @@ impl BrowserAsyncSynchronizer {
             ))
         })
     }
+
+    /// Submit queued upload work without waiting for GPU completion.
+    ///
+    /// Resident preload uses this after each semantic stage so browser-native staging buffers do
+    /// not accumulate, while a single component-end asynchronous barrier replaces dozens of
+    /// serial queue waits.
+    fn submit(&self, stage: &str) -> Result<(), BooguError> {
+        self.client.flush().map_err(|error| {
+            BooguError::Artifact(format!(
+                "WebGPU upload submission after {stage} failed: {error}"
+            ))
+        })
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -5547,6 +5560,10 @@ impl BrowserExecutionPolicies {
         self.denoiser_execution_kind == BrowserDenoiserExecutionKind::PackedF16DeviceWidenDenseF32
     }
 
+    fn requires_packed_f16_request_preload(self) -> bool {
+        self.preload_denoiser_before_request && self.uses_packed_f16_denoiser_source()
+    }
+
     fn packed_qwen_instruction_handoff_policy(self) -> &'static str {
         if self.packed_qwen_instruction_handoff {
             BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY
@@ -6513,6 +6530,12 @@ impl BrowserBooguEngine {
         } else {
             None
         };
+        if packed_f16_resource_plan.is_some() != policies.uses_packed_f16_denoiser_source() {
+            return Err(execution_error(
+                variant,
+                "browser packed-F16 plan presence differs from the selected denoiser source",
+            ));
+        }
         let vram_preflight = resident_resource_plan
             .map(|plan| ("resident-dense-f32", plan.conservative_planned_device_bytes))
             .or_else(|| {
@@ -6829,6 +6852,13 @@ impl BrowserBooguEngine {
             .synchronize()
             .await
             .map_err(|error| map_boogu(variant, error))?;
+        BrowserAsyncSynchronizer::new(&self.device)
+            .submit("resident Qwen stage upload")
+            .map_err(|error| map_boogu(variant, error))
+    }
+
+    async fn finish_preloaded_qwen_uploads(&mut self) -> Result<(), RuntimeError> {
+        let variant = self.identity.variant;
         self.qwen
             .source
             .synchronize_pending()
@@ -6843,6 +6873,13 @@ impl BrowserBooguEngine {
             .synchronize()
             .await
             .map_err(|error| map_boogu(variant, error))?;
+        BrowserAsyncSynchronizer::new(&self.device)
+            .submit("resident denoiser stage upload")
+            .map_err(|error| map_boogu(variant, error))
+    }
+
+    async fn finish_preloaded_denoiser_uploads(&mut self) -> Result<(), RuntimeError> {
+        let variant = self.identity.variant;
         self.denoiser
             .source_mut()
             .synchronize_pending()
@@ -6937,6 +6974,7 @@ impl BrowserBooguEngine {
                 .map_err(|error| map_boogu(variant, error))?,
         );
         self.synchronize_preloaded_qwen_stage().await?;
+        self.finish_preloaded_qwen_uploads().await?;
 
         if variant.is_edit() {
             drop(
@@ -7026,6 +7064,7 @@ impl BrowserBooguEngine {
                 .map_err(|error| map_boogu(variant, error))?,
         );
         self.synchronize_preloaded_denoiser_stage().await?;
+        self.finish_preloaded_denoiser_uploads().await?;
         self.validate_resident_caches()
     }
 
@@ -7080,8 +7119,11 @@ impl BrowserBooguEngine {
         Ok(())
     }
 
-    async fn ensure_preloaded_low_vram_denoiser(&mut self) -> Result<(), RuntimeError> {
-        if !self.policies.preload_denoiser_before_request {
+    async fn ensure_preloaded_packed_f16_denoiser(&mut self) -> Result<(), RuntimeError> {
+        // Resident dense-F32 also sets `preload_denoiser_before_request`: its denoiser was loaded
+        // eagerly into the retaining source and has no packed-F16 plan by design. Only the exact
+        // packed source owns the request-scoped cache/rehydration contract below.
+        if !self.policies.requires_packed_f16_request_preload() {
             return Ok(());
         }
         let plan = self.packed_f16_resource_plan.ok_or_else(|| {
@@ -9288,7 +9330,7 @@ impl BrowserBooguEngine {
             },
         );
         check_cancelled(cancellation)?;
-        self.ensure_preloaded_low_vram_denoiser().await?;
+        self.ensure_preloaded_packed_f16_denoiser().await?;
         self.validate_resident_caches()?;
         let buffer_plan = crate::boogu::validate_browser_buffer_limits_for_dimensions(
             job.variant,
@@ -12040,6 +12082,7 @@ mod browser_source_tests {
             "packed-f16-storage/device-widen-f32-per-semantic-stage/dense-f32-matmul"
         );
         assert!(policy.preload_denoiser_before_request);
+        assert!(policy.requires_packed_f16_request_preload());
         assert!(!policy.eager_preload);
         assert!(!policy.defer_retained_denoiser_synchronization);
         assert!(!policy.defer_retained_qwen_synchronization);
@@ -12123,6 +12166,7 @@ mod browser_source_tests {
         assert!(policy.defer_retained_denoiser_synchronization);
         assert!(!policy.release_unused_qwen_memory_after_stage);
         assert!(!policy.uses_packed_f16_denoiser_source());
+        assert!(!policy.requires_packed_f16_request_preload());
         assert!(!policy.request_scoped_surface_acquire_suspended);
         assert!(policy.require_persistent_range_cache);
         assert_eq!(

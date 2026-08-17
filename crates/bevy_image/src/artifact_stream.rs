@@ -14,7 +14,10 @@ use burn_image::{ArtifactComponentId, ArtifactRequestTransferActivity, ArtifactT
 #[cfg(any(test, target_arch = "wasm32"))]
 use burn_image::{ArtifactManifest, ArtifactTransportLayout, MAX_ARTIFACT_TRANSPORT_LAYOUT_BYTES};
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-use burn_image::{ArtifactReadError, AsyncArtifactShardReader, VerifiedArtifactBytes};
+use burn_image::{
+    ArtifactReadError, AsyncArtifactShardReader, VerifiedArtifactBytes,
+    VerifiedArtifactBytesBuilder,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -2084,7 +2087,7 @@ fn validate_browser_transport_part_offset(
     Ok(())
 }
 
-#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+#[cfg(test)]
 fn verify_browser_transport_reconstruction(
     file: &ArtifactFile,
     bytes: &[u8],
@@ -3013,11 +3016,11 @@ impl BrowserStageShardReader {
         }
     }
 
-    async fn fetch_transport_shard_bytes(
+    async fn fetch_transport_shard_read(
         &mut self,
         file: &ArtifactFile,
         object: &ArtifactTransportObject,
-    ) -> Result<Vec<u8>, BooguError> {
+    ) -> Result<VerifiedArtifactBytes, BooguError> {
         if object.path != file.path || object.size != file.size || object.sha256 != file.sha256 {
             return Err(BooguError::Artifact(
                 ArtifactStreamError::BrowserTransportLayout(format!(
@@ -3027,35 +3030,54 @@ impl BrowserStageShardReader {
                 .to_string(),
             ));
         }
-        let capacity = usize::try_from(file.size).map_err(|_| {
-            BooguError::Artifact(format!(
-                "browser stage {} does not fit Wasm address space",
-                file.path
-            ))
-        })?;
-        let mut bytes = Vec::with_capacity(capacity);
+        let mut builder = VerifiedArtifactBytesBuilder::new(file)
+            .map_err(|error| BooguError::Artifact(error.to_string()))?;
         for part in &object.parts {
-            validate_browser_transport_part_offset(file, part, bytes.len())
+            validate_browser_transport_part_offset(file, part, builder.len())
                 .map_err(|error| BooguError::Artifact(error.to_string()))?;
             let part_bytes = self.fetch_verified_transport_part_bytes(file, part).await?;
-            bytes.extend_from_slice(&part_bytes);
+            builder
+                .extend_from_slice(&part_bytes)
+                .map_err(|error| BooguError::Artifact(error.to_string()))?;
         }
-        verify_browser_transport_reconstruction(file, &bytes)
-            .map_err(|error| BooguError::Artifact(error.to_string()))?;
+        let read = match builder.finish() {
+            Ok(read) => read,
+            Err((_error, bytes)) => {
+                let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                if actual_size != file.size {
+                    return Err(BooguError::Artifact(
+                        ArtifactStreamError::BrowserTransportReconstructionSize {
+                            path: file.path.clone(),
+                            expected: file.size,
+                            actual: actual_size,
+                        }
+                        .to_string(),
+                    ));
+                }
+                return Err(BooguError::Artifact(
+                    ArtifactStreamError::BrowserTransportReconstructionIntegrity {
+                        path: file.path.clone(),
+                        expected: file.sha256,
+                        actual: Sha256Digest::calculate(&bytes),
+                    }
+                    .to_string(),
+                ));
+            }
+        };
         // Prior-session Cache Storage hits become continuity-protected only
         // after both the physical-part digests and complete logical artifact
         // digest have passed.
         for part in &object.parts {
             self.protect_verified_transport_part(part)?;
         }
-        Ok(bytes)
+        Ok(read)
     }
 
-    async fn fetch_verified_shard_bytes(
+    async fn fetch_verified_shard_read(
         &mut self,
         file: &ArtifactFile,
         max_bytes: u64,
-    ) -> Result<Vec<u8>, BooguError> {
+    ) -> Result<VerifiedArtifactBytes, BooguError> {
         self.control.check_cancelled()?;
         self.control
             .push(BrowserArtifactEvent::Started(self.progress_file(file)));
@@ -3067,7 +3089,7 @@ impl BrowserStageShardReader {
             )));
         }
         if let Some(object) = self.transport_object_for_file(file)? {
-            return self.fetch_transport_shard_bytes(file, &object).await;
+            return self.fetch_transport_shard_read(file, &object).await;
         }
         let use_complete_file =
             browser_complete_file_transport_required(self.transport_layout.is_some(), file.role);
@@ -3078,8 +3100,11 @@ impl BrowserStageShardReader {
         } else {
             self.fetch_direct_shard_bytes_attempt(file, false).await?
         };
-        let actual = Sha256Digest::calculate(&bytes);
-        if actual == file.sha256 {
+        let (read, actual) = match VerifiedArtifactBytes::try_verify_sha256(file, bytes) {
+            Ok(read) => (Some(read), None),
+            Err((_error, bytes)) => (None, Some((Sha256Digest::calculate(&bytes), bytes))),
+        };
+        if let Some(read) = read {
             self.control
                 .record_transport_part_verified(self.progress_path(&file.path));
             if use_complete_file {
@@ -3087,8 +3112,9 @@ impl BrowserStageShardReader {
             } else {
                 self.protect_verified_object_ranges(&file.path, file.size, file.sha256)?;
             }
-            return Ok(bytes);
+            return Ok(read);
         }
+        let (actual, bytes) = actual.expect("failed verification retains rejected bytes");
 
         // A complete-object digest is the final trust gate. Purge every range
         // for this URL/object identity and permit exactly one cache-bypassing
@@ -3118,24 +3144,27 @@ impl BrowserStageShardReader {
         } else {
             self.fetch_direct_shard_bytes_attempt(file, true).await?
         };
-        let actual = Sha256Digest::calculate(&bytes);
-        if actual != file.sha256 {
-            drop(bytes);
-            if use_complete_file {
-                self.evict_direct_complete_file(file).await?;
-            } else {
-                self.evict_object_ranges(&file.path, file.size, file.sha256)
-                    .await?;
-            }
-            return Err(BooguError::Artifact(
-                ArtifactStreamError::BrowserCacheIntegrityRetryFailed {
-                    path: file.path.clone(),
-                    expected: file.sha256,
-                    actual,
+        let read = match VerifiedArtifactBytes::try_verify_sha256(file, bytes) {
+            Ok(read) => read,
+            Err((_error, bytes)) => {
+                let actual = Sha256Digest::calculate(&bytes);
+                drop(bytes);
+                if use_complete_file {
+                    self.evict_direct_complete_file(file).await?;
+                } else {
+                    self.evict_object_ranges(&file.path, file.size, file.sha256)
+                        .await?;
                 }
-                .to_string(),
-            ));
-        }
+                return Err(BooguError::Artifact(
+                    ArtifactStreamError::BrowserCacheIntegrityRetryFailed {
+                        path: file.path.clone(),
+                        expected: file.sha256,
+                        actual,
+                    }
+                    .to_string(),
+                ));
+            }
+        };
         self.control
             .record_transport_part_verified(self.progress_path(&file.path));
         if use_complete_file {
@@ -3143,7 +3172,7 @@ impl BrowserStageShardReader {
         } else {
             self.protect_verified_object_ranges(&file.path, file.size, file.sha256)?;
         }
-        Ok(bytes)
+        Ok(read)
     }
 
     fn protect_verified_object_ranges(
@@ -3190,8 +3219,9 @@ impl AsyncStageShardReader for BrowserStageShardReader {
         file: &ArtifactFile,
         max_bytes: u64,
     ) -> Result<AsyncStageShardRead, BooguError> {
-        let bytes = self.fetch_verified_shard_bytes(file, max_bytes).await?;
-        let read = AsyncStageShardRead::verify_sha256(file, bytes)?;
+        let read = AsyncStageShardRead::from_verified_artifact_bytes(
+            self.fetch_verified_shard_read(file, max_bytes).await?,
+        );
         self.control.push(BrowserArtifactEvent::Verified(
             self.progress_path(&file.path),
         ));
@@ -3219,11 +3249,10 @@ impl AsyncArtifactShardReader for BrowserStageShardReader {
         file: &ArtifactFile,
         maximum_bytes: u64,
     ) -> Result<VerifiedArtifactBytes, ArtifactReadError> {
-        let bytes = self
-            .fetch_verified_shard_bytes(file, maximum_bytes)
+        let read = self
+            .fetch_verified_shard_read(file, maximum_bytes)
             .await
             .map_err(|error| ArtifactReadError::transport(error.to_string()))?;
-        let read = VerifiedArtifactBytes::verify_sha256(file, bytes)?;
         self.control.push(BrowserArtifactEvent::Verified(
             self.progress_path(&file.path),
         ));
