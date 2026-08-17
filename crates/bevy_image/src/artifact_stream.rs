@@ -49,16 +49,22 @@ pub const BROWSER_ARTIFACT_RANGE_CACHE_NAME: &str = "burn-image-artifact-ranges-
 /// response and one bounded Wasm copy replace five serial 4 MiB range/cache
 /// operations without retaining more than one physical part at a time.
 pub const BROWSER_ARTIFACT_PART_CACHE_NAME: &str = "burn-image-artifact-parts-v2";
+/// Free origin quota retained beyond the exact missing model payload. Cache Storage bookkeeping,
+/// compact runtime metadata, and one corrupt-part replacement must not turn an admitted model
+/// load into a late quota failure.
+pub const BROWSER_PERSISTENT_CACHE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+const BROWSER_PERSISTENT_CACHE_OVERHEAD_DIVISOR: u64 = 100;
 /// Hard ceiling for one semantic Burnpack object retained in Wasm linear memory.
 pub const MAX_BROWSER_STAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Bootstrap metadata must remain small enough to fetch before the sealed manifest is known.
 pub const MAX_BROWSER_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Browser artifact-cache contract. Disabled preserves single-pass readers
-/// such as exact 1.5K parity; required mode is for policies that deliberately
-/// read the same immutable object more than once and must not fall back to
-/// repeated network transfer. Canonical layouts cache complete transport parts;
-/// legacy direct Burnpacks retain fixed-size range entries.
+/// Browser artifact-cache contract. Disabled preserves isolated qualification readers such as
+/// exact 1.5K parity. Required mode is used by every ordinary interactive policy so immutable
+/// objects survive reloads and release switches without depending on the opportunistic HTTP
+/// cache; it also prevents repeated network transfer within one session. Canonical layouts cache
+/// complete transport parts, while legacy direct Burnpacks retain fixed-size range entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BrowserRangeCachePolicy {
@@ -246,6 +252,28 @@ pub enum ArtifactStreamError {
         expected: Sha256Digest,
         actual: Sha256Digest,
     },
+    #[error("browser persistent-storage operation {operation} failed: {message}")]
+    BrowserStorageOperation {
+        operation: &'static str,
+        message: String,
+    },
+    #[error("browser storage estimate omitted or returned invalid {field}: {actual:?}")]
+    BrowserStorageEstimate {
+        field: &'static str,
+        actual: Option<String>,
+    },
+    #[error(
+        "browser origin has {available_bytes} available storage bytes, but the selected model still needs {missing_bytes} cache bytes plus {reserve_bytes} bytes of safety reserve ({cached_entries}/{total_entries} exact cache entries already present); free origin storage or clear unrelated site data before retrying"
+    )]
+    BrowserStorageQuotaInsufficient {
+        available_bytes: u64,
+        missing_bytes: u64,
+        reserve_bytes: u64,
+        cached_entries: u64,
+        total_entries: u64,
+    },
+    #[error("browser persistent-cache plan is invalid: {0}")]
+    BrowserPersistentCachePlan(String),
     #[error("browser range fetch returned HTTP {status} for {url}; expected 206")]
     BrowserHttpStatus { status: u16, url: String },
     #[error("browser complete-object fetch returned HTTP {status} for {url}; expected 200")]
@@ -439,6 +467,81 @@ fn browser_part_cache_key(url: &str, object_digest: Sha256Digest, object_size: u
     )
 }
 
+/// Exact Cache Storage objects required by one selected browser model closure.
+///
+/// Cache names remain part of the identity because canonical complete transport parts and legacy
+/// fixed ranges use intentionally different response representations.
+#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BrowserPersistentCachePlan {
+    entries: BTreeMap<&'static str, BTreeMap<String, u64>>,
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+impl BrowserPersistentCachePlan {
+    fn register(
+        &mut self,
+        cache: &'static str,
+        key: String,
+        size: u64,
+    ) -> Result<(), ArtifactStreamError> {
+        if size == 0 {
+            return Err(ArtifactStreamError::BrowserPersistentCachePlan(format!(
+                "cache {cache} contains zero-byte entry {key}"
+            )));
+        }
+        match self.entries.entry(cache).or_default().entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(size);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == size => Ok(()),
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                Err(ArtifactStreamError::BrowserPersistentCachePlan(format!(
+                    "cache {cache} entry has conflicting sizes {} and {size}",
+                    entry.get()
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn entry_count(&self) -> u64 {
+        self.entries
+            .values()
+            .map(|entries| entries.len() as u64)
+            .sum()
+    }
+
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.entries
+            .values()
+            .flat_map(|entries| entries.values())
+            .copied()
+            .sum()
+    }
+}
+
+/// Result of checking exact selected-model keys against origin Cache Storage and quota.
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BrowserPersistentCachePreflight {
+    pub(crate) total_entries: u64,
+    pub(crate) cached_entries: u64,
+    pub(crate) missing_entries: u64,
+    pub(crate) missing_bytes: u64,
+    pub(crate) storage_available_bytes: u64,
+    pub(crate) persistent_storage_granted: bool,
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+fn browser_persistent_cache_reserve(missing_bytes: u64) -> u64 {
+    if missing_bytes == 0 {
+        return 0;
+    }
+    BROWSER_PERSISTENT_CACHE_RESERVE_BYTES
+        .saturating_add(missing_bytes / BROWSER_PERSISTENT_CACHE_OVERHEAD_DIVISOR)
+}
+
 #[cfg(any(all(target_arch = "wasm32", feature = "boogu-web"), test))]
 fn browser_complete_file_transport_required(
     has_transport_layout: bool,
@@ -563,6 +666,185 @@ async fn browser_cache_delete(
     value
         .as_bool()
         .ok_or_else(|| browser_cache_operation_error(cache_name, "delete result conversion", value))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+async fn browser_cache_keys(
+    cache: &web_sys::Cache,
+    cache_name: &'static str,
+) -> Result<BTreeSet<String>, ArtifactStreamError> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let value = JsFuture::from(cache.keys())
+        .await
+        .map_err(|value| browser_cache_operation_error(cache_name, "list keys", value))?;
+    let requests = value.dyn_into::<js_sys::Array>().map_err(|value| {
+        browser_cache_operation_error(cache_name, "keys result conversion", value)
+    })?;
+    requests
+        .iter()
+        .map(|value| {
+            value
+                .dyn_into::<web_sys::Request>()
+                .map(|request| request.url())
+                .map_err(|value| {
+                    browser_cache_operation_error(cache_name, "key request conversion", value)
+                })
+        })
+        .collect()
+}
+
+#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+fn browser_storage_estimate_bytes(
+    field: &'static str,
+    value: Option<f64>,
+) -> Result<u64, ArtifactStreamError> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    let Some(value) = value else {
+        return Err(ArtifactStreamError::BrowserStorageEstimate {
+            field,
+            actual: None,
+        });
+    };
+    if !value.is_finite() || !(0.0..=MAX_SAFE_INTEGER).contains(&value) {
+        return Err(ArtifactStreamError::BrowserStorageEstimate {
+            field,
+            actual: Some(value.to_string()),
+        });
+    }
+    Ok(value.floor() as u64)
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+fn browser_storage_operation_error(
+    operation: &'static str,
+    value: wasm_bindgen::JsValue,
+) -> ArtifactStreamError {
+    ArtifactStreamError::BrowserStorageOperation {
+        operation,
+        message: browser_js_message(value),
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+async fn request_browser_persistent_storage(
+    storage: &web_sys::StorageManager,
+) -> Result<bool, ArtifactStreamError> {
+    use wasm_bindgen_futures::JsFuture;
+
+    let persisted = JsFuture::from(
+        storage
+            .persisted()
+            .map_err(|value| browser_storage_operation_error("query persistence", value))?,
+    )
+    .await
+    .map_err(|value| browser_storage_operation_error("query persistence", value))?
+    .as_bool()
+    .ok_or_else(|| ArtifactStreamError::BrowserStorageOperation {
+        operation: "query persistence",
+        message: "StorageManager.persisted() returned a non-boolean value".into(),
+    })?;
+    if persisted {
+        return Ok(true);
+    }
+    JsFuture::from(
+        storage
+            .persist()
+            .map_err(|value| browser_storage_operation_error("request persistence", value))?,
+    )
+    .await
+    .map_err(|value| browser_storage_operation_error("request persistence", value))?
+    .as_bool()
+    .ok_or_else(|| ArtifactStreamError::BrowserStorageOperation {
+        operation: "request persistence",
+        message: "StorageManager.persist() returned a non-boolean value".into(),
+    })
+}
+
+/// Fail before downloading model weights when this origin cannot hold the exact missing cache
+/// closure. Existing entries are recognized by the same URL/digest/size keys used by reads.
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+pub(crate) async fn preflight_browser_persistent_cache(
+    plan: &BrowserPersistentCachePlan,
+) -> Result<BrowserPersistentCachePreflight, ArtifactStreamError> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+
+    let total_entries = plan.entry_count();
+    let total_bytes = plan.total_bytes();
+    if total_entries == 0 || total_bytes == 0 {
+        return Err(ArtifactStreamError::BrowserPersistentCachePlan(
+            "selected model produced an empty cache closure".into(),
+        ));
+    }
+
+    let mut cached_entries = 0_u64;
+    let mut cached_bytes = 0_u64;
+    for (cache_name, expected) in &plan.entries {
+        let cache = open_browser_artifact_cache(cache_name).await?;
+        let present = browser_cache_keys(&cache, cache_name).await?;
+        for (key, size) in expected {
+            if present.contains(key) {
+                cached_entries = cached_entries.saturating_add(1);
+                cached_bytes = cached_bytes.saturating_add(*size);
+            }
+        }
+    }
+    let missing_entries = total_entries.saturating_sub(cached_entries);
+    let missing_bytes = total_bytes.saturating_sub(cached_bytes);
+    let reserve_bytes = browser_persistent_cache_reserve(missing_bytes);
+    let required_available = missing_bytes.checked_add(reserve_bytes).ok_or_else(|| {
+        ArtifactStreamError::BrowserPersistentCachePlan(
+            "selected model cache byte requirement overflowed u64".into(),
+        )
+    })?;
+
+    let window = web_sys::window().ok_or(ArtifactStreamError::BrowserWindowUnavailable)?;
+    let storage = window.navigator().storage();
+    let estimate_value = JsFuture::from(
+        storage
+            .estimate()
+            .map_err(|value| browser_storage_operation_error("estimate quota", value))?,
+    )
+    .await
+    .map_err(|value| browser_storage_operation_error("estimate quota", value))?;
+    let estimate = estimate_value
+        .dyn_into::<web_sys::StorageEstimate>()
+        .map_err(|value| browser_storage_operation_error("estimate conversion", value))?;
+    let storage_usage_bytes = browser_storage_estimate_bytes("usage", estimate.get_usage())?;
+    let storage_quota_bytes = browser_storage_estimate_bytes("quota", estimate.get_quota())?;
+    let storage_available_bytes = storage_quota_bytes.saturating_sub(storage_usage_bytes);
+    if storage_available_bytes < required_available {
+        return Err(ArtifactStreamError::BrowserStorageQuotaInsufficient {
+            available_bytes: storage_available_bytes,
+            missing_bytes,
+            reserve_bytes,
+            cached_entries,
+            total_entries,
+        });
+    }
+
+    let persistent_storage_granted = match request_browser_persistent_storage(&storage).await {
+        Ok(granted) => granted,
+        Err(error) => {
+            web_sys::console::warn_1(
+                &format!(
+                    "burn_image could not request eviction-resistant origin storage; the verified Cache Storage entries remain best-effort: {error}"
+                )
+                .into(),
+            );
+            false
+        }
+    };
+    Ok(BrowserPersistentCachePreflight {
+        total_entries,
+        cached_entries,
+        missing_entries,
+        missing_bytes,
+        storage_available_bytes,
+        persistent_storage_granted,
+    })
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
@@ -2017,6 +2299,94 @@ impl BrowserStageShardReader {
         )
     }
 
+    /// Add only this reader's active logical weights to the selected-model cache preflight.
+    /// Shared physical parts deduplicate by their exact synthetic Cache Storage key.
+    pub(crate) fn extend_persistent_cache_plan(
+        &self,
+        manifest: &ArtifactManifest,
+        active: &BTreeSet<ArtifactPath>,
+        plan: &mut BrowserPersistentCachePlan,
+    ) -> Result<(), BooguError> {
+        if self.cache_policy != BrowserRangeCachePolicy::Required {
+            return Err(BooguError::Artifact(
+                "cannot preflight a browser reader whose persistent cache policy is disabled"
+                    .into(),
+            ));
+        }
+        let base_url = match &self.source {
+            ArtifactSource::Remote { base_url } => base_url,
+            ArtifactSource::LocalDirectory { .. } => {
+                return Err(BooguError::Artifact(
+                    ArtifactStreamError::LocalBrowserSource.to_string(),
+                ));
+            }
+        };
+        for file in manifest
+            .files
+            .iter()
+            .filter(|file| file.role == ArtifactFileRole::Weights)
+        {
+            if !active.contains(&self.progress_path(&file.path)) {
+                continue;
+            }
+            if let Some(layout) = &self.transport_layout {
+                let object = layout.object(&file.path).ok_or_else(|| {
+                    BooguError::Artifact(
+                        ArtifactStreamError::BrowserTransportObjectMissing {
+                            path: file.path.clone(),
+                        }
+                        .to_string(),
+                    )
+                })?;
+                for part in &object.parts {
+                    let url = base_url.resolve(&part.path);
+                    plan.register(
+                        BROWSER_ARTIFACT_PART_CACHE_NAME,
+                        browser_part_cache_key(&url, part.sha256, part.size),
+                        part.size,
+                    )
+                    .map_err(|error| BooguError::Artifact(error.to_string()))?;
+                }
+                continue;
+            }
+
+            let chunk_bytes = self
+                .config
+                .max_chunk_bytes()
+                .min(MAX_BROWSER_CACHE_CHUNK_BYTES);
+            let url = base_url.resolve(&file.path);
+            let mut offset = 0_u64;
+            while offset < file.size {
+                let length = browser_cache_chunk_length(file.size - offset, chunk_bytes);
+                let range = ByteRange::new(offset, length).map_err(|error| {
+                    BooguError::Artifact(format!(
+                        "invalid legacy cache range for {}: {error}",
+                        file.path
+                    ))
+                })?;
+                let request = BrowserRangeRequest {
+                    path: file.path.clone(),
+                    url: url.clone(),
+                    range,
+                    range_header: range.http_range_header(),
+                };
+                plan.register(
+                    BROWSER_ARTIFACT_RANGE_CACHE_NAME,
+                    browser_range_cache_key(&request, file.sha256),
+                    length,
+                )
+                .map_err(|error| BooguError::Artifact(error.to_string()))?;
+                offset = offset.checked_add(length).ok_or_else(|| {
+                    BooguError::Artifact(format!(
+                        "legacy cache plan offset overflowed for {}",
+                        file.path
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     async fn range_cache(&mut self) -> Result<web_sys::Cache, BooguError> {
         if let Some(cache) = &self.range_cache {
             return Ok(cache.clone());
@@ -3269,6 +3639,61 @@ mod tests {
             key,
             browser_range_cache_key(&other_url, Sha256Digest::calculate(b"replacement object"))
         );
+    }
+
+    #[test]
+    fn persistent_cache_plan_deduplicates_and_reserves_headroom_correctness() {
+        let mut plan = BrowserPersistentCachePlan::default();
+        plan.register(
+            BROWSER_ARTIFACT_PART_CACHE_NAME,
+            "https://burn-image.invalid/part/a".into(),
+            20,
+        )
+        .unwrap();
+        plan.register(
+            BROWSER_ARTIFACT_PART_CACHE_NAME,
+            "https://burn-image.invalid/part/a".into(),
+            20,
+        )
+        .unwrap();
+        plan.register(
+            BROWSER_ARTIFACT_PART_CACHE_NAME,
+            "https://burn-image.invalid/part/b".into(),
+            10,
+        )
+        .unwrap();
+        assert_eq!(plan.entry_count(), 2);
+        assert_eq!(plan.total_bytes(), 30);
+        assert_eq!(browser_persistent_cache_reserve(0), 0);
+        assert_eq!(
+            browser_persistent_cache_reserve(1_000),
+            BROWSER_PERSISTENT_CACHE_RESERVE_BYTES + 10
+        );
+        let error = plan
+            .register(
+                BROWSER_ARTIFACT_PART_CACHE_NAME,
+                "https://burn-image.invalid/part/a".into(),
+                21,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactStreamError::BrowserPersistentCachePlan(_)
+        ));
+    }
+
+    #[test]
+    fn storage_estimate_requires_finite_safe_nonnegative_bytes_correctness() {
+        assert_eq!(
+            browser_storage_estimate_bytes("quota", Some(12_345.75)).unwrap(),
+            12_345
+        );
+        for value in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert!(matches!(
+                browser_storage_estimate_bytes("quota", value),
+                Err(ArtifactStreamError::BrowserStorageEstimate { field: "quota", .. })
+            ));
+        }
     }
 
     #[test]

@@ -230,7 +230,11 @@ hit its effective quota despite reporting free blocks. This is quota-aware admis
 For local browser builds and GitHub Pages deployment, see the [web guide](docs/web.md). The same
 Bevy UI used natively reports the current component, aggregate part transfer, verification, and
 inference stage so a large model load does not look frozen; there is no separate browser overlay.
-Before the ordinary page requests weight parts, it also commits and
+Every ordinary browser model policy stores the selected executable closure under exact
+URL/digest/size Cache Storage keys. Startup counts existing keys, checks origin quota for only the
+missing bytes plus reserve, and requests eviction-resistant storage when available. Browser caches
+are origin-scoped, so localhost and the GitHub Pages app do not share downloaded models. Before the
+ordinary page requests weight parts, it also commits and
 releases the selected policy's conservative GPU-memory plan on the exact shared Bevy/Burn WebGPU
 device; failure stops before the large CDN transfer rather than treating API buffer limits as VRAM.
 

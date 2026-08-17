@@ -69,8 +69,9 @@ use crate::{
     ImageRunnerEvent, WgpuExecutionKind,
     artifact_stream::{
         ArtifactStreamConfig, BrowserArtifactControl, BrowserArtifactEvent,
-        BrowserArtifactTrafficSnapshot, BrowserStageShardReader, MAX_BROWSER_MANIFEST_BYTES,
-        artifact_progress_position, fetch_browser_bounded_file, sibling_bundle_base_url,
+        BrowserArtifactTrafficSnapshot, BrowserPersistentCachePlan, BrowserStageShardReader,
+        MAX_BROWSER_MANIFEST_BYTES, artifact_progress_position, fetch_browser_bounded_file,
+        preflight_browser_persistent_cache, sibling_bundle_base_url,
     },
     browser_parity_fixture::{
         BrowserParityFixture, BrowserParityFixtureIdentity, BrowserParityVerificationSnapshot,
@@ -5645,8 +5646,11 @@ impl BrowserExecutionPolicies {
     }
 
     fn for_ordinary_browser_factory(mut self, surface_gate_requested: bool) -> Self {
-        self.require_persistent_range_cache =
-            self.residency == BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser;
+        // Every interactive browser policy must make the selected model's immutable transport
+        // parts explicit Cache Storage entries. Relying on the HTTP cache made resident and Edit
+        // sessions re-download large closures after reloads or model switches. Qualification
+        // policies do not call this factory adapter and retain their exact traffic contracts.
+        self.require_persistent_range_cache = true;
         // Ordinary browser sessions keep the Bevy surface alive so progress, errors, and controls
         // behave exactly like native. Rendered qualification can opt into the strict camera gate
         // explicitly and retains its acquisition/restore evidence contract.
@@ -6329,6 +6333,66 @@ impl BrowserBooguEngine {
             })?;
             validate_browser_turbo_active_transfer_plan(&active_plan)
                 .map_err(|error| execution_error(variant, error))?;
+        }
+        if policies.require_persistent_range_cache {
+            let mut cache_plan = BrowserPersistentCachePlan::default();
+            reader
+                .extend_persistent_cache_plan(
+                    &composition.pipeline_manifest,
+                    &active_transfer_objects,
+                    &mut cache_plan,
+                )
+                .map_err(|error| execution_error(variant, error))?;
+            qwen_reader
+                .extend_persistent_cache_plan(
+                    &composition.qwen_manifest,
+                    &active_transfer_objects,
+                    &mut cache_plan,
+                )
+                .map_err(|error| execution_error(variant, error))?;
+            vae_reader
+                .extend_persistent_cache_plan(
+                    &composition.vae_manifest,
+                    &active_transfer_objects,
+                    &mut cache_plan,
+                )
+                .map_err(|error| execution_error(variant, error))?;
+            let transfer_plan = bootstrap_control
+                .transfer_progress()
+                .ok_or_else(|| execution_error(variant, "selected model transfer plan is empty"))?;
+            let cache_shape = (cache_plan.entry_count(), cache_plan.total_bytes());
+            let transfer_shape = (
+                transfer_plan.bounded_ranges_total,
+                transfer_plan.total_bytes,
+            );
+            if cache_shape != transfer_shape {
+                return Err(execution_error(
+                    variant,
+                    format!(
+                        "selected model cache plan {cache_shape:?} differs from transfer plan {transfer_shape:?}"
+                    ),
+                ));
+            }
+            let cache = preflight_browser_persistent_cache(&cache_plan)
+                .await
+                .map_err(|error| execution_error(variant, error))?;
+            let persistence = if cache.persistent_storage_granted {
+                "persistent"
+            } else {
+                "best effort"
+            };
+            set_browser_factory_progress(format!(
+                "Selected-model cache: {}/{} exact keys present; {} to store; {} free ({persistence})",
+                cache.cached_entries,
+                cache.total_entries,
+                format_transfer_bytes(cache.missing_bytes),
+                format_transfer_bytes(cache.storage_available_bytes),
+            ));
+            bootstrap_control.set_transfer_phase(if cache.missing_entries == 0 {
+                "Loading selected model from persistent cache"
+            } else {
+                "Downloading selected model into persistent cache"
+            });
         }
         let qwen_config_bytes = read_manifest_file(
             &mut qwen_reader,
@@ -11992,6 +12056,7 @@ mod browser_source_tests {
             BROWSER_PACKED_F16_QWEN_HANDOFF_POLICY
         );
         assert!(!policy.request_scoped_surface_acquire_suspended);
+        assert!(!policy.require_persistent_range_cache);
         assert!(
             !policy
                 .provenance_backend()
@@ -12059,6 +12124,7 @@ mod browser_source_tests {
         assert!(!policy.release_unused_qwen_memory_after_stage);
         assert!(!policy.uses_packed_f16_denoiser_source());
         assert!(!policy.request_scoped_surface_acquire_suspended);
+        assert!(policy.require_persistent_range_cache);
         assert_eq!(
             policy.weight_traffic_contract(),
             "eager-preload/qwen+vae+denoiser/zero-inference-artifact-transfers"
@@ -12975,11 +13041,11 @@ mod browser_source_tests {
             "per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4"
         );
         let ordinary = policy.for_ordinary_browser_factory(true);
-        assert!(!ordinary.require_persistent_range_cache);
+        assert!(ordinary.require_persistent_range_cache);
         assert!(ordinary.request_scoped_surface_acquire_suspended);
         assert_eq!(
             ordinary.weight_traffic_contract(),
-            policy.weight_traffic_contract()
+            "persistent-part-cache+legacy-range-cache/qwen+vae+denoiser-first-request/zero-repeat-network-required/retained-q8-direct-matmul-denoiser-cache-hits-dmd-steps-2-through-4"
         );
 
         let exact = BrowserExecutionPolicies::exact_1k5_low_vram_parity(&settings).unwrap();

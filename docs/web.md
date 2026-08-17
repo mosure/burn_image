@@ -104,6 +104,15 @@ runtime-Q8/F32 denoiser for four DMD passes, while Turbo initially preloads 46 p
 widens one dense-F32 semantic stage at a time during DMD, and evicts the packed cache before VAE
 decode. The ordinary persistent cache stores complete, independently authenticated physical parts
 no larger than 20,971,520 bytes; it never stores a complete 256 MiB semantic object or bundle.
+Every ordinary Generate/Edit/1.5K policy uses this explicit Cache Storage path; exact qualification
+routes retain their separately pinned traffic policies. Before weight transfer, the app compares
+the selected variant's active URL/digest/size keys with existing entries, queries origin storage
+quota, and admits only the missing bytes plus bounded overhead. It requests eviction-resistant
+storage when the browser permits it and clearly labels a denied request as best-effort instead of
+pretending the entries cannot be evicted. Cache Storage is origin-scoped: a model cached by a
+localhost build is not visible to `https://mosure.github.io`, and clearing that site's data removes
+its model cache. Only the selected model's executable closure is admitted; switching releases does
+not prefetch all parent pipelines, while shared Qwen/VAE URLs reuse their existing exact entries.
 
 With `artifacts` omitted, that selection resolves exactly to
 `https://aberration.technology/model/boogu-image-0.1-turbo`.

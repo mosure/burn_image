@@ -360,7 +360,9 @@ fn report_browser_turbo_first_dmd_terminal_failure(window: &web_sys::Window, err
 /// remain streamed. Edit variants retain a request-scoped, all-eligible runtime-Q8 denoiser and use
 /// direct quantized matmul. Both policies have conservative sub-32-GB
 /// resource plans and exact per-request cache/network traffic reports. Ordinary Turbo UI loading
-/// requires the integrity-checked persistent range cache.
+/// and both Edit variants require the integrity-checked persistent object cache. Startup compares
+/// the selected executable closure with exact existing Cache Storage keys and fails before model
+/// transfer when origin quota cannot hold the missing bytes plus safety reserve.
 /// `headless=parity&residency=low-vram` replays the low-VRAM policy against the exact
 /// authenticated 1.5K fixture. Exact F32 fixture replay uses
 /// `headless=parity&residency=qualification-f32`: Qwen/VAE are streamed per request and only the
@@ -1143,6 +1145,43 @@ mod web_shell_tests {
                 "canonical Turbo active transfer contract omits {required}"
             );
         }
+    }
+
+    #[test]
+    fn ordinary_browser_cache_is_selected_model_scoped_and_quota_preflighted_correctness() {
+        let stream = include_str!("artifact_stream.rs");
+        let runtime = include_str!("browser_boogu.rs");
+        for required in [
+            "self.require_persistent_range_cache = true",
+            "BrowserPersistentCachePlan",
+            "extend_persistent_cache_plan",
+            "active_transfer_objects",
+            "cache.keys()",
+            "window.navigator().storage()",
+            ".estimate()",
+            ".persisted()",
+            ".persist()",
+            "BrowserStorageQuotaInsufficient",
+            "selected model cache plan {cache_shape:?} differs from transfer plan {transfer_shape:?}",
+            "Loading selected model from persistent cache",
+            "Downloading selected model into persistent cache",
+        ] {
+            assert!(
+                stream.contains(required) || runtime.contains(required),
+                "ordinary browser persistent-cache contract omits {required}"
+            );
+        }
+        let build = runtime
+            .split_once("let mut cache_plan = BrowserPersistentCachePlan::default()")
+            .expect("browser runtime omits selected-model cache preflight")
+            .1;
+        assert!(
+            build
+                .find("preflight_browser_persistent_cache(&cache_plan)")
+                .unwrap()
+                < build.find("let qwen_config_bytes =").unwrap(),
+            "browser runtime reads model files before persistent-cache admission"
+        );
     }
 
     #[test]
