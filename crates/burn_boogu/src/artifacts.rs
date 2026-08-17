@@ -8516,6 +8516,11 @@ mod tests {
         inventory_file.sha256 = Sha256Digest::calculate(&bytes);
         manifest.content_digest = None;
         manifest.seal().unwrap();
+        std::fs::write(
+            directory.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
 
         let mut reader = DirectoryStageShardReader::new(directory.path());
         let entries = loading::verify_inventory_contract(
