@@ -72,6 +72,10 @@ pub const APP_NAME: &str = "burn image";
 
 /// Internal stage prefix used to carry native model-switch setup detail through the existing
 /// model-neutral progress channel without presenting the encoded stage name to users.
+#[cfg(any(
+    feature = "app",
+    all(feature = "boogu-native", not(target_arch = "wasm32"))
+))]
 pub(crate) const MODEL_SWITCH_PROGRESS_STAGE_PREFIX: &str = "model-switch-progress:";
 
 /// Preferred user-facing selector for the parity-qualified mixed-F16 storage profile.
