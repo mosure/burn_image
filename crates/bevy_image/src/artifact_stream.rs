@@ -728,6 +728,16 @@ fn browser_storage_operation_error(
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+fn browser_storage_estimate_field(
+    estimate: &wasm_bindgen::JsValue,
+    field: &'static str,
+) -> Result<u64, ArtifactStreamError> {
+    let value = js_sys::Reflect::get(estimate, &wasm_bindgen::JsValue::from_str(field))
+        .map_err(|value| browser_storage_operation_error("read estimate field", value))?;
+    browser_storage_estimate_bytes(field, value.as_f64())
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
 async fn request_browser_persistent_storage(
     storage: &web_sys::StorageManager,
 ) -> Result<bool, ArtifactStreamError> {
@@ -768,7 +778,6 @@ async fn request_browser_persistent_storage(
 pub(crate) async fn preflight_browser_persistent_cache(
     plan: &BrowserPersistentCachePlan,
 ) -> Result<BrowserPersistentCachePreflight, ArtifactStreamError> {
-    use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
     let total_entries = plan.entry_count();
@@ -809,11 +818,12 @@ pub(crate) async fn preflight_browser_persistent_cache(
     )
     .await
     .map_err(|value| browser_storage_operation_error("estimate quota", value))?;
-    let estimate = estimate_value
-        .dyn_into::<web_sys::StorageEstimate>()
-        .map_err(|value| browser_storage_operation_error("estimate conversion", value))?;
-    let storage_usage_bytes = browser_storage_estimate_bytes("usage", estimate.get_usage())?;
-    let storage_quota_bytes = browser_storage_estimate_bytes("quota", estimate.get_quota())?;
+    // `StorageEstimate` is a WebIDL dictionary returned as a plain JavaScript object, not a
+    // constructible browser class. A checked `JsCast::dyn_into` therefore rejects valid Chrome
+    // results. Read its numeric dictionary fields directly and retain the finite/safe-integer
+    // validation before converting them to Rust byte counts.
+    let storage_usage_bytes = browser_storage_estimate_field(&estimate_value, "usage")?;
+    let storage_quota_bytes = browser_storage_estimate_field(&estimate_value, "quota")?;
     let storage_available_bytes = storage_quota_bytes.saturating_sub(storage_usage_bytes);
     if storage_available_bytes < required_available {
         return Err(ArtifactStreamError::BrowserStorageQuotaInsufficient {
@@ -3688,7 +3698,21 @@ mod tests {
             browser_storage_estimate_bytes("quota", Some(12_345.75)).unwrap(),
             12_345
         );
-        for value in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+        assert_eq!(
+            browser_storage_estimate_bytes("quota", Some(50_481_610_932.0)).unwrap(),
+            50_481_610_932
+        );
+        assert_eq!(
+            browser_storage_estimate_bytes("usage", Some(39_744_192_692.0)).unwrap(),
+            39_744_192_692
+        );
+        for value in [
+            None,
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(9_007_199_254_740_992.0),
+        ] {
             assert!(matches!(
                 browser_storage_estimate_bytes("quota", value),
                 Err(ArtifactStreamError::BrowserStorageEstimate { field: "quota", .. })

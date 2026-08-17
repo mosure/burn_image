@@ -1159,6 +1159,8 @@ mod web_shell_tests {
             "cache.keys()",
             "window.navigator().storage()",
             ".estimate()",
+            "browser_storage_estimate_field",
+            "js_sys::Reflect::get",
             ".persisted()",
             ".persist()",
             "BrowserStorageQuotaInsufficient",
@@ -1171,6 +1173,10 @@ mod web_shell_tests {
                 "ordinary browser persistent-cache contract omits {required}"
             );
         }
+        assert!(
+            !stream.contains("dyn_into::<web_sys::StorageEstimate>()"),
+            "WebIDL StorageEstimate dictionaries must not use a checked JavaScript class cast"
+        );
         let build = runtime
             .split_once("let mut cache_plan = BrowserPersistentCachePlan::default()")
             .expect("browser runtime omits selected-model cache preflight")
