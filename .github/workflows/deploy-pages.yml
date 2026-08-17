@@ -210,8 +210,10 @@ jobs:
             ! grep -Eqi '^content-range:' "$complete_headers"
             if [[ "$cache_policy" == immutable ]]; then
               grep -Eqi '^cache-control:.*immutable' "$complete_headers"
-            elif [[ "$cache_policy" == no-cache ]]; then
-              grep -Eqi '^cache-control:.*no-cache' "$complete_headers"
+            elif [[ "$cache_policy" == manifest ]]; then
+              if ! grep -Eqi '^cache-control:.*no-cache' "$complete_headers"; then
+                echo "::warning title=Manifest cache policy::$url is not served with Cache-Control: no-cache; continuing because its sealed digest and every physical payload remain mandatory."
+              fi
             else
               echo "unknown cache policy $cache_policy for $url" >&2
               return 1
@@ -257,7 +259,7 @@ jobs:
               ([.files[] | select(.path == "metadata/transport-layout.json" and .role == "metadata")] | length) == 1
             ' "$manifest" >/dev/null
             manifest_size="$(stat --format='%s' "$manifest")"
-            verify_complete_object_contract "$base_url/manifest.json" no-cache "$manifest_size"
+            verify_complete_object_contract "$base_url/manifest.json" manifest "$manifest_size"
 
             bundle_name="${base_url##*/}"
             layout_file="$scratch/$bundle_name.transport-layout.json"

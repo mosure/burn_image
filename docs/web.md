@@ -64,7 +64,9 @@ repository variable `BURN_IMAGE_PAGES_READY=true` is set. Before setting it, pub
 canonical CDN entries and enable Pages with **GitHub Actions** as its source. The deploy job probes
 all five manifests, every directly stored non-weight payload, and every sealed-layout physical part
 as exact HTTP 200 complete objects with canonical `Content-Length`, absent-or-identity
-`Content-Encoding`, cross-origin readability, manifest `no-cache`, and payload `immutable` caching.
+`Content-Encoding`, cross-origin readability, and payload `immutable` caching. A manifest that is
+not served with the recommended `no-cache` policy emits a deployment warning rather than bypassing
+the mandatory sealed-digest and payload checks.
 It authenticates the sidecar and its complete logical reconstruction contract
 instead of requesting absent logical Burnpack URLs. A missing/private entry or incomplete CDN
 header policy therefore blocks deployment instead of publishing a page that cannot load its model.
@@ -73,9 +75,9 @@ The expected project URL is
 
 As of 2026-08-16 the canonical model URLs are public. A real-browser transport probe authenticated
 the Turbo/Qwen/VAE manifests and layouts, verified cold whole-part downloads, and resumed from warm
-CacheStorage. Pages remains fail-closed because the public CDN currently marks reusable manifest
-URLs `immutable` instead of the required `no-cache`; this transport probe is not a full generation
-or numerical-parity claim.
+CacheStorage. Pages warns because the public CDN marks reusable manifest URLs `immutable` instead
+of the recommended `no-cache`; sealed-digest and physical-payload failures remain blocking. This
+transport probe is not a full generation or numerical-parity claim.
 
 On Linux, the browser harnesses do not choose shared-memory backing from nominal free blocks alone.
 They use BigInt `statfs` arithmetic and a real bounded 256 MiB write/`fsync`/delete probe to catch

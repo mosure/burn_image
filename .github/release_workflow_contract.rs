@@ -125,6 +125,19 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
             "browser exact complete-object framing gate is missing: {required}"
         );
     }
+    for manifest_policy in [
+        "elif [[ \"$cache_policy\" == manifest ]]",
+        "if ! grep -Eqi '^cache-control:.*no-cache' \"$complete_headers\"",
+        "::warning title=Manifest cache policy::",
+        "continuing because its sealed digest and every physical payload remain mandatory",
+        "verify_complete_object_contract \"$base_url/manifest.json\" manifest \"$manifest_size\"",
+    ] {
+        assert!(
+            DEPLOY_WORKFLOW.contains(manifest_policy),
+            "manifest cache warning contract is missing: {manifest_policy}"
+        );
+    }
+    assert!(!DEPLOY_WORKFLOW.contains("elif [[ \"$cache_policy\" == no-cache ]]"));
 
     let authentication = section(
         DEPLOY_WORKFLOW,

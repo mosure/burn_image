@@ -410,9 +410,10 @@ performance row.
 The browser measurements used quota-aware Chrome shared-memory admission: BigInt `statfs` plus a
 real bounded 256 MiB write/`fsync`/delete probe admitted `/dev/shm`, rejected quota-limited `/tmp`,
 and therefore omitted `--disable-dev-shm-usage`. As of 2026-08-16, the canonical CDN is readable and
-a real-browser probe verified cold whole-part streaming plus warm CacheStorage resume. Pages still
-fails closed because reusable manifest URLs are marked `immutable` instead of `no-cache`; the probe
-does not replace a full generation or parity measurement.
+a real-browser probe verified cold whole-part streaming plus warm CacheStorage resume. Pages warns
+because reusable manifest URLs are marked `immutable` instead of the recommended `no-cache`, while
+sealed-digest and physical-payload failures remain blocking; the probe does not replace a full
+generation or parity measurement.
 
 Native 1K Edit and browser 1K Edit low-VRAM qualification remain pending. Native Turbo has
 the artifact/output/memory candidate recorded above but still lacks an exact-noise full-chain

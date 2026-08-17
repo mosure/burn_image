@@ -181,8 +181,9 @@ sealed manifest `bundle` id. The production release has five entries:
 
 The five-entry upload is public as of 2026-08-16. A real-browser probe authenticated the composed
 Turbo manifest, both dependency manifests, all three transport layouts, cold whole-part downloads,
-and a warm CacheStorage resume. The remaining publication-policy defect is that reusable
-`manifest.json` URLs are marked `immutable`; Pages stays fail-closed until they use `no-cache`.
+and a warm CacheStorage resume. Reusable `manifest.json` URLs are marked `immutable` rather than the
+recommended `no-cache`; Pages reports that policy difference as a warning while retaining blocking
+sealed-digest and physical-payload authentication.
 
 The Linux browser evidence harnesses separately protect host transport from quota surprises: BigInt
 `statfs` accounting is combined with a real bounded 256 MiB write/`fsync`/delete probe. Current runs

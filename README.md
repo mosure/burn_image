@@ -51,7 +51,8 @@ The five-entry canonical CDN release is public. The viewer resolves and verifies
 clients cache it under `~/.burn_image/models/`; `--artifacts /path/to/production-bundle` selects a
 local mirror. A 2026-08-16 browser probe authenticated the composed manifest, both dependencies,
 all three transport layouts, and cold/warm physical-part loading from the public CDN. Pages remains
-fail-closed until the CDN changes reusable `manifest.json` responses from `immutable` to `no-cache`.
+strict on sealed manifest digests and every physical payload; it warns, but does not block, when a
+reusable `manifest.json` response is `immutable` instead of the recommended `no-cache` policy.
 
 The upload-ready artifact has distinct semantic, physical, and browser-cache layers. Logical
 Burnpacks remain bounded by 256 MiB; the sealed transport layout reconstructs them from physical

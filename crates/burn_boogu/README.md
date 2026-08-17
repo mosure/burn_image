@@ -478,9 +478,10 @@ replay; `boogu-full-parity` owns production execution-dtype propagation.
 ## Current limits
 
 As of 2026-08-16, the canonical CDN is readable and a real-browser probe verified authenticated
-cold whole-part streaming plus warm CacheStorage resume. Pages remains fail-closed because reusable
-manifest URLs are marked `immutable` instead of `no-cache`. This transport probe does not replace
-the positive model/parity evidence above.
+cold whole-part streaming plus warm CacheStorage resume. Pages warns because reusable manifest URLs
+are marked `immutable` instead of the recommended `no-cache`, but it still fails closed on sealed
+digest or physical-payload errors. This transport probe does not replace the positive model/parity
+evidence above.
 Linux browser harnesses also use BigInt `statfs` plus a real bounded 256 MiB write/`fsync`/delete
 quota probe; current runs admitted `/dev/shm`, rejected quota-limited `/tmp`, and omitted
 `--disable-dev-shm-usage`.

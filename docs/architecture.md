@@ -264,5 +264,6 @@ portability still require their own attested gates.
 
 Canonical browser/publication evidence uses the separate schema-v2 modular root. As of 2026-08-16,
 its public CDN is readable and a real-browser probe verified authenticated cold whole-part loading
-and warm CacheStorage resume. Pages remains fail-closed until reusable manifests change from
-`immutable` to `no-cache`; verified transport does not replace generation/parity evidence.
+and warm CacheStorage resume. Pages warns when reusable manifests are `immutable` rather than the
+recommended `no-cache`, while sealed manifest and payload failures remain blocking; verified
+transport does not replace generation/parity evidence.

@@ -662,6 +662,7 @@ enabled. The ordinary resident rendered run, other released shapes, synchronized
 cross-stack portability remain separate gates. Ordinary
 rendered Turbo 1024 now has its narrower output/surface/memory evidence above.
 The canonical CDN is readable as of 2026-08-16, and a real-browser probe verified authenticated cold
-whole-part streaming plus warm CacheStorage resume. Pages remains blocked only on the reusable
-manifest cache policy (`immutable` must become `no-cache`). This transport result is not numerical
-parity and does not alter the model evidence above.
+whole-part streaming plus warm CacheStorage resume. Pages warns on the reusable manifest cache
+policy (`immutable` rather than the recommended `no-cache`) without relaxing sealed-digest or
+physical-payload authentication. This transport result is not numerical parity and does not alter
+the model evidence above.

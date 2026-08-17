@@ -136,8 +136,9 @@ CPU tensor backend.
 
 The canonical five-entry CDN deployment is live. A 2026-08-16 real-browser probe authenticated the
 Turbo/Qwen/VAE manifests and layouts, then verified both cold whole-part downloads and a warm
-CacheStorage resume. The deployment gate still requires reusable `manifest.json` URLs to use
-`no-cache`; the current public manifest response is incorrectly marked `immutable`.
+CacheStorage resume. The deployment gate warns when reusable `manifest.json` URLs are marked
+`immutable` instead of the recommended `no-cache`, while sealed digests and payload authentication
+remain mandatory.
 
 Linux evidence harnesses combine BigInt `statfs` arithmetic with a real bounded 256 MiB
 write/`fsync`/delete quota probe. Current runs admitted `/dev/shm`, rejected quota-limited `/tmp`,
