@@ -1,11 +1,47 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
+#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+use bevy::render::renderer::RenderQueue;
 #[cfg(feature = "gpu-interop")]
 use bevy::render::{
     RenderApp,
     renderer::{RenderAdapterInfo, RenderDevice},
 };
+
+/// Cloneable access to the exact Bevy WGPU device and queue shared with Burn.
+///
+/// The browser runtime uses this only for its fail-fast allocation preflight. Keeping these
+/// handles explicit prevents the probe from requesting a second adapter/device and makes the
+/// capacity check exercise the same WebGPU allocation domain that will execute the model.
+#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+#[derive(Resource, Clone)]
+pub(crate) struct SharedWgpuAllocationDevice {
+    device: RenderDevice,
+    queue: RenderQueue,
+}
+
+#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+impl std::fmt::Debug for SharedWgpuAllocationDevice {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedWgpuAllocationDevice")
+    }
+}
+
+#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+impl SharedWgpuAllocationDevice {
+    pub(crate) fn new(device: RenderDevice, queue: RenderQueue) -> Self {
+        Self { device, queue }
+    }
+
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        self.device.wgpu_device()
+    }
+
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+}
 
 /// Burn backend initialized from Bevy's existing WGPU objects.
 #[cfg(feature = "gpu-interop")]
@@ -20,6 +56,7 @@ pub enum BackendFailure {
     RenderSubAppMissing,
     RenderAdapterMissing,
     RenderDeviceMissing,
+    RenderQueueMissing,
     BurnDeviceMissing,
     BurnDeviceLost,
     CpuAdapterRejected,
@@ -39,6 +76,7 @@ impl std::fmt::Display for BackendFailure {
                 formatter.write_str("Bevy did not expose a render adapter")
             }
             Self::RenderDeviceMissing => formatter.write_str("Bevy did not expose a render device"),
+            Self::RenderQueueMissing => formatter.write_str("Bevy did not expose a render queue"),
             Self::BurnDeviceMissing => {
                 formatter.write_str("Burn was not initialized from Bevy's WGPU device")
             }
@@ -164,6 +202,14 @@ fn finish_shared_backend(app: &mut App) {
         app.insert_resource(BackendStatus::failed(BackendFailure::RenderDeviceMissing));
         return;
     };
+    #[cfg(target_arch = "wasm32")]
+    let allocation_device = {
+        let Some(render_queue) = render_app.world().get_resource::<RenderQueue>() else {
+            app.insert_resource(BackendStatus::failed(BackendFailure::RenderQueueMissing));
+            return;
+        };
+        SharedWgpuAllocationDevice::new(render_device.clone(), render_queue.clone())
+    };
     let limits = render_device.limits();
     let info = BackendDeviceInfo {
         adapter_name: adapter.name.clone(),
@@ -179,6 +225,8 @@ fn finish_shared_backend(app: &mut App) {
         .get_resource::<bevy_burn::BurnDevice>()
         .is_some_and(bevy_burn::BurnDevice::is_ready);
     if burn_ready {
+        #[cfg(target_arch = "wasm32")]
+        app.insert_resource(allocation_device);
         app.insert_resource(BackendStatus::ready(info));
     } else {
         app.insert_resource(BackendStatus::failed(BackendFailure::BurnDeviceMissing));

@@ -170,6 +170,24 @@ fn parse_browser_residency(value: Option<&str>) -> Result<BrowserResidencySelect
     all(test, feature = "boogu"),
     all(feature = "boogu-web", target_arch = "wasm32")
 ))]
+fn resolve_browser_residency(
+    value: Option<&str>,
+    headless: Option<BrowserHeadlessMode>,
+) -> Result<BrowserResidencySelector, String> {
+    if value.is_none() && headless.is_none() {
+        // The interactive default prioritizes warm-session throughput. Its mandatory shared-device
+        // allocation preflight fails before model-weight download on devices that cannot admit the
+        // resident plan; `residency=low-vram` remains the explicit bounded-memory alternative.
+        Ok(BrowserResidencySelector::Resident)
+    } else {
+        parse_browser_residency(value)
+    }
+}
+
+#[cfg(any(
+    all(test, feature = "boogu"),
+    all(feature = "boogu-web", target_arch = "wasm32")
+))]
 fn parse_browser_headless_mode(value: Option<&str>) -> Result<Option<BrowserHeadlessMode>, String> {
     match value {
         None => Ok(None),
@@ -331,8 +349,11 @@ fn report_browser_turbo_first_dmd_terminal_failure(window: &web_sys::Window, err
 /// base URL.
 /// When `artifacts` is omitted, the app uses the exact manifest bundle id beneath
 /// `https://aberration.technology/model/`. The default is Turbo with
-/// `profile=production` and `residency=low-vram`; the legacy
-/// `f16-qwen-vision-f32` profile selector remains accepted. The default low-VRAM production path
+/// `profile=production` and warm `residency=resident`; the legacy
+/// `f16-qwen-vision-f32` profile selector remains accepted. The interactive default authenticates,
+/// materializes, and retains the selected request graph before reporting ready, so later requests
+/// reuse the device-resident pipeline. Its mandatory shared-device VRAM preflight fails before
+/// weight download when the conservative plan cannot be committed. Explicit `residency=low-vram`
 /// verifies the complete manifest closure before reporting ready. Turbo preloads a
 /// complete authenticated packed-F16 denoiser and materializes exactly one semantic stage to F32
 /// at a time; this is storage compression, not on-device quantized execution. Qwen and VAE stages
@@ -340,8 +361,7 @@ fn report_browser_turbo_first_dmd_terminal_failure(window: &web_sys::Window, err
 /// direct quantized matmul. Both policies have conservative sub-32-GB
 /// resource plans and exact per-request cache/network traffic reports. Ordinary Turbo UI loading
 /// requires the integrity-checked persistent range cache.
-/// Explicit `residency=resident` instead materializes and retains the exact request graph on WebGPU
-/// before reporting ready. `headless=parity&residency=low-vram` replays the low-VRAM policy against the exact
+/// `headless=parity&residency=low-vram` replays the low-VRAM policy against the exact
 /// authenticated 1.5K fixture. Exact F32 fixture replay uses
 /// `headless=parity&residency=qualification-f32`: Qwen/VAE are streamed per request and only the
 /// F32 denoiser is retained through the four DMD steps, so its evidence does not claim all-stage
@@ -370,7 +390,7 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
     let configuration = (|| {
         let headless = parse_browser_headless_mode(params.get("headless").as_deref())
             .map_err(|error| JsValue::from_str(&error))?;
-        let residency = parse_browser_residency(params.get("residency").as_deref())
+        let residency = resolve_browser_residency(params.get("residency").as_deref(), headless)
             .map_err(|error| JsValue::from_str(&error))?;
         if residency == BrowserResidencySelector::LayerStreamedDiagnostic
             && params.get("artifacts").is_none()
@@ -920,9 +940,18 @@ mod web_shell_tests {
 
     #[cfg(feature = "boogu")]
     #[test]
-    fn browser_residency_defaults_to_low_vram_and_streaming_is_explicit_correctness() {
+    fn browser_interactive_residency_defaults_warm_and_diagnostics_stay_bounded_correctness() {
         assert_eq!(
             super::parse_browser_residency(None).unwrap(),
+            super::BrowserResidencySelector::LowVram
+        );
+        assert_eq!(
+            super::resolve_browser_residency(None, None).unwrap(),
+            super::BrowserResidencySelector::Resident
+        );
+        assert_eq!(
+            super::resolve_browser_residency(None, Some(super::BrowserHeadlessMode::Bootstrap))
+                .unwrap(),
             super::BrowserResidencySelector::LowVram
         );
         assert_eq!(
@@ -1007,109 +1036,93 @@ mod web_shell_tests {
     }
 
     #[test]
-    fn web_shell_exposes_streaming_progress_contract_correctness() {
+    fn web_shell_uses_bevy_as_its_only_visible_interface_correctness() {
         let html = include_str!("../www/index.html");
         for required in [
-            "id=\"model-loader\"",
-            "id=\"artifact-progress\"",
-            "aria-live=\"polite\"",
-            "burn-image-runtime",
-            "burn-image-progress",
-            "verifiedObjects",
-            "transferredBytes",
-            "Reload runtime",
+            "id=\"status\" aria-hidden=\"true\"",
             "id=\"burn-image-reference-input\"",
+            "id=\"burn-image\"",
             ".JPG",
             "HEIC/HEIF decoding is not available in this build",
-            "id=\"model-release\"",
-            "id=\"model-release-note\"",
-            "configureModelReleaseSelector",
-            "./model_selector.mjs",
             "rel=\"icon\"",
             "./out/burn-image-icon.png",
+            "provide_reference_image_error",
+            "reportReferenceError",
             "loadReferenceFile",
             "MAX_REFERENCE_BYTES",
-            "failRun",
+            "await init()",
+            "The visible interface is exclusively Bevy on every platform",
         ] {
             assert!(html.contains(required), "web shell omits {required}");
         }
-        assert!(
-            html.contains("Verified CDN parts are cached and applied to WebGPU stage by stage")
-        );
-        assert!(html.contains("case \"low_vram_resource_plan\""));
-        assert!(html.contains("case \"artifact_traffic\""));
-        assert!(html.contains("persistent-cache hits"));
-        assert!(html.contains("conservative WebGPU plan (not measured)"));
-        for aggregate_progress_contract in [
-            "detail.transfer",
-            "request_activity",
-            "Applying verified cached model stages",
-            "logical_objects_completed",
-            "physical_parts_completed",
-            "requestActivity.bounded_ranges_processed",
-            "physical_parts_total",
-            "panel.hidden = true",
-            "burn-image-backend",
-            "handleBackendEvent",
-            "overlayHandoffBlocked",
-            "backendReady",
-            "surfaceInferenceSuspended",
-            "hideLoaderPanelIfSafe",
-            "Rendered Bevy surface paused for exclusive model work",
-            "blockOverlayHandoff();",
+        for forbidden in [
+            "id=\"model-loader\"",
+            "id=\"artifact-progress\"",
+            "loader-panel",
+            "burn-image-runtime",
+            "burn-image-progress",
+            "configureModelReleaseSelector",
+            "./model_selector.mjs",
+            "surface_inference_suspended",
+            "requestAnimationFrame",
         ] {
             assert!(
-                html.contains(aggregate_progress_contract),
-                "web shell omits aggregate progress behavior {aggregate_progress_contract}"
+                !html.contains(forbidden),
+                "web shell retains fragmented browser UI behavior {forbidden}"
             );
         }
         assert!(
-            !html.contains("shard ${"),
-            "web shell must not present stage-local semantic file counts as transfer shards"
+            html.contains("#status,\n      #burn-image-reference-input"),
+            "the headless status terminal and browser picker must remain nonvisual"
         );
-        assert!(
-            !html.contains("requestAnimationFrame(() => requestAnimationFrame(resolve))"),
-            "web shell must not hide the bootstrap overlay on an arbitrary frame delay"
-        );
+    }
+
+    #[test]
+    fn browser_transport_uses_native_async_part_hashing_correctness() {
+        let source = include_str!("artifact_stream.rs");
+        let runtime = include_str!("browser_boogu.rs");
+        for required in [
+            "verify_browser_transport_part_bytes_async",
+            "digest_with_str_and_u8_array(\"SHA-256\", bytes)",
+            "wasm_bindgen_futures::JsFuture::from(promise)",
+            "verify_browser_transport_reconstruction(file, &bytes)",
+            "fn browser_dom_event_stream_requested()",
+            "if !browser_dom_event_stream_requested()",
+            "Interactive progress goes directly to ImageRunnerEvent/Bevy",
+        ] {
+            assert!(
+                source.contains(required) || runtime.contains(required),
+                "browser cache path omits {required}"
+            );
+        }
         assert_eq!(
-            html.matches("panel.hidden = true").count(),
-            1,
-            "one guarded helper must own every overlay handoff to Bevy"
+            source
+                .matches("verify_browser_transport_part_bytes_async(part, &bytes).await")
+                .count(),
+            2,
+            "cache hit and one integrity refetch must share the native async part verifier"
         );
-        let backend_listener = html
-            .find("window.addEventListener(\"burn-image-backend\", handleBackendEvent)")
-            .expect("web shell omits backend event listener");
-        let wasm_init = html
-            .find("await init()")
-            .expect("web shell omits Wasm init");
+    }
+
+    #[test]
+    fn browser_model_switching_is_owned_by_the_bevy_selector_correctness() {
+        let runtime = include_str!("browser_boogu.rs");
+        let controls = include_str!("controls.rs");
+        for required in [
+            "fn browser_release_switching_enabled()",
+            "!params.has(\"artifacts\") && !params.has(\"headless\")",
+            "pub(crate) fn request_browser_model_release(",
+            ".assign(&url.href())",
+            "the previous browser model is unloading",
+        ] {
+            assert!(
+                runtime.contains(required) || controls.contains(required),
+                "Bevy-owned browser model switching omits {required}"
+            );
+        }
         assert!(
-            backend_listener < wasm_init,
-            "backend listener must be installed before Wasm can dispatch readiness"
-        );
-        let suspended = html
-            .find("case \"surface_inference_suspended\"")
-            .expect("web shell omits surface suspension handling");
-        let resumed = html
-            .find("case \"surface_inference_resumed\"")
-            .expect("web shell omits surface resume handling");
-        assert!(
-            html[suspended..resumed].contains("revealLoaderPanel();"),
-            "surface suspension must reveal the DOM fallback while Bevy cannot render"
-        );
-        let resumed_case = &html[resumed..];
-        assert!(
-            resumed_case.contains("hideLoaderPanelIfSafe();"),
-            "surface resume must return progress ownership to Bevy"
-        );
-        let reference_error = html
-            .split("const showReferenceError")
-            .nth(1)
-            .and_then(|section| section.split("const supportedReferenceFile").next())
-            .expect("web shell omits bounded reference error handling");
-        assert!(reference_error.contains("revealLoaderPanel();"));
-        assert!(
-            !reference_error.contains("blockOverlayHandoff();"),
-            "a corrected reference selection must be able to hand progress back to Bevy"
+            !include_str!("../www/index.html").contains("model-release"),
+            "the browser shell must not reintroduce a second model selector"
         );
     }
 
@@ -1130,6 +1143,67 @@ mod web_shell_tests {
                 "canonical Turbo active transfer contract omits {required}"
             );
         }
+    }
+
+    #[test]
+    fn browser_vram_preflight_precedes_weight_stage_loading_correctness() {
+        let source = include_str!("browser_boogu.rs");
+        for required in [
+            "run_browser_vram_preflight(",
+            "create_buffer(&wgpu::BufferDescriptor",
+            "encoder.clear_buffer(&buffer, 0, None)",
+            "queue.on_submitted_work_done",
+            "BROWSER_VRAM_PREFLIGHT_TIMEOUT_MS",
+            "buffer.destroy()",
+            "failed before model-weight download",
+            "shared_device_and_queue: true",
+        ] {
+            assert!(
+                source.contains(required),
+                "browser VRAM preflight contract omits {required}"
+            );
+        }
+        let build = source
+            .split_once("let vram_preflight =")
+            .expect("browser engine omits model-specific VRAM admission")
+            .1;
+        let preflight = build
+            .find("run_browser_vram_preflight(")
+            .expect("browser engine omits the allocation preflight call");
+        for weight_loader in [
+            "VerifiedAsyncPackedF16DenoiserStageSource::new(",
+            "VerifiedAsyncBurnpackDenoiserStageSource::new(",
+        ] {
+            let loader = build
+                .find(weight_loader)
+                .unwrap_or_else(|| panic!("browser engine omits {weight_loader}"));
+            assert!(
+                preflight < loader,
+                "browser engine can construct {weight_loader} before GPU memory admission"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_resident_requests_remain_warm_without_artifact_io_correctness() {
+        let source = include_str!("browser_boogu.rs");
+        for required in [
+            "policies.retain_qwen_stages = true",
+            "policies.retain_vae_stages = true",
+            "policies.retain_denoiser_stages = true",
+            "policies.eager_preload = true",
+            "eager-preload/qwen+vae+denoiser/zero-inference-artifact-transfers",
+            "resident browser request performed artifact I/O after its eager preload",
+        ] {
+            assert!(
+                source.contains(required),
+                "browser resident warm-session contract omits {required}"
+            );
+        }
+        assert!(
+            source.matches("self.validate_resident_caches()?;").count() >= 2,
+            "resident caches must be validated both before and after inference"
+        );
     }
 
     #[test]

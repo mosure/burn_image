@@ -498,6 +498,8 @@ jobs:
           grep -Eq '^export function start_boogu_web\(\)' "$www_out/bevy_burn_image.js"
           grep -Eq '^export function provide_reference_image\(bytes\)' \
             "$www_out/bevy_burn_image.js"
+          grep -Eq '^export function provide_reference_image_error\(message\)' \
+            "$www_out/bevy_burn_image.js"
           grep -Fq 'wasm.__wbindgen_start()' "$www_out/bevy_burn_image.js"
           sha256sum \
             "$www_out/bevy_burn_image.js" \

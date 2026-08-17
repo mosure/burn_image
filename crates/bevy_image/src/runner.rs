@@ -5,8 +5,8 @@ use std::{
 
 use bevy::prelude::*;
 use burn_image::{
-    CancellationToken, ImageOutput, ImageRequest, ModelDescriptor, ModelId, ProgressEvent,
-    RuntimeError,
+    ArtifactTransferProgress, CancellationToken, ImageOutput, ImageRequest, ModelDescriptor,
+    ModelId, ProgressEvent, RuntimeError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +84,21 @@ pub enum ImageRunnerState {
 #[derive(Resource, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageRunnerStatus {
     pub state: ImageRunnerState,
+}
+
+/// Model-transfer state captured at the moment a runtime begins accepting requests.
+///
+/// A staged browser runtime can be request-ready after its eager GPU preload while some selected
+/// model stages remain in the authenticated CDN/Cache Storage closure. Keeping that distinction
+/// outside [`ImageRunnerState`] lets request validation stay binary while the UI presents one
+/// continuous transfer instead of falsely claiming that the complete model is loaded.
+#[derive(Resource, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImageRunnerReadiness {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<ArtifactTransferProgress>,
+    /// True only when reusable selected-model stages remain device-resident between requests.
+    #[serde(default)]
+    pub selected_model_device_resident: bool,
 }
 
 impl Default for ImageRunnerStatus {
@@ -217,6 +232,7 @@ impl<R: ImageRunner> Plugin for ImageRunnerPlugin<R> {
             });
 
         app.insert_resource(status)
+            .init_resource::<ImageRunnerReadiness>()
             .insert_resource(InstalledImageRunner(Box::new(runner)))
             .init_resource::<ActiveRunnerJobs>()
             .add_systems(

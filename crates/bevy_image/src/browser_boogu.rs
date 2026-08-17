@@ -9,7 +9,7 @@
 use std::{
     collections::VecDeque,
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use burn::{
@@ -501,6 +501,16 @@ enum BrowserRuntimeEvent {
     Preparing {
         message: String,
     },
+    VramPreflight {
+        status: &'static str,
+        model: String,
+        policy: &'static str,
+        required_device_bytes: u64,
+        allocation_count: usize,
+        largest_allocation_bytes: u64,
+        allocations_committed: bool,
+        shared_device_and_queue: bool,
+    },
     ManifestVerified {
         bundle: String,
         weight_objects: u32,
@@ -608,6 +618,10 @@ enum BrowserRuntimeEvent {
     },
     Ready {
         model: String,
+        request_enabled: bool,
+        selected_model_cache_complete: bool,
+        selected_model_device_resident: bool,
+        transfer: Option<burn_image::ArtifactTransferProgress>,
         block0_execution_mode: &'static str,
         qwen_text_layer_allocation_policy: &'static str,
         qwen_text_block_load_synchronization_policy: &'static str,
@@ -2162,6 +2176,164 @@ fn browser_resident_artifact_required(variant: BooguVariant, component: Option<&
         && !component.starts_with("boogu-reference-refiner-")
 }
 
+const BROWSER_VRAM_PREFLIGHT_TIMEOUT_MS: i32 = 45_000;
+
+async fn browser_vram_preflight_timeout() {
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen_futures::JsFuture;
+
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        let result = web_sys::window()
+            .ok_or_else(|| JsValue::from_str("Window is unavailable"))
+            .and_then(|window| {
+                window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    &resolve,
+                    BROWSER_VRAM_PREFLIGHT_TIMEOUT_MS,
+                )
+            });
+        if let Err(error) = result {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+        }
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+async fn run_browser_vram_preflight(
+    variant: BooguVariant,
+    policy: &'static str,
+    required_device_bytes: u64,
+    applied_max_buffer_size: u64,
+    allocation_device: &crate::backend::SharedWgpuAllocationDevice,
+) -> Result<(), RuntimeError> {
+    use futures::future::{Either, select};
+
+    let chunks =
+        crate::boogu::browser_vram_preflight_chunks(required_device_bytes, applied_max_buffer_size)
+            .map_err(|error| execution_error(variant, error))?;
+    let largest_allocation_bytes = chunks.iter().copied().max().unwrap_or_default();
+    let model = boogu_model_descriptor(variant).id.to_string();
+    report_browser_runtime_preparing(format!(
+        "GPU memory preflight: committing {:.1} GiB for {model} before downloading model weights",
+        required_device_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    ));
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::VramPreflight {
+            status: "started",
+            model: model.clone(),
+            policy,
+            required_device_bytes,
+            allocation_count: chunks.len(),
+            largest_allocation_bytes,
+            allocations_committed: false,
+            shared_device_and_queue: true,
+        },
+    );
+
+    let device = allocation_device.device();
+    let queue = allocation_device.queue();
+    let out_of_memory_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal_scope = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("burn-image-browser-vram-preflight"),
+    });
+    let buffers = chunks
+        .iter()
+        .map(|&size| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("burn-image-browser-vram-preflight-reservation"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            // Creation alone may be lazy. Clearing every retained buffer makes the browser submit
+            // real writes against the complete simultaneous residency before any weight part is
+            // requested.
+            encoder.clear_buffer(&buffer, 0, None);
+            buffer
+        })
+        .collect::<Vec<_>>();
+    queue.submit([encoder.finish()]);
+
+    let (completed_tx, completed_rx) = futures::channel::oneshot::channel();
+    queue.on_submitted_work_done(move || {
+        let _ = completed_tx.send(());
+    });
+    let work = async move {
+        let (completion, validation, internal, out_of_memory) = futures::join!(
+            completed_rx,
+            validation_scope.pop(),
+            internal_scope.pop(),
+            out_of_memory_scope.pop(),
+        );
+        completion.map_err(|_| "the WebGPU queue dropped its preflight completion".to_owned())?;
+        for (kind, error) in [
+            ("validation", validation),
+            ("internal", internal),
+            ("out-of-memory", out_of_memory),
+        ] {
+            if let Some(error) = error {
+                return Err(format!("WebGPU {kind} error: {error}"));
+            }
+        }
+        Ok::<(), String>(())
+    };
+    futures::pin_mut!(work);
+    let timeout = browser_vram_preflight_timeout();
+    futures::pin_mut!(timeout);
+    let result = match select(work, timeout).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err(format!(
+            "WebGPU did not commit the preflight allocations within {} seconds",
+            BROWSER_VRAM_PREFLIGHT_TIMEOUT_MS / 1_000
+        )),
+    };
+    for buffer in &buffers {
+        buffer.destroy();
+    }
+    if let Err(error) = result {
+        dispatch_browser_event(
+            BROWSER_RUNTIME_EVENT_NAME,
+            &BrowserRuntimeEvent::VramPreflight {
+                status: "failed",
+                model: model.clone(),
+                policy,
+                required_device_bytes,
+                allocation_count: chunks.len(),
+                largest_allocation_bytes,
+                allocations_committed: false,
+                shared_device_and_queue: true,
+            },
+        );
+        return Err(execution_error(
+            variant,
+            format!(
+                "GPU memory preflight failed before model-weight download: could not commit {required_device_bytes} bytes on the shared WebGPU device ({error})"
+            ),
+        ));
+    }
+
+    dispatch_browser_event(
+        BROWSER_RUNTIME_EVENT_NAME,
+        &BrowserRuntimeEvent::VramPreflight {
+            status: "passed",
+            model,
+            policy,
+            required_device_bytes,
+            allocation_count: chunks.len(),
+            largest_allocation_bytes,
+            allocations_committed: true,
+            shared_device_and_queue: true,
+        },
+    );
+    report_browser_runtime_preparing(format!(
+        "GPU memory preflight passed at {:.1} GiB; starting verified model download",
+        required_device_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    ));
+    Ok(())
+}
+
 pub(crate) fn report_browser_runtime_preparing(message: impl Into<String>) {
     let message = message.into();
     set_browser_factory_progress(message.clone());
@@ -2211,14 +2383,27 @@ fn report_browser_manifest_verified(manifest: &ArtifactManifest) {
 
 fn report_browser_runtime_ready(
     variant: BooguVariant,
+    selected_model_device_resident: bool,
+    transfer: Option<burn_image::ArtifactTransferProgress>,
     qwen_text_layer_allocation_policy: &'static str,
     qwen_text_block_load_synchronization_policy: &'static str,
     qwen_text_layer_submission_policy: &'static str,
 ) {
+    let selected_model_cache_complete = transfer.as_ref().is_some_and(|progress| {
+        progress.total_bytes > 0
+            && progress.loaded_bytes == progress.total_bytes
+            && progress.logical_objects_completed == progress.logical_objects_total
+            && progress.physical_parts_completed == progress.physical_parts_total
+            && progress.bounded_ranges_completed == progress.bounded_ranges_total
+    });
     dispatch_browser_event(
         BROWSER_RUNTIME_EVENT_NAME,
         &BrowserRuntimeEvent::Ready {
             model: boogu_model_descriptor(variant).id.to_string(),
+            request_enabled: true,
+            selected_model_cache_complete,
+            selected_model_device_resident,
+            transfer,
             block0_execution_mode: browser_qwen_block0_execution_mode(),
             qwen_text_layer_allocation_policy,
             qwen_text_block_load_synchronization_policy,
@@ -2419,7 +2604,27 @@ fn format_transfer_duration(seconds: u64) -> String {
     }
 }
 
+fn browser_dom_event_stream_requested() -> bool {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        web_sys::window()
+            .and_then(|window| window.location().search().ok())
+            .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+            .is_some_and(|params| {
+                params.has("headless")
+                    || params.get("rendered-model-smoke").as_deref() == Some("1")
+                    || params.has("rendered-surface-smoke")
+            })
+    })
+}
+
 fn dispatch_browser_event<T: serde::Serialize>(name: &str, value: &T) {
+    // Interactive progress goes directly to ImageRunnerEvent/Bevy. Avoid serializing and
+    // dispatching thousands of unused DOM events now that the browser-only overlay is gone.
+    // Headless and rendered qualification routes retain their exact automation event contracts.
+    if !browser_dom_event_stream_requested() {
+        return;
+    }
     let result = (|| {
         let json = serde_json::to_string(value).map_err(|error| error.to_string())?;
         let detail = js_sys::JSON::parse(&json).map_err(|error| format!("{error:?}"))?;
@@ -2445,6 +2650,7 @@ struct BrowserBuildInputs {
     base_url: burn_image::RemoteBaseUrl,
     settings: crate::BooguAdapterSettings,
     device: burn_wgpu::WgpuDevice,
+    allocation_device: Option<crate::backend::SharedWgpuAllocationDevice>,
     applied_buffer_limits: BrowserAppliedBufferLimits,
 }
 
@@ -4258,6 +4464,7 @@ impl BrowserBooguFactory {
             base_url,
             settings: context.settings,
             device: context.device,
+            allocation_device: context.allocation_device,
             applied_buffer_limits: BrowserAppliedBufferLimits {
                 max_storage_buffer_binding_size: context.max_storage_buffer_binding_size,
                 max_buffer_size: context.max_buffer_size,
@@ -5005,6 +5212,7 @@ async fn build_no_surface_engine(
             execution: WgpuExecutionKind::BrowserWebGpu,
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
             max_buffer_size: limits.max_buffer_size,
+            allocation_device: None,
             settings,
             releases: vec![BooguReleaseIdentity::canonical(variant)],
         },
@@ -5051,6 +5259,7 @@ async fn build_no_surface_engine(
         inputs.settings,
         policies,
         inputs.device,
+        inputs.allocation_device,
         inputs.applied_buffer_limits,
     )
     .await?;
@@ -5139,6 +5348,7 @@ async fn build_no_surface_parity_engine_with_residency(
         settings,
         policies,
         device,
+        None,
         BrowserAppliedBufferLimits {
             max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
             max_buffer_size: limits.max_buffer_size,
@@ -5169,6 +5379,12 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
             ));
         }
         let inputs = Self::validate_context(self.variant, context)?;
+        if inputs.allocation_device.is_none() {
+            return Err(execution_error(
+                self.variant,
+                "ordinary browser factory requires the exact shared Bevy WGPU device/queue for its fail-fast memory preflight",
+            ));
+        }
         let residency = self.residency;
         report_browser_runtime_preparing(
             "Shared WebGPU device ready; verifying the sealed model manifest",
@@ -5219,8 +5435,11 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
                         inputs.identity,
                         inputs.base_url,
                         inputs.settings,
-                        policies.for_ordinary_browser_factory(),
+                        policies.for_ordinary_browser_factory(
+                            browser_surface_inference_gate_requested(),
+                        ),
                         inputs.device,
+                        inputs.allocation_device,
                         inputs.applied_buffer_limits,
                     )
                     .await
@@ -5230,6 +5449,8 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
             match &result {
                 Ok(engine) => report_browser_runtime_ready(
                     engine.identity.variant,
+                    engine.policies.eager_preload,
+                    engine.artifact_control.transfer_progress(),
                     engine.policies.qwen_text_layer_allocation_policy(),
                     engine
                         .policies
@@ -5423,10 +5644,13 @@ impl BrowserExecutionPolicies {
         self.qwen_text_layer_submission_policy
     }
 
-    fn for_ordinary_browser_factory(mut self) -> Self {
+    fn for_ordinary_browser_factory(mut self, surface_gate_requested: bool) -> Self {
         self.require_persistent_range_cache =
             self.residency == BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser;
-        self.request_scoped_surface_acquire_suspended = true;
+        // Ordinary browser sessions keep the Bevy surface alive so progress, errors, and controls
+        // behave exactly like native. Rendered qualification can opt into the strict camera gate
+        // explicitly and retains its acquisition/restore evidence contract.
+        self.request_scoped_surface_acquire_suspended = surface_gate_requested;
         self
     }
 
@@ -5925,6 +6149,7 @@ impl BrowserBooguEngine {
         settings: crate::BooguAdapterSettings,
         policies: BrowserExecutionPolicies,
         device: burn_wgpu::WgpuDevice,
+        allocation_device: Option<crate::backend::SharedWgpuAllocationDevice>,
         applied_buffer_limits: BrowserAppliedBufferLimits,
     ) -> Result<Self, RuntimeError> {
         let variant = identity.variant;
@@ -5991,7 +6216,7 @@ impl BrowserBooguEngine {
             .flat_map(|manifest| active_manifest_weight_artifacts(manifest, true, variant))
             .collect()
         };
-        if policies.eager_preload {
+        let resident_resource_plan = if policies.eager_preload {
             let mut resource_manifest = composition.pipeline_manifest.clone();
             if !composition.legacy_monolith {
                 resource_manifest
@@ -6001,8 +6226,13 @@ impl BrowserBooguEngine {
                     .files
                     .extend(composition.vae_manifest.files.iter().cloned());
             }
-            validate_browser_resident_resource_plan(variant, &resource_manifest)?;
-        }
+            Some(validate_browser_resident_resource_plan(
+                variant,
+                &resource_manifest,
+            )?)
+        } else {
+            None
+        };
         let expected_vae_encoder_weight_artifacts = composition
             .vae_manifest
             .files
@@ -6219,6 +6449,46 @@ impl BrowserBooguEngine {
         } else {
             None
         };
+        let vram_preflight = resident_resource_plan
+            .map(|plan| ("resident-dense-f32", plan.conservative_planned_device_bytes))
+            .or_else(|| {
+                low_vram_resource_plan.map(|plan| {
+                    (
+                        "low-vram-runtime-q8",
+                        plan.conservative_planned_device_bytes,
+                    )
+                })
+            })
+            .or_else(|| {
+                packed_f16_resource_plan.map(|plan| {
+                    (
+                        "preloaded-packed-f16-dense-f32-per-stage",
+                        plan.conservative_planned_device_bytes,
+                    )
+                })
+            });
+        match (allocation_device.as_ref(), vram_preflight) {
+            (Some(allocation_device), Some((policy, required_device_bytes))) => {
+                run_browser_vram_preflight(
+                    variant,
+                    policy,
+                    required_device_bytes,
+                    applied_buffer_limits.max_buffer_size,
+                    allocation_device,
+                )
+                .await?;
+            }
+            (Some(_), None) => {
+                return Err(execution_error(
+                    variant,
+                    "ordinary browser execution policy omits a GPU memory preflight plan",
+                ));
+            }
+            // Surface-free diagnostics own a separate device and retain their existing explicit
+            // hardware/memory qualification contracts. The ordinary page always supplies the
+            // exact shared Bevy device and queue above.
+            (None, _) => {}
+        }
         let packed_f16_qwen_embedding_plan = if policies.uses_packed_f16_denoiser_source() {
             Some(validate_browser_packed_f16_qwen_embedding_plan(
                 variant,
@@ -6407,7 +6677,7 @@ impl BrowserBooguEngine {
                 execution_error(
                     variant,
                     format!(
-                        "browser resident-dense preload failed without fallback: {error}; use residency=layer-streamed-diagnostic only for explicit low-memory diagnosis"
+                        "browser resident-dense preload failed without fallback: {error}; use residency=low-vram for the bounded-memory production path"
                     ),
                 )
             })?;
@@ -9973,7 +10243,19 @@ impl BrowserBooguEngine {
             .ok_or_else(|| {
                 execution_error(job.variant, "artifact traffic counters moved backwards")
             })?;
-        self.last_artifact_traffic = artifact_traffic.into();
+        let artifact_traffic = BrowserArtifactTrafficReport::from(artifact_traffic);
+        if self.policies.eager_preload {
+            self.validate_resident_caches()?;
+            if artifact_traffic != BrowserArtifactTrafficReport::default() {
+                return Err(execution_error(
+                    job.variant,
+                    format!(
+                        "resident browser request performed artifact I/O after its eager preload: {artifact_traffic:?}"
+                    ),
+                ));
+            }
+        }
+        self.last_artifact_traffic = artifact_traffic;
         dispatch_browser_event(
             BROWSER_RUNTIME_EVENT_NAME,
             &BrowserRuntimeEvent::ArtifactTraffic {
@@ -10583,9 +10865,74 @@ impl BrowserBooguRuntime {
     }
 }
 
+fn browser_release_switching_enabled() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .is_some_and(|params| !params.has("artifacts") && !params.has("headless"))
+}
+
+/// Reload the canonical browser release selected by the Bevy model dropdown.
+///
+/// A navigation is the browser's model-switch boundary: it drops the old runtime/device tensors
+/// before the target release begins its VRAM preflight and verified artifact load. Custom artifact
+/// mirrors and no-surface diagnostics remain pinned to their one exact release.
+pub(crate) fn request_browser_model_release(model: &burn_image::ModelId) -> Result<bool, String> {
+    let Some(variant) = crate::boogu::variant_for_model(model) else {
+        return Err(format!(
+            "browser model switch received unknown model {model}"
+        ));
+    };
+    if !browser_release_switching_enabled() {
+        return Ok(false);
+    }
+    let window = web_sys::window().ok_or_else(|| "browser Window is unavailable".to_owned())?;
+    let href = window
+        .location()
+        .href()
+        .map_err(|error| format!("browser model switch could not read the page URL: {error:?}"))?;
+    let url = web_sys::Url::new(&href)
+        .map_err(|error| format!("browser model switch could not parse the page URL: {error:?}"))?;
+    let params = url.search_params();
+    if params.get("variant").as_deref() == Some(variant_slug(variant)) {
+        return Ok(false);
+    }
+    params.set("variant", variant_slug(variant));
+    if params
+        .get("residency")
+        .is_some_and(|value| value != "resident" && value != "low-vram")
+    {
+        params.set("residency", "low-vram");
+    }
+    window
+        .location()
+        .assign(&url.href())
+        .map_err(|error| format!("browser model switch navigation failed: {error:?}"))?;
+    Ok(true)
+}
+
 impl BooguRuntime for BrowserBooguRuntime {
     fn variants(&self) -> Vec<BooguVariant> {
-        vec![self.variant]
+        if browser_release_switching_enabled() {
+            vec![
+                BooguVariant::Image01Turbo,
+                BooguVariant::Image01EditTurbo,
+                BooguVariant::Image01EditTurbo1k5,
+            ]
+        } else {
+            vec![self.variant]
+        }
+    }
+
+    fn readiness(&self) -> crate::ImageRunnerReadiness {
+        let state = self.shared.lock().expect("browser runtime mutex poisoned");
+        let Some(engine) = state.engine.as_ref() else {
+            return crate::ImageRunnerReadiness::default();
+        };
+        crate::ImageRunnerReadiness {
+            transfer: engine.artifact_control.transfer_progress(),
+            selected_model_device_resident: engine.policies.eager_preload,
+        }
     }
 
     fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError> {
@@ -10833,6 +11180,13 @@ fn rendered_model_smoke_requested() -> bool {
         .and_then(|window| window.location().search().ok())
         .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
         .is_some_and(|params| params.get("rendered-model-smoke").as_deref() == Some("1"))
+}
+
+fn browser_surface_inference_gate_requested() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .is_some_and(|params| params.get("surface-gate").as_deref() == Some("1"))
 }
 
 /// Request-local distinction between the serialized localization branch and the ordinary model
@@ -11663,7 +12017,7 @@ mod browser_source_tests {
         submission_policy_drift.qwen_text_layer_submission_policy =
             BROWSER_DEFAULT_QWEN_TEXT_LAYER_SUBMISSION_POLICY;
         assert!(!submission_policy_drift.packed_allocator_policy_is_exact());
-        let ordinary = policy.for_ordinary_browser_factory();
+        let ordinary = policy.for_ordinary_browser_factory(true);
         assert!(ordinary.require_persistent_range_cache);
         assert!(ordinary.request_scoped_surface_acquire_suspended);
         assert_eq!(
@@ -11684,6 +12038,30 @@ mod browser_source_tests {
                 &production_settings(),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn browser_resident_policy_keeps_selected_pipeline_warm_between_requests_correctness() {
+        let policy = BrowserExecutionPolicies::resident_dense_f32(&production_settings())
+            .unwrap()
+            .for_ordinary_browser_factory(false);
+        assert_eq!(
+            policy.residency,
+            BrowserBooguResidencyPolicy::HighVramResidentDenseF32
+        );
+        assert!(policy.eager_preload);
+        assert!(policy.retain_qwen_stages);
+        assert!(policy.retain_vae_stages);
+        assert!(policy.retain_denoiser_stages);
+        assert!(policy.defer_retained_qwen_synchronization);
+        assert!(policy.defer_retained_denoiser_synchronization);
+        assert!(!policy.release_unused_qwen_memory_after_stage);
+        assert!(!policy.uses_packed_f16_denoiser_source());
+        assert!(!policy.request_scoped_surface_acquire_suspended);
+        assert_eq!(
+            policy.weight_traffic_contract(),
+            "eager-preload/qwen+vae+denoiser/zero-inference-artifact-transfers"
         );
     }
 
@@ -12596,7 +12974,7 @@ mod browser_source_tests {
             policy.weight_traffic_contract(),
             "per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4"
         );
-        let ordinary = policy.for_ordinary_browser_factory();
+        let ordinary = policy.for_ordinary_browser_factory(true);
         assert!(!ordinary.require_persistent_range_cache);
         assert!(ordinary.request_scoped_surface_acquire_suspended);
         assert_eq!(

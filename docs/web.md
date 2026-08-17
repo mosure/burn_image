@@ -89,21 +89,21 @@ quota exhaustion despite reporting free space. The exact `/tmp` writes before fa
 159,440,896 bytes for browser 1.5K, and 93,999,104 bytes for the final-source first-DMD diagnostic.
 Probe files are deleted after admission testing.
 
-The HTML shell listens for the Wasm-emitted `burn-image-runtime` and `burn-image-progress` custom
-events. Its accessible loading panel distinguishes runtime/manifest preparation, current semantic
-object transfer and SHA-256 verification, and GPU inference stages. It displays exact current
-bytes, actual zero-based manifest shard position rendered as one-based UI text, rolling transfer
-rate/current-object ETA, cumulative request bytes, verified-object count, and DMD steps. The panel
-does not invent a whole-run percentage: heterogeneous Qwen, VAE, and denoiser objects have very
-different transfer, verification, upload, and synchronization costs. Explicit resident mode
-performs that work during preload. Default low-VRAM mode is variant-aware: Edit retains one
+The HTML shell has no visible loading overlay: native and browser sessions use the same Bevy
+controls, notices, and monotonic selected-model progress surface. That progress reports aggregate
+authenticated bytes, logical objects, unique physical parts, bounded reads, smoothed throughput,
+and ETA; stage-local Qwen/VAE/denoiser file counts are never presented as the complete denominator.
+The runtime-ready boundary means that generation controls can accept a request; it does not imply
+that every request-lazy stage is already cached. If a cold first Run must finish the selected
+closure, the Bevy bar preserves and advances the same aggregate counters. It is one setup
+lifecycle, not a second Qwen download phase. Ordinary browser inference keeps the Bevy cameras
+active so status and controls remain responsive; `surface-gate=1` is reserved for rendered
+qualification that measures suspended acquisition and exact camera restoration. Explicit
+resident mode performs all model work during preload. Explicit low-VRAM mode is variant-aware: Edit retains one
 runtime-Q8/F32 denoiser for four DMD passes, while Turbo initially preloads 46 packed-F16 stages,
 widens one dense-F32 semantic stage at a time during DMD, and evicts the packed cache before VAE
-decode. Compact/ready loader status sits at the bottom-right
-so it does not obscure Bevy's GPU status line; expanded, loading, and error states remain top-right.
-`aria-live` announcements occur at lifecycle boundaries, while high-frequency range updates are
-coalesced to animation frames. The ordinary persistent cache stores independently authenticated
-entries no larger than 4 MiB, not complete 20 MiB physical parts or 256 MiB semantic objects.
+decode. The ordinary persistent cache stores complete, independently authenticated physical parts
+no larger than 20,971,520 bytes; it never stores a complete 256 MiB semantic object or bundle.
 
 With `artifacts` omitted, that selection resolves exactly to
 `https://aberration.technology/model/boogu-image-0.1-turbo`.
@@ -122,11 +122,14 @@ old precise selector remains an alias for existing links and low-level provenanc
 that Qwen vision is stored F32 while the denoiser, Qwen text tower, and VAE are stored F16; it does
 not describe an all-F32 model.
 
-Residency defaults to `low-vram`. It keeps the canonical artifact unchanged and streams Qwen and
-selected VAE objects. Edit retains a request-scoped runtime-Q8/F32 denoiser across four DMD steps;
-ordinary Turbo uses the packed-F16/dense-F32-per-semantic-stage policy described below. Explicit
-`residency=resident` selects the advanced dense-F32 all-stage resident policy, which remains
-unqualified. `residency=layer-streamed-diagnostic` is the intentionally
+The interactive page defaults to `residency=resident`. After its mandatory shared-device VRAM
+preflight, it loads and retains the selected dense-F32 request graph before enabling **Run**, so a
+page session remains warm across requests. `residency=low-vram` is the explicit bounded-memory
+alternative: it keeps the canonical artifact unchanged and streams Qwen and selected VAE objects.
+Edit retains a request-scoped runtime-Q8/F32 denoiser across four DMD steps; ordinary Turbo uses the
+packed-F16/dense-F32-per-semantic-stage policy described below. The new warm source default requires
+refreshed browser hardware qualification; current evidence below remains scoped to low-VRAM.
+`residency=layer-streamed-diagnostic` is the intentionally
 host-heavy diagnostic that reloads denoiser stages on every step. Diagnostic storage profiles and
 layer streaming require an explicit `artifacts=` URL and are not canonical CDN production paths.
 
@@ -207,8 +210,10 @@ range framing and exposed `Content-Range`.
   most one sealed semantic object (hard cap 256 MiB), uploads/materializes it, and releases its host
   bytes. Wasm linear memory never holds a complete bundle even though initialized modules
   accumulate on GPU.
-- Async loading suspends at network boundaries, reports artifact/stage progress to both Bevy and
-  the DOM loading panel, and checks cancellation before every range and semantic boundary.
+- Async loading suspends at network boundaries, reports artifact/stage progress to Bevy, and
+  checks cancellation before every range and semantic boundary. Cache-hit part SHA-256 runs in
+  browser-native Web Crypto so the Wasm main thread does not perform both physical and logical
+  digest loops; the reconstructed logical object still receives its independent Rust SHA-256 gate.
   Ordinary resident forward execution uses the preloaded graph; low-VRAM execution reports exact
   variant-specific phase boundaries and weight traffic.
 - VAE encode and decode apply independently selected objects with the released F32 force-upcast
@@ -457,8 +462,9 @@ fails closed unless `prompt`, `seed`, `width`, and `height` are supplied. Edit i
 the ordinary UI because it requires a reference image. The browser model backend is raw
 `CubeBackend` rather than Burn's fused alias. Floating stages are adapted to F32, and every
 asynchronous semantic source awaits the CubeCL `ComputeClient::sync()` future instead of blocking
-Wasm's event loop. It now defaults to low-VRAM; explicit `residency=resident` selects advanced
-dense-F32 preload. The measurements below are specifically the historical 256-square streamed run.
+Wasm's event loop. Headless diagnostics still default to low-VRAM unless their route fixes another
+policy explicitly; `residency=resident` selects dense-F32 preload. The measurements below are
+specifically the historical 256-square streamed run.
 
 The validated launch was headful so Chrome used the real GPU rather than SwiftShader:
 
@@ -537,9 +543,10 @@ run. The scoped GPU PID was present, but the server saw zero artifact 206 respon
   `f6ff6336e9906a3c9ef85ffcd9c5377ff54684747a05f891aac91e5e870353b6`.
 
 Browser Qwen/VAE stages and floating activations therefore remain F32 even when the sealed
-transport profile stores F16 weights. Explicit `resident` materializes dense-F32 denoiser weights.
-Default low-VRAM Edit runtime-packs inventory-qualified denoiser matrices to Q8S block-32/F32;
-ordinary Turbo retains packed F16 and widens one dense-F32 semantic stage at a time. Earlier
+transport profile stores F16 weights. The interactive default `resident` materializes and retains
+dense-F32 denoiser weights. Explicit low-VRAM Edit runtime-packs inventory-qualified denoiser
+matrices to Q8S block-32/F32; low-VRAM Turbo retains packed F16 and widens one dense-F32 semantic
+stage at a time. Earlier
 fused-shader, blocking-mapper, blocking-barrier, and Turbo Q8 failures are historical implementation
 evidence, not current packed-F16 runtime success.
 
@@ -698,7 +705,15 @@ the largest released 1.5K striped-tail plan; the model-neutral app keeps WebGPU'
 baseline. The historical full run reported applied limits of 2,147,483,644 bytes for
 `max_storage_buffer_binding_size` and 4,294,967,292 bytes for `max_buffer_size`. Factory startup
 fails closed below the selected shape's exact model requirement. Resource plans do not infer
-available VRAM from API buffer limits, so allocation or device loss is terminal.
+available VRAM from API buffer limits. The ordinary rendered page therefore performs a second,
+capacity-oriented admission before requesting any model-weight transport part: after authenticating
+only the bounded manifests, transport layouts, configs, and tokenizer, it retains 256 MiB-or-smaller
+storage reservations totaling the selected policy's conservative device-byte plan on the exact
+shared Bevy/Burn device, clears every reservation to defeat lazy allocation, and waits for queue plus
+validation/internal/out-of-memory scopes. Success releases every reservation and starts the verified
+weight download; failure or a 45-second timeout leaves the model unloaded. This is a fail-fast
+allocation test, not a free-VRAM query or durable hardware guarantee: WebGPU exposes no portable
+free-memory counter, and memory pressure can change after admission.
 
 An ordinary strict-F32 1536-square decode would create a `[1, 256, 1536, 1536]` feature tensor
 requiring one 2,415,919,104-byte buffer, which exceeds the qualification Chrome device's

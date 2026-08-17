@@ -357,27 +357,28 @@ async function validateCommittedSources() {
   const failures = [];
   for (const required of [
     'id="burn-image"',
-    'import init, { provide_reference_image } from "./out/bevy_burn_image.js"',
-    'import { configureModelReleaseSelector } from "./model_selector.mjs"',
+    'id="status" aria-hidden="true"',
+    'id="burn-image-reference-input"',
+    'provide_reference_image_error',
+    'reportReferenceError',
     'rel="icon" type="image/png" sizes="512x512" href="./out/burn-image-icon.png"',
-    'case "packed_f16_resource_plan"',
-    'case "packed_f16_denoiser_preload"',
-    'case "packed_f16_denoiser_lifecycle"',
-    'case "packed_f16_dmd_vae_handoff"',
-    'case "surface_inference_suspended"',
-    'case "surface_inference_resumed"',
-    "surfaceInferenceSuspended = true",
-    "surfaceInferenceSuspended = false",
-    "hideLoaderPanelIfSafe",
-    "Rendered Bevy surface paused for exclusive model work",
-    'html[data-surface-inference="suspended"] *',
-    "animation-play-state: paused !important",
-    "transition: none !important",
-    '.loader-panel[data-compact="true"]',
-    "bottom: 1rem",
-    "bottom: 0.55rem",
+    "The visible interface is exclusively Bevy on every platform",
+    "await init()",
   ]) {
     if (!indexSource.includes(required)) failures.push(`www/index.html omits ${required}`);
+  }
+  for (const forbidden of [
+    'id="model-loader"',
+    'id="artifact-progress"',
+    "loader-panel",
+    "burn-image-runtime",
+    "burn-image-progress",
+    "configureModelReleaseSelector",
+    "surface_inference_suspended",
+  ]) {
+    if (indexSource.includes(forbidden)) {
+      failures.push(`www/index.html retains fragmented browser UI behavior ${forbidden}`);
+    }
   }
   const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   if (
@@ -400,12 +401,6 @@ async function validateCommittedSources() {
     if (!modelSelectorSource.includes(required)) {
       failures.push(`model selector omits ${required}`);
     }
-  }
-  if (!/const failRun = \(message\) => \{[\s\S]*?panel\.dataset\.compact = "false";/.test(indexSource)) {
-    failures.push("www/index.html does not keep inference errors expanded at top-right");
-  }
-  if (!/case "ready":[\s\S]*?panel\.dataset\.compact = "true";/.test(indexSource)) {
-    failures.push("www/index.html does not compact ready status at bottom-right");
   }
   for (const required of [
     `BROWSER_BACKEND_EVENT_NAME: &str = "${BACKEND_EVENT_NAME}"`,
@@ -470,6 +465,10 @@ async function validateCommittedSources() {
     TURBO_LOW_VRAM_WEIGHT_TRAFFIC_CONTRACT,
     "with_required_range_cache()",
     "BrowserRuntimeEvent::PackedF16DenoiserPreload",
+    "BrowserRuntimeEvent::VramPreflight",
+    "run_browser_vram_preflight(",
+    "queue.on_submitted_work_done",
+    "failed before model-weight download",
     "BrowserRuntimeEvent::PackedF16DenoiserLifecycle",
     "BrowserRuntimeEvent::PackedF16DmdVaeHandoff",
     "BrowserRuntimeEvent::PackedF16QwenHostEmbedding",
@@ -546,6 +545,9 @@ async function validateCommittedSources() {
     "transport_object_for_file",
     "fetch_verified_transport_part_bytes",
     "verify_browser_transport_part_bytes",
+    "verify_browser_transport_part_bytes_async",
+    'digest_with_str_and_u8_array("SHA-256", bytes)',
+    "wasm_bindgen_futures::JsFuture::from(promise)",
     "verify_browser_transport_reconstruction",
     "protect_verified_transport_part(part)",
     "ARTIFACT_TRANSPORT_TARGET_PART_BYTES.min(ARTIFACT_TRANSPORT_MAX_PART_BYTES)",
@@ -816,6 +818,7 @@ async function validateCommittedSources() {
     "selectChromeSharedMemoryPolicy",
     "renderedChromeLaunchEvidence",
     "sharedMemoryPolicy.disable_dev_shm_usage",
+    'query.set("surface-gate", "1")',
     'query.set("qwen-block0-execution-mode", requestedQwenBlock0ExecutionMode)',
     'pathname.endsWith(".mjs")',
     '"/model_selector.mjs"',
@@ -3656,6 +3659,7 @@ async function main() {
     });
     if (modelMode) {
       query.set("rendered-model-smoke", "1");
+      query.set("surface-gate", "1");
       query.set("qwen-block0-execution-mode", requestedQwenBlock0ExecutionMode);
       query.set("variant", "turbo");
       query.set("profile", "production");

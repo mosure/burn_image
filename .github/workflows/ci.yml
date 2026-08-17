@@ -449,6 +449,7 @@ jobs:
           cmp -s crates/bevy_image/www/burn-image-icon.png "$icon_output"
           grep -Eq '^export function start_boogu_web\(\)' "$js_output"
           grep -Eq '^export function provide_reference_image\(bytes\)' "$js_output"
+          grep -Eq '^export function provide_reference_image_error\(message\)' "$js_output"
           grep -Fq 'wasm.__wbindgen_start()' "$js_output"
           wc -c "$js_output" "$wasm_output" "$icon_output"
 

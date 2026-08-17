@@ -306,6 +306,10 @@ pub enum ArtifactStreamError {
         expected: u64,
         actual: u64,
     },
+    #[error("browser Web Crypto SHA-256 failed for transport part {path}: {message}")]
+    BrowserTransportPartCrypto { path: ArtifactPath, message: String },
+    #[error("browser Web Crypto returned {actual} SHA-256 bytes for {path}; expected 32")]
+    BrowserTransportPartCryptoSize { path: ArtifactPath, actual: u32 },
     #[error(
         "browser transport reconstruction for {path} contains {actual} bytes; expected exactly {expected}"
     )]
@@ -1662,7 +1666,7 @@ impl BrowserArtifactControl {
     }
 }
 
-#[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
+#[cfg(test)]
 fn verify_browser_transport_part_bytes(
     part: &ArtifactTransportPart,
     bytes: &[u8],
@@ -1690,6 +1694,73 @@ fn verify_browser_transport_part_bytes(
         });
     }
     let actual = Sha256Digest::calculate(bytes);
+    if actual != part.sha256 {
+        return Err(ArtifactStreamError::BrowserTransportPartIntegrity {
+            path: part.path.clone(),
+            expected: part.sha256,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Authenticate one bounded physical part with the browser's native Web Crypto implementation.
+///
+/// Cache hits previously ran both the per-part and reconstructed-logical SHA-256 loops on the
+/// Wasm main thread. Web Crypto keeps the independent part seal while yielding to the browser;
+/// the complete logical Burnpack is still hashed in Rust before any tensor parser sees it.
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+async fn verify_browser_transport_part_bytes_async(
+    part: &ArtifactTransportPart,
+    bytes: &[u8],
+) -> Result<(), ArtifactStreamError> {
+    let maximum = ARTIFACT_TRANSPORT_TARGET_PART_BYTES.min(ARTIFACT_TRANSPORT_MAX_PART_BYTES);
+    if part.size == 0 || part.size > maximum {
+        return Err(ArtifactStreamError::BrowserTransportPartTooLarge {
+            path: part.path.clone(),
+            actual: part.size,
+            maximum,
+        });
+    }
+    let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_size != part.size {
+        return Err(ArtifactStreamError::BrowserTransportPartSize {
+            path: part.path.clone(),
+            expected: part.size,
+            actual: actual_size,
+        });
+    }
+    let window = web_sys::window().ok_or(ArtifactStreamError::BrowserWindowUnavailable)?;
+    let crypto =
+        window
+            .crypto()
+            .map_err(|error| ArtifactStreamError::BrowserTransportPartCrypto {
+                path: part.path.clone(),
+                message: format!("Crypto is unavailable: {error:?}"),
+            })?;
+    let promise = crypto
+        .subtle()
+        .digest_with_str_and_u8_array("SHA-256", bytes)
+        .map_err(|error| ArtifactStreamError::BrowserTransportPartCrypto {
+            path: part.path.clone(),
+            message: format!("digest could not start: {error:?}"),
+        })?;
+    let value = wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|error| ArtifactStreamError::BrowserTransportPartCrypto {
+            path: part.path.clone(),
+            message: format!("digest rejected: {error:?}"),
+        })?;
+    let digest = js_sys::Uint8Array::new(&value);
+    if digest.length() != 32 {
+        return Err(ArtifactStreamError::BrowserTransportPartCryptoSize {
+            path: part.path.clone(),
+            actual: digest.length(),
+        });
+    }
+    let mut digest_bytes = [0u8; 32];
+    digest.copy_to(&mut digest_bytes);
+    let actual = Sha256Digest::from_bytes(digest_bytes);
     if actual != part.sha256 {
         return Err(ArtifactStreamError::BrowserTransportPartIntegrity {
             path: part.path.clone(),
@@ -2511,7 +2582,7 @@ impl BrowserStageShardReader {
         let bytes = self
             .fetch_transport_part_complete_attempt(logical_file, part, false)
             .await?;
-        let actual = match verify_browser_transport_part_bytes(part, &bytes) {
+        let actual = match verify_browser_transport_part_bytes_async(part, &bytes).await {
             Ok(()) => {
                 self.control
                     .record_transport_part_verified(self.progress_path(&part.path));
@@ -2540,7 +2611,7 @@ impl BrowserStageShardReader {
         let bytes = self
             .fetch_transport_part_complete_attempt(logical_file, part, true)
             .await?;
-        match verify_browser_transport_part_bytes(part, &bytes) {
+        match verify_browser_transport_part_bytes_async(part, &bytes).await {
             Ok(()) => {
                 self.control
                     .record_transport_part_verified(self.progress_path(&part.path));

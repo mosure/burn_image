@@ -20,7 +20,7 @@ use burn_image::{
 use crate::{
     CancelImageJob, CompleteImageJob, EditorMode, ImageBytesLoaded, ImageDisplayFailed,
     ImageEditorState, ImageFrontendSet, ImageIoFailed, ImageJobId, ImageJobPhase, ImageJobRejected,
-    ImageJobs, ImageRunnerState, ImageRunnerStatus, LoadImageBytes,
+    ImageJobs, ImageRunnerReadiness, ImageRunnerState, ImageRunnerStatus, LoadImageBytes,
     MODEL_SWITCH_PROGRESS_STAGE_PREFIX, PrepareImageDownload, REFERENCE_IMAGE_IO_ID,
 };
 
@@ -245,6 +245,7 @@ pub struct ImageControlPanelPlugin;
 impl Plugin for ImageControlPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ImageControlPanelState>()
+            .init_resource::<ImageRunnerReadiness>()
             .init_resource::<ModelDropdownState>()
             .init_resource::<SizeDropdownState>()
             .add_systems(Startup, setup_controls)
@@ -1290,6 +1291,23 @@ fn handle_model_option(
         editor.mode = mode;
     }
     apply_descriptor_size(descriptor, &mut editor, &mut panel);
+    #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+    match crate::browser_boogu::request_browser_model_release(&descriptor.id) {
+        Ok(true) => {
+            panel.notice = format!(
+                "Switching to {}; the previous browser model is unloading",
+                descriptor.display_name
+            );
+            dropdown.open = false;
+            return;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            panel.notice = error;
+            dropdown.open = false;
+            return;
+        }
+    }
     panel.notice = format!(
         "{} selected; it will load on the next Run",
         descriptor.display_name
@@ -2161,6 +2179,62 @@ fn runner_progress_presentation(state: &ImageRunnerState) -> ProgressPresentatio
     }
 }
 
+fn readiness_transfer_presentation(
+    state: &ImageRunnerState,
+    readiness: &ImageRunnerReadiness,
+) -> Option<ProgressPresentation> {
+    let ImageRunnerState::Ready { capabilities } = state else {
+        return None;
+    };
+    if capabilities.execution != crate::WgpuExecutionKind::BrowserWebGpu {
+        return None;
+    }
+    let transfer = readiness.transfer.as_ref()?;
+    if transfer.total_bytes == 0 {
+        return None;
+    }
+    if transfer.loaded_bytes >= transfer.total_bytes {
+        return Some(ProgressPresentation {
+            headline: if readiness.selected_model_device_resident {
+                "Selected model warm on GPU".into()
+            } else {
+                "Selected model cached".into()
+            },
+            detail: if readiness.selected_model_device_resident {
+                format!(
+                    "{} verified | {}/{} parts | reusable stages remain resident for repeat Runs",
+                    format_bytes(transfer.total_bytes),
+                    transfer.physical_parts_completed,
+                    transfer.physical_parts_total,
+                )
+            } else {
+                format!(
+                    "{} verified | {}/{} parts | stages stream from browser cache per Run",
+                    format_bytes(transfer.total_bytes),
+                    transfer.physical_parts_completed,
+                    transfer.physical_parts_total,
+                )
+            },
+            fraction: Some(1.0),
+            tone: ProgressTone::Complete,
+        });
+    }
+    let remaining = transfer.total_bytes.saturating_sub(transfer.loaded_bytes);
+    Some(ProgressPresentation {
+        headline: "Ready to run; selected model setup continues".into(),
+        detail: format!(
+            "{} / {} cached | {}/{} parts | {} remaining for the first Run",
+            format_bytes(transfer.loaded_bytes),
+            format_bytes(transfer.total_bytes),
+            transfer.physical_parts_completed,
+            transfer.physical_parts_total,
+            format_bytes(remaining),
+        ),
+        fraction: Some(transfer.loaded_bytes as f32 / transfer.total_bytes as f32),
+        tone: ProgressTone::Normal,
+    })
+}
+
 fn setup_progress_fraction(message: &str) -> Option<f32> {
     if let Some(percent) = message
         .strip_prefix("Model transfer ")
@@ -2487,6 +2561,7 @@ fn humanize_stage(stage: &str) -> String {
 fn update_progress_panel(
     time: Res<Time>,
     runner: Res<ImageRunnerStatus>,
+    readiness: Res<ImageRunnerReadiness>,
     jobs: Res<ImageJobs>,
     panel: Res<ImageControlPanelState>,
     mut labels: ParamSet<(
@@ -2495,13 +2570,16 @@ fn update_progress_panel(
     )>,
     mut fills: Query<(&mut Node, &mut BackgroundColor), With<ProgressFill>>,
 ) {
-    let presentation = progress_presentation(
-        &runner.state,
-        panel.latest_job.and_then(|id| jobs.get(id)),
-        &panel.notice,
-    );
+    let job = panel.latest_job.and_then(|id| jobs.get(id));
+    let presentation = if job.is_none() && panel.notice.is_empty() {
+        readiness_transfer_presentation(&runner.state, &readiness)
+            .unwrap_or_else(|| progress_presentation(&runner.state, None, ""))
+    } else {
+        progress_presentation(&runner.state, job, &panel.notice)
+    };
     if presentation.fraction.is_some()
         && !runner.is_changed()
+        && !readiness.is_changed()
         && !jobs.is_changed()
         && !panel.is_changed()
     {
@@ -2846,6 +2924,9 @@ thread_local! {
     static BROWSER_REFERENCE_QUEUE: std::cell::RefCell<Option<Vec<u8>>> = const {
         std::cell::RefCell::new(None)
     };
+    static BROWSER_REFERENCE_ERROR: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 /// Receive browser-selected image bytes from the JavaScript host.
@@ -2860,11 +2941,35 @@ pub fn provide_reference_image(bytes: Vec<u8>) -> Result<(), wasm_bindgen::JsVal
     // The picker has one reference slot. If the host submits several files
     // before Bevy's next update, retain only the newest bounded payload.
     BROWSER_REFERENCE_QUEUE.with(|queue| *queue.borrow_mut() = Some(bytes));
+    BROWSER_REFERENCE_ERROR.with(|error| *error.borrow_mut() = None);
+    Ok(())
+}
+
+/// Route browser file-picker validation failures into the same Bevy notice surface used natively.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn provide_reference_image_error(message: String) -> Result<(), wasm_bindgen::JsValue> {
+    let message = message.trim();
+    if message.is_empty() || message.len() > 1_024 {
+        return Err(wasm_bindgen::JsValue::from_str(
+            "reference image error must contain 1..=1024 UTF-8 bytes",
+        ));
+    }
+    BROWSER_REFERENCE_QUEUE.with(|queue| *queue.borrow_mut() = None);
+    BROWSER_REFERENCE_ERROR.with(|error| *error.borrow_mut() = Some(message.to_owned()));
     Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
-fn drain_browser_reference_queue(mut load: MessageWriter<LoadImageBytes>) {
+fn drain_browser_reference_queue(
+    mut load: MessageWriter<LoadImageBytes>,
+    mut panel: ResMut<ImageControlPanelState>,
+) {
+    BROWSER_REFERENCE_ERROR.with(|error| {
+        if let Some(message) = error.borrow_mut().take() {
+            panel.notice = message;
+        }
+    });
     BROWSER_REFERENCE_QUEUE.with(|queue| {
         if let Some(bytes) = queue.borrow_mut().take() {
             load.write(LoadImageBytes {
@@ -2948,8 +3053,8 @@ mod tests {
         MIN_VIEWER_HEIGHT, can_cycle_models, descriptor_mode, event_progress_presentation,
         format_progress, image_control_panel_layout, model_control_value, next_model_descriptor,
         next_supported_size_index, preferred_size_index, preset_dimensions, preset_index,
-        reference_control_relevant, runner_control_value, runner_progress_presentation,
-        setup_progress_fraction,
+        readiness_transfer_presentation, reference_control_relevant, runner_control_value,
+        runner_progress_presentation, setup_progress_fraction,
     };
     #[cfg(feature = "boogu")]
     use super::{apply_descriptor_size, next_supported_size_index_for_descriptor};
@@ -3125,6 +3230,69 @@ mod tests {
         assert!(presentation.detail.contains("96.0 MiB/s"));
         assert!(presentation.detail.contains("ETA 3m 12s"));
         assert!(presentation.detail.len() <= 80);
+    }
+
+    #[test]
+    fn browser_request_ready_preserves_incomplete_selected_model_progress_correctness() {
+        let mut capabilities = crate::runner::tests::test_capabilities("test/browser-model");
+        capabilities.execution = crate::WgpuExecutionKind::BrowserWebGpu;
+        let state = crate::ImageRunnerState::Ready { capabilities };
+        let readiness = crate::ImageRunnerReadiness {
+            transfer: Some(ArtifactTransferProgress {
+                phase: "Model setup".into(),
+                component: Some(ArtifactComponentId::new("boogu-denoiser-blocks").unwrap()),
+                logical_objects_completed: 106,
+                logical_objects_total: 186,
+                physical_parts_completed: 1_001,
+                physical_parts_total: 1_751,
+                bounded_ranges_completed: 1_001,
+                bounded_ranges_total: 1_751,
+                loaded_bytes: 19_870_166_528,
+                total_bytes: 35_106_151_424,
+                bytes_per_second: Some(100_000_000),
+                eta_seconds: Some(153),
+                request_activity: None,
+            }),
+            selected_model_device_resident: false,
+        };
+        let presentation = readiness_transfer_presentation(&state, &readiness).unwrap();
+        assert_eq!(
+            presentation.headline,
+            "Ready to run; selected model setup continues"
+        );
+        assert_eq!(
+            presentation.fraction,
+            Some(19_870_166_528_f32 / 35_106_151_424_f32)
+        );
+        assert!(presentation.detail.contains("18.51 GiB / 32.70 GiB cached"));
+        assert!(presentation.detail.contains("1001/1751 parts"));
+        assert!(
+            presentation
+                .detail
+                .contains("14.19 GiB remaining for the first Run")
+        );
+
+        let mut warm = readiness.clone();
+        let warm_transfer = warm.transfer.as_mut().unwrap();
+        warm_transfer.loaded_bytes = warm_transfer.total_bytes;
+        warm_transfer.logical_objects_completed = warm_transfer.logical_objects_total;
+        warm_transfer.physical_parts_completed = warm_transfer.physical_parts_total;
+        warm_transfer.bounded_ranges_completed = warm_transfer.bounded_ranges_total;
+        warm_transfer.eta_seconds = None;
+        warm.selected_model_device_resident = true;
+        let presentation = readiness_transfer_presentation(&state, &warm).unwrap();
+        assert_eq!(presentation.headline, "Selected model warm on GPU");
+        assert_eq!(presentation.fraction, Some(1.0));
+        assert!(
+            presentation
+                .detail
+                .contains("reusable stages remain resident for repeat Runs")
+        );
+
+        let native_state = crate::ImageRunnerState::Ready {
+            capabilities: crate::runner::tests::test_capabilities("test/native-model"),
+        };
+        assert!(readiness_transfer_presentation(&native_state, &readiness).is_none());
     }
 
     #[test]

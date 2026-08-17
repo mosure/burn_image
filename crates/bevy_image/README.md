@@ -68,7 +68,12 @@ Progress remains visible throughout shared-GPU setup, manifest and shard
 transfer, model-stage initialization, inference steps, output preparation,
 cancellation, and failures. The headline, detail text, and progress bar report
 the active phase instead of treating device creation or a downloaded manifest
-as model readiness. Lazy native model switches forward their setup milestones and bundle-local
+as model readiness. In the browser, request-ready and fully-cached are distinct: after the eager
+denoiser preload enables **Run**, the Bevy panel retains the exact selected-closure bytes/parts and
+remaining amount. A cold request continues those same counters in Bevy itself and is not presented
+as a fresh Qwen-only download. Ordinary browser inference keeps Bevy rendering responsive; the
+request-scoped surface-acquisition gate is an explicit rendered-qualification option rather than
+the interactive default. Lazy native model switches forward their setup milestones and bundle-local
 download file counts into the active job instead of leaving a static model-switch label. A missing
 model runtime is shown explicitly; pressing
 **Run** cannot produce a placeholder result.
@@ -223,14 +228,15 @@ model configurations but do not inherit that shape-specific evidence.
 
 The `BooguRuntimeFactory`/`BooguRuntime` injection boundary remains public for embedders.
 `BrowserBooguFactory` is the concrete Wasm implementation: it uses bounded HTTP ranges plus
-digest-verified async Qwen/VAE/denoiser sources. Browser production defaults to the low-VRAM policy
-described below. Explicit `residency=resident` selects the advanced
+digest-verified async Qwen/VAE/denoiser sources. The interactive browser defaults to
+`residency=resident`, selecting the high-throughput
 `browser-high-vram-resident-dense-f32` policy: before **Ready**, it sequentially verifies and
 uploads one bounded semantic object at a time, releases each host payload, and retains every
 initialized dense-F32 WebGPU stage. Forward execution therefore performs no repeated model-weight
 download, hash/decode, or host-to-device transfer. This needs workstation-class WebGPU memory and
 fails before **Ready** if its resource plan, allocation, or device synchronization fails; it never
-falls back to CPU. This explicit dense-F32 mode is not currently qualified.
+falls back to CPU. The source-default change requires refreshed browser hardware qualification;
+the evidence below remains scoped to the explicitly selected low-VRAM policy.
 
 Repository and Pages builds inherit both browser patches from the workspace root. Patched `wgpu`
 29.0.4 bounds `writeBuffer`/`writeTexture` calls to 2 MiB and exposes rejected queue-completion
@@ -241,7 +247,7 @@ equivalent `wgpu` **and** `cubecl-wgpu` patches in its own workspace root until 
 upstream/resolvable. The browser qualification statements do not cover a graph missing either
 patch.
 
-The default `residency=low-vram` path is variant-aware while keeping the same canonical production
+The explicit `residency=low-vram` path is variant-aware while keeping the same canonical production
 artifact. Edit streams Qwen and selected VAE objects, runtime-quantizes inventory-qualified
 denoiser matrices to Q8S block-32/F32, retains that request-scoped denoiser through four DMD steps,
 and clears it before decode. Runtime Q8 is current only for Edit. Ordinary Turbo instead uses
@@ -263,7 +269,7 @@ pool still requires the measured aggregate GPU-memory gate. Browser VAE transpor
 selected objects while the current source initializes the full 335,278,732-byte F32 autoencoder.
 This is storage compression followed by dense-F32 execution, not quantized execution.
 
-Ordinary rendered requests also use the request-scoped surface gate: both primary-window cameras
+Rendered qualification requests use the explicit request-scoped surface gate: both primary-window cameras
 are inactive before runtime submission, texture acquisition remains suspended through the terminal
 model event, and their exact active states are restored before output-ready publication. Current
 serialized Run C and the subsequent ordinary run both completed this gate, produced the same
@@ -427,12 +433,22 @@ reloads the page so only one model is resident. An explicit custom artifact URL 
 because it names one exact bundle. Native file
 helpers remain excluded from Wasm builds.
 
+Before the ordinary page fetches any model-weight part, it stress-tests the selected model's
+conservative residency on the exact shared Bevy/Burn WebGPU device. The probe retains and GPU-clears
+bounded 256 MiB-or-smaller storage buffers up to the planned byte total, drains queue/error scopes
+with a 45-second bound, then destroys the buffers. A failure leaves the model unloaded instead of
+spending bandwidth on an unusable closure. WebGPU does not expose portable free-VRAM telemetry, so
+this is a point-in-time allocation admission rather than a reported capacity or parity claim.
+
 The repository's GitHub Pages workflow packages the tracked `www/` shell, the exact app-icon copy,
 and ignored generated `www/out/` bindgen output only; model objects are never copied into Pages and must be published on
 the Aberration CDN before the deployment gate can pass. During runtime build and
-inference, Wasm dispatches structured `burn-image-runtime` and `burn-image-progress` DOM events.
-The shell turns them into exact current-object bytes/shard progress, transfer rate and ETA,
-verified-object totals, stage/step state, terminal errors, and a manual full-runtime reload action.
+inference, Wasm retains structured `burn-image-runtime` and `burn-image-progress` DOM events for
+automation and qualification evidence. The shell does not render them as a second interface:
+aggregate selected-model bytes/unique-part progress, transfer rate and ETA, verified-object totals,
+stage/step state, and terminal errors are shown by Bevy just as they are natively. The `ready` event
+carries the same partial transfer snapshot, so enabling a request cannot reset the bar to 100%
+before request-lazy stages have been cached.
 
 The Wasm feature sets compile and package. Before low-VRAM became the browser production default,
 an externally attested headful X11/Vulkan `headless=infer` run completed one real 256x256 Turbo

@@ -45,7 +45,8 @@ export function modelReleaseSelectionState(href) {
   return {
     current,
     enabled: true,
-    reason: "Changing release reloads this page so only one WebGPU model is active.",
+    reason:
+      "Changing release reloads this page and unloads the previous model. Warm GPU residency is the default; use ?residency=low-vram on smaller GPUs.",
   };
 }
 

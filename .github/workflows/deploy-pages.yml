@@ -531,11 +531,13 @@ jobs:
             crates/bevy_image/www/out/bevy_burn_image.js
           grep -Eq '^export function provide_reference_image\(bytes\)' \
             crates/bevy_image/www/out/bevy_burn_image.js
+          grep -Eq '^export function provide_reference_image_error\(message\)' \
+            crates/bevy_image/www/out/bevy_burn_image.js
           grep -Fq 'wasm.__wbindgen_start()' crates/bevy_image/www/out/bevy_burn_image.js
-          grep -Fq 'burn-image-runtime' crates/bevy_image/www/index.html
-          grep -Fq 'burn-image-progress' crates/bevy_image/www/index.html
-          grep -Fq 'id="artifact-progress"' crates/bevy_image/www/index.html
-          grep -Fq './model_selector.mjs' crates/bevy_image/www/index.html
+          grep -Fq 'id="burn-image"' crates/bevy_image/www/index.html
+          grep -Fq 'provide_reference_image_error' crates/bevy_image/www/index.html
+          ! grep -Fq 'id="model-loader"' crates/bevy_image/www/index.html
+          ! grep -Fq 'id="artifact-progress"' crates/bevy_image/www/index.html
           grep -Fq './out/burn-image-icon.png' crates/bevy_image/www/index.html
           cmp -s crates/bevy_image/www/burn-image-icon.png \
             crates/bevy_image/www/out/burn-image-icon.png

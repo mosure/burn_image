@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BackendState, BackendStatus, CompleteImageJob, FailImageJob, FrontendError, ImageFrontendSet,
     ImageJobCancellationRequested, ImageJobDispatched, ImageJobId, ImageRunnerCapabilities,
-    ImageRunnerEvent, ImageRunnerState, ImageRunnerStatus, ReportImageProgress, WgpuExecutionKind,
+    ImageRunnerEvent, ImageRunnerReadiness, ImageRunnerState, ImageRunnerStatus,
+    ReportImageProgress, WgpuExecutionKind,
 };
 
 /// Largest current browser tensor after verified F16 Qwen row storage is adapted to F32.
@@ -235,8 +236,68 @@ pub struct BooguFactoryContext {
     /// Limits actually applied to the shared WGPU device, not merely advertised by its adapter.
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
+    /// Exact Bevy WGPU device/queue handles used only for a browser allocation preflight.
+    /// Surface-free diagnostics intentionally leave this absent.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) allocation_device: Option<crate::backend::SharedWgpuAllocationDevice>,
     pub settings: BooguAdapterSettings,
     pub releases: Vec<BooguReleaseIdentity>,
+}
+
+/// Keep each fail-fast WebGPU allocation comfortably below the released model buffer limit.
+/// Every buffer is retained until the whole planned residency has been committed.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) const BROWSER_VRAM_PREFLIGHT_TARGET_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Split one conservative model residency into aligned WebGPU allocation sizes.
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+pub(crate) fn browser_vram_preflight_chunks(
+    required_bytes: u64,
+    max_buffer_size: u64,
+) -> Result<Vec<u64>, String> {
+    const ALIGNMENT: u64 = wgpu::COPY_BUFFER_ALIGNMENT;
+    if required_bytes == 0 {
+        return Err("browser VRAM preflight requires a non-zero residency plan".into());
+    }
+    if !required_bytes.is_multiple_of(ALIGNMENT) {
+        return Err(format!(
+            "browser VRAM preflight byte plan {required_bytes} is not {ALIGNMENT}-byte aligned"
+        ));
+    }
+    let chunk_bytes = BROWSER_VRAM_PREFLIGHT_TARGET_CHUNK_BYTES
+        .min(max_buffer_size)
+        .checked_div(ALIGNMENT)
+        .and_then(|units| units.checked_mul(ALIGNMENT))
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| {
+            format!(
+                "shared WebGPU max_buffer_size={max_buffer_size} cannot hold one aligned preflight allocation"
+            )
+        })?;
+    let full_chunks = required_bytes / chunk_bytes;
+    let remainder = required_bytes % chunk_bytes;
+    let capacity = usize::try_from(full_chunks + u64::from(remainder > 0))
+        .map_err(|_| "browser VRAM preflight allocation count does not fit usize".to_owned())?;
+    let mut chunks = Vec::with_capacity(capacity);
+    chunks.resize(
+        capacity.saturating_sub(usize::from(remainder > 0)),
+        chunk_bytes,
+    );
+    if remainder > 0 {
+        chunks.push(remainder);
+    }
+    if chunks.is_empty()
+        || chunks
+            .iter()
+            .any(|&bytes| bytes == 0 || bytes > max_buffer_size || !bytes.is_multiple_of(ALIGNMENT))
+        || chunks
+            .iter()
+            .try_fold(0_u64, |total, &bytes| total.checked_add(bytes))
+            != Some(required_bytes)
+    {
+        return Err("browser VRAM preflight produced an invalid allocation plan".into());
+    }
+    Ok(chunks)
 }
 
 /// Fully resolved Boogu work passed to an injected runtime.
@@ -261,6 +322,12 @@ pub struct BooguRuntimeJob {
 pub trait BooguRuntime: Send + Sync + 'static {
     /// Releases this initialized runtime can execute.
     fn variants(&self) -> Vec<BooguVariant>;
+
+    /// Aggregate selected-model transfer state when this runtime starts accepting requests.
+    /// Native or fully resident implementations may retain the default absence.
+    fn readiness(&self) -> ImageRunnerReadiness {
+        ImageRunnerReadiness::default()
+    }
 
     fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError>;
 
@@ -344,12 +411,39 @@ struct BooguAdapterHost {
 /// cancellation request removes that entry immediately, while the browser task may still own the
 /// shared GPU queue until it emits its actual `Cancelled` terminal event.
 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-#[derive(Resource, Debug, Default)]
+#[derive(Resource, Debug)]
 struct BrowserSurfaceInferenceGate {
+    enabled: bool,
     active_jobs: HashSet<ImageJobId>,
     saved_primary_window_camera_states: BTreeMap<Entity, bool>,
     primary_window: Option<Entity>,
     violation: Option<String>,
+}
+
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+impl Default for BrowserSurfaceInferenceGate {
+    fn default() -> Self {
+        Self {
+            enabled: browser_surface_inference_gate_requested(),
+            active_jobs: HashSet::new(),
+            saved_primary_window_camera_states: BTreeMap::new(),
+            primary_window: None,
+            violation: None,
+        }
+    }
+}
+
+#[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
+fn browser_surface_inference_gate_requested() -> bool {
+    web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .is_some_and(|params| params.get("surface-gate").as_deref() == Some("1"))
+}
+
+#[cfg(test)]
+const fn browser_surface_inference_gate_requested() -> bool {
+    false
 }
 
 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
@@ -418,6 +512,7 @@ impl<F: BooguRuntimeFactory> Plugin for BooguAdapterPlugin<F> {
         app.insert_resource(ImageRunnerStatus::initializing(
             "Boogu runtime is waiting for the shared WGPU device",
         ))
+        .init_resource::<ImageRunnerReadiness>()
         .init_resource::<BooguAdapterStatus>()
         .insert_resource(BooguAdapterHost {
             settings: self.settings.clone(),
@@ -761,9 +856,13 @@ fn report_browser_surface_gate_failure(
 fn initialize_boogu_runtime(
     backend: Res<BackendStatus>,
     burn_device: Option<Res<bevy_burn::BurnDevice>>,
+    #[cfg(target_arch = "wasm32")] allocation_device: Option<
+        Res<crate::backend::SharedWgpuAllocationDevice>,
+    >,
     mut host: ResMut<BooguAdapterHost>,
     mut adapter_status: ResMut<BooguAdapterStatus>,
     mut runner_status: ResMut<ImageRunnerStatus>,
+    mut runner_readiness: ResMut<ImageRunnerReadiness>,
 ) {
     if matches!(host.phase, FactoryPhase::Ready | FactoryPhase::Failed) {
         return;
@@ -812,6 +911,8 @@ fn initialize_boogu_runtime(
             execution: current_execution_kind(),
             max_storage_buffer_binding_size: device_info.max_storage_buffer_binding_size,
             max_buffer_size: device_info.max_buffer_size,
+            #[cfg(target_arch = "wasm32")]
+            allocation_device: allocation_device.as_deref().cloned(),
             settings: host.settings.clone(),
             releases: canonical_releases(),
         };
@@ -830,6 +931,7 @@ fn initialize_boogu_runtime(
             return;
         }
         host.phase = FactoryPhase::Building;
+        runner_readiness.transfer = None;
         *adapter_status = BooguAdapterStatus::BuildingRuntime;
         *runner_status = ImageRunnerStatus::initializing(
             "Boogu runtime is loading verified artifacts on the shared WGPU device",
@@ -847,6 +949,7 @@ fn initialize_boogu_runtime(
     match poll_result {
         Ok(None) => {}
         Ok(Some(runtime)) => {
+            let readiness = runtime.readiness();
             let variants = match validate_runtime_variants(runtime.variants()) {
                 Ok(variants) => variants,
                 Err(error) => {
@@ -875,6 +978,7 @@ fn initialize_boogu_runtime(
             host.runtime = Some(runtime);
             host.factory = None;
             host.phase = FactoryPhase::Ready;
+            *runner_readiness = readiness;
             *adapter_status = BooguAdapterStatus::Ready { variants };
             *runner_status = ready;
         }
@@ -1014,27 +1118,30 @@ fn submit_boogu_jobs(
         // here is therefore synchronous-before-submit and reaches render extraction before model
         // inference can begin on the shared queue.
         #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-        let surface_suspend = match suspend_browser_surface_inference(
-            &mut surface_gate,
-            &primary_windows,
-            &mut cameras,
-        ) {
-            Ok(report) => report,
-            Err(message) => {
-                report_browser_surface_gate_failure(dispatch.id, "suspend", &message, false);
-                failed.write(FailImageJob {
-                    id: dispatch.id,
-                    error: FrontendError::model_runtime(message),
-                });
-                continue;
+        let surface_suspend = if surface_gate.enabled {
+            match suspend_browser_surface_inference(
+                &mut surface_gate,
+                &primary_windows,
+                &mut cameras,
+            ) {
+                Ok(report) => Some(report),
+                Err(message) => {
+                    report_browser_surface_gate_failure(dispatch.id, "suspend", &message, false);
+                    failed.write(FailImageJob {
+                        id: dispatch.id,
+                        error: FrontendError::model_runtime(message),
+                    });
+                    continue;
+                }
             }
+        } else {
+            None
         };
         match runtime.submit(job) {
             Ok(token) => {
                 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-                {
+                if let Some(mut report) = surface_suspend {
                     surface_gate.active_jobs.insert(dispatch.id);
-                    let mut report = surface_suspend;
                     report.active_job_count = surface_gate.active_jobs.len();
                     report_browser_surface_suspended(dispatch.id, report);
                 }
@@ -1050,7 +1157,7 @@ fn submit_boogu_jobs(
             }
             Err(error) => {
                 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-                {
+                if surface_suspend.is_some() {
                     let report = restore_pending_browser_surface_inference(
                         &mut surface_gate,
                         &primary_windows,
@@ -1117,21 +1224,26 @@ fn poll_boogu_runtime(
             }
             ImageRunnerEvent::Completed { id, output } => {
                 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-                let surface_resume = resume_browser_surface_inference(
-                    &mut surface_gate,
-                    id,
-                    &primary_windows,
-                    &mut cameras,
-                );
+                let surface_resume = surface_gate.active_jobs.contains(&id).then(|| {
+                    resume_browser_surface_inference(
+                        &mut surface_gate,
+                        id,
+                        &primary_windows,
+                        &mut cameras,
+                    )
+                });
                 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-                report_browser_surface_resumed(id, "completed", surface_resume);
+                if let Some(report) = surface_resume {
+                    report_browser_surface_resumed(id, "completed", report);
+                }
                 let Some(active) = host.active.remove(&id) else {
                     continue;
                 };
                 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-                if !surface_resume.exact_saved_states_restored
-                    || !surface_resume.all_primary_window_cameras_restored
-                {
+                if surface_resume.is_some_and(|report| {
+                    !report.exact_saved_states_restored
+                        || !report.all_primary_window_cameras_restored
+                }) {
                     report_browser_surface_gate_failure(
                         id,
                         "restore",
@@ -1158,7 +1270,7 @@ fn poll_boogu_runtime(
             }
             ImageRunnerEvent::Failed { id, error } => {
                 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-                {
+                if surface_gate.active_jobs.contains(&id) {
                     let report = resume_browser_surface_inference(
                         &mut surface_gate,
                         id,
@@ -1184,7 +1296,7 @@ fn poll_boogu_runtime(
             }
             ImageRunnerEvent::Cancelled { id } => {
                 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-                {
+                if surface_gate.active_jobs.contains(&id) {
                     let report = resume_browser_surface_inference(
                         &mut surface_gate,
                         id,
@@ -1778,6 +1890,30 @@ mod tests {
         BooguAdapterSettings::verified_f16(ArtifactSource::Remote {
             base_url: RemoteBaseUrl::new("https://cdn.example/boogu").unwrap(),
         })
+    }
+
+    #[test]
+    fn browser_vram_preflight_chunks_cover_exact_plan_correctness() {
+        let required = BROWSER_VRAM_PREFLIGHT_TARGET_CHUNK_BYTES * 2 + 64 * 1024 * 1024;
+        let chunks = browser_vram_preflight_chunks(required, u64::MAX).unwrap();
+        assert_eq!(
+            chunks,
+            vec![
+                BROWSER_VRAM_PREFLIGHT_TARGET_CHUNK_BYTES,
+                BROWSER_VRAM_PREFLIGHT_TARGET_CHUNK_BYTES,
+                64 * 1024 * 1024,
+            ]
+        );
+        assert_eq!(chunks.into_iter().sum::<u64>(), required);
+    }
+
+    #[test]
+    fn browser_vram_preflight_respects_applied_buffer_limit_correctness() {
+        let chunks = browser_vram_preflight_chunks(48, 20).unwrap();
+        assert_eq!(chunks, vec![20, 20, 8]);
+        assert!(browser_vram_preflight_chunks(0, 20).is_err());
+        assert!(browser_vram_preflight_chunks(16, 3).is_err());
+        assert!(browser_vram_preflight_chunks(18, 20).is_err());
     }
 
     fn request() -> ImageRequest {

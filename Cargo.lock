@@ -686,6 +686,7 @@ dependencies = [
  "clap",
  "console_error_panic_hook",
  "cubecl",
+ "futures",
  "half",
  "image",
  "js-sys",

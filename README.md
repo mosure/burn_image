@@ -139,7 +139,10 @@ workflow rejects using the canonical 1.5K parent as the flat parity root. Its br
 `qualification-f32` control is disabled by default and non-blocking when explicitly dispatched; the
 browser low-VRAM numerical and strict measured-memory outcome remains mandatory.
 
-Browser builds default to `residency=low-vram`. The default is variant-aware: Edit retains a
+Interactive browser builds now default to `residency=resident`: after the mandatory shared-device
+VRAM preflight, the selected Qwen/VAE/denoiser request graph is verified, materialized, and retained
+on WebGPU before **Ready**, so repeat Runs reuse a warm pipeline. `residency=low-vram` remains the
+explicit bounded-memory path. That policy is variant-aware: Edit retains a
 request-scoped runtime-Q8/F32 denoiser, while ordinary Turbo uses
 `low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser`. Turbo authenticates 46 stages / 106
 objects / 912 F16 tensors, retaining 19,870,010,624 padded packed-F16 bytes. Each DMD step widens one
@@ -147,7 +150,8 @@ semantic stage at a time on device and executes dense-F32 matmul; runtime Q8 is 
 Turbo policy. DMD is fail-closed on artifact, cache, or network traffic. After the fourth step, the
 runtime transfers the exact final F32 latent across a synchronized boundary, evicts the entire
 request-scoped packed cache before VAE decode, and rehydrates it from the verified persistent range
-cache before the next request.
+cache before the next request. The published low-VRAM evidence below remains scoped to that
+explicit policy; the new warm interactive default requires refreshed browser hardware evidence.
 
 The packed-F16 Turbo plan records a 22,304,263,424-byte preload peak and a 26,492,170,880-byte
 conservative inference bound. Its exact-size persistent Qwen text-layer pool still requires the
@@ -223,9 +227,12 @@ not pass `--disable-dev-shm-usage`: `/dev/shm` completed all 268,435,456 probe b
 hit its effective quota despite reporting free blocks. This is quota-aware admission, not a
 `statfs`-only capacity claim.
 
-For local browser builds and GitHub Pages deployment, see the [web guide](docs/web.md). The web
-shell reports the current component, shard transfer, verification, and inference stage so a large
-model load does not look frozen.
+For local browser builds and GitHub Pages deployment, see the [web guide](docs/web.md). The same
+Bevy UI used natively reports the current component, aggregate part transfer, verification, and
+inference stage so a large model load does not look frozen; there is no separate browser overlay.
+Before the ordinary page requests weight parts, it also commits and
+releases the selected policy's conservative GPU-memory plan on the exact shared Bevy/Burn WebGPU
+device; failure stops before the large CDN transfer rather than treating API buffer limits as VRAM.
 
 This workspace carries two required root `[patch.crates-io]` entries: patched `wgpu` 29.0.4 bounds
 browser uploads and surfaces rejected `GPUQueue.onSubmittedWorkDone()` promises, while patched
