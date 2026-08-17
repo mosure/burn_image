@@ -214,7 +214,10 @@ mod native {
                 .spawn(async move {
                     let selected = rfd::AsyncFileDialog::new()
                         .set_title("Open reference image")
-                        .add_filter("Image", &["png", "jpg", "jpeg", "webp"])
+                        .add_filter(
+                            "Image",
+                            &["png", "PNG", "jpg", "JPG", "jpeg", "JPEG", "webp", "WEBP"],
+                        )
                         .pick_file()
                         .await;
                     let result = match selected {

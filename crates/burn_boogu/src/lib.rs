@@ -110,5 +110,8 @@ pub use processing::{
 pub use runtime::{BooguImageModel, BooguRuntimeDTypes, BooguRuntimeMetadata};
 #[cfg(feature = "wgpu")]
 pub use wgpu_device::require_native_wgpu_device;
-#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-pub use wgpu_device::{configure_native_full_autotune, require_native_full_autotune_configured};
+#[cfg(all(feature = "wgpu", feature = "autotune", not(target_arch = "wasm32")))]
+pub use wgpu_device::{
+    configure_native_autotune, configure_native_full_autotune, require_native_autotune_configured,
+    require_native_full_autotune_configured,
+};

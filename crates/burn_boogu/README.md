@@ -67,6 +67,9 @@ With `burnpack`, the artifact boundary is deliberately explicit:
 - `AsyncStageShardReader` receives the exact sealed `ArtifactFile` and a pre-read byte cap. The
   verified sources enforce file identity, declared size, SHA-256, stage ownership, key, shape,
   stored dtype, duplicate/missing tensors, and module-apply completeness.
+- Canonical CDN manifests keep those logical Burnpack objects below 256 MiB while a sealed sidecar
+  maps them to physical parts targeting 20,971,520 bytes and hard-capped at 25,000,000 bytes.
+  Browser CacheStorage remains a third layer: authenticated range entries never exceed 4 MiB.
 
 No loader calls `collect()` on an unloaded lazy module. Qwen rank-two checkpoint tensors retain
 their saved `[out, in]` shape until Burn's ordinary Col load mapper applies them.
@@ -260,7 +263,7 @@ diagnostics additionally reload denoiser stages on every step and intentionally 
 | Binary | Purpose |
 | --- | --- |
 | `boogu-import` | convert a pinned Hugging Face snapshot into a descriptive sealed candidate bundle |
-| `boogu-prepare-cdn-release` | split three exact legacy monoliths into two shared component entries and three dependency-pinned parents, with strict closure reports |
+| `boogu-prepare-cdn-release` | split three exact legacy monoliths into two shared component entries and three dependency-pinned parents, emit a sealed part-only 20 MiB-target / 25,000,000-byte-hard-max physical transport, and write strict closure reports |
 | `boogu-run` | native verified-artifact WGPU generation/editing; Qwen/VAE retained after first use, resident denoiser |
 | `boogu-run-wgpu-blackbox` | native WGPU runner exposing required padded blackbox attention and fail-closed kernel controls |
 | `boogu-qwen-parity` | aligned real-fixture Qwen vision/text/final-state parity and dtype observations |
@@ -285,7 +288,7 @@ and per-stage timings. It is a high-VRAM benchmark, not the browser residency po
 The 1.5K Edit runtime uses a separately converted bundle and requires a source image:
 
 ```bash
-cargo run --release -p burn_boogu --features runtime,import,wgpu \
+cargo run --release -p burn_boogu --features runtime,import,wgpu,autotune \
   --bin boogu-run-wgpu-blackbox -- \
   --artifacts .artifacts/boogu-image-0.1-edit-turbo-1k5 \
   --variant edit-turbo-1k5 --profile f16-qwen-vision-f32 \
@@ -321,7 +324,7 @@ mandatory low-VRAM numerical and measured-memory gate.
 The parity-gated 1024 native-WGPU performance policy is selected explicitly:
 
 ```bash
-cargo run --release -p burn_boogu --features runtime,import,wgpu \
+cargo run --release -p burn_boogu --features runtime,import,wgpu,autotune \
   --bin boogu-run-wgpu-blackbox -- \
   --artifacts .artifacts/boogu-image-0.1-turbo \
   --variant turbo --profile f16-qwen-vision-f32 \
@@ -474,9 +477,10 @@ replay; `boogu-full-parity` owns production execution-dtype propagation.
 
 ## Current limits
 
-As of 2026-08-14, canonical CDN publication remains blocked: the five prepared model entry URLs
-return HTTP 403 and do not expose the required Range/`Content-Range` headers through CORS. The
-positive browser evidence above used verified local modular artifacts and does not waive that gate.
+As of 2026-08-16, the canonical CDN is readable and a real-browser probe verified authenticated
+cold whole-part streaming plus warm CacheStorage resume. Pages remains fail-closed because reusable
+manifest URLs are marked `immutable` instead of `no-cache`. This transport probe does not replace
+the positive model/parity evidence above.
 Linux browser harnesses also use BigInt `statfs` plus a real bounded 256 MiB write/`fsync`/delete
 quota probe; current runs admitted `/dev/shm`, rejected quota-limited `/tmp`, and omitted
 `--disable-dev-shm-usage`.

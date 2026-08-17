@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -7,7 +8,8 @@ use std::{
 
 use crate::{
     ArtifactBundleId, ArtifactDependency, ArtifactFile, ArtifactManifest, ArtifactReadError,
-    ArtifactVerifier, IntegrityPolicy, VerifiedArtifactDirectory,
+    ArtifactTransportLayout, ArtifactTransportPart, ArtifactVerifier, IntegrityPolicy,
+    VerifiedArtifactDirectory, VerifiedArtifactTransportLayout,
 };
 
 /// Platform adapter used by the reusable native filesystem cache.
@@ -23,7 +25,8 @@ pub trait ArtifactBundleFetcher {
         maximum_bytes: u64,
     ) -> Result<Vec<u8>, ArtifactReadError>;
 
-    /// Stream one exact file into `destination`. The cache independently verifies size/SHA-256.
+    /// Stream one exact sealed manifest file or manifest-sealed transport part into `destination`.
+    /// The cache independently verifies size/SHA-256.
     fn fetch_file(
         &mut self,
         bundle: &ArtifactBundleId,
@@ -61,9 +64,9 @@ impl FilesystemArtifactCache {
 
     /// Resolve one exact dependency into the verified cache.
     ///
-    /// The directory is `<root>/<bundle>/<content-digest>`. Payloads are installed atomically and
-    /// `manifest.json` is written only after every declared file verifies, making it the cache
-    /// commit point.
+    /// The directory is `<root>/<bundle>/<content-digest>`. Direct payloads and any authenticated
+    /// transport parts are installed atomically; `manifest.json` is written only after the complete
+    /// physical representation verifies, making it the cache commit point.
     pub fn ensure_dependency<F: ArtifactBundleFetcher>(
         &self,
         dependency: &ArtifactDependency,
@@ -87,11 +90,7 @@ impl FilesystemArtifactCache {
             && dependency
                 .validate_resolved_manifest(directory.manifest())
                 .is_ok()
-            && directory
-                .manifest()
-                .files
-                .iter()
-                .all(|file| verified_cached_file(&bundle_root.join(file.path.as_str()), file))
+            && verified_cached_bundle(&bundle_root, directory.manifest())?
         {
             return Ok(directory);
         }
@@ -120,12 +119,44 @@ impl FilesystemArtifactCache {
         if manifest_path.exists() {
             fs::remove_file(&manifest_path).map_err(directory_error("remove invalid manifest"))?;
         }
+        // Compact declared files, including the sealed transport sidecar, are installed first.
+        // The authenticated sidecar then becomes the only authority for physical weight parts.
+        // Logical weight files are deliberately absent from a transport-backed cache so the
+        // strict directory reader cannot observe two competing physical representations.
+        for file in manifest
+            .files
+            .iter()
+            .filter(|file| file.role != crate::ArtifactFileRole::Weights)
+        {
+            install_file_if_missing(&dependency.bundle, file, &bundle_root, fetcher)?;
+        }
+        let transport = cached_transport_layout(&bundle_root, &manifest)?;
+        let mut installed_parts = BTreeSet::new();
         for file in &manifest.files {
-            let destination = bundle_root.join(file.path.as_str());
-            if verified_cached_file(&destination, file) {
-                continue;
+            if file.role == crate::ArtifactFileRole::Weights
+                && let Some(layout) = transport.as_ref()
+            {
+                let object = layout.object(&file.path).ok_or_else(|| {
+                    ArtifactReadError::Directory(format!(
+                        "verified transport layout omits logical weight {}",
+                        file.path
+                    ))
+                })?;
+                for part in &object.parts {
+                    if installed_parts.insert(part.path.clone()) {
+                        let physical = transport_part_file(part);
+                        install_file_if_missing(
+                            &dependency.bundle,
+                            &physical,
+                            &bundle_root,
+                            fetcher,
+                        )?;
+                    }
+                }
+                remove_stale_logical_weight(&bundle_root.join(file.path.as_str()))?;
+            } else if file.role == crate::ArtifactFileRole::Weights {
+                install_file_if_missing(&dependency.bundle, file, &bundle_root, fetcher)?;
             }
-            install_verified_file(&dependency.bundle, file, &destination, fetcher)?;
         }
         install_bytes_atomically(&manifest_path, &manifest_bytes)?;
         let directory =
@@ -134,6 +165,95 @@ impl FilesystemArtifactCache {
             .validate_resolved_manifest(directory.manifest())
             .map_err(|error| ArtifactReadError::Directory(error.to_string()))?;
         Ok(directory)
+    }
+}
+
+fn install_file_if_missing<F: ArtifactBundleFetcher>(
+    bundle: &ArtifactBundleId,
+    file: &ArtifactFile,
+    bundle_root: &Path,
+    fetcher: &mut F,
+) -> Result<(), ArtifactReadError> {
+    let destination = bundle_root.join(file.path.as_str());
+    if !verified_cached_file(&destination, file) {
+        install_verified_file(bundle, file, &destination, fetcher)?;
+    }
+    Ok(())
+}
+
+fn verified_cached_bundle(
+    bundle_root: &Path,
+    manifest: &ArtifactManifest,
+) -> Result<bool, ArtifactReadError> {
+    let transport = cached_transport_layout(bundle_root, manifest)?;
+    for file in &manifest.files {
+        if file.role == crate::ArtifactFileRole::Weights
+            && let Some(layout) = transport.as_ref()
+        {
+            // A transport-backed cache has exactly one physical representation. An old logical
+            // materialization forces a repair pass that removes it before the manifest is
+            // recommitted.
+            if fs::symlink_metadata(bundle_root.join(file.path.as_str())).is_ok() {
+                return Ok(false);
+            }
+            let object = layout.object(&file.path).ok_or_else(|| {
+                ArtifactReadError::Directory(format!(
+                    "verified transport layout omits logical weight {}",
+                    file.path
+                ))
+            })?;
+            for part in &object.parts {
+                if !verified_cached_file(
+                    &bundle_root.join(part.path.as_str()),
+                    &transport_part_file(part),
+                ) {
+                    return Ok(false);
+                }
+            }
+        } else if !verified_cached_file(&bundle_root.join(file.path.as_str()), file) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn cached_transport_layout(
+    bundle_root: &Path,
+    manifest: &ArtifactManifest,
+) -> Result<Option<VerifiedArtifactTransportLayout>, ArtifactReadError> {
+    let Some(declaration) = ArtifactTransportLayout::declared_file(manifest)? else {
+        return Ok(None);
+    };
+    let path = bundle_root.join(declaration.path.as_str());
+    if !verified_cached_file(&path, declaration) {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(directory_error("read cached transport layout"))?;
+    ArtifactTransportLayout::parse_and_validate(manifest, &bytes)
+        .map(Some)
+        .map_err(ArtifactReadError::from)
+}
+
+fn transport_part_file(part: &ArtifactTransportPart) -> ArtifactFile {
+    ArtifactFile {
+        path: part.path.clone(),
+        size: part.size,
+        sha256: part.sha256,
+        role: crate::ArtifactFileRole::Other,
+        component: None,
+        shard: None,
+    }
+}
+
+fn remove_stale_logical_weight(path: &Path) -> Result<(), ArtifactReadError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(ArtifactReadError::Directory(format!(
+            "cached logical weight path is a directory: {}",
+            path.display()
+        ))),
+        Ok(_) => fs::remove_file(path).map_err(directory_error("remove stale logical weight")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(directory_error("inspect stale logical weight")(error)),
     }
 }
 
@@ -307,8 +427,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::{
-        ARTIFACT_MANIFEST_SCHEMA_V1, ArtifactBundleId, ArtifactComponentId, ArtifactFileRole,
-        ArtifactPath, ArtifactProfileId, ModelId, NumericFormat, Sha256Digest,
+        ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_MANIFEST_SCHEMA_V1,
+        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY,
+        ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY, ARTIFACT_TRANSPORT_LAYOUT_PATH,
+        ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY,
+        ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION, ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+        ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY, ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY,
+        ARTIFACT_TRANSPORT_TARGET_PART_BYTES, ArtifactBundleId, ArtifactComponentId,
+        ArtifactFileRole, ArtifactPath, ArtifactProfileId, ArtifactShardReader,
+        ArtifactTransportObject, ModelId, NumericFormat, Sha256Digest,
     };
 
     use super::*;
@@ -386,6 +513,146 @@ mod tests {
         (dependency, fetcher)
     }
 
+    struct TransportMemoryFetcher {
+        manifest: Vec<u8>,
+        payloads: BTreeMap<ArtifactPath, Vec<u8>>,
+        manifest_reads: usize,
+        payload_reads: usize,
+    }
+
+    impl ArtifactBundleFetcher for TransportMemoryFetcher {
+        fn fetch_manifest(
+            &mut self,
+            _bundle: &ArtifactBundleId,
+            _maximum_bytes: u64,
+        ) -> Result<Vec<u8>, ArtifactReadError> {
+            self.manifest_reads += 1;
+            Ok(self.manifest.clone())
+        }
+
+        fn fetch_file(
+            &mut self,
+            _bundle: &ArtifactBundleId,
+            file: &ArtifactFile,
+            destination: &mut dyn Write,
+        ) -> Result<(), ArtifactReadError> {
+            self.payload_reads += 1;
+            let bytes = self.payloads.get(&file.path).ok_or_else(|| {
+                ArtifactReadError::transport(format!("unexpected fetch for {}", file.path))
+            })?;
+            destination
+                .write_all(bytes)
+                .map_err(|error| ArtifactReadError::transport(error.to_string()))
+        }
+    }
+
+    fn transport_fixture() -> (
+        ArtifactDependency,
+        ArtifactFile,
+        ArtifactPath,
+        TransportMemoryFetcher,
+    ) {
+        let payload = b"transport-backed cached component payload".to_vec();
+        let digest = Sha256Digest::calculate(&payload);
+        let logical = ArtifactFile {
+            path: ArtifactPath::new("objects/component.bpk").unwrap(),
+            size: payload.len() as u64,
+            sha256: digest,
+            role: ArtifactFileRole::Weights,
+            component: None,
+            shard: None,
+        };
+        let part_path = ArtifactPath::new(format!("transport/{digest}.part")).unwrap();
+        let bundle = ArtifactBundleId::new("transport-cache-test").unwrap();
+        let profile = ArtifactProfileId::new("f16").unwrap();
+        let model = ModelId::new("tests/transport-cache").unwrap();
+        let layout = ArtifactTransportLayout {
+            schema_version: ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
+            bundle: bundle.clone(),
+            profile: profile.clone(),
+            model: model.clone(),
+            model_revision: "immutable-transport-revision".into(),
+            target_part_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+            hard_max_part_bytes: ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+            objects: vec![ArtifactTransportObject {
+                path: logical.path.clone(),
+                size: logical.size,
+                sha256: logical.sha256,
+                parts: vec![ArtifactTransportPart {
+                    path: part_path.clone(),
+                    offset: 0,
+                    size: payload.len() as u64,
+                    sha256: digest,
+                }],
+            }],
+        };
+        let layout_bytes = serde_json::to_vec(&layout).unwrap();
+        let sidecar = ArtifactFile {
+            path: ArtifactPath::new(ARTIFACT_TRANSPORT_LAYOUT_PATH).unwrap(),
+            size: layout_bytes.len() as u64,
+            sha256: Sha256Digest::calculate(&layout_bytes),
+            role: ArtifactFileRole::Metadata,
+            component: None,
+            shard: None,
+        };
+        let mut manifest = ArtifactManifest {
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
+            bundle: bundle.clone(),
+            profile: profile.clone(),
+            model: model.clone(),
+            model_revision: layout.model_revision.clone(),
+            numeric_format: NumericFormat::F16,
+            components: Vec::new(),
+            files: vec![logical.clone(), sidecar.clone()],
+            dependencies: Vec::new(),
+            metadata: BTreeMap::from([
+                (
+                    ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY.into(),
+                    ARTIFACT_TRANSPORT_LAYOUT_PATH.into(),
+                ),
+                (
+                    ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY.into(),
+                    ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION.to_string(),
+                ),
+                (ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY.into(), "true".into()),
+                (
+                    ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY.into(),
+                    ARTIFACT_TRANSPORT_TARGET_PART_BYTES.to_string(),
+                ),
+                (
+                    ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY.into(),
+                    ARTIFACT_TRANSPORT_MAX_PART_BYTES.to_string(),
+                ),
+                (
+                    ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY.into(),
+                    ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
+                ),
+                (
+                    ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+                    ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
+                ),
+            ]),
+            content_digest: None,
+        };
+        let content_digest = manifest.seal().unwrap();
+        layout.validate_for_manifest(&manifest).unwrap();
+        let dependency = ArtifactDependency {
+            role: ArtifactComponentId::new("component").unwrap(),
+            bundle,
+            profile,
+            model,
+            model_revision: manifest.model_revision.clone(),
+            content_digest,
+        };
+        let fetcher = TransportMemoryFetcher {
+            manifest: serde_json::to_vec(&manifest).unwrap(),
+            payloads: BTreeMap::from([(sidecar.path, layout_bytes), (part_path.clone(), payload)]),
+            manifest_reads: 0,
+            payload_reads: 0,
+        };
+        (dependency, logical, part_path, fetcher)
+    }
+
     #[test]
     fn dependency_cache_commits_last_and_reuses_verified_payload_correctness() {
         let root = tempfile::tempdir().unwrap();
@@ -398,6 +665,70 @@ mod tests {
 
         let second = cache.ensure_dependency(&dependency, &mut fetcher).unwrap();
         assert_eq!(first.root(), second.root());
+        assert_eq!(fetcher.manifest_reads, 1);
+        assert_eq!(fetcher.payload_reads, 1);
+    }
+
+    #[test]
+    fn dependency_transport_cache_commits_parts_and_reopens_reader_correctness() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = FilesystemArtifactCache::new(root.path(), 1024 * 1024).unwrap();
+        let (dependency, logical, part_path, mut fetcher) = transport_fixture();
+
+        let first = cache.ensure_dependency(&dependency, &mut fetcher).unwrap();
+        assert!(first.root().join("manifest.json").is_file());
+        assert!(first.root().join(ARTIFACT_TRANSPORT_LAYOUT_PATH).is_file());
+        assert!(first.root().join(part_path.as_str()).is_file());
+        assert!(!first.root().join(logical.path.as_str()).exists());
+        let mut reader = first.shard_reader().unwrap();
+        assert_eq!(
+            reader.read_shard(&logical).unwrap(),
+            fetcher.payloads[&part_path]
+        );
+        assert_eq!(fetcher.manifest_reads, 1);
+        assert_eq!(fetcher.payload_reads, 2);
+
+        let second = cache.ensure_dependency(&dependency, &mut fetcher).unwrap();
+        let mut reader = second.shard_reader().unwrap();
+        assert_eq!(
+            reader.read_shard(&logical).unwrap(),
+            fetcher.payloads[&part_path]
+        );
+        assert_eq!(fetcher.manifest_reads, 1);
+        assert_eq!(fetcher.payload_reads, 2);
+    }
+
+    #[test]
+    fn dependency_transport_cache_migrates_committed_logical_representation_correctness() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = FilesystemArtifactCache::new(root.path(), 1024 * 1024).unwrap();
+        let (dependency, logical, part_path, mut fetcher) = transport_fixture();
+        let bundle_root = root
+            .path()
+            .join(dependency.bundle.as_str())
+            .join(dependency.content_digest.to_string());
+        fs::create_dir_all(bundle_root.join("objects")).unwrap();
+        fs::create_dir_all(bundle_root.join("metadata")).unwrap();
+        fs::write(bundle_root.join("manifest.json"), &fetcher.manifest).unwrap();
+        fs::write(
+            bundle_root.join(ARTIFACT_TRANSPORT_LAYOUT_PATH),
+            &fetcher.payloads[&ArtifactPath::new(ARTIFACT_TRANSPORT_LAYOUT_PATH).unwrap()],
+        )
+        .unwrap();
+        fs::write(
+            bundle_root.join(logical.path.as_str()),
+            &fetcher.payloads[&part_path],
+        )
+        .unwrap();
+
+        let directory = cache.ensure_dependency(&dependency, &mut fetcher).unwrap();
+        assert!(!directory.root().join(logical.path.as_str()).exists());
+        assert!(directory.root().join(part_path.as_str()).is_file());
+        let mut reader = directory.shard_reader().unwrap();
+        assert_eq!(
+            reader.read_shard(&logical).unwrap(),
+            fetcher.payloads[&part_path]
+        );
         assert_eq!(fetcher.manifest_reads, 1);
         assert_eq!(fetcher.payload_reads, 1);
     }

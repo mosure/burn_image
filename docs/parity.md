@@ -551,7 +551,7 @@ cargo run -p burn_boogu --release --all-features \
   --profile q8s-block32-f32-qwen-vision-f32 \
   --quantized-load-policy auto --capture-stages true --require
 
-cargo run -p burn_boogu --release --features "runtime,import,wgpu" \
+cargo run -p burn_boogu --release --features "runtime,import,wgpu,autotune" \
   --bin boogu-full-parity -- \
   --artifacts "$ARTIFACTS" --fixture "$FIXTURE" \
   --profile f16-qwen-vision-f32 --qwen-residency retained \
@@ -568,7 +568,7 @@ cargo run -p burn_boogu --release --features "runtime,import,wgpu" \
 
 # Exact native Edit-Turbo 1.5K release policy over the qualified schema-v1 flat artifact.
 # Other runtime policies require an explicit diagnostic flag.
-cargo run -p burn_boogu --release --features "runtime,import,wgpu" \
+cargo run -p burn_boogu --release --features "runtime,import,wgpu,autotune" \
   --bin boogu-full-parity -- \
   --artifacts "$EDIT_1K5_FLAT_PARITY_ARTIFACTS" --fixture "$EDIT_1K5_FIXTURE" \
   --profile f16-qwen-vision-f32 --qwen-residency retained \
@@ -585,7 +585,7 @@ cargo run -p burn_boogu --release --features "runtime,import,wgpu" \
 
 # Qualified native low-VRAM replay: phase-streamed Qwen/VAE, resident mixed-F16 denoiser,
 # plus strict sampled process VRAM below decimal 32 GB.
-cargo run -p burn_boogu --release --locked --features "runtime,import,wgpu" \
+cargo run -p burn_boogu --release --locked --features "runtime,import,wgpu,autotune" \
   --bin boogu-full-parity -- \
   --artifacts "$EDIT_1K5_FLAT_PARITY_ARTIFACTS" --fixture "$EDIT_1K5_FIXTURE" \
   --profile f16-qwen-vision-f32 --native-runtime-policy low-vram \
@@ -661,6 +661,7 @@ required low-VRAM numerical and strict measured-memory outcome. Its evidence is 
 enabled. The ordinary resident rendered run, other released shapes, synchronized performance, and
 cross-stack portability remain separate gates. Ordinary
 rendered Turbo 1024 now has its narrower output/surface/memory evidence above.
-Canonical CDN/Pages deployment remains blocked as of 2026-08-14 because the prepared entries return
-HTTP 403 without the required Range/`Content-Range` CORS policy; local modular evidence does not
-waive that publication gate.
+The canonical CDN is readable as of 2026-08-16, and a real-browser probe verified authenticated cold
+whole-part streaming plus warm CacheStorage resume. Pages remains blocked only on the reusable
+manifest cache policy (`immutable` must become `no-cache`). This transport result is not numerical
+parity and does not alter the model evidence above.

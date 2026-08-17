@@ -1009,8 +1009,9 @@ where
 /// Wasm-local asynchronous source of one verified FLUX VAE half at a time.
 ///
 /// Futures deliberately have no [`Send`] requirement so browser fetch/cache and WebGPU handles
-/// can stay on one JavaScript event loop. Implementations must fetch and apply physical shards
-/// sequentially and leave the opposite VAE half lazy and unfetched.
+/// can stay on one JavaScript event loop. Implementations must fetch and apply logical Burnpack
+/// objects sequentially and leave the opposite VAE half lazy and unfetched; transport adapters may
+/// reconstruct each object from multiple physical CDN parts.
 #[allow(async_fn_in_trait)]
 pub trait AsyncBooguVaeStageSource<B: Backend> {
     /// Verify, load, and return the encoder half for one encode call.

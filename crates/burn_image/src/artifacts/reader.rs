@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -7,8 +8,9 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    ArtifactFile, ArtifactManifest, ArtifactPath, ArtifactVerifier, IntegrityPolicy,
-    VerificationStatus, VerifiedArtifact,
+    ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath, ArtifactTransportLayout,
+    ArtifactTransportLayoutError, ArtifactTransportObject, ArtifactVerifier, IntegrityPolicy,
+    VerificationStatus, VerifiedArtifact, VerifiedArtifactTransportLayout,
 };
 
 /// Conservative default cap for a compact sealed artifact manifest read from disk.
@@ -34,6 +36,8 @@ pub enum ArtifactReadError {
     EvidenceMismatch(ArtifactPath),
     #[error("artifact directory is invalid: {0}")]
     Directory(String),
+    #[error(transparent)]
+    TransportLayout(#[from] ArtifactTransportLayoutError),
 }
 
 impl ArtifactReadError {
@@ -42,7 +46,8 @@ impl ArtifactReadError {
     }
 }
 
-/// Supplies one manifest-declared physical object at a time.
+/// Supplies one manifest-declared logical object at a time, reconstructing physical parts when the
+/// sealed transport layout requires them.
 pub trait ArtifactShardReader {
     fn read_shard(&mut self, file: &ArtifactFile) -> Result<Vec<u8>, ArtifactReadError>;
 }
@@ -139,21 +144,68 @@ pub trait AsyncArtifactShardReader {
 #[derive(Clone, Debug)]
 pub struct DirectoryArtifactShardReader {
     root: PathBuf,
+    manifest_files: Option<BTreeMap<ArtifactPath, ArtifactFile>>,
+    transport_layout: Option<VerifiedArtifactTransportLayout>,
 }
 
 impl DirectoryArtifactShardReader {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            manifest_files: None,
+            transport_layout: None,
+        }
+    }
+
+    /// Construct a reader bound to one sealed manifest and its optional sealed transport layout.
+    ///
+    /// Legacy manifests without transport declarations continue reading logical files directly.
+    /// Once a layout is declared, every logical weight is reconstructed exclusively from its
+    /// verified content-addressed parts; a missing direct logical file is therefore expected.
+    pub fn from_manifest(
+        root: impl Into<PathBuf>,
+        manifest: &ArtifactManifest,
+    ) -> Result<Self, ArtifactReadError> {
+        let root = root.into();
+        let mut reader = Self::new(&root);
+        let transport_layout = match ArtifactTransportLayout::declared_file(manifest)? {
+            Some(layout_file) => {
+                let bytes = reader.read_direct_shard(layout_file)?;
+                Some(ArtifactTransportLayout::parse_and_validate(
+                    manifest, &bytes,
+                )?)
+            }
+            None => None,
+        };
+        reader.manifest_files = Some(
+            manifest
+                .files
+                .iter()
+                .cloned()
+                .map(|file| (file.path.clone(), file))
+                .collect(),
+        );
+        reader.transport_layout = transport_layout;
+        Ok(reader)
+    }
+
+    pub fn from_verified_directory(
+        directory: &VerifiedArtifactDirectory,
+    ) -> Result<Self, ArtifactReadError> {
+        Self::from_manifest(directory.root(), directory.manifest())
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
-}
 
-impl ArtifactShardReader for DirectoryArtifactShardReader {
-    fn read_shard(&mut self, file: &ArtifactFile) -> Result<Vec<u8>, ArtifactReadError> {
+    pub fn transport_layout(&self) -> Option<&VerifiedArtifactTransportLayout> {
+        self.transport_layout.as_ref()
+    }
+
+    fn read_direct_shard(&self, file: &ArtifactFile) -> Result<Vec<u8>, ArtifactReadError> {
         let path = self.root.join(file.path.as_str());
+        reject_symlink_chain(&path)?;
         let metadata = fs::symlink_metadata(&path).map_err(|error| {
             ArtifactReadError::Directory(format!("inspect {}: {error}", path.display()))
         })?;
@@ -175,6 +227,140 @@ impl ArtifactShardReader for DirectoryArtifactShardReader {
         }
         read_bounded_file(&path, file.size, &file.path)
     }
+
+    fn read_transport_object(
+        &self,
+        file: &ArtifactFile,
+        object: &ArtifactTransportObject,
+    ) -> Result<Vec<u8>, ArtifactReadError> {
+        if file.role != ArtifactFileRole::Weights
+            || file.path != object.path
+            || file.size != object.size
+            || file.sha256 != object.sha256
+        {
+            return Err(ArtifactReadError::EvidenceMismatch(file.path.clone()));
+        }
+        let mut logical_verifier = ArtifactVerifier::new(file, IntegrityPolicy::RequireSha256);
+        let initial_capacity = usize::try_from(file.size)
+            .unwrap_or(usize::MAX)
+            .min(1024 * 1024);
+        let mut output = Vec::with_capacity(initial_capacity);
+        let mut buffer = [0_u8; 1024 * 1024];
+
+        for part in &object.parts {
+            let part_path = self.root.join(part.path.as_str());
+            reject_symlink_chain(&part_path)?;
+            let metadata = fs::symlink_metadata(&part_path).map_err(|error| {
+                ArtifactReadError::Directory(format!("inspect {}: {error}", part_path.display()))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ArtifactReadError::Directory(format!(
+                    "artifact transport part is not a regular non-symlink file: {}",
+                    part_path.display()
+                )));
+            }
+            if metadata.len() != part.size {
+                return Err(ArtifactReadError::Integrity {
+                    path: part.path.clone(),
+                    message: format!(
+                        "declared {} bytes but local transport part has {} bytes",
+                        part.size,
+                        metadata.len()
+                    ),
+                });
+            }
+            let physical_file = ArtifactFile {
+                path: part.path.clone(),
+                size: part.size,
+                sha256: part.sha256,
+                role: ArtifactFileRole::Other,
+                component: None,
+                shard: None,
+            };
+            let mut part_verifier =
+                ArtifactVerifier::new(&physical_file, IntegrityPolicy::RequireSha256);
+            let mut input = fs::File::open(&part_path).map_err(|error| {
+                ArtifactReadError::transport(format!("open {}: {error}", part_path.display()))
+            })?;
+            loop {
+                let read = input.read(&mut buffer).map_err(|error| {
+                    ArtifactReadError::transport(format!(
+                        "read transport part {}: {error}",
+                        part_path.display()
+                    ))
+                })?;
+                if read == 0 {
+                    break;
+                }
+                part_verifier.update(&buffer[..read]).map_err(|error| {
+                    ArtifactReadError::Integrity {
+                        path: part.path.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+                logical_verifier.update(&buffer[..read]).map_err(|error| {
+                    ArtifactReadError::Integrity {
+                        path: file.path.clone(),
+                        message: error.to_string(),
+                    }
+                })?;
+                output.extend_from_slice(&buffer[..read]);
+            }
+            part_verifier
+                .finish()
+                .map_err(|error| ArtifactReadError::Integrity {
+                    path: part.path.clone(),
+                    message: error.to_string(),
+                })?;
+        }
+        logical_verifier
+            .finish()
+            .map_err(|error| ArtifactReadError::Integrity {
+                path: file.path.clone(),
+                message: error.to_string(),
+            })?;
+        Ok(output)
+    }
+}
+
+impl ArtifactShardReader for DirectoryArtifactShardReader {
+    fn read_shard(&mut self, file: &ArtifactFile) -> Result<Vec<u8>, ArtifactReadError> {
+        if let Some(manifest_files) = &self.manifest_files {
+            match manifest_files.get(&file.path) {
+                Some(expected) if expected == file => {}
+                _ => return Err(ArtifactReadError::EvidenceMismatch(file.path.clone())),
+            }
+        }
+        if let Some(layout) = &self.transport_layout
+            && file.role == ArtifactFileRole::Weights
+        {
+            let object = layout.object(&file.path).ok_or_else(|| {
+                ArtifactReadError::Directory(format!(
+                    "verified transport layout omits logical weight {}",
+                    file.path
+                ))
+            })?;
+            return self.read_transport_object(file, object);
+        }
+        self.read_direct_shard(file)
+    }
+}
+
+fn reject_symlink_chain(path: &Path) -> Result<(), ArtifactReadError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if current.exists()
+            && fs::symlink_metadata(&current)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(ArtifactReadError::Directory(format!(
+                "artifact path traverses a symlink: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A sealed native bundle directory with exact per-file verification helpers.
@@ -242,6 +428,12 @@ impl VerifiedArtifactDirectory {
         &self.manifest
     }
 
+    /// Construct a reader bound to this directory's sealed manifest and optional transport
+    /// layout.
+    pub fn shard_reader(&self) -> Result<DirectoryArtifactShardReader, ArtifactReadError> {
+        DirectoryArtifactShardReader::from_verified_directory(self)
+    }
+
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>, ArtifactReadError> {
         let file = self
             .manifest
@@ -249,7 +441,7 @@ impl VerifiedArtifactDirectory {
             .iter()
             .find(|file| file.path.as_str() == path)
             .ok_or_else(|| ArtifactReadError::Directory(format!("manifest omits {path}")))?;
-        let mut reader = DirectoryArtifactShardReader::new(&self.root);
+        let mut reader = self.shard_reader()?;
         let bytes = reader.read_shard(file)?;
         verify_bytes(file, &bytes)?;
         Ok(bytes)
@@ -315,7 +507,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::{
-        ARTIFACT_MANIFEST_SCHEMA_V1, ArtifactBundleId, ArtifactFileRole, ArtifactProfileId,
+        ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_MANIFEST_SCHEMA_V1,
+        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY,
+        ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY, ARTIFACT_TRANSPORT_LAYOUT_PATH,
+        ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY,
+        ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION, ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+        ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY, ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY,
+        ARTIFACT_TRANSPORT_TARGET_PART_BYTES, ArtifactBundleId, ArtifactFileRole,
+        ArtifactProfileId, ArtifactTransportLayout, ArtifactTransportObject, ArtifactTransportPart,
         ModelId, NumericFormat, Sha256Digest,
     };
 
@@ -330,6 +529,121 @@ mod tests {
             component: None,
             shard: None,
         }
+    }
+
+    fn transport_metadata() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY.into(),
+                ARTIFACT_TRANSPORT_LAYOUT_PATH.into(),
+            ),
+            (
+                ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY.into(),
+                ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION.to_string(),
+            ),
+            (ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY.into(), "true".into()),
+            (
+                ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY.into(),
+                ARTIFACT_TRANSPORT_TARGET_PART_BYTES.to_string(),
+            ),
+            (
+                ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY.into(),
+                ARTIFACT_TRANSPORT_MAX_PART_BYTES.to_string(),
+            ),
+            (
+                ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY.into(),
+                ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
+            ),
+            (
+                ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+                ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
+            ),
+        ])
+    }
+
+    fn write_transport_bundle(
+        root: &Path,
+        physical_bytes: &[u8],
+        logical_sha256: Sha256Digest,
+    ) -> (ArtifactManifest, ArtifactFile, ArtifactPath) {
+        let bundle = ArtifactBundleId::new("reader-transport-test").unwrap();
+        let profile = ArtifactProfileId::new("f16").unwrap();
+        let model = ModelId::new("example/reader-transport-test").unwrap();
+        let revision = "0123456789abcdef".to_string();
+        let part_sha256 = Sha256Digest::calculate(physical_bytes);
+        let part_path = ArtifactPath::new(format!("transport/{part_sha256}.part")).unwrap();
+        let logical = ArtifactFile {
+            path: ArtifactPath::new("objects/logical.bpk").unwrap(),
+            size: physical_bytes.len() as u64,
+            sha256: logical_sha256,
+            role: ArtifactFileRole::Weights,
+            component: None,
+            shard: None,
+        };
+        let layout = ArtifactTransportLayout {
+            schema_version: ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
+            bundle: bundle.clone(),
+            profile: profile.clone(),
+            model: model.clone(),
+            model_revision: revision.clone(),
+            target_part_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+            hard_max_part_bytes: ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+            objects: vec![ArtifactTransportObject {
+                path: logical.path.clone(),
+                size: logical.size,
+                sha256: logical.sha256,
+                parts: vec![ArtifactTransportPart {
+                    path: part_path.clone(),
+                    offset: 0,
+                    size: physical_bytes.len() as u64,
+                    sha256: part_sha256,
+                }],
+            }],
+        };
+        let sidecar = serde_json::to_vec(&layout).unwrap();
+        let sidecar_file = ArtifactFile {
+            path: ArtifactPath::new(ARTIFACT_TRANSPORT_LAYOUT_PATH).unwrap(),
+            size: sidecar.len() as u64,
+            sha256: Sha256Digest::calculate(&sidecar),
+            role: ArtifactFileRole::Metadata,
+            component: None,
+            shard: None,
+        };
+        let config_bytes = b"configuration";
+        let config = ArtifactFile {
+            path: ArtifactPath::new("metadata/config.json").unwrap(),
+            size: config_bytes.len() as u64,
+            sha256: Sha256Digest::calculate(config_bytes),
+            role: ArtifactFileRole::Config,
+            component: None,
+            shard: None,
+        };
+        let mut manifest = ArtifactManifest {
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
+            bundle,
+            profile,
+            model,
+            model_revision: revision,
+            numeric_format: NumericFormat::F16,
+            components: Vec::new(),
+            files: vec![logical.clone(), sidecar_file, config],
+            dependencies: Vec::new(),
+            metadata: transport_metadata(),
+            content_digest: None,
+        };
+        manifest.seal().unwrap();
+
+        fs::create_dir_all(root.join("metadata")).unwrap();
+        fs::create_dir_all(root.join("transport")).unwrap();
+        fs::write(root.join(ARTIFACT_TRANSPORT_LAYOUT_PATH), sidecar).unwrap();
+        fs::write(root.join(part_path.as_str()), physical_bytes).unwrap();
+        fs::write(root.join("metadata/config.json"), config_bytes).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        (manifest, logical, part_path)
     }
 
     #[test]
@@ -406,5 +720,104 @@ mod tests {
         let mut reader = DirectoryArtifactShardReader::new(root.path());
         let error = reader.read_shard(&declared).unwrap_err();
         assert!(error.to_string().contains("declared 5 bytes"));
+    }
+
+    #[test]
+    fn directory_reader_reconstructs_verified_logical_weight_from_parts_correctness() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"logical bytes exist only as a physical transport part";
+        let (_, logical, _) =
+            write_transport_bundle(root.path(), bytes, Sha256Digest::calculate(bytes));
+        assert!(!root.path().join(logical.path.as_str()).exists());
+
+        let directory = VerifiedArtifactDirectory::open(root.path()).unwrap();
+        let reader = directory.shard_reader().unwrap();
+        assert!(reader.transport_layout().is_some());
+        assert_eq!(directory.read_file(logical.path.as_str()).unwrap(), bytes);
+        assert_eq!(
+            directory.read_text("metadata/config.json").unwrap(),
+            "configuration"
+        );
+    }
+
+    #[test]
+    fn directory_reader_rejects_missing_or_tampered_transport_parts_correctness() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"authenticated physical part";
+        let (_, logical, part_path) =
+            write_transport_bundle(root.path(), bytes, Sha256Digest::calculate(bytes));
+        let mut tampered = bytes.to_vec();
+        tampered[0] ^= 1;
+        fs::write(root.path().join(part_path.as_str()), tampered).unwrap();
+        let directory = VerifiedArtifactDirectory::open(root.path()).unwrap();
+        let error = directory.read_file(logical.path.as_str()).unwrap_err();
+        assert!(matches!(error, ArtifactReadError::Integrity { .. }));
+
+        fs::remove_file(root.path().join(part_path.as_str())).unwrap();
+        let error = directory.read_file(logical.path.as_str()).unwrap_err();
+        assert!(matches!(error, ArtifactReadError::Directory(_)));
+    }
+
+    #[test]
+    fn directory_reader_rejects_valid_parts_with_bad_logical_digest_correctness() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"part digest is valid but logical identity is not";
+        let wrong_logical_sha = Sha256Digest::calculate(b"different logical bytes");
+        let (_, logical, _) = write_transport_bundle(root.path(), bytes, wrong_logical_sha);
+        let directory = VerifiedArtifactDirectory::open(root.path()).unwrap();
+        let error = directory.read_file(logical.path.as_str()).unwrap_err();
+        assert!(matches!(error, ArtifactReadError::Integrity { .. }));
+        assert!(error.to_string().contains(logical.path.as_str()));
+    }
+
+    #[test]
+    fn directory_reader_rejects_tampered_sealed_sidecar_correctness() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"logical bytes";
+        let (manifest, _, _) =
+            write_transport_bundle(root.path(), bytes, Sha256Digest::calculate(bytes));
+        let sidecar_path = root.path().join(ARTIFACT_TRANSPORT_LAYOUT_PATH);
+        let mut sidecar = fs::read(&sidecar_path).unwrap();
+        sidecar[0] ^= 1;
+        fs::write(sidecar_path, sidecar).unwrap();
+        let error =
+            DirectoryArtifactShardReader::from_manifest(root.path(), &manifest).unwrap_err();
+        assert!(matches!(error, ArtifactReadError::TransportLayout(_)));
+    }
+
+    #[test]
+    fn manifest_bound_directory_reader_rejects_foreign_file_identity_correctness() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"bound logical bytes";
+        let (manifest, mut logical, _) =
+            write_transport_bundle(root.path(), bytes, Sha256Digest::calculate(bytes));
+        let mut reader =
+            DirectoryArtifactShardReader::from_manifest(root.path(), &manifest).unwrap();
+        logical.sha256 = Sha256Digest::calculate(b"foreign identity");
+        assert!(matches!(
+            reader.read_shard(&logical),
+            Err(ArtifactReadError::EvidenceMismatch(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_reader_rejects_transport_symlink_chain_correctness() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"symlinked part bytes";
+        let (manifest, logical, part_path) =
+            write_transport_bundle(root.path(), bytes, Sha256Digest::calculate(bytes));
+        let outside = root.path().join("outside.part");
+        fs::write(&outside, bytes).unwrap();
+        fs::remove_file(root.path().join(part_path.as_str())).unwrap();
+        symlink(&outside, root.path().join(part_path.as_str())).unwrap();
+
+        let mut reader =
+            DirectoryArtifactShardReader::from_manifest(root.path(), &manifest).unwrap();
+        let error = reader.read_shard(&logical).unwrap_err();
+        assert!(matches!(error, ArtifactReadError::Directory(_)));
+        assert!(error.to_string().contains("symlink"));
     }
 }

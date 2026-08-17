@@ -196,6 +196,39 @@ fn decode_dynamic_image(
     Ok(decoded)
 }
 
+fn looks_like_heif(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let Ok(box_size) = usize::try_from(u32::from_be_bytes(
+        bytes[..4].try_into().expect("four-byte box size"),
+    )) else {
+        return false;
+    };
+    if box_size < 12 {
+        return false;
+    }
+    bytes[8..box_size.min(bytes.len())]
+        .chunks_exact(4)
+        .enumerate()
+        .filter(|(index, _)| *index != 1) // the second word is the minor version, not a brand
+        .any(|(_, brand)| {
+            matches!(
+                brand,
+                b"heic"
+                    | b"heix"
+                    | b"hevc"
+                    | b"hevx"
+                    | b"heim"
+                    | b"heis"
+                    | b"hevm"
+                    | b"hevs"
+                    | b"mif1"
+                    | b"msf1"
+            )
+        })
+}
+
 /// Decodes browser/native bytes into a canonical edit input.
 pub fn decode_input_image(
     bytes: &[u8],
@@ -205,6 +238,12 @@ pub fn decode_input_image(
         return Err(FrontendError::new(
             FrontendErrorKind::ImageDecode,
             "input image bytes are empty",
+        ));
+    }
+    if looks_like_heif(bytes) {
+        return Err(FrontendError::new(
+            FrontendErrorKind::UnsupportedImage,
+            "HEIC/HEIF decoding is not available in this build; convert the image to JPEG, PNG, or WebP",
         ));
     }
     let decoded = decode_dynamic_image(bytes, encoding.and_then(encoding_to_format))?;
@@ -735,6 +774,32 @@ mod tests {
     use burn_image::{ColorSpace, HostImage, PixelBuffer, PixelFormat};
 
     use super::*;
+
+    #[test]
+    fn heif_container_reports_an_explicit_unsupported_format_correctness() {
+        let bytes = [
+            0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'm', b'i',
+            b'f', b'1', b'h', b'e', b'i', b'c',
+        ];
+        let error = decode_input_image(&bytes, None).expect_err("HEIC must fail explicitly");
+        assert_eq!(error.kind, FrontendErrorKind::UnsupportedImage);
+        assert!(error.message.contains("HEIC/HEIF"));
+    }
+
+    #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_file_loader_accepts_uppercase_jpg_extension_correctness() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reference.JPG");
+        let image =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 2, image::Rgb([30, 90, 180])));
+        let mut encoded = Cursor::new(Vec::new());
+        image.write_to(&mut encoded, ImageFormat::Jpeg).unwrap();
+        std::fs::write(&path, encoded.into_inner()).unwrap();
+
+        let decoded = load_image_file(&path).expect("JPEG is detected from bytes, not extension");
+        assert_eq!(decoded.dimensions(), Some(Dimensions::new(3, 2).unwrap()));
+    }
 
     #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
     #[test]

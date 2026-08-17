@@ -14,6 +14,9 @@ import {
   GENERIC_WEB_REQUIRED_DEVICE_FEATURES,
   GPU_INTERVAL_AGGREGATION_POLICY,
   gpuTerminalDiagnostic,
+  captureCdpNetworkRequestContext,
+  cdpNetworkLoadingFailedDiagnostic,
+  isProvenBenignFaviconFailure,
   LOW_VRAM_DEVICE_CAP_BYTES,
   LOW_VRAM_BACKEND,
   RENDERED_LAUNCH_READINESS_PROBE_POLICY,
@@ -75,6 +78,7 @@ import {
   resolveTurboSecondRequestRunReadyUiContract,
   validateBackendReadyEvent,
   validateHardwareNvidiaAdapter,
+  validateCdpNetworkFailureEvidence,
   validatePackedF16PreDmdInputDiagnostics,
   validatePackedF16DmdVaeHandoff,
   validatePackedF16QwenHostEmbedding,
@@ -83,12 +87,18 @@ import {
   validatePackedF16QwenPostHandoffDiagnostics,
   validatePackedF16QwenPreHandoffDiagnostics,
   validateRenderedSurfaceEvidence,
+  validateRenderedModelTransportEvidence,
   validateRenderedSurfaceSnapshot,
   validateRequestScopedSurfaceGate,
   validateTestedPackageIdentity,
   validateTurbo1024ModelEvidence,
   validateTurbo1024MultiRequestEvidence,
 } from "./wasm_rendered_surface_contract.mjs";
+import {
+  ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES,
+  ARTIFACT_TRANSPORT_LAYOUT_PATH,
+  ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+} from "./artifact_transport_contract.mjs";
 
 const TEST_ENGINE_SESSION_ID = "3c6eeea1-a432-4d50-92cc-f39f867d1941";
 const TEST_ADAPTER_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition";
@@ -457,6 +467,11 @@ function validTestedPackageIdentity() {
         "bevy_burn_image_bg.wasm",
         "2",
       ),
+      app_icon: entry(
+        "/tmp/browser-package/burn-image-icon.png",
+        "burn-image-icon.png",
+        "8",
+      ),
     },
     page_modules: {
       model_selector: entry(
@@ -480,6 +495,11 @@ function validTestedPackageIdentity() {
         "/workspace/crates/bevy_image/tests/wasm_rendered_surface_contract.mjs",
         "crates/bevy_image/tests/wasm_rendered_surface_contract.mjs",
         "5",
+      ),
+      artifact_transport_contract: entry(
+        "/workspace/crates/bevy_image/tests/artifact_transport_contract.mjs",
+        "crates/bevy_image/tests/artifact_transport_contract.mjs",
+        "7",
       ),
     },
     validated: true,
@@ -525,6 +545,8 @@ function validEvidence() {
     },
     page_errors: [],
     gpu_errors: [],
+    network_failures: [],
+    ignored_benign_network_failures: [],
     chrome_stderr: "normal Chrome diagnostics",
     screenshot_bytes: 4096,
     screenshot_sha256: "a".repeat(64),
@@ -538,6 +560,11 @@ function validEvidence() {
         "bevy_burn_image_bg.wasm": {
           bytes: testedPackageIdentity.generated_package.webassembly.bytes,
           sha256: testedPackageIdentity.generated_package.webassembly.sha256,
+        },
+        "burn-image-icon.png": {
+          bytes: testedPackageIdentity.generated_package.app_icon.bytes,
+          sha256: testedPackageIdentity.generated_package.app_icon.sha256,
+          content_type: "image/png",
         },
       },
       page_modules: {
@@ -553,6 +580,17 @@ function validEvidence() {
 
 test("accepts hardware NVIDIA shared-device rendered-surface evidence", () => {
   assert.deepEqual(validateRenderedSurfaceEvidence(validEvidence()), []);
+});
+
+test("separates bounded physical transport evidence from logical model artifacts", () => {
+  const transport = validModelTransport();
+  assert.deepEqual(validateRenderedModelTransportEvidence(transport), []);
+  transport.bundles[0].physical_transport.max_part_bytes = 25_000_001;
+  assert.ok(
+    validateRenderedModelTransportEvidence(transport).some((failure) =>
+      failure.includes("physical transport inventory"),
+    ),
+  );
 });
 
 test("keeps the generic rendered shell portable without Boogu timing features", () => {
@@ -833,7 +871,105 @@ test("rejects backend failure and browser errors", () => {
   assert.ok(failures.some((failure) => /Chrome stderr/.test(failure)));
 });
 
-test("requires exact tested JS, Wasm, selector, runtime, and harness package identities", () => {
+test("binds Network.loadingFailed to exact request URL, method, Range, type, and cancellation", () => {
+  const context = captureCdpNetworkRequestContext({
+    requestId: "request-17",
+    type: "Fetch",
+    documentURL: "http://127.0.0.1:39001/index.html",
+    initiator: { type: "script" },
+    request: {
+      url: "http://127.0.0.1:39001/model/boogu-image-0.1-turbo/transport/a.part",
+      method: "GET",
+      headers: { range: "bytes=0-4194303" },
+    },
+  });
+  assert.deepEqual(context, {
+    request_id: "request-17",
+    url: "http://127.0.0.1:39001/model/boogu-image-0.1-turbo/transport/a.part",
+    method: "GET",
+    range_header: "bytes=0-4194303",
+    request_type: "Fetch",
+    document_url: "http://127.0.0.1:39001/index.html",
+    initiator_type: "script",
+    redirect_count: 0,
+    model_artifact_request: true,
+  });
+  const diagnostic = cdpNetworkLoadingFailedDiagnostic(
+    {
+      requestId: "request-17",
+      type: "Fetch",
+      errorText: "net::ERR_ABORTED",
+      canceled: true,
+    },
+    context,
+  );
+  assert.equal(diagnostic.context_bound, true);
+  assert.equal(diagnostic.model_artifact_request, true);
+  assert.equal(diagnostic.type, "Fetch");
+  assert.equal(diagnostic.errorText, "net::ERR_ABORTED");
+  assert.equal(diagnostic.error_text, "net::ERR_ABORTED");
+  assert.equal(diagnostic.canceled, true);
+  assert.equal(diagnostic.proven_benign_favicon, false);
+  assert.ok(
+    validateCdpNetworkFailureEvidence([diagnostic], []).some((failure) =>
+      failure.includes("/model/boogu-image-0.1-turbo/transport/a.part"),
+    ),
+  );
+});
+
+test("ignores only an exact proven canceled root favicon request", () => {
+  const context = captureCdpNetworkRequestContext({
+    requestId: "favicon-1",
+    type: "Other",
+    request: {
+      url: "http://127.0.0.1:39001/favicon.ico",
+      method: "GET",
+      headers: {},
+    },
+  });
+  const favicon = cdpNetworkLoadingFailedDiagnostic(
+    {
+      requestId: "favicon-1",
+      type: "Other",
+      errorText: "net::ERR_ABORTED",
+      canceled: true,
+    },
+    context,
+  );
+  assert.equal(isProvenBenignFaviconFailure(favicon), true);
+  assert.deepEqual(validateCdpNetworkFailureEvidence([], [favicon]), []);
+  for (const mutation of [
+    { ...favicon, url: "http://127.0.0.1:39001/model/favicon.ico" },
+    { ...favicon, range_header: "bytes=0-7" },
+    { ...favicon, canceled: false },
+    { ...favicon, context_bound: false },
+    { ...favicon, error_text: "net::ERR_FAILED" },
+  ]) {
+    assert.equal(isProvenBenignFaviconFailure(mutation), false);
+    assert.ok(validateCdpNetworkFailureEvidence([], [mutation]).length > 0);
+  }
+});
+
+test("rendered source records structured loadingFailed context before fail-closed reporting", async () => {
+  const source = await readFile(
+    new URL("./wasm_rendered_surface_smoke.mjs", import.meta.url),
+    "utf8",
+  );
+  for (const marker of [
+    'message.method === "Network.requestWillBeSent"',
+    "captureCdpNetworkRequestContext(message.params, previous)",
+    'message.method === "Network.loadingFailed"',
+    "cdpNetworkLoadingFailedDiagnostic(",
+    "diagnostic.proven_benign_favicon",
+    "networkFailures.push(diagnostic)",
+    "ignoredBenignNetworkFailures.push(diagnostic)",
+    'record("page", `network request failed: ${JSON.stringify(diagnostic)}`)',
+  ]) {
+    assert.ok(source.includes(marker), `rendered harness omits ${marker}`);
+  }
+});
+
+test("requires exact tested JS, Wasm, page assets, runtime, and harness identities", () => {
   const evidence = validEvidence();
   assert.deepEqual(
     validateTestedPackageIdentity(
@@ -846,20 +982,24 @@ test("requires exact tested JS, Wasm, selector, runtime, and harness package ide
   evidence.tested_package_identity.generated_package.javascript.relative_path = "other.js";
   evidence.tested_package_identity.generated_package.webassembly.sha256 = "invalid";
   evidence.tested_package_identity.page_modules.model_selector.relative_path = "other.mjs";
+  evidence.tested_package_identity.generated_package.app_icon.relative_path = "other.png";
   evidence.tested_package_identity.sources.browser_runtime.absolute_path = "relative.rs";
   evidence.tested_package_identity.sources.rendered_harness.bytes = 0;
   evidence.served_transport.generated["bevy_burn_image.js"].sha256 = "5".repeat(64);
   evidence.served_transport.page_modules["model_selector.mjs"].content_type =
     "application/octet-stream";
+  evidence.served_transport.generated["burn-image-icon.png"].sha256 = "9".repeat(64);
   const failures = validateRenderedSurfaceEvidence(evidence);
   for (const pattern of [
     /javascript.relative_path/,
     /webassembly.sha256/,
     /model_selector.relative_path/,
+    /app_icon.relative_path/,
     /browser_runtime.absolute_path/,
     /rendered_harness.bytes/,
     /served bevy_burn_image.js/,
     /served model_selector.mjs MIME/,
+    /served burn-image-icon.png MIME/,
   ]) {
     assert.ok(failures.some((failure) => pattern.test(failure)), String(pattern));
   }
@@ -1231,6 +1371,68 @@ function validSurfaceTextureGateWindow(
   };
 }
 
+function validModelTransport() {
+  const bundles = [
+    "boogu-image-0.1-turbo",
+    "qwen3-vl-8b-base-boogu-image-0.1",
+    "flux1-vae-boogu-image-0.1",
+  ].map((bundle, index) => ({
+    bundle,
+    content_digest: String(index + 1).repeat(64),
+    logical_artifacts: {
+      file_count: 10 + index,
+      bytes: 1_000 + index,
+      max_file_bytes: 900 + index,
+      weight_file_count: 2,
+      weight_bytes: 900 + index,
+      max_weight_file_bytes: 500 + index,
+    },
+    direct_artifacts: { file_count: 8 + index, bytes: 100, max_file_bytes: 50 },
+    physical_transport: {
+      part_reference_count: 2,
+      unique_part_count: 2,
+      reconstructed_bytes: 900 + index,
+      unique_part_bytes: 900 + index,
+      max_part_bytes: 500 + index,
+      target_part_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+      hard_max_part_bytes: ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES,
+      every_part_statted: true,
+      part_sha256_policy: "verified-by-browser-runtime-before-use",
+    },
+    transport_sidecar: {
+      path: ARTIFACT_TRANSPORT_LAYOUT_PATH,
+      size: 100 + index,
+      sha256: String(index + 4).repeat(64),
+      authenticated: true,
+    },
+    manifest_sha256: String(index + 7).repeat(64),
+  }));
+  return {
+    policy: "exact-local-modular-part-only-parent-plus-qwen-vae-siblings-range-cors",
+    bundles,
+    total_logical_artifact_files: bundles.reduce(
+      (total, bundle) => total + bundle.logical_artifacts.file_count,
+      0,
+    ),
+    total_logical_artifact_bytes: bundles.reduce(
+      (total, bundle) => total + bundle.logical_artifacts.bytes,
+      0,
+    ),
+    total_physical_transport_parts: bundles.reduce(
+      (total, bundle) => total + bundle.physical_transport.unique_part_count,
+      0,
+    ),
+    total_physical_transport_part_bytes: bundles.reduce(
+      (total, bundle) => total + bundle.physical_transport.unique_part_bytes,
+      0,
+    ),
+    maximum_physical_transport_part_bytes: Math.max(
+      ...bundles.map((bundle) => bundle.physical_transport.max_part_bytes),
+    ),
+    validated: true,
+  };
+}
+
 function validTurboEvidence() {
   const runId = 7;
   const preDmdInputDiagnostics = validPackedF16PreDmdInputDiagnostics(runId);
@@ -1257,8 +1459,10 @@ function validTurboEvidence() {
     window_end_epoch_ms: end,
     terminal_event: terminalEvent,
     model_response_count: traffic.network_requests,
-    http_206_response_count: traffic.network_requests,
-    content_range_validated_response_count: traffic.network_requests,
+    http_200_complete_part_response_count: traffic.network_requests,
+    http_206_response_count: 0,
+    complete_object_validated_response_count: traffic.network_requests,
+    content_range_validated_response_count: 0,
     response_body_bytes: traffic.network_response_bytes,
     unexpected_status_response_count: 0,
     missing_content_length_count: 0,
@@ -1387,6 +1591,7 @@ function validTurboEvidence() {
     cdp_preload_network_traffic: cdpPreloadNetworkTraffic,
     artifact_traffic: artifactTraffic,
     cdp_network_traffic: cdpNetworkTraffic,
+    modular_artifact_transport: validModelTransport(),
     ui_contract: {
       event: "ready",
       model: TURBO_MODEL_ID,
@@ -2164,7 +2369,7 @@ test("keeps packed-F16 preload outside the Generate request traffic window", () 
   assert.ok(failures.some((failure) => /artifact traffic is not contained/.test(failure)));
 });
 
-test("attributes only exact modular 206 responses inside the Bevy request window", () => {
+test("attributes only exact modular complete-part responses inside the Bevy request window", () => {
   const timeOrigin = 1_000_000;
   const bases = [
     "http://127.0.0.1:39001/model/boogu-image-0.1-turbo",
@@ -2179,37 +2384,76 @@ test("attributes only exact modular 206 responses inside the Bevy request window
     ],
     output_events: [{ event: "ready", model: TURBO_MODEL_ID, at_ms: 9_000 }],
   };
-  const response = (atMs, url, start, end, total, status = 206) => ({
-    at_ms: atMs,
-    method: "Network.responseReceived",
-    params: {
-      response: {
-        url,
-        status,
-        headers: {
-          "Content-Length": String(end - start + 1),
-          "Content-Range": `bytes ${start}-${end}/${total}`,
+  const response = (atMs, url, start, end, total, status) => {
+    const physicalPart = url.includes("/transport/") && url.endsWith(".part");
+    const actualStatus = status ?? (physicalPart ? 200 : 206);
+    return {
+      at_ms: atMs,
+      method: "Network.responseReceived",
+      params: {
+        response: {
+          url,
+          status: actualStatus,
+          headers: {
+            "Content-Length": String(end - start + 1),
+            ...(actualStatus === 206
+              ? { "Content-Range": `bytes ${start}-${end}/${total}` }
+              : {}),
+          },
         },
       },
-    },
-  });
+    };
+  };
   const summary = summarizeTurboRequestCdpNetwork(
     [
       response(timeOrigin + 500, `${bases[0]}/before.bpk`, 0, 3, 8),
-      response(timeOrigin + 2_000, `${bases[0]}/denoiser.bpk`, 0, 3, 8),
-      response(timeOrigin + 3_000, `${bases[1]}/qwen.bpk`, 4, 7, 8),
+      response(timeOrigin + 2_000, `${bases[0]}/transport/a.part`, 0, 3, 8),
+      response(timeOrigin + 3_000, `${bases[1]}/transport/b.part`, 4, 7, 8),
       response(timeOrigin + 4_000, `${bases[2]}-lookalike/ignored.bpk`, 0, 3, 8),
       response(timeOrigin + 9_500, `${bases[2]}/after.bpk`, 0, 3, 8),
     ],
     snapshot,
     bases,
+    new Map([
+      [
+        "/model/boogu-image-0.1-turbo/transport/a.part",
+        {
+          bundle: "boogu-image-0.1-turbo",
+          component: "shared:boogu-block-0+boogu-block-1",
+          components: ["boogu-block-0", "boogu-block-1"],
+          logical_paths: ["objects/a.bpk", "objects/b.bpk"],
+          shared_physical_part: true,
+        },
+      ],
+      [
+        "/model/qwen3-vl-8b-base-boogu-image-0.1/transport/b.part",
+        {
+          bundle: "qwen3-vl-8b-base-boogu-image-0.1",
+          component: "qwen-text",
+          components: ["qwen-text"],
+          logical_paths: ["objects/c.bpk"],
+          shared_physical_part: false,
+        },
+      ],
+    ]),
   );
   assert.equal(summary.model_response_count, 2);
-  assert.equal(summary.http_206_response_count, 2);
-  assert.equal(summary.content_range_validated_response_count, 2);
+  assert.equal(summary.http_200_complete_part_response_count, 2);
+  assert.equal(summary.http_206_response_count, 0);
+  assert.equal(summary.complete_object_validated_response_count, 2);
+  assert.equal(summary.content_range_validated_response_count, 0);
   assert.equal(summary.response_body_bytes, 8);
   assert.equal(summary.terminal_event, "ready");
   assert.deepEqual(summary.model_base_urls, [...bases].sort());
+  assert.equal(summary.physical_transport_response_count, 2);
+  assert.equal(summary.physical_transport_response_bytes, 8);
+  assert.equal(summary.unmapped_physical_transport_response_count, 0);
+  assert.deepEqual(
+    summary.logical_component_traffic[
+      "boogu-image-0.1-turbo/shared:boogu-block-0+boogu-block-1"
+    ].components,
+    ["boogu-block-0", "boogu-block-1"],
+  );
 });
 
 test("attributes only exact modular 206 responses inside the denoiser preload window", () => {
@@ -2336,8 +2580,10 @@ function validMultiRequestEvidence() {
     window_end_epoch_ms: end,
     terminal_event: "ready",
     model_response_count: traffic.network_requests,
-    http_206_response_count: traffic.network_requests,
-    content_range_validated_response_count: traffic.network_requests,
+    http_200_complete_part_response_count: traffic.network_requests,
+    http_206_response_count: 0,
+    complete_object_validated_response_count: traffic.network_requests,
+    content_range_validated_response_count: 0,
     response_body_bytes: traffic.network_response_bytes,
     unexpected_status_response_count: 0,
     missing_content_length_count: 0,
@@ -2350,7 +2596,9 @@ function validMultiRequestEvidence() {
     window_end_epoch_ms: end,
     terminal_event: "stage_completed:dmd",
     model_response_count: 0,
+    http_200_complete_part_response_count: 0,
     http_206_response_count: 0,
+    complete_object_validated_response_count: 0,
     content_range_validated_response_count: 0,
     response_body_bytes: 0,
     unexpected_status_response_count: 0,
@@ -2458,6 +2706,7 @@ function validMultiRequestEvidence() {
     ),
     cdp_dmd_network_traffic: dmdNetwork(1_000_001_200, 1_000_001_700),
     dmd_runtime_io_attestation: dmdAttestation(7, 8_800),
+    modular_artifact_transport: structuredClone(base.modular_artifact_transport),
     served_transport: structuredClone(servedTransport),
     tested_package_identity: structuredClone(packageIdentity),
     ui_contract: structuredClone(base.ui_contract),
@@ -2631,6 +2880,7 @@ function validMultiRequestEvidence() {
     cdp_network_traffic: cdpNetwork(warmTraffic, 1_000_011_100, 1_000_019_000),
     cdp_dmd_network_traffic: dmdNetwork(1_000_011_200, 1_000_011_700),
     dmd_runtime_io_attestation: dmdAttestation(8, 18_800),
+    modular_artifact_transport: structuredClone(base.modular_artifact_transport),
     served_transport: structuredClone(servedTransport),
     tested_package_identity: structuredClone(packageIdentity),
     ui_contract: structuredClone(base.ui_contract),

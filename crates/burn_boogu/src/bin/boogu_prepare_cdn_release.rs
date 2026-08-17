@@ -24,16 +24,23 @@ use burn_boogu::{
 };
 use burn_flux_vae::{
     FLUX_VAE_COMPONENT_BUNDLE_ID, FLUX_VAE_COMPONENT_MODEL_ID, FLUX_VAE_COMPONENT_MODEL_REVISION,
-    FLUX_VAE_COMPONENT_PROFILE, flux_vae_component_dependency,
+    FLUX_VAE_COMPONENT_PROFILE, FLUX_VAE_COMPONENT_ROLE,
 };
 use burn_image::{
-    ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_MANIFEST_SCHEMA_V2, ArtifactBundleId, ArtifactComponent,
-    ArtifactDependency, ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath,
-    ArtifactProfileId, ModelId, NumericFormat, Sha256Digest,
+    ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_MANIFEST_SCHEMA_V1,
+    ARTIFACT_MANIFEST_SCHEMA_V2, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
+    ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY, ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY,
+    ARTIFACT_TRANSPORT_LAYOUT_PATH, ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY,
+    ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
+    ARTIFACT_TRANSPORT_MAX_PART_BYTES, ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY,
+    ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY, ARTIFACT_TRANSPORT_TARGET_PART_BYTES, ArtifactBundleId,
+    ArtifactComponent, ArtifactComponentId, ArtifactDependency, ArtifactFile, ArtifactFileRole,
+    ArtifactManifest, ArtifactPath, ArtifactProfileId, ArtifactTransportLayout,
+    ArtifactTransportObject, ArtifactTransportPart, ModelId, NumericFormat, Sha256Digest,
 };
 use burn_qwen3_vl::{
     QWEN_BASE_CONDITIONING_PROFILE, QWEN_COMPONENT_BUNDLE_ID, QWEN_COMPONENT_MODEL_ID,
-    QWEN_COMPONENT_MODEL_REVISION, qwen_component_dependency,
+    QWEN_COMPONENT_MODEL_REVISION, QWEN_COMPONENT_ROLE,
 };
 use clap::Parser;
 use serde::Serialize;
@@ -46,8 +53,10 @@ const INVENTORY_PATH: &str = "metadata/tensor-inventory.json";
 const SOURCE_FILES_PATH: &str = "metadata/source-files.json";
 const VAE_CONFIG_PATH: &str = "metadata/source/vae/config.json";
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_WEIGHT_BYTES: u64 = 256 * 1024 * 1024;
+// Every object published directly to the CDN, not only transport parts, must fit the same
+// browser-friendly physical ceiling. Logical weight objects retain their separate semantic cap
+// because the release tree contains only their bounded transport parts.
+const MAX_METADATA_BYTES: u64 = ARTIFACT_TRANSPORT_MAX_PART_BYTES;
 
 #[derive(Debug, Parser)]
 #[command(about = "Build the dependency-pinned modular Boogu CDN release")]
@@ -127,6 +136,8 @@ struct BrowserBounds {
     maximum_manifest_bytes: u64,
     maximum_metadata_bytes: u64,
     maximum_semantic_object_bytes: u64,
+    transport_part_target_bytes: u64,
+    maximum_transport_part_bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +155,11 @@ struct BundlePlan {
     weight_objects: usize,
     payload_bytes: u64,
     largest_payload_bytes: u64,
+    transport_objects: usize,
+    transport_parts: usize,
+    transport_payload_bytes: u64,
+    largest_transport_part_bytes: u64,
+    transport_layout_bytes: u64,
     manifest_bytes: u64,
     dependencies: Vec<String>,
     browser_transport_fit: bool,
@@ -192,6 +208,9 @@ struct SharedContractProof {
     dependency_closures_verified: bool,
     component_contracts_verified: bool,
     bounded_burnpacks_verified: bool,
+    bounded_transport_parts_verified: bool,
+    transport_part_target_bytes: u64,
+    maximum_transport_part_bytes: u64,
     duplicate_shared_bytes_removed: u64,
     component_revision_algorithm: &'static str,
     qwen_manifest_digest: String,
@@ -208,7 +227,19 @@ struct PreparationSummary {
     equivalence_report: String,
     bundles: usize,
     logical_declared_payload_bytes: u64,
+    physical_transport_parts: usize,
+    physical_transport_payload_bytes: u64,
+    largest_transport_part_bytes: u64,
     duplicate_shared_bytes_removed: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransportStats {
+    objects: usize,
+    parts: usize,
+    bytes: u64,
+    largest_part_bytes: u64,
+    layout_bytes: u64,
 }
 
 struct Cleanup {
@@ -312,10 +343,8 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         args.copy,
     )?;
 
-    let qwen_dependency = qwen_component_dependency();
-    qwen_dependency.validate_resolved_manifest(&qwen_manifest)?;
-    let vae_dependency = flux_vae_component_dependency();
-    vae_dependency.validate_resolved_manifest(&vae_manifest)?;
+    let qwen_dependency = dependency_from_manifest(QWEN_COMPONENT_ROLE, &qwen_manifest)?;
+    let vae_dependency = dependency_from_manifest(FLUX_VAE_COMPONENT_ROLE, &vae_manifest)?;
     let mut pipeline_manifests = Vec::with_capacity(legacy.len());
     for source in &legacy {
         pipeline_manifests.push(stage_pipeline_bundle(
@@ -325,6 +354,20 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
             args.copy,
         )?);
     }
+
+    let candidate_manifest_digests = std::iter::once(&qwen_manifest)
+        .chain(std::iter::once(&vae_manifest))
+        .chain(pipeline_manifests.iter())
+        .map(|manifest| (manifest.bundle.to_string(), sealed_digest(manifest)))
+        .collect::<BTreeMap<_, _>>();
+    write_json_new(
+        &reports_root.join("candidate-manifest-digests.json"),
+        &candidate_manifest_digests,
+    )?;
+    eprintln!(
+        "candidate transport-sealed manifest digests:\n{}",
+        serde_json::to_string_pretty(&candidate_manifest_digests)?
+    );
 
     let manifests = std::iter::once(&qwen_manifest)
         .chain(std::iter::once(&vae_manifest))
@@ -389,6 +432,9 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         dependency_closures_verified: true,
         component_contracts_verified: true,
         bounded_burnpacks_verified: true,
+        bounded_transport_parts_verified: true,
+        transport_part_target_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+        maximum_transport_part_bytes: ARTIFACT_TRANSPORT_MAX_PART_BYTES,
         duplicate_shared_bytes_removed,
         component_revision_algorithm: "sha256(compact-json(owner-filtered-source-files-sorted-by-path) + LF)",
         qwen_manifest_digest: sealed_digest(&qwen_manifest),
@@ -483,8 +529,22 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     let absolute_output = fs::canonicalize(&args.output_root)?;
     let logical_declared_payload_bytes = plan.bundles.iter().try_fold(0_u64, |sum, bundle| {
         sum.checked_add(bundle.payload_bytes)
-            .ok_or("physical payload byte count overflow")
+            .ok_or("logical payload byte count overflow")
     })?;
+    let physical_transport_parts = plan.bundles.iter().try_fold(0_usize, |sum, bundle| {
+        sum.checked_add(bundle.transport_parts)
+            .ok_or("transport part count overflow")
+    })?;
+    let physical_transport_payload_bytes = plan.bundles.iter().try_fold(0_u64, |sum, bundle| {
+        sum.checked_add(bundle.transport_payload_bytes)
+            .ok_or("transport payload byte count overflow")
+    })?;
+    let largest_transport_part_bytes = plan
+        .bundles
+        .iter()
+        .map(|bundle| bundle.largest_transport_part_bytes)
+        .max()
+        .unwrap_or(0);
     let summary = PreparationSummary {
         output_root: path_text(&absolute_output),
         upload_tree: path_text(&absolute_output.join("aberration.technology/model")),
@@ -495,6 +555,9 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         ),
         bundles: plan.bundles.len(),
         logical_declared_payload_bytes,
+        physical_transport_parts,
+        physical_transport_payload_bytes,
+        largest_transport_part_bytes,
         duplicate_shared_bytes_removed,
     };
     println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -723,8 +786,9 @@ fn stage_component_bundle(
         content_digest: None,
     };
     manifest.seal()?;
-    write_manifest(&destination, &manifest)?;
     verify_materialized_manifest(&destination, &manifest, copy)?;
+    install_transport_layout(&destination, &mut manifest)?;
+    write_manifest(&destination, &manifest)?;
     Ok(manifest)
 }
 
@@ -782,8 +846,9 @@ fn stage_pipeline_bundle(
         content_digest: None,
     };
     manifest.seal()?;
-    write_manifest(&destination, &manifest)?;
     verify_materialized_manifest(&destination, &manifest, copy)?;
+    install_transport_layout(&destination, &mut manifest)?;
+    write_manifest(&destination, &manifest)?;
     Ok(manifest)
 }
 
@@ -819,8 +884,8 @@ fn component_metadata(
     );
     metadata.insert("tensor_inventory_schema".into(), "2".into());
     metadata.insert(
-        "target_max_shard_bytes".into(),
-        MAX_WEIGHT_BYTES.to_string(),
+        ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
     );
     metadata.insert(
         "verified_legacy_bundle".into(),
@@ -882,7 +947,10 @@ fn prove_reconstructed_closure(
             file.role != ArtifactFileRole::Weights
                 && !matches!(
                     file.path.as_str(),
-                    INVENTORY_PATH | SOURCE_FILES_PATH | VAE_CONFIG_PATH
+                    INVENTORY_PATH
+                        | SOURCE_FILES_PATH
+                        | VAE_CONFIG_PATH
+                        | ARTIFACT_TRANSPORT_LAYOUT_PATH
                 )
         })
         .cloned()
@@ -896,7 +964,10 @@ fn prove_reconstructed_closure(
             file.role != ArtifactFileRole::Weights
                 && !matches!(
                     file.path.as_str(),
-                    INVENTORY_PATH | SOURCE_FILES_PATH | VAE_CONFIG_PATH
+                    INVENTORY_PATH
+                        | SOURCE_FILES_PATH
+                        | VAE_CONFIG_PATH
+                        | ARTIFACT_TRANSPORT_LAYOUT_PATH
                 )
         })
         .cloned()
@@ -1143,6 +1214,173 @@ fn write_json_artifact(
     })
 }
 
+fn install_transport_layout(
+    root: &Path,
+    manifest: &mut ArtifactManifest,
+) -> Result<TransportStats, Box<dyn Error>> {
+    if ARTIFACT_TRANSPORT_TARGET_PART_BYTES > ARTIFACT_TRANSPORT_MAX_PART_BYTES {
+        return Err("transport part target exceeds the hard physical CDN-object ceiling".into());
+    }
+    let mut weights = manifest
+        .files
+        .iter()
+        .filter(|file| file.role == ArtifactFileRole::Weights)
+        .cloned()
+        .collect::<Vec<_>>();
+    weights.sort_by(|left, right| left.path.cmp(&right.path));
+    if weights.is_empty() {
+        return Err("transport layout requires at least one semantic weight object".into());
+    }
+
+    let transport_root = root.join("transport");
+    fs::create_dir(&transport_root)?;
+    let mut objects = Vec::with_capacity(weights.len());
+    let mut unique_parts = BTreeMap::<ArtifactPath, (u64, Sha256Digest)>::new();
+    for file in &weights {
+        require_regular_path(root, Path::new(file.path.as_str()))?;
+        let source_path = root.join(file.path.as_str());
+        let source_size = fs::metadata(&source_path)?.len();
+        if source_size != file.size {
+            return Err(format!(
+                "semantic object {} is {source_size} bytes, expected {}",
+                file.path, file.size
+            )
+            .into());
+        }
+        if file.size > ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES {
+            return Err(format!(
+                "semantic object {} is {} bytes, exceeding {ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES}",
+                file.path, file.size
+            )
+            .into());
+        }
+
+        let mut input = fs::File::open(&source_path)?;
+        let mut offset = 0_u64;
+        let mut parts = Vec::new();
+        while offset < file.size {
+            let expected = ARTIFACT_TRANSPORT_TARGET_PART_BYTES.min(file.size - offset);
+            let capacity = usize::try_from(expected)?;
+            let mut bytes = vec![0_u8; capacity];
+            input.read_exact(&mut bytes)?;
+            let digest = Sha256Digest::calculate(&bytes);
+            let relative = ArtifactPath::new(format!("transport/{digest}.part"))?;
+            let destination = root.join(relative.as_str());
+            match fs::symlink_metadata(&destination) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink()
+                        || !metadata.is_file()
+                        || metadata.len() != expected
+                        || sha256_file(&destination)? != digest
+                    {
+                        return Err(format!(
+                            "content-addressed transport part collision at {}",
+                            destination.display()
+                        )
+                        .into());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    write_bytes_new(&destination, &bytes)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            if let Some((declared_size, declared_digest)) =
+                unique_parts.insert(relative.clone(), (expected, digest))
+                && (declared_size != expected || declared_digest != digest)
+            {
+                return Err(format!("inconsistent transport part declaration {relative}").into());
+            }
+            parts.push(ArtifactTransportPart {
+                path: relative,
+                offset,
+                size: expected,
+                sha256: digest,
+            });
+            offset = offset
+                .checked_add(expected)
+                .ok_or("transport part offset overflow")?;
+        }
+        let mut trailing = [0_u8; 1];
+        if input.read(&mut trailing)? != 0 {
+            return Err(format!("semantic object {} exceeds its sealed size", file.path).into());
+        }
+        objects.push(ArtifactTransportObject {
+            path: file.path.clone(),
+            size: file.size,
+            sha256: file.sha256,
+            parts,
+        });
+        fs::remove_file(&source_path)?;
+    }
+
+    let layout = ArtifactTransportLayout {
+        schema_version: ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
+        bundle: manifest.bundle.clone(),
+        profile: manifest.profile.clone(),
+        model: manifest.model.clone(),
+        model_revision: manifest.model_revision.clone(),
+        target_part_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+        hard_max_part_bytes: ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+        objects,
+    };
+    manifest.metadata.insert(
+        ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY.into(),
+        ARTIFACT_TRANSPORT_LAYOUT_PATH.into(),
+    );
+    manifest.metadata.insert(
+        ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY.into(),
+        ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION.to_string(),
+    );
+    manifest
+        .metadata
+        .insert(ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY.into(), "true".into());
+    manifest.metadata.insert(
+        ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY.into(),
+        ARTIFACT_TRANSPORT_TARGET_PART_BYTES.to_string(),
+    );
+    manifest.metadata.insert(
+        ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY.into(),
+        ARTIFACT_TRANSPORT_MAX_PART_BYTES.to_string(),
+    );
+    manifest.metadata.insert(
+        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY.into(),
+        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
+    );
+    let layout_bytes = json_bytes(&layout)?;
+    let layout_path = ArtifactPath::new(ARTIFACT_TRANSPORT_LAYOUT_PATH)?;
+    write_bytes_new(&root.join(layout_path.as_str()), &layout_bytes)?;
+    manifest.files.push(ArtifactFile {
+        path: layout_path,
+        size: u64::try_from(layout_bytes.len())?,
+        sha256: Sha256Digest::calculate(&layout_bytes),
+        role: ArtifactFileRole::Metadata,
+        component: None,
+        shard: None,
+    });
+    manifest.seal()?;
+    ArtifactTransportLayout::parse_and_validate(manifest, &layout_bytes)?;
+
+    let (bytes, largest_part_bytes) =
+        unique_parts
+            .values()
+            .try_fold((0_u64, 0_u64), |(total, largest), (size, _)| {
+                Ok::<_, Box<dyn Error>>((
+                    total
+                        .checked_add(*size)
+                        .ok_or("transport payload byte count overflow")?,
+                    largest.max(*size),
+                ))
+            })?;
+    Ok(TransportStats {
+        objects: weights.len(),
+        parts: unique_parts.len(),
+        bytes,
+        largest_part_bytes,
+        layout_bytes: u64::try_from(layout_bytes.len())?,
+    })
+}
+
 fn write_manifest(root: &Path, manifest: &ArtifactManifest) -> Result<u64, Box<dyn Error>> {
     let bytes = write_json_new(&root.join("manifest.json"), manifest)?;
     if bytes > MAX_MANIFEST_BYTES {
@@ -1186,6 +1424,7 @@ fn bundle_plan(
     kind: &'static str,
 ) -> Result<BundlePlan, Box<dyn Error>> {
     let directory = cdn_tree.join(manifest.bundle.as_str());
+    let transport = transport_stats(&directory, manifest)?;
     let manifest_bytes = fs::metadata(directory.join("manifest.json"))?.len();
     let payload_bytes = manifest.files.iter().try_fold(0_u64, |sum, file| {
         sum.checked_add(file.size)
@@ -1197,10 +1436,9 @@ fn bundle_plan(
         .map(|file| file.size)
         .max()
         .ok_or("manifest has no files")?;
-    let browser_fit = manifest.files.iter().all(|file| match file.role {
-        ArtifactFileRole::Weights => file.size <= MAX_WEIGHT_BYTES,
-        _ => file.size <= MAX_METADATA_BYTES,
-    });
+    // `transport_stats` authenticates the sidecar through the shared transport validator, which
+    // fail-closes every directly published non-weight file at the physical CDN-object ceiling.
+    let browser_fit = transport.largest_part_bytes <= ARTIFACT_TRANSPORT_MAX_PART_BYTES;
     if !browser_fit {
         return Err(format!("{} is not browser transport-fit", manifest.bundle).into());
     }
@@ -1223,6 +1461,11 @@ fn bundle_plan(
         weight_objects: weight_count(manifest),
         payload_bytes,
         largest_payload_bytes,
+        transport_objects: transport.objects,
+        transport_parts: transport.parts,
+        transport_payload_bytes: transport.bytes,
+        largest_transport_part_bytes: transport.largest_part_bytes,
+        transport_layout_bytes: transport.layout_bytes,
         manifest_bytes,
         dependencies: manifest
             .dependencies
@@ -1235,8 +1478,67 @@ fn bundle_plan(
             maximum_response_bytes: 16 * 1024 * 1024,
             maximum_manifest_bytes: MAX_MANIFEST_BYTES,
             maximum_metadata_bytes: MAX_METADATA_BYTES,
-            maximum_semantic_object_bytes: MAX_WEIGHT_BYTES,
+            maximum_semantic_object_bytes: ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
+            transport_part_target_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+            maximum_transport_part_bytes: ARTIFACT_TRANSPORT_MAX_PART_BYTES,
         },
+    })
+}
+
+fn transport_stats(
+    root: &Path,
+    manifest: &ArtifactManifest,
+) -> Result<TransportStats, Box<dyn Error>> {
+    let declaration = ArtifactTransportLayout::declared_file(manifest)?
+        .ok_or("manifest does not seal its transport layout")?;
+    let relative = declaration.path.as_str();
+    require_regular_path(root, Path::new(relative))?;
+    let path = root.join(relative);
+    if fs::metadata(&path)?.len() != declaration.size {
+        return Err("transport layout differs from its sealed declaration".into());
+    }
+    let bytes = fs::read(path)?;
+    let verified = ArtifactTransportLayout::parse_and_validate(manifest, &bytes)?;
+    let layout = verified.layout();
+    let mut unique_parts = BTreeMap::<ArtifactPath, (u64, Sha256Digest)>::new();
+    for object in &layout.objects {
+        for part in &object.parts {
+            if let Some((size, digest)) =
+                unique_parts.insert(part.path.clone(), (part.size, part.sha256))
+                && (size != part.size || digest != part.sha256)
+            {
+                return Err(
+                    format!("inconsistent transport part declaration {}", part.path).into(),
+                );
+            }
+            require_regular_path(root, Path::new(part.path.as_str()))?;
+            let actual = fs::metadata(root.join(part.path.as_str()))?.len();
+            if actual != part.size {
+                return Err(format!(
+                    "transport part {} is {actual} bytes, expected {}",
+                    part.path, part.size
+                )
+                .into());
+            }
+        }
+    }
+    let (payload_bytes, largest_part_bytes) =
+        unique_parts
+            .values()
+            .try_fold((0_u64, 0_u64), |(total, largest), (size, _)| {
+                Ok::<_, Box<dyn Error>>((
+                    total
+                        .checked_add(*size)
+                        .ok_or("transport payload byte count overflow")?,
+                    largest.max(*size),
+                ))
+            })?;
+    Ok(TransportStats {
+        objects: layout.objects.len(),
+        parts: unique_parts.len(),
+        bytes: payload_bytes,
+        largest_part_bytes,
+        layout_bytes: declaration.size,
     })
 }
 
@@ -1307,6 +1609,23 @@ fn sealed_digest(manifest: &ArtifactManifest) -> String {
         .content_digest
         .expect("sealed manifest has a content digest")
         .to_string()
+}
+
+fn dependency_from_manifest(
+    role: &str,
+    manifest: &ArtifactManifest,
+) -> Result<ArtifactDependency, Box<dyn Error>> {
+    manifest.validate_sealed()?;
+    Ok(ArtifactDependency {
+        role: ArtifactComponentId::new(role)?,
+        bundle: manifest.bundle.clone(),
+        profile: manifest.profile.clone(),
+        model: manifest.model.clone(),
+        model_revision: manifest.model_revision.clone(),
+        content_digest: manifest
+            .content_digest
+            .expect("validated sealed manifest has a content digest"),
+    })
 }
 
 fn sort_files(files: &mut [ArtifactFile]) {
@@ -1435,4 +1754,109 @@ fn require_same_file(_left: &Path, _right: &Path) -> Result<(), Box<dyn Error>> 
 
 fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, fs};
+
+    use burn_image::{
+        ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_TRANSPORT_LAYOUT_PATH,
+        ARTIFACT_TRANSPORT_TARGET_PART_BYTES, ArtifactBundleId, ArtifactFile, ArtifactFileRole,
+        ArtifactManifest, ArtifactPath, ArtifactProfileId, ArtifactTransportLayout, ModelId,
+        NumericFormat, Sha256Digest,
+    };
+
+    use super::{install_transport_layout, transport_stats};
+
+    fn install_fixture() -> (tempfile::TempDir, ArtifactManifest, Vec<u8>) {
+        let directory = tempfile::tempdir().unwrap();
+        let logical_path = ArtifactPath::new("objects/fixture.bpk").unwrap();
+        let logical_size = usize::try_from(ARTIFACT_TRANSPORT_TARGET_PART_BYTES).unwrap() + 7;
+        let bytes = (0..logical_size)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        fs::create_dir_all(directory.path().join("objects")).unwrap();
+        fs::create_dir_all(directory.path().join("metadata")).unwrap();
+        fs::write(directory.path().join(logical_path.as_str()), &bytes).unwrap();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "target_max_shard_bytes".into(),
+            (256_u64 * 1024 * 1024).to_string(),
+        );
+        let mut manifest = ArtifactManifest {
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
+            bundle: ArtifactBundleId::new("transport-generator-test").unwrap(),
+            profile: ArtifactProfileId::new("f16").unwrap(),
+            model: ModelId::new("tests/transport-generator").unwrap(),
+            model_revision: "immutable-test-revision".into(),
+            numeric_format: NumericFormat::F16,
+            components: Vec::new(),
+            files: vec![ArtifactFile {
+                path: logical_path,
+                size: bytes.len() as u64,
+                sha256: Sha256Digest::calculate(&bytes),
+                role: ArtifactFileRole::Weights,
+                component: None,
+                shard: None,
+            }],
+            dependencies: Vec::new(),
+            metadata,
+            content_digest: None,
+        };
+        manifest.seal().unwrap();
+        install_transport_layout(directory.path(), &mut manifest).unwrap();
+        (directory, manifest, bytes)
+    }
+
+    #[test]
+    fn transport_parts_are_bounded_content_addressed_and_deterministic_correctness() {
+        let (directory, manifest, original) = install_fixture();
+        assert!(!directory.path().join("objects/fixture.bpk").exists());
+        let layout_bytes = fs::read(directory.path().join(ARTIFACT_TRANSPORT_LAYOUT_PATH)).unwrap();
+        let layout = ArtifactTransportLayout::parse_and_validate(&manifest, &layout_bytes).unwrap();
+        let object = &layout.objects()[0];
+        assert_eq!(object.parts.len(), 2);
+        assert_eq!(object.parts[0].size, ARTIFACT_TRANSPORT_TARGET_PART_BYTES);
+        assert_eq!(object.parts[1].size, 7);
+        let reconstructed = object
+            .parts
+            .iter()
+            .flat_map(|part| fs::read(directory.path().join(part.path.as_str())).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(reconstructed, original);
+
+        let stats = transport_stats(directory.path(), &manifest).unwrap();
+        assert_eq!(stats.objects, 1);
+        assert_eq!(stats.parts, 2);
+        assert_eq!(stats.bytes, original.len() as u64);
+        assert_eq!(
+            stats.largest_part_bytes,
+            ARTIFACT_TRANSPORT_TARGET_PART_BYTES
+        );
+
+        let (second_directory, second_manifest, _) = install_fixture();
+        assert_eq!(manifest.content_digest, second_manifest.content_digest);
+        assert_eq!(
+            layout_bytes,
+            fs::read(second_directory.path().join(ARTIFACT_TRANSPORT_LAYOUT_PATH)).unwrap()
+        );
+    }
+
+    #[test]
+    fn generator_plan_rejects_direct_metadata_above_physical_ceiling_correctness() {
+        let (directory, mut manifest, _original) = install_fixture();
+        manifest.files.push(ArtifactFile {
+            path: ArtifactPath::new("metadata/oversized.bin").unwrap(),
+            size: burn_image::ARTIFACT_TRANSPORT_MAX_PART_BYTES + 1,
+            sha256: Sha256Digest::calculate(b"oversized-fixture"),
+            role: ArtifactFileRole::Other,
+            component: None,
+            shard: None,
+        });
+        manifest.seal().unwrap();
+
+        let error = transport_stats(directory.path(), &manifest).unwrap_err();
+        assert!(error.to_string().contains("physical CDN object cap"));
+    }
 }

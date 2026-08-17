@@ -19,9 +19,40 @@ import {
   selectBrowser1k5ChromeSharedMemoryPolicy,
   summarizeBrowser1k5RuntimeWebGpuCalls,
   validateBrowser1k5LowVramResourcePlan,
+  validateBrowser1k5TransportValidation,
   validateBrowserPackageIdentity,
   validateDenoiserResidencyPolicy,
 } from "./wasm_browser_1k5_contract.mjs";
+
+function validTransportValidation() {
+  return {
+    artifact_file_count: 253,
+    artifact_weight_file_count: 223,
+    artifact_bytes: 38_224_723_735,
+    artifact_weight_bytes: 38_000_000_000,
+    transport_layout_path: "metadata/transport-layout.json",
+    physical_transport_part_reference_count: 2_000,
+    physical_transport_unique_part_count: 2_000,
+    physical_transport_reconstructed_bytes: 38_000_000_000,
+    physical_transport_unique_part_bytes: 38_000_000_000,
+    physical_transport_max_part_bytes: 20 * 1024 * 1024,
+    physical_transport_target_part_bytes: 20 * 1024 * 1024,
+    physical_transport_hard_max_part_bytes: 25_000_000,
+    direct_artifact_file_count: 33,
+    direct_artifact_bytes: 224_723_735,
+    transport_sidecars: [
+      "boogu-image-0.1-edit-turbo-1k5",
+      "qwen3-vl-8b-base-boogu-image-0.1",
+      "flux1-vae-boogu-image-0.1",
+    ].map((bundle, index) => ({
+      bundle,
+      path: "metadata/transport-layout.json",
+      size: 10_000 + index,
+      sha256: String(index + 1).repeat(64),
+      authenticated: true,
+    })),
+  };
+}
 
 const testsDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testsDir, "../../..");
@@ -372,9 +403,11 @@ test("binds browser JavaScript, Wasm, runtime, and harness sources by size and S
   const wwwOutDir = await mkdtemp(join(tmpdir(), "burn-image-1k5-package-identity-"));
   const javascript = Buffer.from("export const browserPackage = true;\n");
   const wasm = Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]);
+  const icon = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   try {
     await writeFile(join(wwwOutDir, "bevy_burn_image.js"), javascript);
     await writeFile(join(wwwOutDir, "bevy_burn_image_bg.wasm"), wasm);
+    await writeFile(join(wwwOutDir, "burn-image-icon.png"), icon);
     const identity = await collectBrowserPackageIdentity({
       wwwOutDir,
       repoRoot,
@@ -393,12 +426,18 @@ test("binds browser JavaScript, Wasm, runtime, and harness sources by size and S
       identity.files.browser_wasm.sha256,
       createHash("sha256").update(wasm).digest("hex"),
     );
+    assert.equal(identity.files.browser_icon.size_bytes, icon.length);
+    assert.equal(
+      identity.files.browser_icon.sha256,
+      createHash("sha256").update(icon).digest("hex"),
+    );
     for (const source of [
       "browser_runtime_source",
       "qualification_harness_script",
       "qualification_harness_page",
       "qualification_contract_source",
       "qualification_scope_source",
+      "artifact_transport_contract_source",
     ]) {
       assert.ok(identity.files[source].size_bytes > 0, `${source} has no size`);
       assert.match(identity.files[source].sha256, /^[0-9a-f]{64}$/);
@@ -406,6 +445,16 @@ test("binds browser JavaScript, Wasm, runtime, and harness sources by size and S
   } finally {
     await rm(wwwOutDir, { recursive: true, force: true });
   }
+});
+
+test("separates logical artifact evidence from bounded part-only transport evidence", () => {
+  const validation = validTransportValidation();
+  assert.deepEqual(validateBrowser1k5TransportValidation(validation), []);
+  validation.physical_transport_max_part_bytes = 25_000_001;
+  validation.physical_transport_reconstructed_bytes -= 1;
+  const failures = validateBrowser1k5TransportValidation(validation);
+  assert.ok(failures.some((failure) => failure.includes("20 MiB")));
+  assert.ok(failures.some((failure) => failure.includes("logical weight bytes")));
 });
 
 test("fails package identity closed when a browser payload is absent", async () => {

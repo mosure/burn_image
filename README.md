@@ -47,19 +47,55 @@ cargo run --release --locked -p bevy_burn_image \
 provenance profile `f16-qwen-vision-f32`: the denoiser, Qwen text tower, and VAE are stored as F16,
 while the Qwen vision tower remains F32. The longer name is intentionally retained only where
 low-level artifact/parity tools need the exact immutable identity; it does not mean an F32 model.
-Once the five-entry canonical CDN release is published, the viewer resolves it, verifies it, and
-caches it under `~/.burn_image/models/`. Until then, add
-`--artifacts /path/to/production-bundle` to use a local bundle. As of the 2026-08-14 qualification
-checkpoint, the prepared canonical model entries still return HTTP 403 and the CDN response policy
-does not expose the required Range headers through CORS, so canonical CDN/Pages deployment remains
-blocked.
+The five-entry canonical CDN release is public. The viewer resolves and verifies it, and native
+clients cache it under `~/.burn_image/models/`; `--artifacts /path/to/production-bundle` selects a
+local mirror. A 2026-08-16 browser probe authenticated the composed manifest, both dependencies,
+all three transport layouts, and cold/warm physical-part loading from the public CDN. Pages remains
+fail-closed until the CDN changes reusable `manifest.json` responses from `immutable` to `no-cache`.
+
+The upload-ready artifact has distinct semantic, physical, and browser-cache layers. Logical
+Burnpacks remain bounded by 256 MiB; the sealed transport layout reconstructs them from physical
+parts targeting 20,971,520 bytes with an exact 25,000,000-byte hard maximum; and the browser stores
+each authenticated physical part as one complete CacheStorage object. Legacy direct Burnpacks keep
+authenticated range entries no larger than 4 MiB. Each network object completes into a
+browser-owned `Blob` whose exact size is checked before one bounded copy enters Wasm. Preparing this
+local tree does not replace remote payload authentication or a full browser model qualification.
 Enter a prompt, select **Run**, then save the generated PNG from the viewer.
+
+Interactive native builds use static CubeCL kernels by default, so opening the app or trying a new
+shape never starts an opaque tuning pass. Long-running workloads can opt in with
+`--features boogu-native,native-autotune` and then choose `--autotune balanced`; qualification uses
+`--autotune full`. The first uncached feature-enabled request deliberately benchmarks candidates
+and must not be treated as ordinary interactive latency.
+
+Native automation uses ordinary CLI arguments and the same validated image-job path as the UI; it
+does not synthesize pointer or keyboard input. Supplying `--output` hides the window, waits for the
+selected runtime, executes exactly one request, writes the PNG plus a JSON timing/provenance report,
+and exits with a meaningful status code:
+
+```bash
+target/release/burn-image-viewer \
+  --variant edit-turbo \
+  --prompt "make the bird red" \
+  --source input.jpg \
+  --width 1024 --height 1024 --seed 0 \
+  --output result.png \
+  --report result.json \
+  --timeout-seconds 1800
+```
+
+For generation, use `--variant turbo` and omit `--source`. Use `--show-window` only when visually
+debugging an automated request; no window interaction is required. Run `burn-image-viewer --help`
+for the complete contract.
 
 For image editing, use `--variant edit-turbo` and select or drop a reference image. The distinct
 1.5K checkpoint is selected with `--variant edit-turbo-1k5` and its matching artifact bundle on
-native or browser builds. One startup initializes one release: change native `--variant` by exiting
-and restarting the viewer. On canonical browser pages, the outer **Model release** selector changes
-`variant` and reloads the page; an explicit custom `artifacts=` URL locks that exact release.
+native or browser builds. Canonical native interactive runs expose all three in the in-canvas Model
+drop-down: the next **Run** releases the idle model and lazily loads only the new selection. This
+keeps one GPU-resident model and avoids downloading every release at startup. Automated, explicit
+custom-artifact, and qualification runs stay single-release. On canonical browser pages, the outer
+**Model release** selector changes `variant` and reloads the page; an explicit custom `artifacts=`
+URL locks that exact release.
 
 To select the implemented native low-VRAM policy, replace the final quick-start argument with
 `--residency low-vram`. It streams Qwen and the required VAE half by phase while retaining one

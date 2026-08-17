@@ -367,6 +367,9 @@ const BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT: usize = 48;
 const BROWSER_1K5_AUTHENTICATED_ONLY_TENSOR_COUNT: usize = 17;
 const BROWSER_1K5_NUMERICAL_TENSOR_COUNT: usize = 355;
 const BROWSER_1K5_VAE_REFERENCE_REPEAT_COUNT: usize = 3;
+const BROWSER_TURBO_ACTIVE_LOGICAL_OBJECTS: u32 = 186;
+const BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS: u32 = 1_751;
+const BROWSER_TURBO_ACTIVE_TRANSPORT_BYTES: u64 = 35_106_151_424;
 // Browser parity is deliberately observer-heavy. Keep each asynchronous WebGPU map bounded so a
 // single large semantic activation cannot require a 100+ MiB staging map. This does not alter the
 // tensor values or production inference path; the complete F32 vector is assembled on the host for
@@ -1620,7 +1623,7 @@ fn validate_browser_packed_f16_qwen_embedding_plan(
             return Err(execution_error(
                 variant,
                 format!(
-                    "browser host-routed Qwen component {component} has {} physical objects, expected exactly one",
+                    "browser host-routed Qwen component {component} has {} logical Burnpack objects, expected exactly one",
                     files.len()
                 ),
             ));
@@ -2114,7 +2117,7 @@ fn validate_browser_resident_resource_plan(
             "resident browser resource plan contains no model weights",
         ));
     }
-    // The production bundle mixes F16 and F32 storage. Doubling the complete physical Burnpack
+    // The production bundle mixes F16 and F32 storage. Doubling the complete logical Burnpack
     // weight payload is a conservative bound for dense-F32 materialization, including headers and
     // alignment. Activation residency is reported separately from the shape-aware single-buffer
     // gate; eight simultaneous maximum model buffers remain a conservative fused-workset reserve.
@@ -2307,32 +2310,113 @@ pub(crate) fn report_browser_surface_inference_gate_failure(
 }
 
 fn dispatch_browser_progress(event: &ProgressEvent) {
-    let status = match event {
-        ProgressEvent::ArtifactStarted {
-            file_index,
-            file_count,
-            ..
-        } => Some(format!(
-            "Model setup: loading object {} of {file_count}",
-            file_index + 1
-        )),
-        ProgressEvent::ArtifactProgress {
-            loaded_bytes,
-            total_bytes,
-            ..
-        } => Some(format!(
-            "Model setup: loading current object {:.1}%",
-            100.0 * *loaded_bytes as f64 / (*total_bytes).max(1) as f64
-        )),
-        ProgressEvent::ArtifactVerified { path, .. } => {
-            Some(format!("Model setup: verified {path}"))
-        }
+    let transfer = match event {
+        ProgressEvent::ArtifactStarted { transfer, .. }
+        | ProgressEvent::ArtifactProgress { transfer, .. }
+        | ProgressEvent::ArtifactVerified { transfer, .. } => transfer.as_ref(),
         _ => None,
     };
+    let status = transfer
+        .map(browser_transfer_progress_status)
+        .or_else(|| match event {
+            ProgressEvent::ArtifactStarted { path, .. } => Some(format!(
+                "Model setup: streaming {path}; overall totals unavailable"
+            )),
+            ProgressEvent::ArtifactProgress {
+                loaded_bytes,
+                total_bytes,
+                ..
+            } => Some(format!(
+                "Model setup: loading current object {:.1}%",
+                100.0 * *loaded_bytes as f64 / (*total_bytes).max(1) as f64
+            )),
+            ProgressEvent::ArtifactVerified { path, .. } => {
+                Some(format!("Model setup: verified {path}"))
+            }
+            _ => None,
+        });
     if let Some(status) = status {
         set_browser_factory_progress(status);
     }
     dispatch_browser_event(BROWSER_PROGRESS_EVENT_NAME, event);
+}
+
+fn browser_transfer_progress_status(progress: &burn_image::ArtifactTransferProgress) -> String {
+    let percent = 100.0 * progress.loaded_bytes as f64 / progress.total_bytes.max(1) as f64;
+    let component = progress
+        .component
+        .as_ref()
+        .map(|component| format!(" - {component}"))
+        .unwrap_or_default();
+    let rate = progress
+        .bytes_per_second
+        .map(|bytes| format!(" - {}/s", format_transfer_bytes(bytes)))
+        .unwrap_or_default();
+    let eta = progress
+        .eta_seconds
+        .map(|seconds| format!(" - ETA {}", format_transfer_duration(seconds)))
+        .unwrap_or_default();
+    format!(
+        "Model transfer {percent:.1}%: {}{component} - {} / {} - {}/{} logical objects - {}/{} unique parts - {}/{} bounded reads{rate}{eta}",
+        progress.phase,
+        format_transfer_bytes(progress.loaded_bytes),
+        format_transfer_bytes(progress.total_bytes),
+        progress.logical_objects_completed,
+        progress.logical_objects_total,
+        progress.physical_parts_completed,
+        progress.physical_parts_total,
+        progress.bounded_ranges_completed,
+        progress.bounded_ranges_total,
+    )
+}
+
+fn validate_browser_turbo_active_transfer_plan(
+    progress: &burn_image::ArtifactTransferProgress,
+) -> Result<(), String> {
+    let actual = (
+        progress.logical_objects_total,
+        progress.physical_parts_total,
+        progress.bounded_ranges_total,
+        progress.total_bytes,
+    );
+    let expected = (
+        BROWSER_TURBO_ACTIVE_LOGICAL_OBJECTS,
+        BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS,
+        u64::from(BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS),
+        BROWSER_TURBO_ACTIVE_TRANSPORT_BYTES,
+    );
+    if actual != expected {
+        return Err(format!(
+            "canonical Turbo active transport plan is {actual:?}; expected {expected:?} after excluding non-executable Qwen vision, VAE encoder, and reference-refiner stages"
+        ));
+    }
+    Ok(())
+}
+
+fn format_transfer_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn format_transfer_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{}s", seconds.max(1))
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
 }
 
 fn dispatch_browser_event<T: serde::Serialize>(name: &str, value: &T) {
@@ -5073,6 +5157,10 @@ async fn build_no_surface_parity_engine_with_residency(
 }
 
 impl BooguRuntimeFactory for BrowserBooguFactory {
+    fn initialization_variant(&self) -> Option<BooguVariant> {
+        Some(self.variant)
+    }
+
     fn start(&mut self, context: BooguFactoryContext) -> Result<(), RuntimeError> {
         if self.started {
             return Err(execution_error(
@@ -5349,14 +5437,14 @@ impl BrowserExecutionPolicies {
             && self.denoiser_retaining_wrapper_adapter
                 == BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage
         {
-            "persistent-range-cache/qwen+vae+denoiser-first-request/zero-repeat-network-required/retained-q8-denoiser-cache-hits-dmd-steps-2-through-4/dense-f32-materialized-per-semantic-stage"
+            "persistent-part-cache+legacy-range-cache/qwen+vae+denoiser-first-request/zero-repeat-network-required/retained-q8-denoiser-cache-hits-dmd-steps-2-through-4/dense-f32-materialized-per-semantic-stage"
         } else if self.require_persistent_range_cache
             && self.preload_denoiser_before_request
             && self.residency == BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
         {
-            "persistent-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage"
+            "persistent-part-cache+legacy-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage"
         } else if self.require_persistent_range_cache && self.residency.is_low_vram() {
-            "persistent-range-cache/qwen+vae+denoiser-first-request/zero-repeat-network-required/retained-q8-direct-matmul-denoiser-cache-hits-dmd-steps-2-through-4"
+            "persistent-part-cache+legacy-range-cache/qwen+vae+denoiser-first-request/zero-repeat-network-required/retained-q8-direct-matmul-denoiser-cache-hits-dmd-steps-2-through-4"
         } else if self.preload_denoiser_before_request
             && self.residency == BrowserBooguResidencyPolicy::LowVramPreloadedPackedF16Denoiser
         {
@@ -5754,6 +5842,7 @@ async fn fetch_browser_dependency_manifest(
     Ok((base_url, manifest))
 }
 
+#[cfg(test)]
 fn manifest_weight_artifacts(
     manifest: &ArtifactManifest,
     qualify_bundle: bool,
@@ -5762,6 +5851,32 @@ fn manifest_weight_artifacts(
         .files
         .iter()
         .filter(|file| matches!(file.role, burn_image::ArtifactFileRole::Weights))
+        .map(|file| {
+            let path = if qualify_bundle {
+                format!("{}/{}", manifest.bundle, file.path)
+            } else {
+                file.path.to_string()
+            };
+            (path, file.size)
+        })
+        .collect()
+}
+
+fn active_manifest_weight_artifacts(
+    manifest: &ArtifactManifest,
+    qualify_bundle: bool,
+    variant: BooguVariant,
+) -> BTreeMap<String, u64> {
+    manifest
+        .files
+        .iter()
+        .filter(|file| matches!(file.role, burn_image::ArtifactFileRole::Weights))
+        .filter(|file| {
+            browser_resident_artifact_required(
+                variant,
+                file.component.as_ref().map(|component| component.as_str()),
+            )
+        })
         .map(|file| {
             let path = if qualify_bundle {
                 format!("{}/{}", manifest.bundle, file.path)
@@ -5865,7 +5980,7 @@ impl BrowserBooguEngine {
         let composition =
             BrowserArtifactComposition::resolve(variant, manifest, base_url, stream_config).await?;
         let expected_weight_artifacts = if composition.legacy_monolith {
-            manifest_weight_artifacts(&composition.pipeline_manifest, false)
+            active_manifest_weight_artifacts(&composition.pipeline_manifest, false, variant)
         } else {
             [
                 &composition.pipeline_manifest,
@@ -5873,7 +5988,7 @@ impl BrowserBooguEngine {
                 &composition.vae_manifest,
             ]
             .into_iter()
-            .flat_map(|manifest| manifest_weight_artifacts(manifest, true))
+            .flat_map(|manifest| active_manifest_weight_artifacts(manifest, true, variant))
             .collect()
         };
         if policies.eager_preload {
@@ -5914,8 +6029,14 @@ impl BrowserBooguEngine {
         }
 
         let bootstrap_control = BrowserArtifactControl::default();
-        bootstrap_control.set_observer(Some(Arc::new(|event| {
-            let progress = browser_artifact_progress(RunId(0), event);
+        bootstrap_control.set_transfer_phase("Model setup");
+        let bootstrap_progress_control = bootstrap_control.clone();
+        bootstrap_control.set_observer(Some(Arc::new(move |event| {
+            let progress = browser_artifact_progress(
+                RunId(0),
+                event,
+                bootstrap_progress_control.transfer_progress(),
+            );
             dispatch_browser_progress(&progress);
         })));
         let make_reader = |base_url, bundle| {
@@ -5942,15 +6063,43 @@ impl BrowserBooguEngine {
         let reader = make_reader(
             composition.pipeline_base_url.clone(),
             composition.pipeline_manifest.bundle.clone(),
-        );
+        )
+        .with_manifest_transport_layout(&composition.pipeline_manifest)
+        .await
+        .map_err(|error| execution_error(variant, error))?;
         let mut qwen_reader = make_reader(
             composition.qwen_base_url.clone(),
             composition.qwen_manifest.bundle.clone(),
-        );
+        )
+        .with_manifest_transport_layout(&composition.qwen_manifest)
+        .await
+        .map_err(|error| execution_error(variant, error))?;
         let mut vae_reader = make_reader(
             composition.vae_base_url.clone(),
             composition.vae_manifest.bundle.clone(),
-        );
+        )
+        .with_manifest_transport_layout(&composition.vae_manifest)
+        .await
+        .map_err(|error| execution_error(variant, error))?;
+        let active_transfer_objects = expected_weight_artifacts
+            .keys()
+            .map(|path| {
+                ArtifactPath::new(path.clone()).map_err(|error| execution_error(variant, error))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        bootstrap_control
+            .retain_transfer_logical_objects(&active_transfer_objects)
+            .map_err(|error| execution_error(variant, error))?;
+        if variant == BooguVariant::Image01Turbo
+            && settings.storage_profile == BooguStorageProfile::F16QwenVisionF32
+            && !composition.legacy_monolith
+        {
+            let active_plan = bootstrap_control.transfer_progress().ok_or_else(|| {
+                execution_error(variant, "canonical Turbo active transport plan is empty")
+            })?;
+            validate_browser_turbo_active_transfer_plan(&active_plan)
+                .map_err(|error| execution_error(variant, error))?;
+        }
         let qwen_config_bytes = read_manifest_file(
             &mut qwen_reader,
             &composition.qwen_manifest,
@@ -10548,14 +10697,22 @@ fn install_artifact_observer(
     id: ImageJobId,
     run_id: RunId,
 ) {
+    control.set_transfer_phase("Inference model transfer");
+    control.start_request_transfer_activity();
     let observer_shared = Arc::clone(shared);
+    let progress_control = control.clone();
     control.set_observer(Some(Arc::new(move |event| {
-        let progress = browser_artifact_progress(run_id, event);
+        let progress =
+            browser_artifact_progress(run_id, event, progress_control.transfer_progress());
         queue_progress(&observer_shared, id, progress);
     })));
 }
 
-fn browser_artifact_progress(run_id: RunId, event: BrowserArtifactEvent) -> ProgressEvent {
+fn browser_artifact_progress(
+    run_id: RunId,
+    event: BrowserArtifactEvent,
+    transfer: Option<burn_image::ArtifactTransferProgress>,
+) -> ProgressEvent {
     match event {
         BrowserArtifactEvent::Started(file) => {
             let (file_index, file_count) = artifact_progress_position(&file);
@@ -10566,6 +10723,7 @@ fn browser_artifact_progress(run_id: RunId, event: BrowserArtifactEvent) -> Prog
                 file_index,
                 file_count,
                 total_bytes: file.size,
+                transfer,
             }
         }
         BrowserArtifactEvent::Progress {
@@ -10577,8 +10735,13 @@ fn browser_artifact_progress(run_id: RunId, event: BrowserArtifactEvent) -> Prog
             path,
             loaded_bytes,
             total_bytes,
+            transfer,
         },
-        BrowserArtifactEvent::Verified(path) => ProgressEvent::ArtifactVerified { run_id, path },
+        BrowserArtifactEvent::Verified(path) => ProgressEvent::ArtifactVerified {
+            run_id,
+            path,
+            transfer,
+        },
     }
 }
 
@@ -11505,7 +11668,7 @@ mod browser_source_tests {
         assert!(ordinary.request_scoped_surface_acquire_suspended);
         assert_eq!(
             ordinary.weight_traffic_contract(),
-            "persistent-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage"
+            "persistent-part-cache+legacy-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage"
         );
         assert_eq!(
             ordinary.packed_f16_dmd_vae_handoff_policy(),
@@ -12927,6 +13090,38 @@ mod browser_source_tests {
         assert!(
             manifest_weight_artifacts(&weights, true).contains_key("shared-qwen/objects/tiny.bpk")
         );
+    }
+
+    #[test]
+    fn canonical_turbo_active_transfer_denominator_is_exact_correctness() {
+        let exact = burn_image::ArtifactTransferProgress {
+            phase: "Model setup".into(),
+            component: None,
+            logical_objects_completed: BROWSER_TURBO_ACTIVE_LOGICAL_OBJECTS,
+            logical_objects_total: BROWSER_TURBO_ACTIVE_LOGICAL_OBJECTS,
+            physical_parts_completed: BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS,
+            physical_parts_total: BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS,
+            bounded_ranges_completed: u64::from(BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS),
+            bounded_ranges_total: u64::from(BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS),
+            loaded_bytes: BROWSER_TURBO_ACTIVE_TRANSPORT_BYTES,
+            total_bytes: BROWSER_TURBO_ACTIVE_TRANSPORT_BYTES,
+            bytes_per_second: None,
+            eta_seconds: None,
+            request_activity: None,
+        };
+        validate_browser_turbo_active_transfer_plan(&exact).unwrap();
+
+        for drift in [
+            (185, 1_751, 35_106_151_424),
+            (186, 1_752, 35_106_151_424),
+            (186, 1_751, 35_106_151_425),
+        ] {
+            let mut invalid = exact.clone();
+            invalid.logical_objects_total = drift.0;
+            invalid.physical_parts_total = drift.1;
+            invalid.total_bytes = drift.2;
+            assert!(validate_browser_turbo_active_transfer_plan(&invalid).is_err());
+        }
     }
 
     #[test]

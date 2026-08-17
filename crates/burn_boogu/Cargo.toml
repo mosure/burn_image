@@ -18,10 +18,15 @@ std = []
 runtime = ["std", "burn_qwen3_vl/tokenizers"]
 ndarray = ["burn/ndarray", "dep:burn-ndarray"]
 flex = ["burn/flex"]
+autotune = [
+  "burn/autotune",
+  "burn-wgpu?/autotune",
+  "burn-cuda?/autotune",
+]
 cuda-experimental = [
   "burn/cuda",
   "burn/fusion",
-  "burn/autotune",
+  "autotune",
   "dep:burn-cubecl",
   "dep:burn-cuda",
   "dep:burn-fusion",
@@ -81,7 +86,7 @@ wgpu = { workspace = true, optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "macos")))'.dependencies.burn-wgpu]
 workspace = true
-features = ["autotune", "fusion", "std", "vulkan"]
+features = ["fusion", "std", "vulkan"]
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-cubecl]
@@ -91,7 +96,7 @@ optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-cuda]
 workspace = true
-features = ["autotune", "fusion", "std"]
+features = ["fusion", "std"]
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-fusion]
@@ -111,7 +116,7 @@ optional = true
 
 [target.'cfg(all(not(target_arch = "wasm32"), target_os = "macos"))'.dependencies.burn-wgpu]
 workspace = true
-features = ["autotune", "fusion", "std", "metal"]
+features = ["fusion", "std", "metal"]
 optional = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.burn-wgpu]
@@ -147,7 +152,7 @@ required-features = ["runtime", "import", "cuda-experimental"]
 [[bin]]
 name = "boogu-run-wgpu-blackbox"
 path = "src/bin/boogu_run_wgpu_blackbox.rs"
-required-features = ["runtime", "import", "wgpu"]
+required-features = ["runtime", "import", "wgpu", "autotune"]
 
 [[bin]]
 name = "boogu-parity"
@@ -167,7 +172,7 @@ required-features = ["import", "wgpu"]
 [[bin]]
 name = "boogu-full-parity"
 path = "src/bin/boogu_full_parity.rs"
-required-features = ["runtime", "import", "wgpu"]
+required-features = ["runtime", "import", "wgpu", "autotune"]
 
 [[bin]]
 name = "boogu-verify-artifacts"

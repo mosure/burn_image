@@ -30,12 +30,17 @@ inside `ImageFrontendSet::Dispatch`.
 
 `BurnImageShellPlugin` installs a compact, responsive control panel and a
 camera-backed image viewport. The panel provides a multiline prompt or edit
-instruction, capability-safe generate/edit selection, the loaded-model identity, capability-aware
+instruction, a model selector that derives Generate or Edit behavior from the selected model,
+capability-aware
 size presets, a numeric `u64` seed, reference-image input, Run, Cancel, Save
-PNG, Fit image, and 100% controls. Loading a reference selects edit mode and an
+PNG, and an edit-only **Use output as reference** action. Loading a reference selects edit mode and an
 edit-capable model when available; it does not enter Edit mode when the initialized runtime cannot
-execute edits. A concrete Boogu runtime initializes exactly one release, so its in-canvas Model
-control is labelled **Loaded model** and disabled rather than implying an in-process hot swap.
+execute edits. Reusing an output is always explicit and never replaces the reference after a Generate
+request. The canonical native viewer exposes Generate, Edit 1K, and Edit 1.5K in a real model
+drop-down. It initializes only the selected release, then unloads that release and lazily loads the
+new selection on the next **Run**, keeping one model resident instead of tripling startup traffic or
+VRAM. Singleton embedders and the browser runtime keep the Model control disabled rather than
+implying a hot swap they do not implement.
 NativeWgpu and BrowserWebGpu use the same
 Boogu descriptors: Turbo and 1K Edit accept 256-1024 output dimensions bounded
 to 1,048,576 pixels and default to 1024x1024; Edit-Turbo 1.5K defaults to
@@ -54,8 +59,7 @@ current directory or starts a browser Blob download.
 
 The latest reference or generated image is fitted automatically. Drag with the
 left or middle mouse button to pan, use the wheel or a touchpad pinch to zoom
-toward the pointer, select **Fit image** to recenter and contain the image, or
-select **100%** for one image pixel per logical display pixel. Camera input is
+toward the pointer, and use those manual controls to choose the desired framing. Camera input is
 limited to the image viewport and is disabled while a text field or the panel
 owns input. The panel moves below the viewport on narrow windows and remains
 scrollable when vertical space is limited.
@@ -64,7 +68,9 @@ Progress remains visible throughout shared-GPU setup, manifest and shard
 transfer, model-stage initialization, inference steps, output preparation,
 cancellation, and failures. The headline, detail text, and progress bar report
 the active phase instead of treating device creation or a downloaded manifest
-as model readiness. A missing model runtime is shown explicitly; pressing
+as model readiness. Lazy native model switches forward their setup milestones and bundle-local
+download file counts into the active job instead of leaving a static model-switch label. A missing
+model runtime is shown explicitly; pressing
 **Run** cannot produce a placeholder result.
 
 ## Boogu adapter
@@ -128,10 +134,10 @@ local-bundle-only and rereads Qwen and VAE per request plus denoiser stages on e
 a memory diagnostic, not a supported production path. Neither policy substitutes a mock result or
 CPU tensor backend.
 
-The canonical five-entry CDN deployment is not live at this documentation checkpoint: its model
-entry probes return HTTP 403 and its response policy does not expose the required Range headers
-through CORS. Use a verified local `--artifacts` bundle or an explicit diagnostic mirror until the
-public deployment gate passes.
+The canonical five-entry CDN deployment is live. A 2026-08-16 real-browser probe authenticated the
+Turbo/Qwen/VAE manifests and layouts, then verified both cold whole-part downloads and a warm
+CacheStorage resume. The deployment gate still requires reusable `manifest.json` URLs to use
+`no-cache`; the current public manifest response is incorrectly marked `immutable`.
 
 Linux evidence harnesses combine BigInt `statfs` arithmetic with a real bounded 256 MiB
 write/`fsync`/delete quota probe. Current runs admitted `/dev/shm`, rejected quota-limited `/tmp`,
@@ -142,15 +148,22 @@ sealed manifest/provenance identity `f16-qwen-vision-f32`: Qwen vision is stored
 denoiser, Qwen text tower, and VAE are stored F16. The precise name remains accepted for backward
 compatibility and low-level tooling; it does not mean the complete model executes F32.
 
-An embedder selecting the qualified native mixed-F16 execution kernels in either high- or low-VRAM
-mode must call
+An embedder built with the optional `native-autotune` feature and selecting the qualified native
+mixed-F16 execution kernels in either high- or low-VRAM mode must call
 `burn_boogu::configure_native_full_autotune()` on the main thread before Bevy creates or imports its
 WGPU device. For Turbo and 1K Edit this selects padded-blackbox `p4/kv1/q1` denoiser q8192 with
 strict-F32 RMSNorm, preserved-F16 VAE q4096, and safe F32 GroupNorm accumulation; Edit-Turbo 1.5K
-uses its separately qualified q16384/VAE-q4096 bounds. High-VRAM mode retains q128 Qwen with
-deferred terminal-stage synchronization, while low-VRAM streams q128 Qwen with a per-stage
-boundary. `NativeBooguFactory` fails closed if full autotune was omitted or selected too late. The
-packaged `burn-image-viewer` binary performs this setup automatically. Browser and diagnostic
+uses its separately qualified q16384/VAE-q4096 bounds. Full-autotune qualification and 1.5K retain
+q128 Qwen. Interactive balanced high-VRAM 1K uses q1024 with deferred terminal-stage
+synchronization; low-VRAM streams q128 Qwen with a per-stage boundary.
+`NativeBooguFactory` fails closed if a feature-enabled selected autotune policy was omitted or
+selected too late. Ordinary `boogu-native` builds instead use static kernels and perform no tuning
+or pre-Ready warmup. Add `native-autotune` and pass `--autotune balanced` to opt into shape-bucketed
+tuning; balanced resident Edit 1K then performs one best-effort kernel warmup before reporting
+**Ready**. On that measured feature-enabled warm path, an ordinary
+1024x1024 Edit request completed in 10.848 model seconds / 10.883 host seconds (Qwen 0.654 s, VAE
+encode 0.164 s, four-step DMD 9.743 s, VAE decode 0.227 s). Pass `--autotune full` in the same
+feature-enabled build for the qualified fixed-shape policy. Browser and diagnostic
 storage/residency paths retain their independent policies.
 
 Run a converted Turbo bundle with:
@@ -168,10 +181,35 @@ use an already verified local conversion. Replace `native-high-vram` with `low-v
 phase-resident policy. Its static sub-32-decimal-GB plan remains distinct from the measured native
 Turbo output-qualification candidate above.
 
-Use `--variant edit-turbo` with the matching Edit-Turbo bundle. Changing the native release means
-exiting the viewer and restarting it with the new `--variant`; this intentionally releases one GPU
-runtime before constructing another. The native and browser viewers also
-accept the distinct `--variant edit-turbo-1k5` release with a
+For unattended native execution, pass the request directly instead of automating the UI:
+
+```sh
+target/release/burn-image-viewer \
+  --variant turbo \
+  --prompt "a glossy blue ceramic bird" \
+  --width 1024 --height 1024 --seed 0 \
+  --output result.png \
+  --report result.json \
+  --timeout-seconds 1800
+```
+
+`--output` selects one-shot automation, hides the window by default, submits through the ordinary
+`SubmitImageJob` path after runtime readiness, saves through the production PNG encoder, writes
+load/request/stage timings and provenance, then returns success or failure as the process exit code.
+Edit mode additionally requires `--source <IMAGE>`; Turbo rejects one. `--show-window` is an
+optional visual-debug aid and never changes request routing.
+
+Interactive canonical native runs default to `--variant turbo`; `--variant edit-turbo` and
+`--variant edit-turbo-1k5` choose the initial selection. The Model drop-down can change among all
+three without restarting: the selected release is loaded on the next **Run**. The switch worker
+first joins the previous release's inference worker so every retained module is dropped, then
+synchronizes and cleans the inference-device allocator, and only then constructs the new release.
+This prevents old and new model residency from overlapping. Model loading, switching, and inference
+run on dedicated native worker threads; submitting and polling from Bevy stay nonblocking. The
+interactive multi-model viewer also uses a separate native compute device/queue from Bevy's render
+queue so long inference dispatches do not serialize swap-chain presentation. Automated,
+qualification, custom-artifact, and browser runs remain deliberately single-release. The native and
+browser viewers accept the distinct `edit-turbo-1k5` release with a
 `boogu-image-0.1-edit-turbo-1k5` bundle. Its omitted-size default is 1536x1536; the
 official presets are 1536x1536, 1264x1856, 1856x1264, 1344x1744, 1744x1344, 1392x1696,
 1696x1392, 1152x2032, 2032x1152, and 2368x992, bounded to 2,360,832 pixels. The viewer
@@ -331,13 +369,14 @@ external scoped GPU-process attestation rather than relying on that adapter labe
 
 ## Artifact streaming
 
-`StreamingArtifactLoader` requests one exact range at a time, hashes borrowed
-bytes without retaining them, and commits a `TransactionalArtifactSink` only
-after the complete file digest passes. Heavy profiles should make each
-manifest file a bounded shard, release its loader after commit, then proceed to
-the next shard. On Wasm, `fetch_browser_range` performs the actual HTTP request,
-requires 206 plus the matching `Content-Range`, and rejects a response above 16
-MiB. This prevents a complete model bundle from entering Wasm linear memory.
+`StreamingArtifactLoader` retains its generic range contract for legacy objects. Canonical
+manifests keep logical Burnpacks below the 256 MiB semantic ceiling and seal a sidecar that
+reconstructs them from content-addressed physical CDN parts. Parts target 20,971,520 bytes and may
+never exceed 25,000,000 bytes. Canonical Wasm loading uses one HTTP 200/CacheStorage entry per part,
+checks any exposed identity framing, verifies exact `Blob.size` and the part SHA-256, then copies
+only that bounded part into Wasm. Compact declared files use the same whole-object path. Legacy
+direct Burnpacks retain exact 206 ranges and 4 MiB cache entries. A complete model bundle never
+enters Wasm linear memory.
 
 ## Builds
 
@@ -363,6 +402,8 @@ mkdir -p crates/bevy_image/www/out
 wasm-bindgen --target web --out-dir crates/bevy_image/www/out \
   --out-name bevy_burn_image \
   target/wasm32-unknown-unknown/wasm-release/bevy_burn_image.wasm
+install -m 0644 crates/bevy_image/www/burn-image-icon.png \
+  crates/bevy_image/www/out/burn-image-icon.png
 rg '^export function (start_boogu_web|provide_reference_image)' \
   crates/bevy_image/www/out/bevy_burn_image.js
 npx --yes serve crates/bevy_image/www --listen 8080
@@ -385,8 +426,9 @@ reloads the page so only one model is resident. An explicit custom artifact URL 
 because it names one exact bundle. Native file
 helpers remain excluded from Wasm builds.
 
-The repository's GitHub Pages workflow packages the tracked `www/` shell and ignored generated
-`www/out/` bindgen output only; model objects stay on the Aberration CDN. During runtime build and
+The repository's GitHub Pages workflow packages the tracked `www/` shell, the exact app-icon copy,
+and ignored generated `www/out/` bindgen output only; model objects are never copied into Pages and must be published on
+the Aberration CDN before the deployment gate can pass. During runtime build and
 inference, Wasm dispatches structured `burn-image-runtime` and `burn-image-progress` DOM events.
 The shell turns them into exact current-object bytes/shard progress, transfer rate and ETA,
 verified-object totals, stage/step state, terminal errors, and a manual full-runtime reload action.

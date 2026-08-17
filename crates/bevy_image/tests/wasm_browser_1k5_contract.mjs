@@ -3,6 +3,12 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join } from "node:path";
 
+import {
+  ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES,
+  ARTIFACT_TRANSPORT_LAYOUT_PATH,
+  ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+} from "./artifact_transport_contract.mjs";
+
 export const BROWSER_1K5_F32_QUALIFICATION_DENOISER_RESIDENCY =
   "request-scoped-f32-policy-retained-through-four-dmd-steps";
 export const BROWSER_1K5_LOW_VRAM_DENOISER_RESIDENCY =
@@ -126,11 +132,14 @@ export function browser1k5ChromeLaunchEvidence({
 const BROWSER_PACKAGE_IDENTITY_PATHS = Object.freeze({
   browser_javascript: "crates/bevy_image/www/out/bevy_burn_image.js",
   browser_wasm: "crates/bevy_image/www/out/bevy_burn_image_bg.wasm",
+  browser_icon: "crates/bevy_image/www/out/burn-image-icon.png",
   browser_runtime_source: "crates/bevy_image/src/browser_boogu.rs",
   qualification_harness_script: "crates/bevy_image/tests/wasm_browser_1k5_parity.mjs",
   qualification_harness_page: "crates/bevy_image/tests/wasm_browser_1k5_parity.html",
   qualification_contract_source: "crates/bevy_image/tests/wasm_browser_1k5_contract.mjs",
   qualification_scope_source: "crates/bevy_image/tests/wasm_browser_1k5_scope.mjs",
+  artifact_transport_contract_source:
+    "crates/bevy_image/tests/artifact_transport_contract.mjs",
 });
 
 export function denoiserResidencyPolicyForMode(residencyMode) {
@@ -150,6 +159,55 @@ export function validateDenoiserResidencyPolicy(attestation, residencyMode) {
     : [
         `denoiser residency policy is ${JSON.stringify(attestation?.policy ?? null)}; expected ${JSON.stringify(expectedPolicy)} for ${residencyMode}`,
       ];
+}
+
+export function validateBrowser1k5TransportValidation(validation) {
+  const failures = [];
+  for (const field of [
+    "artifact_file_count",
+    "artifact_weight_file_count",
+    "artifact_bytes",
+    "artifact_weight_bytes",
+    "physical_transport_unique_part_count",
+    "physical_transport_unique_part_bytes",
+    "direct_artifact_file_count",
+    "direct_artifact_bytes",
+  ]) {
+    if (!Number.isSafeInteger(validation?.[field]) || validation[field] <= 0) {
+      failures.push(`${field} is not a positive safe integer`);
+    }
+  }
+  if (
+    validation?.transport_layout_path !== ARTIFACT_TRANSPORT_LAYOUT_PATH ||
+    validation?.physical_transport_target_part_bytes !==
+      ARTIFACT_TRANSPORT_TARGET_PART_BYTES ||
+    validation?.physical_transport_hard_max_part_bytes !==
+      ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES ||
+    !Number.isSafeInteger(validation?.physical_transport_max_part_bytes) ||
+    validation.physical_transport_max_part_bytes <= 0 ||
+    validation.physical_transport_max_part_bytes > ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES
+  ) {
+    failures.push("physical transport does not attest the exact 20 MiB target / 25000000-byte cap");
+  }
+  if (
+    validation?.physical_transport_reconstructed_bytes !== validation?.artifact_weight_bytes
+  ) {
+    failures.push("physical transport reconstruction bytes differ from logical weight bytes");
+  }
+  if (!Array.isArray(validation?.transport_sidecars) || validation.transport_sidecars.length !== 3) {
+    failures.push("transport validation does not contain exactly three modular sidecars");
+  } else {
+    for (const sidecar of validation.transport_sidecars) {
+      if (
+        sidecar?.path !== ARTIFACT_TRANSPORT_LAYOUT_PATH ||
+        sidecar?.authenticated !== true ||
+        !/^[0-9a-f]{64}$/.test(sidecar?.sha256 ?? "")
+      ) {
+        failures.push(`${JSON.stringify(sidecar?.bundle)} sidecar is not SHA-256 authenticated`);
+      }
+    }
+  }
+  return failures;
 }
 
 function resourcePlanValue(value) {
@@ -387,11 +445,13 @@ export async function collectBrowserPackageIdentity({
   const fileInputs = {
     browser_javascript: join(wwwOutDir, "bevy_burn_image.js"),
     browser_wasm: join(wwwOutDir, "bevy_burn_image_bg.wasm"),
+    browser_icon: join(wwwOutDir, "burn-image-icon.png"),
     browser_runtime_source: join(repoRoot, "crates/bevy_image/src/browser_boogu.rs"),
     qualification_harness_script: harnessScriptPath,
     qualification_harness_page: join(testsDir, "wasm_browser_1k5_parity.html"),
     qualification_contract_source: join(testsDir, "wasm_browser_1k5_contract.mjs"),
     qualification_scope_source: join(testsDir, "wasm_browser_1k5_scope.mjs"),
+    artifact_transport_contract_source: join(testsDir, "artifact_transport_contract.mjs"),
   };
   const files = Object.fromEntries(
     await Promise.all(

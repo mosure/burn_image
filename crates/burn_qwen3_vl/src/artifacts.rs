@@ -35,7 +35,7 @@ use crate::{
     vision::{Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger},
 };
 
-const QWEN_METADATA_VALUES: [(&str, &str); 9] = [
+const QWEN_METADATA_VALUES: [(&str, &str); 17] = [
     ("component_bundle", "true"),
     ("component_kind", "qwen3-vl-base-conditioning"),
     ("artifact_layout", "semantic-burnpack-v1"),
@@ -45,11 +45,20 @@ const QWEN_METADATA_VALUES: [(&str, &str); 9] = [
     ("stored_tensor_count", "754"),
     ("tensor_inventory_entries", "755"),
     ("omitted_tensor_count", "1"),
+    ("physical_shards_bounded", "true"),
+    ("target_max_shard_bytes", "268435456"),
+    ("transport_layout_path", "metadata/transport-layout.json"),
+    ("transport_layout_schema", "1"),
+    ("transport_parts_required", "true"),
+    ("transport_part_target_bytes", "20971520"),
+    ("target_max_transport_shard_bytes", "25000000"),
+    ("semantic_object_max_bytes", "268435456"),
 ];
 
-const QWEN_METADATA_PATHS: [&str; 21] = [
+const QWEN_METADATA_PATHS: [&str; 22] = [
     "metadata/tensor-inventory.json",
     "metadata/source-files.json",
+    "metadata/transport-layout.json",
     "metadata/source/mllm/chat_template.json",
     "metadata/source/mllm/config.json",
     "metadata/source/mllm/generation_config.json",
@@ -86,7 +95,7 @@ pub const QWEN_COMPONENT_MODEL_REVISION: &str =
     "020ea5b58bd3fc9abf5f23e92e4039864a6d6ff4993db777a713b489bbd6c5a1";
 /// Exact sealed digest of the canonical reusable Qwen component manifest.
 pub const QWEN_COMPONENT_CONTENT_DIGEST: &str =
-    "2f7ed91e09f208853b189ee8c3d6db74a02d2512e07f4818f6688131359d98fc";
+    "2bab9d7c378158137c117a43d7a3cc5d66dc94af5dd0856d12348d08b2b9e9da";
 
 /// Construct the complete immutable dependency pin for the released Qwen component.
 pub fn qwen_component_dependency() -> ArtifactDependency {
@@ -162,8 +171,9 @@ fn contract(stage: impl Into<String>, message: impl Into<String>) -> Qwen3VlArti
 
 /// Validated semantic view of a sealed base-conditioning component manifest.
 ///
-/// Construction is allocation-free with respect to model weights. Every physical object is read,
-/// SHA-256 checked, parsed, applied, and dropped only when its semantic stage is requested.
+/// Construction is allocation-free with respect to model weights. Every logical Burnpack object is
+/// read (and may be reconstructed from physical transport parts), SHA-256 checked, parsed, applied,
+/// and dropped only when its semantic stage is requested.
 #[derive(Clone)]
 pub struct Qwen3VlComponentContract {
     manifest: ArtifactManifest,
@@ -544,7 +554,7 @@ impl<B: Backend, R: ArtifactShardReader> VerifiedBurnpackQwen3VlStageSource<B, R
             if found.replace(tensor).is_some() {
                 return Err(contract(
                     qwen_streaming_stage_name(&stage),
-                    "row slice appears in more than one physical object",
+                    "row slice appears in more than one logical Burnpack object",
                 ));
             }
         }
@@ -561,11 +571,8 @@ impl<B: Backend> VerifiedBurnpackQwen3VlStageSource<B, DirectoryArtifactShardRea
         let directory = VerifiedArtifactDirectory::open(root.as_ref().to_owned())?;
         let contract =
             Qwen3VlComponentContract::released_base(directory.manifest().clone(), config)?;
-        Ok(Self::new(
-            contract,
-            device,
-            DirectoryArtifactShardReader::new(root.as_ref()),
-        ))
+        let reader = directory.shard_reader()?;
+        Ok(Self::new(contract, device, reader))
     }
 }
 
@@ -751,7 +758,7 @@ impl<B: Backend, R: AsyncArtifactShardReader> VerifiedAsyncBurnpackQwen3VlStageS
             if found.replace(tensor).is_some() {
                 return Err(contract(
                     qwen_streaming_stage_name(&stage),
-                    "row slice appears in more than one physical object",
+                    "row slice appears in more than one logical Burnpack object",
                 ));
             }
         }
@@ -805,7 +812,7 @@ impl<B: Backend, R: AsyncArtifactShardReader> AsyncQwen3VlStageSource<B>
                 if applied {
                     return Err(contract(
                         qwen_streaming_stage_name(&stage),
-                        "row slice appears in more than one physical object",
+                        "row slice appears in more than one logical Burnpack object",
                     ));
                 }
                 state
@@ -1305,7 +1312,7 @@ mod tests {
             config.text_config.hidden_size,
         )
         .unwrap();
-        let mut reader = DirectoryArtifactShardReader::new(&root);
+        let mut reader = directory.shard_reader().unwrap();
         for spec in &contract.plan.embedding_rows.chunks {
             let stage = Qwen3VlStage::EmbeddingRows {
                 chunk: spec.chunk_index,

@@ -4,22 +4,24 @@
 use bevy::input_focus::InputFocus;
 use bevy::{
     input::mouse::{MouseScrollUnit, MouseWheel},
+    picking::Pickable,
     prelude::*,
-    text::{EditableText, EditableTextFilter, TextCursorStyle},
+    text::{EditableText, EditableTextFilter, LineHeight, TextCursorStyle, TextEdit},
     ui::InteractionDisabled,
     window::PrimaryWindow,
 };
 #[cfg(test)]
 use burn_image::DimensionConstraints;
 use burn_image::{
-    Dimensions, HostImage, ImageEncoding, ImageTaskKind, ModelDescriptor, ProgressEvent,
+    ArtifactTransferProgress, Dimensions, HostImage, ImageEncoding, ImageTaskKind, InputImage,
+    ModelDescriptor, ProgressEvent,
 };
 
 use crate::{
-    ActualSizeImageView, CancelImageJob, CompleteImageJob, EditorMode, FitImageView,
-    ImageBytesLoaded, ImageDisplayFailed, ImageEditorState, ImageFrontendSet, ImageIoFailed,
-    ImageJobId, ImageJobPhase, ImageJobRejected, ImageJobs, ImageRunnerState, ImageRunnerStatus,
-    LoadImageBytes, PrepareImageDownload, REFERENCE_IMAGE_IO_ID,
+    CancelImageJob, CompleteImageJob, EditorMode, ImageBytesLoaded, ImageDisplayFailed,
+    ImageEditorState, ImageFrontendSet, ImageIoFailed, ImageJobId, ImageJobPhase, ImageJobRejected,
+    ImageJobs, ImageRunnerState, ImageRunnerStatus, LoadImageBytes,
+    MODEL_SWITCH_PROGRESS_STAGE_PREFIX, PrepareImageDownload, REFERENCE_IMAGE_IO_ID,
 };
 
 #[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
@@ -37,7 +39,7 @@ use crate::ImageDownloadReady;
 const MAX_REFERENCE_BYTES: usize = 64 * 1024 * 1024;
 #[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
 const DOWNLOAD_IO_ID: ImageIoId = ImageIoId(2);
-const DESKTOP_PANEL_WIDTH: f32 = 360.0;
+const DESKTOP_PANEL_WIDTH: f32 = 380.0;
 const DESKTOP_LAYOUT_MIN_WIDTH: f32 = 820.0;
 const NARROW_PANEL_HEIGHT_RATIO: f32 = 0.48;
 const NARROW_PANEL_MIN_HEIGHT: f32 = 260.0;
@@ -78,6 +80,16 @@ pub struct ImageControlPanelState {
     seed_valid: bool,
 }
 
+#[derive(Resource, Default)]
+struct SizeDropdownState {
+    open: bool,
+}
+
+#[derive(Resource, Default)]
+struct ModelDropdownState {
+    open: bool,
+}
+
 impl Default for ImageControlPanelState {
     fn default() -> Self {
         Self {
@@ -96,34 +108,52 @@ impl Default for ImageControlPanelState {
 }
 
 #[derive(Component, Default)]
-struct ModeButton;
-#[derive(Component, Default)]
 struct ModelButton;
+#[derive(Component, Default)]
+struct ModelDropdown;
+#[derive(Component, Clone, Copy)]
+struct ModelOption {
+    index: usize,
+}
+#[derive(Component)]
+struct ModelOptionLabel;
 #[derive(Component, Default)]
 struct SizeButton;
 #[derive(Component, Default)]
+struct SizeDropdown;
+#[derive(Component, Clone, Copy)]
+struct SizeOption {
+    index: usize,
+}
+#[derive(Component, Default)]
+struct SizeDropdownHint;
+#[derive(Component, Default)]
 struct ReferenceButton;
 #[derive(Component, Default)]
+struct SelectorAffordance;
+#[derive(Component, Default)]
 struct RunButton;
+#[derive(Component)]
+struct RunRequirementsLabel;
 #[derive(Component, Default)]
 struct CancelButton;
 #[derive(Component, Default)]
 struct SaveButton;
 #[derive(Component, Default)]
-struct FitButton;
+struct UseOutputReferenceButton;
 #[derive(Component, Default)]
-struct ActualSizeButton;
+struct UseOutputReferenceAction;
 #[derive(Component)]
 struct PromptInput;
 #[derive(Component)]
 struct SeedInput;
 #[derive(Component, Default)]
-struct ModeButtonLabel;
+struct RandomSeedButton;
 #[derive(Component, Default)]
 struct ModelButtonLabel;
 #[derive(Component, Default)]
 struct SizeButtonLabel;
-#[derive(Component)]
+#[derive(Component, Default)]
 struct ReferenceLabel;
 #[derive(Component)]
 struct ProgressLabel;
@@ -141,6 +171,7 @@ struct ImageControlPanelScroll;
 #[derive(Component, Clone, Copy)]
 struct ButtonPalette {
     idle: Color,
+    hovered: Color,
     pressed: Color,
     disabled: Color,
 }
@@ -149,14 +180,16 @@ impl ButtonPalette {
     const fn neutral() -> Self {
         Self {
             idle: Color::srgb(0.14, 0.18, 0.27),
+            hovered: Color::srgb(0.19, 0.25, 0.38),
             pressed: Color::srgb(0.24, 0.32, 0.48),
             disabled: Color::srgb(0.085, 0.095, 0.12),
         }
     }
 
-    const fn action(idle: Color) -> Self {
+    const fn action(idle: Color, hovered: Color) -> Self {
         Self {
             idle,
+            hovered,
             pressed: Color::srgb(0.24, 0.32, 0.48),
             disabled: Color::srgb(0.085, 0.095, 0.12),
         }
@@ -212,6 +245,8 @@ pub struct ImageControlPanelPlugin;
 impl Plugin for ImageControlPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ImageControlPanelState>()
+            .init_resource::<ModelDropdownState>()
+            .init_resource::<SizeDropdownState>()
             .add_systems(Startup, setup_controls)
             .add_systems(
                 Update,
@@ -220,12 +255,11 @@ impl Plugin for ImageControlPanelPlugin {
                     scroll_control_panel,
                     select_initial_model,
                     sync_text_inputs,
-                    handle_mode_button,
                     handle_model_button,
                     handle_size_button,
                     handle_reference_button,
+                    handle_use_output_reference_button,
                     accept_native_file_dialog,
-                    handle_view_buttons,
                     handle_run_button,
                     handle_cancel_button,
                     handle_save_button,
@@ -234,9 +268,40 @@ impl Plugin for ImageControlPanelPlugin {
                     update_control_labels,
                     update_progress_panel,
                     update_action_availability,
+                    update_control_affordances,
                     update_button_colors,
                 )
                     .chain(),
+            )
+            .add_systems(
+                Update,
+                (
+                    handle_random_seed_button
+                        .after(sync_text_inputs)
+                        .before(update_action_availability),
+                    handle_model_option.after(handle_model_button),
+                    close_model_dropdown_on_outside_click.after(handle_model_option),
+                    sync_model_dropdown
+                        .after(update_action_availability)
+                        .after(close_model_dropdown_on_outside_click)
+                        .before(update_control_affordances),
+                    handle_size_option.after(handle_size_button),
+                    close_size_dropdown_on_outside_click.after(handle_size_option),
+                    sync_size_dropdown
+                        .after(update_action_availability)
+                        .after(close_size_dropdown_on_outside_click)
+                        .before(update_control_affordances),
+                    sync_run_requirements.after(update_action_availability),
+                    sync_output_action_visibility
+                        .after(update_action_availability)
+                        .after(capture_outputs),
+                ),
+            )
+            .add_systems(
+                Update,
+                sync_reference_control_visibility
+                    .after(handle_size_button)
+                    .before(handle_reference_button),
             )
             .add_systems(Update, capture_outputs.after(ImageFrontendSet::Feedback));
 
@@ -267,8 +332,8 @@ fn setup_controls(mut commands: Commands) {
                 top: px(PANEL_TOP),
                 bottom: px(PANEL_MARGIN),
                 width: px(DESKTOP_PANEL_WIDTH),
-                padding: px(14).all(),
-                row_gap: px(9),
+                padding: px(16).all(),
+                row_gap: px(10),
                 flex_direction: FlexDirection::Column,
                 overflow: Overflow::scroll_y(),
                 scrollbar_width: 7.0,
@@ -282,17 +347,23 @@ fn setup_controls(mut commands: Commands) {
         ))
         .with_children(|panel| {
             panel.spawn((
-                Text::new("IMAGE GENERATION AND EDITING"),
-                TextFont::from_font_size(18.0),
+                Text::new("CREATE / EDIT"),
+                TextFont::from_font_size(16.0),
                 TextColor(Color::srgb(0.78, 0.86, 1.0)),
+                LineHeight::RelativeToFont(1.2),
             ));
 
-            spawn_labeled_button::<ModeButton, ModeButtonLabel>(panel, "Mode", "Generate");
-            spawn_labeled_button::<ModelButton, ModelButtonLabel>(panel, "Model", "waiting...");
+            spawn_labeled_button::<ModelButton, ModelButtonLabel>(
+                panel,
+                "Model",
+                "waiting...",
+                "v",
+            );
+            spawn_model_dropdown(panel);
 
             panel.spawn((
-                Text::new("Prompt / instruction"),
-                TextFont::from_font_size(13.0),
+                Text::new("PROMPT / INSTRUCTION"),
+                TextFont::from_font_size(11.0),
                 TextColor(Color::srgb(0.7, 0.74, 0.8)),
             ));
             panel.spawn((
@@ -304,17 +375,18 @@ fn setup_controls(mut commands: Commands) {
                     ..default()
                 },
                 PromptInput,
-                TextFont::from_font_size(15.0),
+                TextFont::from_font_size(14.0),
                 TextColor(Color::WHITE),
                 TextCursorStyle::default(),
                 TextLayout {
                     linebreak: LineBreak::WordOrCharacter,
                     ..default()
                 },
+                LineHeight::RelativeToFont(1.35),
                 Node {
                     width: percent(100),
-                    min_height: px(105),
-                    padding: px(8).all(),
+                    min_height: px(108),
+                    padding: px(10).all(),
                     border: px(1).all(),
                     ..default()
                 },
@@ -322,7 +394,13 @@ fn setup_controls(mut commands: Commands) {
                 BackgroundColor(Color::srgb(0.09, 0.105, 0.14)),
             ));
 
-            spawn_labeled_button::<SizeButton, SizeButtonLabel>(panel, "Size", "model default");
+            spawn_labeled_button::<SizeButton, SizeButtonLabel>(
+                panel,
+                "Size",
+                "model default",
+                "v",
+            );
+            spawn_size_dropdown(panel);
 
             panel
                 .spawn(Node {
@@ -333,8 +411,8 @@ fn setup_controls(mut commands: Commands) {
                 })
                 .with_children(|row| {
                     row.spawn((
-                        Text::new("Seed"),
-                        TextFont::from_font_size(13.0),
+                        Text::new("SEED"),
+                        TextFont::from_font_size(11.0),
                         TextColor(Color::srgb(0.7, 0.74, 0.8)),
                         Node {
                             width: px(74),
@@ -345,38 +423,83 @@ fn setup_controls(mut commands: Commands) {
                         EditableText::new("0"),
                         EditableTextFilter::new(|character| character.is_ascii_digit()),
                         SeedInput,
-                        TextFont::from_font_size(15.0),
+                        TextFont::from_font_size(14.0),
                         TextColor(Color::WHITE),
                         TextCursorStyle::default(),
                         TextLayout::no_wrap(),
                         Node {
                             flex_grow: 1.0,
-                            min_height: px(34),
-                            padding: px(7).all(),
+                            height: px(28),
+                            padding: UiRect::axes(px(8), px(3)),
                             border: px(1).all(),
+                            border_radius: BorderRadius::all(px(4)),
                             ..default()
                         },
                         BorderColor::all(Color::srgb(0.26, 0.3, 0.4)),
                         BackgroundColor(Color::srgb(0.09, 0.105, 0.14)),
                     ));
+                    let palette = ButtonPalette::neutral();
+                    row.spawn((
+                        Button,
+                        RandomSeedButton,
+                        Node {
+                            width: px(82),
+                            min_height: px(34),
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::Center,
+                            padding: UiRect::axes(px(8), px(6)),
+                            border_radius: BorderRadius::all(px(4)),
+                            flex_shrink: 0.0,
+                            ..default()
+                        },
+                        palette,
+                        BackgroundColor(palette.idle),
+                    ))
+                    .with_child((
+                        Text::new("Random"),
+                        TextFont::from_font_size(11.0),
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
                 });
+
+            spawn_labeled_button::<ReferenceButton, ReferenceLabel>(
+                panel,
+                "Reference",
+                reference_button_text(),
+                ">",
+            );
 
             panel
                 .spawn((
-                    Button,
-                    ReferenceButton,
-                    control_button_node(),
-                    ButtonPalette::neutral(),
-                    BackgroundColor(ButtonPalette::neutral().idle),
+                    Node {
+                        display: Display::None,
+                        width: percent(100),
+                        ..default()
+                    },
+                    UseOutputReferenceAction,
                 ))
-                .with_children(|button| {
-                    button.spawn((
-                        Text::new(reference_button_text()),
-                        TextFont::from_font_size(14.0),
-                        TextColor(Color::WHITE),
-                        ReferenceLabel,
-                    ));
+                .with_children(|row| {
+                    spawn_action_button::<UseOutputReferenceButton>(
+                        row,
+                        "Use output as reference",
+                        Color::srgb(0.18, 0.35, 0.5),
+                        Color::srgb(0.24, 0.47, 0.66),
+                    );
                 });
+
+            panel.spawn((
+                Text::new(""),
+                TextFont::from_font_size(10.5),
+                TextColor(Color::srgb(0.82, 0.67, 0.36)),
+                TextLayout {
+                    linebreak: LineBreak::WordOrCharacter,
+                    ..default()
+                },
+                LineHeight::RelativeToFont(1.3),
+                Visibility::Hidden,
+                RunRequirementsLabel,
+            ));
 
             panel
                 .spawn(Node {
@@ -385,87 +508,91 @@ fn setup_controls(mut commands: Commands) {
                     ..default()
                 })
                 .with_children(|row| {
-                    spawn_action_button::<RunButton>(row, "Run", Color::srgb(0.15, 0.42, 0.75));
+                    spawn_action_button::<RunButton>(
+                        row,
+                        "Run",
+                        Color::srgb(0.15, 0.42, 0.75),
+                        Color::srgb(0.2, 0.53, 0.9),
+                    );
                     spawn_action_button::<CancelButton>(
                         row,
                         "Cancel",
                         Color::srgb(0.54, 0.2, 0.22),
+                        Color::srgb(0.68, 0.28, 0.31),
                     );
                     spawn_action_button::<SaveButton>(
                         row,
                         "Save PNG",
                         Color::srgb(0.18, 0.42, 0.3),
+                        Color::srgb(0.24, 0.55, 0.39),
                     );
                 });
-
-            panel
-                .spawn(Node {
-                    width: percent(100),
-                    column_gap: px(7),
-                    ..default()
-                })
-                .with_children(|row| {
-                    spawn_action_button::<FitButton>(
-                        row,
-                        "Fit image",
-                        Color::srgb(0.18, 0.25, 0.36),
-                    );
-                    spawn_action_button::<ActualSizeButton>(
-                        row,
-                        "100%",
-                        Color::srgb(0.18, 0.25, 0.36),
-                    );
-                });
-
-            panel.spawn((
-                Text::new("Preparing model runtime"),
-                TextFont::from_font_size(13.0),
-                TextColor(Color::srgb(0.84, 0.88, 0.94)),
-                TextLayout {
-                    linebreak: LineBreak::WordOrCharacter,
-                    ..default()
-                },
-                ProgressLabel,
-            ));
 
             panel
                 .spawn((
                     Node {
-                        position_type: PositionType::Relative,
                         width: percent(100),
-                        height: px(7),
-                        overflow: Overflow::clip(),
-                        border_radius: BorderRadius::all(px(4)),
+                        padding: px(10).all(),
+                        row_gap: px(7),
+                        flex_direction: FlexDirection::Column,
+                        border_radius: BorderRadius::all(px(7)),
                         ..default()
                     },
-                    BackgroundColor(Color::srgb(0.13, 0.15, 0.19)),
+                    BackgroundColor(Color::srgb(0.075, 0.09, 0.12)),
                 ))
-                .with_children(|track| {
-                    track.spawn((
-                        Node {
-                            position_type: PositionType::Absolute,
-                            left: px(0),
-                            top: px(0),
-                            width: percent(28),
-                            height: percent(100),
-                            border_radius: BorderRadius::all(px(4)),
+                .with_children(|status| {
+                    status.spawn((
+                        Text::new("Preparing model runtime"),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::srgb(0.84, 0.88, 0.94)),
+                        TextLayout {
+                            linebreak: LineBreak::WordOrCharacter,
                             ..default()
                         },
-                        BackgroundColor(Color::srgb(0.32, 0.68, 0.83)),
-                        ProgressFill,
+                        LineHeight::RelativeToFont(1.3),
+                        ProgressLabel,
+                    ));
+
+                    status
+                        .spawn((
+                            Node {
+                                position_type: PositionType::Relative,
+                                width: percent(100),
+                                height: px(6),
+                                overflow: Overflow::clip(),
+                                border_radius: BorderRadius::all(px(3)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.13, 0.15, 0.19)),
+                        ))
+                        .with_children(|track| {
+                            track.spawn((
+                                Node {
+                                    position_type: PositionType::Absolute,
+                                    left: px(0),
+                                    top: px(0),
+                                    width: percent(28),
+                                    height: percent(100),
+                                    border_radius: BorderRadius::all(px(3)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgb(0.32, 0.68, 0.83)),
+                                ProgressFill,
+                            ));
+                        });
+
+                    status.spawn((
+                        Text::new("Waiting for the shared GPU"),
+                        TextFont::from_font_size(10.5),
+                        TextColor(Color::srgb(0.62, 0.68, 0.76)),
+                        TextLayout {
+                            linebreak: LineBreak::WordOrCharacter,
+                            ..default()
+                        },
+                        LineHeight::RelativeToFont(1.35),
+                        ProgressDetailLabel,
                     ));
                 });
-
-            panel.spawn((
-                Text::new("Waiting for the shared GPU"),
-                TextFont::from_font_size(11.0),
-                TextColor(Color::srgb(0.58, 0.64, 0.72)),
-                TextLayout {
-                    linebreak: LineBreak::WordOrCharacter,
-                    ..default()
-                },
-                ProgressDetailLabel,
-            ));
         });
 }
 
@@ -543,6 +670,7 @@ fn spawn_labeled_button<M: Component + Default, L: Component + Default>(
     panel: &mut ChildSpawnerCommands,
     caption: &str,
     value: &str,
+    affordance: &str,
 ) {
     panel
         .spawn((
@@ -554,11 +682,156 @@ fn spawn_labeled_button<M: Component + Default, L: Component + Default>(
         ))
         .with_children(|button| {
             button.spawn((
-                Text::new(format!("{caption}: {value}")),
-                TextFont::from_font_size(14.0),
+                Text::new(caption.to_ascii_uppercase()),
+                TextFont::from_font_size(10.0),
+                TextColor(Color::srgb(0.58, 0.65, 0.75)),
+                Pickable::IGNORE,
+                Node {
+                    width: px(68),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+            ));
+            button.spawn((
+                Text::new(value),
+                TextFont::from_font_size(13.0),
                 TextColor(Color::WHITE),
+                TextLayout {
+                    linebreak: LineBreak::WordOrCharacter,
+                    ..default()
+                },
+                LineHeight::RelativeToFont(1.25),
+                Pickable::IGNORE,
+                Node {
+                    min_width: px(0),
+                    flex_grow: 1.0,
+                    ..default()
+                },
                 L::default(),
             ));
+            button.spawn((
+                Text::new(affordance),
+                TextFont::from_font_size(13.0),
+                TextColor(Color::srgb(0.58, 0.65, 0.75)),
+                Pickable::IGNORE,
+                Visibility::Inherited,
+                SelectorAffordance,
+            ));
+        });
+}
+
+fn spawn_size_dropdown(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn((
+            Node {
+                display: Display::None,
+                width: percent(100),
+                padding: px(6).all(),
+                row_gap: px(6),
+                column_gap: px(6),
+                flex_wrap: FlexWrap::Wrap,
+                border: px(1).all(),
+                border_radius: BorderRadius::all(px(6)),
+                ..default()
+            },
+            BorderColor::all(Color::srgb(0.28, 0.34, 0.46)),
+            BackgroundColor(Color::srgb(0.07, 0.085, 0.12)),
+            SizeDropdown,
+        ))
+        .with_children(|dropdown| {
+            for (index, (width, height)) in SIZE_PRESETS.iter().copied().enumerate() {
+                let palette = ButtonPalette::neutral();
+                dropdown
+                    .spawn((
+                        Button,
+                        SizeOption { index },
+                        Node {
+                            display: Display::Flex,
+                            flex_grow: 1.0,
+                            flex_basis: percent(46),
+                            min_width: px(132),
+                            min_height: px(32),
+                            align_items: AlignItems::Center,
+                            justify_content: JustifyContent::Center,
+                            padding: UiRect::axes(px(8), px(6)),
+                            border_radius: BorderRadius::all(px(4)),
+                            ..default()
+                        },
+                        palette,
+                        BackgroundColor(palette.idle),
+                    ))
+                    .with_child((
+                        Text::new(format!("{width} x {height}")),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                    ));
+            }
+            dropdown.spawn((
+                Text::new(""),
+                TextFont::from_font_size(10.0),
+                TextColor(Color::srgb(0.68, 0.72, 0.8)),
+                TextLayout {
+                    linebreak: LineBreak::WordOrCharacter,
+                    ..default()
+                },
+                LineHeight::RelativeToFont(1.25),
+                Pickable::IGNORE,
+                Visibility::Hidden,
+                Node {
+                    width: percent(100),
+                    flex_basis: percent(100),
+                    ..default()
+                },
+                SizeDropdownHint,
+            ));
+        });
+}
+
+fn spawn_model_dropdown(panel: &mut ChildSpawnerCommands) {
+    panel
+        .spawn((
+            Node {
+                display: Display::None,
+                width: percent(100),
+                padding: px(6).all(),
+                row_gap: px(6),
+                flex_direction: FlexDirection::Column,
+                border: px(1).all(),
+                border_radius: BorderRadius::all(px(6)),
+                ..default()
+            },
+            BorderColor::all(Color::srgb(0.28, 0.34, 0.46)),
+            BackgroundColor(Color::srgb(0.07, 0.085, 0.12)),
+            ModelDropdown,
+        ))
+        .with_children(|dropdown| {
+            for index in 0..3 {
+                let palette = ButtonPalette::neutral();
+                dropdown
+                    .spawn((
+                        Button,
+                        ModelOption { index },
+                        Node {
+                            display: Display::None,
+                            width: percent(100),
+                            min_height: px(34),
+                            align_items: AlignItems::Center,
+                            padding: UiRect::axes(px(10), px(7)),
+                            border_radius: BorderRadius::all(px(4)),
+                            ..default()
+                        },
+                        palette,
+                        BackgroundColor(palette.idle),
+                    ))
+                    .with_child((
+                        Text::new(""),
+                        TextFont::from_font_size(12.0),
+                        TextColor(Color::WHITE),
+                        Pickable::IGNORE,
+                        ModelOptionLabel,
+                    ));
+            }
         });
 }
 
@@ -566,8 +839,9 @@ fn spawn_action_button<M: Component + Default>(
     row: &mut ChildSpawnerCommands,
     label: &str,
     color: Color,
+    hovered: Color,
 ) {
-    let palette = ButtonPalette::action(color);
+    let palette = ButtonPalette::action(color, hovered);
     row.spawn((
         Button,
         InteractionDisabled,
@@ -590,6 +864,7 @@ fn spawn_action_button<M: Component + Default>(
             Text::new(label),
             TextFont::from_font_size(13.0),
             TextColor(Color::WHITE),
+            Pickable::IGNORE,
         ));
     });
 }
@@ -597,10 +872,11 @@ fn spawn_action_button<M: Component + Default>(
 fn control_button_node() -> Node {
     Node {
         width: percent(100),
-        min_height: px(38),
+        min_height: px(42),
         align_items: AlignItems::Center,
         justify_content: JustifyContent::FlexStart,
-        padding: px(8).all(),
+        column_gap: px(8),
+        padding: UiRect::axes(px(10), px(8)),
         border: px(1).all(),
         ..default()
     }
@@ -794,14 +1070,8 @@ fn select_initial_model(
     };
     if let Some(descriptor) = capabilities.models.first() {
         editor.model = Some(descriptor.id.clone());
-        if descriptor
-            .capabilities
-            .tasks
-            .contains(&ImageTaskKind::Generate)
-        {
-            editor.mode = EditorMode::Generate;
-        } else if descriptor.capabilities.tasks.contains(&ImageTaskKind::Edit) {
-            editor.mode = EditorMode::Edit;
+        if let Some(mode) = descriptor_mode(descriptor) {
+            editor.mode = mode;
         }
         apply_descriptor_size(descriptor, &mut editor, &mut panel);
         editor.options.seed = Some(0);
@@ -858,9 +1128,17 @@ fn sync_text_inputs(
     }
 }
 
-fn handle_mode_button(
-    interactions: Query<&Interaction, (Changed<Interaction>, With<ModeButton>)>,
-    status: Res<ImageRunnerStatus>,
+#[allow(clippy::type_complexity)]
+fn handle_random_seed_button(
+    interactions: Query<
+        &Interaction,
+        (
+            Changed<Interaction>,
+            With<RandomSeedButton>,
+            Without<InteractionDisabled>,
+        ),
+    >,
+    mut seeds: Query<&mut EditableText, With<SeedInput>>,
     mut editor: ResMut<ImageEditorState>,
     mut panel: ResMut<ImageControlPanelState>,
 ) {
@@ -870,27 +1148,33 @@ fn handle_mode_button(
     {
         return;
     }
-    let requested_mode = match editor.mode {
-        EditorMode::Generate => EditorMode::Edit,
-        EditorMode::Edit => EditorMode::Generate,
-    };
-    let Some(descriptor) = descriptor_for_mode(&status.state, requested_mode) else {
-        panel.notice = format!(
-            "The loaded runtime does not support {} mode",
-            editor_mode_label(requested_mode)
-        );
-        return;
-    };
-    editor.mode = requested_mode;
-    editor.model = Some(descriptor.id.clone());
-    apply_descriptor_size(descriptor, &mut editor, &mut panel);
+    let value = distinct_random_seed(editor.options.seed, rand::random());
+    if let Ok(mut seed) = seeds.single_mut() {
+        seed.clear();
+        seed.editor_mut().set_text(&value.to_string());
+        seed.queue_edit(TextEdit::TextEnd(false));
+    }
+    editor.options.seed = Some(value);
+    panel.seed_valid = true;
+    panel.notice = format!("Random seed: {value}");
+    #[cfg(target_arch = "wasm32")]
+    if browser_model_smoke_requested() {
+        dispatch_browser_text_value("seed_changed", &value.to_string());
+    }
+}
+
+fn distinct_random_seed(current: Option<u64>, candidate: u64) -> u64 {
+    if current == Some(candidate) {
+        candidate.wrapping_add(1)
+    } else {
+        candidate
+    }
 }
 
 fn handle_model_button(
     interactions: Query<&Interaction, (Changed<Interaction>, With<ModelButton>)>,
-    status: Res<ImageRunnerStatus>,
-    mut editor: ResMut<ImageEditorState>,
-    mut panel: ResMut<ImageControlPanelState>,
+    mut dropdown: ResMut<ModelDropdownState>,
+    mut size_dropdown: ResMut<SizeDropdownState>,
 ) {
     if !interactions
         .iter()
@@ -898,26 +1182,11 @@ fn handle_model_button(
     {
         return;
     }
-    let ImageRunnerState::Ready { capabilities } = &status.state else {
-        return;
-    };
-    let Some(descriptor) = next_model_descriptor(&capabilities.models, editor.model.as_ref())
-    else {
-        return;
-    };
-    editor.model = Some(descriptor.id.clone());
-    if descriptor
-        .capabilities
-        .tasks
-        .contains(&ImageTaskKind::Generate)
-    {
-        editor.mode = EditorMode::Generate;
-    } else if descriptor.capabilities.tasks.contains(&ImageTaskKind::Edit) {
-        editor.mode = EditorMode::Edit;
-    }
-    apply_descriptor_size(descriptor, &mut editor, &mut panel);
+    dropdown.open = !dropdown.open;
+    size_dropdown.open = false;
 }
 
+#[cfg(test)]
 fn next_model_descriptor<'a>(
     models: &'a [ModelDescriptor],
     current: Option<&burn_image::ModelId>,
@@ -941,6 +1210,21 @@ fn descriptor_for_mode(state: &ImageRunnerState, mode: EditorMode) -> Option<&Mo
         .find(|descriptor| descriptor.capabilities.tasks.contains(&task))
 }
 
+fn descriptor_for_mode_prefer_model<'a>(
+    state: &'a ImageRunnerState,
+    mode: EditorMode,
+    preferred: Option<&burn_image::ModelId>,
+) -> Option<&'a ModelDescriptor> {
+    let ImageRunnerState::Ready { capabilities } = state else {
+        return None;
+    };
+    let task = editor_mode_task(mode);
+    preferred
+        .and_then(|model| capabilities.descriptor(model))
+        .filter(|descriptor| descriptor.capabilities.tasks.contains(&task))
+        .or_else(|| descriptor_for_mode(state, mode))
+}
+
 const fn editor_mode_task(mode: EditorMode) -> ImageTaskKind {
     match mode {
         EditorMode::Generate => ImageTaskKind::Generate,
@@ -948,18 +1232,23 @@ const fn editor_mode_task(mode: EditorMode) -> ImageTaskKind {
     }
 }
 
-const fn editor_mode_label(mode: EditorMode) -> &'static str {
-    match mode {
-        EditorMode::Generate => "Generate",
-        EditorMode::Edit => "Edit",
+fn descriptor_mode(descriptor: &ModelDescriptor) -> Option<EditorMode> {
+    let generate = descriptor
+        .capabilities
+        .tasks
+        .contains(&ImageTaskKind::Generate);
+    let edit = descriptor.capabilities.tasks.contains(&ImageTaskKind::Edit);
+    match (generate, edit) {
+        (true, _) => Some(EditorMode::Generate),
+        (false, true) => Some(EditorMode::Edit),
+        (false, false) => None,
     }
 }
 
 fn handle_size_button(
     interactions: Query<&Interaction, (Changed<Interaction>, With<SizeButton>)>,
-    status: Res<ImageRunnerStatus>,
-    mut editor: ResMut<ImageEditorState>,
-    mut panel: ResMut<ImageControlPanelState>,
+    mut dropdown: ResMut<SizeDropdownState>,
+    mut model_dropdown: ResMut<ModelDropdownState>,
 ) {
     if !interactions
         .iter()
@@ -967,7 +1256,140 @@ fn handle_size_button(
     {
         return;
     }
+    dropdown.open = !dropdown.open;
+    model_dropdown.open = false;
+}
+
+#[allow(clippy::type_complexity)]
+fn handle_model_option(
+    interactions: Query<
+        (&Interaction, &ModelOption),
+        (Changed<Interaction>, With<Button>, Without<ModelButton>),
+    >,
+    status: Res<ImageRunnerStatus>,
+    mut editor: ResMut<ImageEditorState>,
+    mut panel: ResMut<ImageControlPanelState>,
+    mut dropdown: ResMut<ModelDropdownState>,
+) {
+    let Some(option) = interactions
+        .iter()
+        .find_map(|(interaction, option)| (*interaction == Interaction::Pressed).then_some(option))
+    else {
+        return;
+    };
     let ImageRunnerState::Ready { capabilities } = &status.state else {
+        dropdown.open = false;
+        return;
+    };
+    let Some(descriptor) = capabilities.models.get(option.index) else {
+        dropdown.open = false;
+        return;
+    };
+    editor.model = Some(descriptor.id.clone());
+    if let Some(mode) = descriptor_mode(descriptor) {
+        editor.mode = mode;
+    }
+    apply_descriptor_size(descriptor, &mut editor, &mut panel);
+    panel.notice = format!(
+        "{} selected; it will load on the next Run",
+        descriptor.display_name
+    );
+    dropdown.open = false;
+}
+
+fn close_model_dropdown_on_outside_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    model_buttons: Query<&Interaction, With<ModelButton>>,
+    model_options: Query<&Interaction, (With<ModelOption>, Without<ModelButton>)>,
+    mut dropdown: ResMut<ModelDropdownState>,
+) {
+    if !dropdown.open || !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let clicked_selector = model_buttons
+        .iter()
+        .chain(model_options.iter())
+        .any(|interaction| *interaction == Interaction::Pressed);
+    if !clicked_selector {
+        dropdown.open = false;
+    }
+}
+
+fn sync_model_dropdown(
+    mut dropdown_state: ResMut<ModelDropdownState>,
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
+    jobs: Res<ImageJobs>,
+    mut dropdowns: Query<&mut Node, (With<ModelDropdown>, Without<ModelOption>)>,
+    mut options: Query<(&ModelOption, &mut Node, &mut ButtonPalette), Without<ModelDropdown>>,
+    mut labels: Query<(&ChildOf, &mut Text), With<ModelOptionLabel>>,
+) {
+    let running = jobs.iter().any(|job| !job.phase.is_terminal());
+    let capabilities = match &runner.state {
+        ImageRunnerState::Ready { capabilities } => Some(capabilities),
+        _ => None,
+    };
+    if running || capabilities.is_none_or(|capabilities| capabilities.models.len() < 2) {
+        dropdown_state.open = false;
+    }
+    let display = if dropdown_state.open {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in &mut dropdowns {
+        node.display = display;
+    }
+    for (option, mut node, mut palette) in &mut options {
+        let descriptor =
+            capabilities.and_then(|capabilities| capabilities.models.get(option.index));
+        let supported = descriptor.is_some();
+        node.display = if supported {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        palette.idle =
+            if descriptor.is_some_and(|descriptor| editor.model.as_ref() == Some(&descriptor.id)) {
+                Color::srgb(0.2, 0.34, 0.54)
+            } else {
+                ButtonPalette::neutral().idle
+            };
+    }
+    for (parent, mut text) in &mut labels {
+        let label = options
+            .get(parent.parent())
+            .ok()
+            .and_then(|(option, _, _)| {
+                capabilities.and_then(|capabilities| capabilities.models.get(option.index))
+            })
+            .map(|descriptor| descriptor.display_name.as_str())
+            .unwrap_or_default();
+        if text.0 != label {
+            text.0 = label.into();
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn handle_size_option(
+    interactions: Query<
+        (&Interaction, &SizeOption),
+        (Changed<Interaction>, With<Button>, Without<SizeButton>),
+    >,
+    status: Res<ImageRunnerStatus>,
+    mut editor: ResMut<ImageEditorState>,
+    mut panel: ResMut<ImageControlPanelState>,
+    mut dropdown: ResMut<SizeDropdownState>,
+) {
+    let Some(option) = interactions
+        .iter()
+        .find_map(|(interaction, option)| (*interaction == Interaction::Pressed).then_some(option))
+    else {
+        return;
+    };
+    let ImageRunnerState::Ready { capabilities } = &status.state else {
+        dropdown.open = false;
         return;
     };
     let Some(descriptor) = editor.model.as_ref().and_then(|model| {
@@ -976,21 +1398,168 @@ fn handle_size_button(
             .iter()
             .find(|descriptor| descriptor.id == *model)
     }) else {
+        dropdown.open = false;
         return;
     };
-    let current = editor
-        .options
-        .dimensions
-        .and_then(preset_index)
-        .unwrap_or(panel.size_index);
-    if let Some(index) = next_supported_size_index_for_descriptor(current, descriptor) {
-        panel.size_index = index;
-        editor.options.dimensions = Some(preset_dimensions(index));
+    if option.index < SIZE_PRESETS.len()
+        && descriptor_supports_dimensions(descriptor, preset_dimensions(option.index))
+    {
+        panel.size_index = option.index;
+        editor.options.dimensions = Some(preset_dimensions(option.index));
     }
+    dropdown.open = false;
+}
+
+fn close_size_dropdown_on_outside_click(
+    mouse: Res<ButtonInput<MouseButton>>,
+    size_buttons: Query<&Interaction, With<SizeButton>>,
+    size_options: Query<&Interaction, (With<SizeOption>, Without<SizeButton>)>,
+    mut dropdown: ResMut<SizeDropdownState>,
+) {
+    if !dropdown.open || !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let clicked_selector = size_buttons
+        .iter()
+        .chain(size_options.iter())
+        .any(|interaction| *interaction == Interaction::Pressed);
+    if !clicked_selector {
+        dropdown.open = false;
+    }
+}
+
+fn sync_size_dropdown(
+    mut dropdown_state: ResMut<SizeDropdownState>,
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
+    jobs: Res<ImageJobs>,
+    mut dropdowns: Query<&mut Node, (With<SizeDropdown>, Without<SizeOption>)>,
+    mut options: Query<(&SizeOption, &mut Node, &mut ButtonPalette), Without<SizeDropdown>>,
+    mut hints: Query<(&mut Text, &mut Visibility), With<SizeDropdownHint>>,
+) {
+    let running = jobs.iter().any(|job| !job.phase.is_terminal());
+    let descriptor = match &runner.state {
+        ImageRunnerState::Ready { capabilities } => editor
+            .model
+            .as_ref()
+            .and_then(|model| capabilities.descriptor(model)),
+        _ => None,
+    };
+    if running || descriptor.is_none() {
+        dropdown_state.open = false;
+    }
+    let display = if dropdown_state.open {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in &mut dropdowns {
+        node.display = display;
+    }
+
+    let selected = editor.options.dimensions.and_then(preset_index);
+    for (option, mut node, mut palette) in &mut options {
+        let supported = descriptor.is_some_and(|descriptor| {
+            option.index < SIZE_PRESETS.len()
+                && descriptor_supports_dimensions(descriptor, preset_dimensions(option.index))
+        });
+        node.display = if supported {
+            Display::Flex
+        } else {
+            Display::None
+        };
+        palette.idle = if selected == Some(option.index) {
+            Color::srgb(0.2, 0.34, 0.54)
+        } else {
+            ButtonPalette::neutral().idle
+        };
+    }
+
+    let hint = descriptor.and_then(size_dropdown_hint);
+    for (mut text, mut visibility) in &mut hints {
+        let message = hint.unwrap_or_default();
+        if text.0 != message {
+            text.0 = message.into();
+        }
+        let next = if hint.is_some() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != next {
+            *visibility = next;
+        }
+    }
+}
+
+fn size_dropdown_hint(_descriptor: &ModelDescriptor) -> Option<&'static str> {
+    #[cfg(feature = "boogu")]
+    if crate::boogu::variant_for_model(&_descriptor.id)
+        == Some(burn_boogu::BooguVariant::Image01EditTurbo)
+    {
+        return Some("For 1.5K sizes, choose Edit - Turbo 1.5K from the Model menu.");
+    }
+    None
+}
+
+fn sync_reference_control_visibility(
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
+    panel: Res<ImageControlPanelState>,
+    mut reference_buttons: Query<
+        &mut Node,
+        (With<ReferenceButton>, Without<UseOutputReferenceAction>),
+    >,
+    mut use_output_actions: Query<
+        &mut Node,
+        (With<UseOutputReferenceAction>, Without<ReferenceButton>),
+    >,
+) {
+    if !runner.is_changed() && !editor.is_changed() && !panel.is_changed() {
+        return;
+    }
+    let relevant = reference_control_relevant(&editor, &runner.state);
+    let reference_display = if relevant {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in &mut reference_buttons {
+        if node.display != reference_display {
+            node.display = reference_display;
+        }
+    }
+    let use_output_display = if relevant && panel.latest_output.is_some() {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in &mut use_output_actions {
+        if node.display != use_output_display {
+            node.display = use_output_display;
+        }
+    }
+}
+
+pub(crate) fn reference_control_relevant(
+    editor: &ImageEditorState,
+    runner: &ImageRunnerState,
+) -> bool {
+    if editor.mode != EditorMode::Edit {
+        return false;
+    }
+    let (Some(model), ImageRunnerState::Ready { capabilities }) = (&editor.model, runner) else {
+        return false;
+    };
+    capabilities
+        .descriptor(model)
+        .is_some_and(|descriptor| descriptor.capabilities.tasks.contains(&ImageTaskKind::Edit))
 }
 
 fn handle_reference_button(
     interactions: Query<&Interaction, (Changed<Interaction>, With<ReferenceButton>)>,
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
     mut panel: ResMut<ImageControlPanelState>,
     #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))] dialog_state: Res<
         ImageFileDialogState,
@@ -1003,6 +1572,10 @@ fn handle_reference_button(
         .iter()
         .any(|interaction| *interaction == Interaction::Pressed)
     {
+        return;
+    }
+    if !reference_control_relevant(&editor, &runner.state) {
+        panel.notice = "Reference images are available only in Edit mode".into();
         return;
     }
     #[cfg(target_arch = "wasm32")]
@@ -1027,6 +1600,43 @@ fn handle_reference_button(
     {
         panel.notice = "Drop a PNG, JPEG, or WebP file on the window".into();
     }
+}
+
+#[allow(clippy::type_complexity)]
+fn handle_use_output_reference_button(
+    interactions: Query<
+        &Interaction,
+        (
+            Changed<Interaction>,
+            With<UseOutputReferenceButton>,
+            Without<InteractionDisabled>,
+        ),
+    >,
+    runner: Res<ImageRunnerStatus>,
+    mut editor: ResMut<ImageEditorState>,
+    mut panel: ResMut<ImageControlPanelState>,
+) {
+    if !interactions
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
+    {
+        return;
+    }
+    if !reference_control_relevant(&editor, &runner.state) {
+        panel.notice = "Output can become a reference only in Edit mode".into();
+        return;
+    }
+    let Some((_, output)) = panel.latest_output.as_ref() else {
+        panel.notice = "No completed output is available as a reference".into();
+        return;
+    };
+    editor.source = Some(match output {
+        HostImage::Pixels(pixels) => InputImage::Pixels(pixels.clone()),
+        HostImage::Encoded(encoded) => InputImage::Encoded(encoded.clone()),
+    });
+    // A mask is spatially bound to the prior reference and cannot safely follow a replacement.
+    editor.mask = None;
+    panel.notice = "Current output is now the edit reference".into();
 }
 
 #[cfg(all(feature = "native-io", not(target_arch = "wasm32")))]
@@ -1063,41 +1673,6 @@ fn accept_native_file_dialog(
 
 #[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
 fn accept_native_file_dialog() {}
-
-#[allow(clippy::type_complexity)]
-fn handle_view_buttons(
-    fit_interactions: Query<
-        &Interaction,
-        (
-            Changed<Interaction>,
-            With<FitButton>,
-            Without<InteractionDisabled>,
-        ),
-    >,
-    actual_size_interactions: Query<
-        &Interaction,
-        (
-            Changed<Interaction>,
-            With<ActualSizeButton>,
-            Without<InteractionDisabled>,
-        ),
-    >,
-    mut fit: MessageWriter<FitImageView>,
-    mut actual_size: MessageWriter<ActualSizeImageView>,
-) {
-    if fit_interactions
-        .iter()
-        .any(|interaction| *interaction == Interaction::Pressed)
-    {
-        fit.write(FitImageView);
-    }
-    if actual_size_interactions
-        .iter()
-        .any(|interaction| *interaction == Interaction::Pressed)
-    {
-        actual_size.write(ActualSizeImageView);
-    }
-}
 
 #[allow(clippy::type_complexity)]
 fn handle_run_button(
@@ -1242,7 +1817,11 @@ fn accept_reference_images(
         }
         let dimensions = loaded.image.dimensions();
         editor.source = Some(loaded.image.clone());
-        let edit_descriptor = descriptor_for_mode(&runner.state, EditorMode::Edit);
+        let edit_descriptor = descriptor_for_mode_prefer_model(
+            &runner.state,
+            EditorMode::Edit,
+            editor.model.as_ref(),
+        );
         if let Some(descriptor) = edit_descriptor {
             editor.mode = EditorMode::Edit;
             editor.model = Some(descriptor.id.clone());
@@ -1421,7 +2000,7 @@ fn capture_frontend_errors(
     }
 }
 
-// The four marker-filtered mutable Text queries must be a ParamSet: Bevy
+// The three marker-filtered mutable Text queries must be a ParamSet: Bevy
 // correctly rejects them as ordinary parameters because their access could
 // overlap, even though each marker is unique in this plugin.
 #[allow(clippy::type_complexity)]
@@ -1429,7 +2008,6 @@ fn update_control_labels(
     editor: Res<ImageEditorState>,
     runner: Res<ImageRunnerStatus>,
     mut labels: ParamSet<(
-        Query<&mut Text, With<ModeButtonLabel>>,
         Query<&mut Text, With<ModelButtonLabel>>,
         Query<&mut Text, With<SizeButtonLabel>>,
         Query<&mut Text, With<ReferenceLabel>>,
@@ -1439,35 +2017,23 @@ fn update_control_labels(
         return;
     }
     if let Ok(mut label) = labels.p0().single_mut() {
-        let value = format!(
-            "Mode: {}",
-            match editor.mode {
-                EditorMode::Generate => "Generate",
-                EditorMode::Edit => "Edit",
-            }
-        );
+        let value = model_control_value(&editor, &runner.state);
         if label.0 != value {
             label.0 = value;
         }
     }
     if let Ok(mut label) = labels.p1().single_mut() {
-        let value = model_control_label(&editor, &runner.state);
-        if label.0 != value {
-            label.0 = value;
-        }
-    }
-    if let Ok(mut label) = labels.p2().single_mut() {
         let value = editor.options.dimensions.map_or_else(
-            || "Size: model default".into(),
-            |size| format!("Size: {} x {}", size.width(), size.height()),
+            || "Model default".into(),
+            |size| format!("{} x {}", size.width(), size.height()),
         );
         if label.0 != value {
             label.0 = value;
         }
     }
-    if let Ok(mut label) = labels.p3().single_mut() {
+    if let Ok(mut label) = labels.p2().single_mut() {
         let value = if editor.source.is_some() {
-            "Reference: loaded (click to replace)".into()
+            "Loaded - click to replace".into()
         } else {
             reference_button_text().into()
         };
@@ -1477,21 +2043,26 @@ fn update_control_labels(
     }
 }
 
-fn model_control_label(editor: &ImageEditorState, runner: &ImageRunnerState) -> String {
+fn model_control_value(editor: &ImageEditorState, runner: &ImageRunnerState) -> String {
     let Some(model) = &editor.model else {
-        return runner_state_label(runner);
+        return runner_control_value(runner);
     };
     let ImageRunnerState::Ready { capabilities } = runner else {
-        return format!("Loaded model: {model}");
+        return model.to_string();
     };
     let display_name = capabilities
         .descriptor(model)
         .map(|descriptor| descriptor.display_name.as_str())
         .unwrap_or_else(|| model.as_str());
-    if capabilities.models.len() < 2 {
-        format!("Loaded model: {display_name}")
-    } else {
-        format!("Model: {display_name}")
+    display_name.to_owned()
+}
+
+fn runner_control_value(state: &ImageRunnerState) -> String {
+    match state {
+        ImageRunnerState::Missing => "Runtime unavailable".into(),
+        ImageRunnerState::Initializing { .. } => "Preparing runtime".into(),
+        ImageRunnerState::Ready { .. } => "Runtime ready".into(),
+        ImageRunnerState::Failed { .. } => "Runtime failed".into(),
     }
 }
 
@@ -1502,12 +2073,28 @@ fn can_cycle_models(runner: &ImageRunnerState) -> bool {
     )
 }
 
-fn can_change_mode(runner: &ImageRunnerState, current: EditorMode) -> bool {
-    let requested = match current {
-        EditorMode::Generate => EditorMode::Edit,
-        EditorMode::Edit => EditorMode::Generate,
+fn can_cycle_size(
+    runner: &ImageRunnerState,
+    editor: &ImageEditorState,
+    panel: &ImageControlPanelState,
+) -> bool {
+    let ImageRunnerState::Ready { capabilities } = runner else {
+        return false;
     };
-    descriptor_for_mode(runner, requested).is_some()
+    let Some(descriptor) = editor
+        .model
+        .as_ref()
+        .and_then(|model| capabilities.descriptor(model))
+    else {
+        return false;
+    };
+    let current = editor
+        .options
+        .dimensions
+        .and_then(preset_index)
+        .unwrap_or(panel.size_index);
+    next_supported_size_index_for_descriptor(current, descriptor)
+        .is_some_and(|next| next != current)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1575,11 +2162,20 @@ fn runner_progress_presentation(state: &ImageRunnerState) -> ProgressPresentatio
 }
 
 fn setup_progress_fraction(message: &str) -> Option<f32> {
+    if let Some(percent) = message
+        .strip_prefix("Model transfer ")
+        .and_then(|message| message.split_once('%').map(|(percent, _)| percent))
+        .and_then(|percent| percent.trim().parse::<f32>().ok())
+    {
+        return percent
+            .is_finite()
+            .then(|| (percent / 100.0).clamp(0.0, 1.0));
+    }
     let remainder = message.strip_prefix("Model setup ")?;
     let fraction = remainder.split(':').next()?;
     let (completed, total) = fraction.split_once('/')?;
-    let completed = completed.trim().parse::<u32>().ok()?;
-    let total = total.trim().parse::<u32>().ok()?;
+    let completed = completed.trim().parse::<u64>().ok()?;
+    let total = total.trim().parse::<u64>().ok()?;
     (total > 0 && completed <= total).then(|| completed as f32 / total as f32)
 }
 
@@ -1623,6 +2219,19 @@ fn job_progress_presentation(job: &crate::ImageJobRecord) -> ProgressPresentatio
 }
 
 fn event_progress_presentation(prefix: &str, progress: &ProgressEvent) -> ProgressPresentation {
+    if let ProgressEvent::StageStarted { stage, .. } = progress
+        && let Some(encoded) = stage.strip_prefix(MODEL_SWITCH_PROGRESS_STAGE_PREFIX)
+    {
+        return model_switch_progress_presentation(prefix, encoded);
+    }
+    if let Some(transfer) = match progress {
+        ProgressEvent::ArtifactStarted { transfer, .. }
+        | ProgressEvent::ArtifactProgress { transfer, .. }
+        | ProgressEvent::ArtifactVerified { transfer, .. } => transfer.as_ref(),
+        _ => None,
+    } {
+        return transfer_progress_presentation(prefix, transfer);
+    }
     let (headline, detail, fraction, tone) = match progress {
         ProgressEvent::RunStarted { .. } => (
             "Starting inference".into(),
@@ -1633,24 +2242,20 @@ fn event_progress_presentation(prefix: &str, progress: &ProgressEvent) -> Progre
         ProgressEvent::ArtifactStarted {
             path,
             component,
-            file_index,
-            file_count,
             total_bytes,
             ..
         } => (
             "Loading model data".into(),
             format!(
-                "{}: file {} of {} - {} ({})",
+                "{} | {} | {}",
                 component
                     .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| "artifact".into()),
-                file_index + 1,
-                file_count,
-                path,
+                    .map(|component| humanize_stage(&component.to_string()))
+                    .unwrap_or_else(|| "Model artifact".into()),
+                compact_artifact_name(path),
                 format_bytes(*total_bytes)
             ),
-            Some(*file_index as f32 / (*file_count).max(1) as f32),
+            None,
             ProgressTone::Normal,
         ),
         ProgressEvent::ArtifactProgress {
@@ -1661,8 +2266,8 @@ fn event_progress_presentation(prefix: &str, progress: &ProgressEvent) -> Progre
         } => (
             "Loading model data".into(),
             format!(
-                "{} - {} of {}",
-                path,
+                "{} | {} / {}",
+                compact_artifact_name(path),
                 format_bytes(*loaded_bytes),
                 format_bytes(*total_bytes)
             ),
@@ -1671,7 +2276,7 @@ fn event_progress_presentation(prefix: &str, progress: &ProgressEvent) -> Progre
         ),
         ProgressEvent::ArtifactVerified { path, .. } => (
             "Model object verified".into(),
-            path.to_string(),
+            compact_artifact_name(path),
             None,
             ProgressTone::Normal,
         ),
@@ -1733,6 +2338,130 @@ fn event_progress_presentation(prefix: &str, progress: &ProgressEvent) -> Progre
         detail,
         fraction,
         tone,
+    }
+}
+
+fn model_switch_progress_presentation(prefix: &str, encoded: &str) -> ProgressPresentation {
+    let message = encoded
+        .split_once(':')
+        .and_then(|(steps, message)| {
+            steps
+                .parse::<u32>()
+                .ok()
+                .filter(|steps| *steps > 0)
+                .map(|_| message)
+        })
+        .unwrap_or(encoded);
+    ProgressPresentation {
+        headline: format!("{prefix}: Switching model"),
+        detail: compact_model_switch_message(message),
+        fraction: setup_progress_fraction(message),
+        tone: ProgressTone::Normal,
+    }
+}
+
+fn compact_model_switch_message(message: &str) -> String {
+    let nested = message.strip_prefix("Model setup: ").unwrap_or(message);
+    if let Some(download) = nested.strip_prefix("downloading ")
+        && let Some((_, artifact)) = download.split_once(" artifact ")
+        && let Some((counts, description)) = artifact.split_once(": ")
+        && let Some((index, total)) = counts.split_once('/')
+        && index.parse::<u32>().is_ok()
+        && total.parse::<u32>().is_ok()
+    {
+        let (path, bytes) = description
+            .rsplit_once(" (")
+            .and_then(|(path, suffix)| {
+                suffix
+                    .strip_suffix(" bytes)")
+                    .and_then(|bytes| bytes.parse::<u64>().ok())
+                    .map(|bytes| (path, bytes))
+            })
+            .unwrap_or((description, 0));
+        let name = path.rsplit('/').next().unwrap_or(path);
+        return if bytes > 0 {
+            format!(
+                "Downloading model file {index} of {total} | {name} | {}",
+                format_bytes(bytes)
+            )
+        } else {
+            format!("Downloading model file {index} of {total} | {name}")
+        };
+    }
+    if let Some((_, detail)) = message
+        .strip_prefix("Model setup ")
+        .and_then(|message| message.split_once(": "))
+    {
+        return detail.to_owned();
+    }
+    nested.to_owned()
+}
+
+fn transfer_progress_presentation(
+    prefix: &str,
+    transfer: &ArtifactTransferProgress,
+) -> ProgressPresentation {
+    if transfer.loaded_bytes >= transfer.total_bytes
+        && transfer.total_bytes > 0
+        && let Some(activity) = &transfer.request_activity
+    {
+        let component = activity
+            .component
+            .as_ref()
+            .or(transfer.component.as_ref())
+            .map(|component| format!(" | {}", humanize_stage(&component.to_string())))
+            .unwrap_or_default();
+        return ProgressPresentation {
+            headline: format!("{prefix} | {}{component}", activity.phase),
+            detail: format!(
+                "{} from cache | {} objects | {} reads",
+                format_bytes(activity.processed_bytes),
+                activity.logical_objects_completed,
+                activity.bounded_ranges_processed,
+            ),
+            fraction: None,
+            tone: ProgressTone::Normal,
+        };
+    }
+    let component = transfer
+        .component
+        .as_ref()
+        .map(|component| format!(" | {}", humanize_stage(&component.to_string())))
+        .unwrap_or_default();
+    let rate = transfer
+        .bytes_per_second
+        .map(|bytes| format!(" | {}/s", format_bytes(bytes)))
+        .unwrap_or_default();
+    let eta = transfer
+        .eta_seconds
+        .map(|seconds| format!(" | ETA {}", format_duration(seconds)))
+        .unwrap_or_default();
+    ProgressPresentation {
+        headline: format!("{prefix} | {}{component}", transfer.phase),
+        detail: format!(
+            "{} / {} | {}/{} parts{rate}{eta}",
+            format_bytes(transfer.loaded_bytes),
+            format_bytes(transfer.total_bytes),
+            transfer.physical_parts_completed,
+            transfer.physical_parts_total,
+        ),
+        fraction: Some(transfer.loaded_bytes as f32 / transfer.total_bytes.max(1) as f32),
+        tone: ProgressTone::Normal,
+    }
+}
+
+fn compact_artifact_name(path: &burn_image::ArtifactPath) -> String {
+    let value = path.to_string();
+    value.rsplit('/').next().unwrap_or(&value).to_owned()
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{}s", seconds.max(1))
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
     }
 }
 
@@ -1819,10 +2548,30 @@ fn update_action_availability(
     editor: Res<ImageEditorState>,
     jobs: Res<ImageJobs>,
     panel: Res<ImageControlPanelState>,
-    mode_buttons: Query<(Entity, Has<InteractionDisabled>), With<ModeButton>>,
-    model_buttons: Query<
+    model_buttons: Query<(Entity, Has<InteractionDisabled>), With<ModelButton>>,
+    size_buttons: Query<
         (Entity, Has<InteractionDisabled>),
-        (With<ModelButton>, Without<ModeButton>),
+        (With<SizeButton>, Without<ModelButton>),
+    >,
+    reference_buttons: Query<
+        (Entity, Has<InteractionDisabled>),
+        (
+            With<ReferenceButton>,
+            Without<UseOutputReferenceButton>,
+            Without<ModelButton>,
+        ),
+    >,
+    use_output_buttons: Query<
+        (Entity, Has<InteractionDisabled>),
+        (
+            With<UseOutputReferenceButton>,
+            Without<ReferenceButton>,
+            Without<RunButton>,
+        ),
+    >,
+    random_seed_buttons: Query<
+        (Entity, Has<InteractionDisabled>),
+        (With<RandomSeedButton>, Without<RunButton>),
     >,
     run_buttons: Query<(Entity, Has<InteractionDisabled>), With<RunButton>>,
     cancel_buttons: Query<
@@ -1832,15 +2581,6 @@ fn update_action_availability(
     save_buttons: Query<
         (Entity, Has<InteractionDisabled>),
         (With<SaveButton>, Without<RunButton>, Without<CancelButton>),
-    >,
-    view_buttons: Query<
-        (Entity, Has<InteractionDisabled>),
-        (
-            Or<(With<FitButton>, With<ActualSizeButton>)>,
-            Without<RunButton>,
-            Without<CancelButton>,
-            Without<SaveButton>,
-        ),
     >,
 ) {
     if !runner.is_changed() && !editor.is_changed() && !jobs.is_changed() && !panel.is_changed() {
@@ -1854,15 +2594,26 @@ fn update_action_availability(
         && editor.model.is_some()
         && editor.validate_request().is_ok();
     let can_save = panel.latest_output.is_some();
-    let can_adjust_view = can_save || editor.source.is_some();
+    let reference_relevant = reference_control_relevant(&editor, &runner.state);
+    let can_use_output = !running && reference_relevant && panel.latest_output.is_some();
     let can_select_model = !running && can_cycle_models(&runner.state);
-    let can_select_mode = !running && can_change_mode(&runner.state, editor.mode);
+    let can_select_size = !running && can_cycle_size(&runner.state, &editor, &panel);
+    let can_choose_reference = !running && reference_relevant;
 
-    for (entity, disabled) in &mode_buttons {
-        set_button_disabled(&mut commands, entity, disabled, !can_select_mode);
-    }
     for (entity, disabled) in &model_buttons {
         set_button_disabled(&mut commands, entity, disabled, !can_select_model);
+    }
+    for (entity, disabled) in &size_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_select_size);
+    }
+    for (entity, disabled) in &reference_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_choose_reference);
+    }
+    for (entity, disabled) in &use_output_buttons {
+        set_button_disabled(&mut commands, entity, disabled, !can_use_output);
+    }
+    for (entity, disabled) in &random_seed_buttons {
+        set_button_disabled(&mut commands, entity, disabled, running);
     }
     for (entity, disabled) in &run_buttons {
         set_button_disabled(&mut commands, entity, disabled, !can_run);
@@ -1873,8 +2624,105 @@ fn update_action_availability(
     for (entity, disabled) in &save_buttons {
         set_button_disabled(&mut commands, entity, disabled, !can_save);
     }
-    for (entity, disabled) in &view_buttons {
-        set_button_disabled(&mut commands, entity, disabled, !can_adjust_view);
+}
+
+fn run_requirement_message(
+    runner: &ImageRunnerState,
+    editor: &ImageEditorState,
+    jobs: &ImageJobs,
+    panel: &ImageControlPanelState,
+) -> Option<String> {
+    if jobs.iter().any(|job| !job.phase.is_terminal())
+        || has_pending_submission(panel, jobs)
+        || !matches!(runner, ImageRunnerState::Ready { .. })
+        || editor.model.is_none()
+    {
+        return None;
+    }
+
+    let prompt_missing = editor.prompt_or_instruction.trim().is_empty();
+    if editor.mode == EditorMode::Edit {
+        match (prompt_missing, editor.source.is_none()) {
+            (true, true) => {
+                return Some(
+                    "Enter an instruction and choose a reference image to enable Run.".into(),
+                );
+            }
+            (true, false) => return Some("Enter an instruction to enable Run.".into()),
+            (false, true) => return Some("Choose a reference image to enable Run.".into()),
+            (false, false) => {}
+        }
+    } else if prompt_missing {
+        return Some("Enter a prompt to enable Run.".into());
+    }
+    if !panel.seed_valid {
+        return Some("Enter a valid numeric seed to enable Run.".into());
+    }
+    editor.validate_request().err().map(|error| error.message)
+}
+
+fn sync_run_requirements(
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
+    jobs: Res<ImageJobs>,
+    panel: Res<ImageControlPanelState>,
+    mut labels: Query<(&mut Text, &mut Visibility), With<RunRequirementsLabel>>,
+) {
+    if !runner.is_changed() && !editor.is_changed() && !jobs.is_changed() && !panel.is_changed() {
+        return;
+    }
+    let message = run_requirement_message(&runner.state, &editor, &jobs, &panel);
+    for (mut text, mut visibility) in &mut labels {
+        let value = message.as_deref().unwrap_or_default();
+        if text.0 != value {
+            text.0 = value.into();
+        }
+        let next = if message.is_some() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != next {
+            *visibility = next;
+        }
+    }
+}
+
+fn sync_output_action_visibility(
+    panel: Res<ImageControlPanelState>,
+    mut save_buttons: Query<&mut Node, With<SaveButton>>,
+) {
+    if !panel.is_changed() {
+        return;
+    }
+    let display = if panel.latest_output.is_some() {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in &mut save_buttons {
+        if node.display != display {
+            node.display = display;
+        }
+    }
+}
+
+fn update_control_affordances(
+    buttons: Query<Has<InteractionDisabled>, With<Button>>,
+    mut affordances: Query<(&ChildOf, &mut Visibility), With<SelectorAffordance>>,
+) {
+    for (parent, mut visibility) in &mut affordances {
+        let Ok(disabled) = buttons.get(parent.parent()) else {
+            continue;
+        };
+        let next = if disabled {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        if *visibility != next {
+            *visibility = next;
+        }
     }
 }
 
@@ -1937,15 +2785,6 @@ fn format_progress(progress: &ProgressEvent) -> String {
     }
 }
 
-fn runner_state_label(state: &ImageRunnerState) -> String {
-    match state {
-        ImageRunnerState::Missing => "No model runtime installed".into(),
-        ImageRunnerState::Initializing { message } => message.clone(),
-        ImageRunnerState::Ready { .. } => "Model runtime ready".into(),
-        ImageRunnerState::Failed { error } => format!("Model runtime failed: {error}"),
-    }
-}
-
 fn update_button_colors(
     mut buttons: Query<(
         &Interaction,
@@ -1959,6 +2798,8 @@ fn update_button_colors(
             palette.disabled
         } else if *interaction == Interaction::Pressed {
             palette.pressed
+        } else if *interaction == Interaction::Hovered {
+            palette.hovered
         } else {
             palette.idle
         };
@@ -1970,9 +2811,9 @@ fn update_button_colors(
 
 const fn reference_button_text() -> &'static str {
     if cfg!(target_arch = "wasm32") {
-        "Reference: choose image..."
+        "Choose image..."
     } else {
-        "Reference: choose or drop image"
+        "Choose or drop image"
     }
 }
 
@@ -2104,17 +2945,19 @@ mod tests {
     #[cfg(any(target_arch = "wasm32", test))]
     use super::BROWSER_UI_CONTRACT_EVENT_NAME;
     use super::{
-        MIN_VIEWER_HEIGHT, can_change_mode, can_cycle_models, descriptor_for_mode,
-        event_progress_presentation, format_progress, image_control_panel_layout,
-        model_control_label, next_model_descriptor, next_supported_size_index,
-        preferred_size_index, preset_dimensions, preset_index, runner_progress_presentation,
-        runner_state_label, setup_progress_fraction,
+        MIN_VIEWER_HEIGHT, can_cycle_models, descriptor_mode, event_progress_presentation,
+        format_progress, image_control_panel_layout, model_control_value, next_model_descriptor,
+        next_supported_size_index, preferred_size_index, preset_dimensions, preset_index,
+        reference_control_relevant, runner_control_value, runner_progress_presentation,
+        setup_progress_fraction,
     };
     #[cfg(feature = "boogu")]
     use super::{apply_descriptor_size, next_supported_size_index_for_descriptor};
-    use bevy::{prelude::Vec2, ui::InteractionDisabled};
+    use bevy::{picking::Pickable, prelude::*, ui::InteractionDisabled};
     use burn_image::{
-        DimensionConstraints, Dimensions, ImageTaskKind, ModelId, ProgressEvent, RunId,
+        ArtifactComponentId, ArtifactPath, ArtifactRequestTransferActivity,
+        ArtifactTransferProgress, DimensionConstraints, Dimensions, ImageTaskKind, ModelId,
+        ProgressEvent, RunId,
     };
 
     fn runner_with_models(models: &[(&str, &str, &[ImageTaskKind])]) -> crate::ImageRunnerState {
@@ -2181,13 +3024,162 @@ mod tests {
             runner_progress_presentation(&state).fraction,
             Some(1.0 / 3.0)
         );
+
+        assert_eq!(
+            setup_progress_fraction("Model transfer 37.5%: Qwen - 1.0 GiB / 2.7 GiB"),
+            Some(0.375)
+        );
+    }
+
+    #[test]
+    fn model_switch_progress_replaces_the_stale_stage_label_correctness() {
+        let event = ProgressEvent::StageStarted {
+            run_id: RunId(3),
+            stage: format!(
+                "{}5:Model setup 3/5: loading Qwen stages to GPU",
+                super::MODEL_SWITCH_PROGRESS_STAGE_PREFIX
+            ),
+            total_steps: None,
+        };
+        let presentation = event_progress_presentation("Job 3", &event);
+        assert_eq!(presentation.headline, "Job 3: Switching model");
+        assert_eq!(presentation.detail, "loading Qwen stages to GPU");
+        assert_eq!(presentation.fraction, Some(3.0 / 5.0));
+    }
+
+    #[test]
+    fn model_switch_download_status_names_the_bundle_local_file_count_correctness() {
+        let event = ProgressEvent::StageStarted {
+            run_id: RunId(4),
+            stage: format!(
+                "{}5:Model setup: downloading Boogu artifact 17/110: pipeline/objects/abcdef.bpk (20971520 bytes)",
+                super::MODEL_SWITCH_PROGRESS_STAGE_PREFIX
+            ),
+            total_steps: None,
+        };
+        let presentation = event_progress_presentation("Job 4", &event);
+        assert_eq!(presentation.headline, "Job 4: Switching model");
+        assert_eq!(
+            presentation.detail,
+            "Downloading model file 17 of 110 | abcdef.bpk | 20.0 MiB"
+        );
+        // A bundle-local file count is useful status, but is not misrepresented as whole-switch
+        // progress because the dependency bundles have separate denominators.
+        assert_eq!(presentation.fraction, None);
+    }
+
+    #[test]
+    fn stage_local_file_count_is_not_presented_as_overall_progress_correctness() {
+        let event = ProgressEvent::ArtifactStarted {
+            run_id: RunId(7),
+            path: ArtifactPath::new("pipeline/objects/current.bpk").unwrap(),
+            component: Some(ArtifactComponentId::new("boogu-denoiser-blocks").unwrap()),
+            file_index: 1,
+            file_count: 4,
+            total_bytes: 32,
+            transfer: None,
+        };
+        let presentation = event_progress_presentation("Job 7", &event);
+        assert_eq!(presentation.fraction, None);
+        assert_eq!(
+            presentation.detail,
+            "boogu denoiser blocks | current.bpk | 32 B"
+        );
+        assert!(!presentation.detail.contains("file 2 of 4"));
+    }
+
+    #[test]
+    fn aggregate_transfer_presentation_uses_bytes_and_unique_closure_counts_correctness() {
+        let transfer = ArtifactTransferProgress {
+            phase: "Inference model transfer".into(),
+            component: Some(ArtifactComponentId::new("qwen").unwrap()),
+            logical_objects_completed: 41,
+            logical_objects_total: 223,
+            physical_parts_completed: 300,
+            physical_parts_total: 1_904,
+            bounded_ranges_completed: 1_500,
+            bounded_ranges_total: 9_520,
+            loaded_bytes: 6 * 1024 * 1024 * 1024,
+            total_bytes: 24 * 1024 * 1024 * 1024,
+            bytes_per_second: Some(96 * 1024 * 1024),
+            eta_seconds: Some(192),
+            request_activity: None,
+        };
+        let event = ProgressEvent::ArtifactProgress {
+            run_id: RunId(7),
+            path: ArtifactPath::new("qwen/objects/current.bpk").unwrap(),
+            loaded_bytes: 8,
+            total_bytes: 16,
+            transfer: Some(transfer),
+        };
+        let presentation = event_progress_presentation("Job 7", &event);
+        assert_eq!(
+            presentation.headline,
+            "Job 7 | Inference model transfer | qwen"
+        );
+        assert_eq!(presentation.fraction, Some(0.25));
+        assert!(presentation.detail.contains("6.00 GiB / 24.00 GiB"));
+        assert!(presentation.detail.contains("300/1904 parts"));
+        assert!(!presentation.detail.contains("41/223"));
+        assert!(!presentation.detail.contains("1500/9520"));
+        assert!(presentation.detail.contains("96.0 MiB/s"));
+        assert!(presentation.detail.contains("ETA 3m 12s"));
+        assert!(presentation.detail.len() <= 80);
+    }
+
+    #[test]
+    fn complete_transport_presents_cache_rehydration_as_indeterminate_correctness() {
+        let total = 35_106_151_424;
+        let transfer = ArtifactTransferProgress {
+            phase: "Inference model transfer".into(),
+            component: Some(ArtifactComponentId::new("boogu-denoiser-blocks").unwrap()),
+            logical_objects_completed: 186,
+            logical_objects_total: 186,
+            physical_parts_completed: 1_751,
+            physical_parts_total: 1_751,
+            bounded_ranges_completed: 9_000,
+            bounded_ranges_total: 9_000,
+            loaded_bytes: total,
+            total_bytes: total,
+            bytes_per_second: Some(96 * 1024 * 1024),
+            eta_seconds: None,
+            request_activity: Some(ArtifactRequestTransferActivity {
+                phase: "Applying verified cached model stages".into(),
+                current_path: Some(
+                    ArtifactPath::new("pipeline/objects/denoiser-block-02.bpk").unwrap(),
+                ),
+                component: Some(ArtifactComponentId::new("boogu-denoiser-blocks").unwrap()),
+                logical_objects_completed: 3,
+                bounded_ranges_processed: 17,
+                processed_bytes: 68 * 1024 * 1024,
+            }),
+        };
+        let event = ProgressEvent::ArtifactProgress {
+            run_id: RunId(8),
+            path: ArtifactPath::new("pipeline/objects/denoiser-block-02.bpk").unwrap(),
+            loaded_bytes: 4,
+            total_bytes: 8,
+            transfer: Some(transfer),
+        };
+        let presentation = event_progress_presentation("Job 8", &event);
+        assert_eq!(
+            presentation.headline,
+            "Job 8 | Applying verified cached model stages | boogu denoiser blocks"
+        );
+        assert_eq!(presentation.fraction, None);
+        assert_eq!(
+            presentation.detail,
+            "68.0 MiB from cache | 3 objects | 17 reads"
+        );
+        assert!(!presentation.detail.contains("lifetime transport"));
+        assert!(presentation.detail.len() <= 64);
     }
 
     #[test]
     fn controls_layout_preserves_viewer_on_wide_and_narrow_windows_correctness() {
         let desktop = image_control_panel_layout(Vec2::new(1_280.0, 800.0));
         assert!(!desktop.narrow);
-        assert_eq!(desktop.panel_width, 360.0);
+        assert_eq!(desktop.panel_width, 380.0);
         assert!(desktop.viewer_width > desktop.panel_width);
         assert!(desktop.viewer_height > 700.0);
 
@@ -2249,10 +3241,60 @@ mod tests {
     }
 
     #[test]
+    fn random_seed_button_updates_editor_and_text_input_correctness() {
+        let mut app = App::new();
+        app.insert_resource(crate::ImageEditorState {
+            options: burn_image::GenerationOptions {
+                seed: Some(5),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .init_resource::<super::ImageControlPanelState>()
+        .add_systems(Update, super::handle_random_seed_button);
+        app.world_mut()
+            .spawn((Button, super::RandomSeedButton, Interaction::Pressed));
+        let seed_input = app
+            .world_mut()
+            .spawn((super::SeedInput, bevy::text::EditableText::new("5")))
+            .id();
+
+        app.update();
+
+        let value = app
+            .world()
+            .resource::<crate::ImageEditorState>()
+            .options
+            .seed
+            .expect("random seed button must set a seed");
+        assert_ne!(value, 5);
+        assert_eq!(
+            app.world()
+                .get::<bevy::text::EditableText>(seed_input)
+                .unwrap()
+                .value()
+                .to_string(),
+            value.to_string()
+        );
+        assert!(
+            app.world()
+                .resource::<super::ImageControlPanelState>()
+                .seed_valid
+        );
+    }
+
+    #[test]
+    fn random_seed_collision_is_advanced_without_overflow_correctness() {
+        assert_eq!(super::distinct_random_seed(Some(7), 7), 8);
+        assert_eq!(super::distinct_random_seed(Some(u64::MAX), u64::MAX), 0);
+        assert_eq!(super::distinct_random_seed(Some(7), 9), 9);
+    }
+
+    #[test]
     fn missing_runtime_label_does_not_claim_generation_correctness() {
         assert_eq!(
-            runner_state_label(&crate::ImageRunnerState::Missing),
-            "No model runtime installed"
+            runner_control_value(&crate::ImageRunnerState::Missing),
+            "Runtime unavailable"
         );
         let _ = ModelId::new("test/model").unwrap();
     }
@@ -2266,10 +3308,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(
-            model_control_label(&editor, &runner),
-            "Loaded model: Test Turbo"
-        );
+        assert_eq!(model_control_value(&editor, &runner), "Test Turbo");
         assert!(!can_cycle_models(&runner));
         let crate::ImageRunnerState::Ready { capabilities } = &runner else {
             unreachable!();
@@ -2298,6 +3337,147 @@ mod tests {
     }
 
     #[test]
+    fn run_control_stays_disabled_until_edit_input_is_valid_correctness() {
+        let runner = runner_with_models(&[("test/edit", "Test Edit", &[ImageTaskKind::Edit])]);
+        let editor = crate::ImageEditorState {
+            mode: crate::EditorMode::Edit,
+            model: Some(ModelId::new("test/edit").unwrap()),
+            prompt_or_instruction: "Improve this image".into(),
+            source: None,
+            ..Default::default()
+        };
+        assert!(editor.validate_request().is_err());
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(editor)
+            .init_resource::<crate::ImageJobs>()
+            .init_resource::<super::ImageControlPanelState>()
+            .add_systems(Update, super::update_action_availability);
+        let run = app
+            .world_mut()
+            .spawn((super::RunButton, InteractionDisabled))
+            .id();
+
+        app.update();
+
+        assert!(app.world().get::<InteractionDisabled>(run).is_some());
+    }
+
+    #[test]
+    fn generate_run_enables_only_after_a_prompt_is_entered_correctness() {
+        let runner =
+            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                model: Some(ModelId::new("test/turbo").unwrap()),
+                ..Default::default()
+            })
+            .init_resource::<crate::ImageJobs>()
+            .init_resource::<super::ImageControlPanelState>()
+            .add_systems(Update, super::update_action_availability);
+        let run = app
+            .world_mut()
+            .spawn((super::RunButton, InteractionDisabled))
+            .id();
+
+        app.update();
+        assert!(app.world().get::<InteractionDisabled>(run).is_some());
+
+        app.world_mut()
+            .resource_mut::<crate::ImageEditorState>()
+            .prompt_or_instruction = "A ceramic bird".into();
+        app.update();
+        assert!(app.world().get::<InteractionDisabled>(run).is_none());
+    }
+
+    #[test]
+    fn disabled_run_explains_the_missing_mode_inputs_correctness() {
+        let runner = runner_with_models(&[(
+            "test/edit",
+            "Test Edit",
+            &[ImageTaskKind::Generate, ImageTaskKind::Edit],
+        )]);
+        let jobs = crate::ImageJobs::default();
+        let panel = super::ImageControlPanelState::default();
+        let mut editor = crate::ImageEditorState {
+            mode: crate::EditorMode::Edit,
+            model: Some(ModelId::new("test/edit").unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::run_requirement_message(&runner, &editor, &jobs, &panel).as_deref(),
+            Some("Enter an instruction and choose a reference image to enable Run.")
+        );
+
+        editor.mode = crate::EditorMode::Generate;
+        assert_eq!(
+            super::run_requirement_message(&runner, &editor, &jobs, &panel).as_deref(),
+            Some("Enter a prompt to enable Run.")
+        );
+    }
+
+    #[test]
+    fn save_action_is_hidden_until_an_output_exists_correctness() {
+        let mut app = App::new();
+        app.init_resource::<super::ImageControlPanelState>()
+            .add_systems(Update, super::sync_output_action_visibility);
+        let save = app
+            .world_mut()
+            .spawn((super::SaveButton, Node::default()))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(save).unwrap().display,
+            Display::None
+        );
+
+        let dimensions = burn_image::Dimensions::new(1, 1).unwrap();
+        let pixels = burn_image::PixelBuffer::new(
+            dimensions,
+            burn_image::PixelFormat::Rgba8,
+            burn_image::ColorSpace::Srgb,
+            vec![20, 40, 60, 255],
+        )
+        .unwrap();
+        app.world_mut()
+            .resource_mut::<super::ImageControlPanelState>()
+            .latest_output = Some((crate::ImageJobId(1), burn_image::HostImage::Pixels(pixels)));
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(save).unwrap().display,
+            Display::Flex
+        );
+    }
+
+    #[test]
+    fn enabled_buttons_have_a_distinct_hover_palette_correctness() {
+        let palette = super::ButtonPalette::neutral();
+        let mut app = App::new();
+        app.add_systems(Update, super::update_button_colors);
+        let button = app
+            .world_mut()
+            .spawn((Interaction::Hovered, palette, BackgroundColor(palette.idle)))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world().get::<BackgroundColor>(button).unwrap().0,
+            palette.hovered
+        );
+
+        app.world_mut()
+            .entity_mut(button)
+            .insert(InteractionDisabled);
+        app.update();
+        assert_eq!(
+            app.world().get::<BackgroundColor>(button).unwrap().0,
+            palette.disabled
+        );
+    }
+
+    #[test]
     fn genuine_multi_model_runtime_keeps_model_cycling_correctness() {
         let runner = runner_with_models(&[
             ("test/turbo", "Test Turbo", &[ImageTaskKind::Generate]),
@@ -2308,7 +3488,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(model_control_label(&editor, &runner), "Model: Test Turbo");
+        assert_eq!(model_control_value(&editor, &runner), "Test Turbo");
         assert!(can_cycle_models(&runner));
         let crate::ImageRunnerState::Ready { capabilities } = &runner else {
             unreachable!();
@@ -2323,55 +3503,319 @@ mod tests {
     }
 
     #[test]
-    fn mode_selection_never_enters_an_unsupported_task_correctness() {
-        let generation_only =
-            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
-        assert!(!can_change_mode(
-            &generation_only,
-            crate::EditorMode::Generate
-        ));
-        assert!(descriptor_for_mode(&generation_only, crate::EditorMode::Edit).is_none());
-
-        let multi = runner_with_models(&[
-            ("test/turbo", "Test Turbo", &[ImageTaskKind::Generate]),
-            ("test/edit", "Test Edit", &[ImageTaskKind::Edit]),
+    fn model_dropdown_selects_an_explicit_model_and_derives_edit_mode_correctness() {
+        let runner = runner_with_models(&[
+            (
+                "Boogu/Boogu-Image-0.1-Turbo",
+                "Generate - Turbo 1K",
+                &[ImageTaskKind::Generate],
+            ),
+            (
+                "Boogu/Boogu-Image-0.1-Edit-Turbo",
+                "Edit - Turbo 1K",
+                &[ImageTaskKind::Edit],
+            ),
         ]);
-        assert!(can_change_mode(&multi, crate::EditorMode::Generate));
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                model: Some(ModelId::new("Boogu/Boogu-Image-0.1-Turbo").unwrap()),
+                ..Default::default()
+            })
+            .init_resource::<super::ImageControlPanelState>()
+            .init_resource::<super::ModelDropdownState>()
+            .init_resource::<super::SizeDropdownState>()
+            .add_systems(
+                Update,
+                (super::handle_model_button, super::handle_model_option).chain(),
+            );
+        app.world_mut()
+            .spawn((super::ModelButton, Interaction::Pressed));
+        app.world_mut().spawn((
+            Button,
+            super::ModelOption { index: 1 },
+            Interaction::Pressed,
+        ));
+
+        app.update();
+
+        let editor = app.world().resource::<crate::ImageEditorState>();
+        assert_eq!(editor.mode, crate::EditorMode::Edit);
         assert_eq!(
-            descriptor_for_mode(&multi, crate::EditorMode::Edit)
-                .unwrap()
-                .id
-                .as_str(),
-            "test/edit"
+            editor.model.as_ref().unwrap().as_str(),
+            "Boogu/Boogu-Image-0.1-Edit-Turbo"
         );
     }
 
     #[test]
-    fn unsupported_mode_press_keeps_the_editor_dispatchable_correctness() {
-        let runner =
-            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
-        let mut app = bevy::prelude::App::new();
+    fn reference_control_tracks_mode_and_selected_model_capability_correctness() {
+        let runner = runner_with_models(&[
+            (
+                "test/hybrid",
+                "Hybrid",
+                &[ImageTaskKind::Generate, ImageTaskKind::Edit],
+            ),
+            ("test/generate", "Generate", &[ImageTaskKind::Generate]),
+        ]);
+        let mut app = App::new();
         app.insert_resource(crate::ImageRunnerStatus { state: runner })
             .insert_resource(crate::ImageEditorState {
-                model: Some(ModelId::new("test/turbo").unwrap()),
+                model: Some(ModelId::new("test/hybrid").unwrap()),
                 ..Default::default()
             })
             .init_resource::<super::ImageControlPanelState>()
-            .add_systems(bevy::prelude::Update, super::handle_mode_button);
+            .add_systems(Update, super::sync_reference_control_visibility);
+        let button = app
+            .world_mut()
+            .spawn((super::ReferenceButton, Node::default()))
+            .id();
+        let use_output = app
+            .world_mut()
+            .spawn((super::UseOutputReferenceAction, Node::default()))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(button).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(use_output).unwrap().display,
+            Display::None
+        );
+
         app.world_mut()
-            .spawn((super::ModeButton, bevy::prelude::Interaction::Pressed));
+            .resource_mut::<crate::ImageEditorState>()
+            .mode = crate::EditorMode::Edit;
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(button).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(use_output).unwrap().display,
+            Display::None
+        );
+        assert!(reference_control_relevant(
+            app.world().resource::<crate::ImageEditorState>(),
+            &app.world().resource::<crate::ImageRunnerStatus>().state,
+        ));
+
+        let dimensions = burn_image::Dimensions::new(1, 1).unwrap();
+        let pixels = burn_image::PixelBuffer::new(
+            dimensions,
+            burn_image::PixelFormat::Rgba8,
+            burn_image::ColorSpace::Srgb,
+            vec![1, 2, 3, 255],
+        )
+        .unwrap();
+        app.world_mut()
+            .resource_mut::<super::ImageControlPanelState>()
+            .latest_output = Some((crate::ImageJobId(1), burn_image::HostImage::Pixels(pixels)));
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(use_output).unwrap().display,
+            Display::Flex
+        );
+
+        app.world_mut()
+            .resource_mut::<crate::ImageEditorState>()
+            .model = Some(ModelId::new("test/generate").unwrap());
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(button).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world().get::<Node>(use_output).unwrap().display,
+            Display::None
+        );
+    }
+
+    #[test]
+    fn edit_mode_can_explicitly_reuse_the_current_output_as_reference_correctness() {
+        let runner = runner_with_models(&[(
+            "test/hybrid",
+            "Hybrid",
+            &[ImageTaskKind::Generate, ImageTaskKind::Edit],
+        )]);
+        let dimensions = burn_image::Dimensions::new(1, 1).unwrap();
+        let output_pixels = burn_image::PixelBuffer::new(
+            dimensions,
+            burn_image::PixelFormat::Rgba8,
+            burn_image::ColorSpace::Srgb,
+            vec![20, 40, 60, 255],
+        )
+        .unwrap();
+        let mask = burn_image::InputMask::new(
+            dimensions,
+            burn_image::MaskSemantics::WhiteEdits,
+            vec![255],
+        )
+        .unwrap();
+        let panel = super::ImageControlPanelState {
+            latest_output: Some((
+                crate::ImageJobId(2),
+                burn_image::HostImage::Pixels(output_pixels.clone()),
+            )),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                mode: crate::EditorMode::Edit,
+                model: Some(ModelId::new("test/hybrid").unwrap()),
+                mask: Some(mask),
+                ..Default::default()
+            })
+            .insert_resource(panel)
+            .add_systems(Update, super::handle_use_output_reference_button);
+        app.world_mut()
+            .spawn((super::UseOutputReferenceButton, Interaction::Pressed));
 
         app.update();
 
+        let editor = app.world().resource::<crate::ImageEditorState>();
         assert_eq!(
-            app.world().resource::<crate::ImageEditorState>().mode,
-            crate::EditorMode::Generate
+            editor.source,
+            Some(burn_image::InputImage::Pixels(output_pixels))
         );
+        assert!(editor.mask.is_none());
         assert_eq!(
             app.world()
                 .resource::<super::ImageControlPanelState>()
                 .notice,
-            "The loaded runtime does not support Edit mode"
+            "Current output is now the edit reference"
+        );
+    }
+
+    #[test]
+    fn generate_mode_never_overwrites_the_reference_from_current_output_correctness() {
+        let runner = runner_with_models(&[(
+            "test/hybrid",
+            "Hybrid",
+            &[ImageTaskKind::Generate, ImageTaskKind::Edit],
+        )]);
+        let dimensions = burn_image::Dimensions::new(1, 1).unwrap();
+        let original = burn_image::PixelBuffer::new(
+            dimensions,
+            burn_image::PixelFormat::Rgba8,
+            burn_image::ColorSpace::Srgb,
+            vec![1, 2, 3, 255],
+        )
+        .unwrap();
+        let output = burn_image::PixelBuffer::new(
+            dimensions,
+            burn_image::PixelFormat::Rgba8,
+            burn_image::ColorSpace::Srgb,
+            vec![20, 40, 60, 255],
+        )
+        .unwrap();
+        let panel = super::ImageControlPanelState {
+            latest_output: Some((crate::ImageJobId(3), burn_image::HostImage::Pixels(output))),
+            ..Default::default()
+        };
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                mode: crate::EditorMode::Generate,
+                model: Some(ModelId::new("test/hybrid").unwrap()),
+                source: Some(burn_image::InputImage::Pixels(original.clone())),
+                ..Default::default()
+            })
+            .insert_resource(panel)
+            .add_systems(Update, super::handle_use_output_reference_button);
+        app.world_mut()
+            .spawn((super::UseOutputReferenceButton, Interaction::Pressed));
+
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<crate::ImageEditorState>().source,
+            Some(burn_image::InputImage::Pixels(original))
+        );
+    }
+
+    #[test]
+    fn decorative_button_text_never_blocks_parent_picking_correctness() {
+        let mut app = App::new();
+        app.add_systems(Startup, super::setup_controls);
+        app.update();
+
+        let world = app.world_mut();
+        let selector = {
+            let mut query = world.query_filtered::<Entity, With<super::ModelButton>>();
+            query.single(world).unwrap()
+        };
+        let action = {
+            let mut query = world.query_filtered::<Entity, With<super::RunButton>>();
+            query.single(world).unwrap()
+        };
+        for button in [selector, action] {
+            let children: Vec<_> = world.get::<Children>(button).unwrap().iter().collect();
+            assert!(!children.is_empty());
+            for child in children {
+                assert!(world.get::<Text>(child).is_some());
+                assert_eq!(world.get::<Pickable>(child), Some(&Pickable::IGNORE));
+            }
+        }
+    }
+
+    #[test]
+    fn seed_input_uses_a_compact_single_line_height_correctness() {
+        let mut app = App::new();
+        app.add_systems(Startup, super::setup_controls);
+        app.update();
+
+        let world = app.world_mut();
+        let input = {
+            let mut query = world.query_filtered::<&Node, With<super::SeedInput>>();
+            query.single(world).unwrap().clone()
+        };
+        assert_eq!(input.height, px(28));
+        assert_eq!(input.padding.top, px(3));
+        assert_eq!(input.padding.bottom, px(3));
+    }
+
+    #[test]
+    fn selected_model_capability_is_the_single_mode_authority_correctness() {
+        let runner = runner_with_models(&[
+            ("test/turbo", "Test Turbo", &[ImageTaskKind::Generate]),
+            ("test/edit", "Test Edit", &[ImageTaskKind::Edit]),
+            (
+                "test/hybrid",
+                "Hybrid",
+                &[ImageTaskKind::Generate, ImageTaskKind::Edit],
+            ),
+        ]);
+        let crate::ImageRunnerState::Ready { capabilities } = runner else {
+            unreachable!();
+        };
+        assert_eq!(
+            descriptor_mode(
+                capabilities
+                    .descriptor(&ModelId::new("test/turbo").unwrap())
+                    .unwrap()
+            ),
+            Some(crate::EditorMode::Generate)
+        );
+        assert_eq!(
+            descriptor_mode(
+                capabilities
+                    .descriptor(&ModelId::new("test/edit").unwrap())
+                    .unwrap()
+            ),
+            Some(crate::EditorMode::Edit)
+        );
+        // A hybrid descriptor has one deterministic UI mode rather than introducing another
+        // independent selector; hosts may still author explicit Edit requests through the API.
+        assert_eq!(
+            descriptor_mode(
+                capabilities
+                    .descriptor(&ModelId::new("test/hybrid").unwrap())
+                    .unwrap()
+            ),
+            Some(crate::EditorMode::Generate)
         );
     }
 
@@ -2400,6 +3844,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn size_dropdown_selects_the_explicit_pressed_preset_correctness() {
+        let mut runner =
+            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
+        let crate::ImageRunnerState::Ready { capabilities } = &mut runner else {
+            unreachable!();
+        };
+        capabilities.models[0].capabilities.dimensions = dimensions(256, 1024, Some(1024 * 1024));
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                model: Some(ModelId::new("test/turbo").unwrap()),
+                ..Default::default()
+            })
+            .init_resource::<super::ImageControlPanelState>()
+            .insert_resource(super::SizeDropdownState { open: true })
+            .add_systems(Update, super::handle_size_option);
+        app.world_mut()
+            .spawn((Button, super::SizeOption { index: 4 }, Interaction::Pressed));
+
+        app.update();
+
+        assert_eq!(
+            app.world()
+                .resource::<crate::ImageEditorState>()
+                .options
+                .dimensions,
+            Some(Dimensions::new(1024, 768).unwrap())
+        );
+        assert_eq!(
+            app.world()
+                .resource::<super::ImageControlPanelState>()
+                .size_index,
+            4
+        );
+        assert!(!app.world().resource::<super::SizeDropdownState>().open);
+    }
+
+    #[test]
+    fn size_dropdown_lists_only_model_supported_presets_correctness() {
+        let mut runner =
+            runner_with_models(&[("test/turbo", "Test Turbo", &[ImageTaskKind::Generate])]);
+        let crate::ImageRunnerState::Ready { capabilities } = &mut runner else {
+            unreachable!();
+        };
+        capabilities.models[0].capabilities.dimensions = dimensions(256, 1024, Some(1024 * 1024));
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                model: Some(ModelId::new("test/turbo").unwrap()),
+                options: burn_image::GenerationOptions {
+                    dimensions: Some(Dimensions::new(1024, 1024).unwrap()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .init_resource::<crate::ImageJobs>()
+            .insert_resource(super::SizeDropdownState { open: true })
+            .add_systems(Update, super::sync_size_dropdown);
+        let dropdown = app
+            .world_mut()
+            .spawn((super::SizeDropdown, Node::default()))
+            .id();
+        let supported = app
+            .world_mut()
+            .spawn((
+                super::SizeOption { index: 3 },
+                Node::default(),
+                super::ButtonPalette::neutral(),
+            ))
+            .id();
+        let unsupported = app
+            .world_mut()
+            .spawn((
+                super::SizeOption { index: 6 },
+                Node::default(),
+                super::ButtonPalette::neutral(),
+            ))
+            .id();
+
+        app.update();
+
+        assert_eq!(
+            app.world().get::<Node>(dropdown).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(supported).unwrap().display,
+            Display::Flex
+        );
+        assert_eq!(
+            app.world().get::<Node>(unsupported).unwrap().display,
+            Display::None
+        );
+        assert_eq!(
+            app.world()
+                .get::<super::ButtonPalette>(supported)
+                .unwrap()
+                .idle,
+            Color::srgb(0.2, 0.34, 0.54)
+        );
+    }
+
     #[cfg(feature = "boogu")]
     #[test]
     fn turbo_controls_start_at_core_1k_default_correctness() {
@@ -2416,6 +3963,14 @@ mod tests {
                 editor.options.dimensions,
                 Some(Dimensions::new(1024, 1024).unwrap())
             );
+            if variant == burn_boogu::BooguVariant::Image01EditTurbo {
+                assert_eq!(
+                    super::size_dropdown_hint(&descriptor),
+                    Some("For 1.5K sizes, choose Edit - Turbo 1.5K from the Model menu.")
+                );
+            } else {
+                assert_eq!(super::size_dropdown_hint(&descriptor), None);
+            }
         }
     }
 

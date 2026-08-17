@@ -41,6 +41,11 @@ import {
   validateTurboFirstDmdReport,
   validateTurboFirstDmdSourceContract,
 } from "./wasm_turbo_first_dmd_contract.mjs";
+import {
+  ARTIFACT_TRANSPORT_LAYOUT_PATH,
+  transportTelemetryFiles,
+  validateArtifactBundleTransport,
+} from "./artifact_transport_contract.mjs";
 
 const ENABLE_ENV = "BURN_IMAGE_TURBO_FIRST_DMD";
 const VALIDATE_ONLY_ENV = "BURN_IMAGE_TURBO_FIRST_DMD_VALIDATE_ONLY";
@@ -113,11 +118,11 @@ const BUNDLES = Object.freeze({
   }),
   "qwen3-vl-8b-base-boogu-image-0.1": Object.freeze({
     schema_version: 1,
-    content_digest: "2f7ed91e09f208853b189ee8c3d6db74a02d2512e07f4818f6688131359d98fc",
+    content_digest: "2bab9d7c378158137c117a43d7a3cc5d66dc94af5dd0856d12348d08b2b9e9da",
   }),
   "flux1-vae-boogu-image-0.1": Object.freeze({
     schema_version: 1,
-    content_digest: "8ff1043ac3d47e6addbb5e07f437c04585f678819ffd0e505ac46effdf1c31d6",
+    content_digest: "a7a4758d3334bf3c2749cc9e84bed748fd0dc9b982299708748e1343b08efab9",
   }),
 });
 
@@ -182,6 +187,8 @@ async function validateFixture(fixtureDir) {
 
 async function validateArtifacts(artifactRoot) {
   const manifests = {};
+  const telemetryByPath = new Map();
+  const validations = {};
   for (const [bundle, expected] of Object.entries(BUNDLES)) {
     const bundleRoot = await requireDirectory(join(artifactRoot, bundle), bundle);
     const path = join(bundleRoot, "manifest.json");
@@ -203,23 +210,44 @@ async function validateArtifacts(artifactRoot) {
         throw new Error(`${bundle}.${field} differs from ${expected[field]}`);
       }
     }
+    const transport = await validateArtifactBundleTransport({
+      bundleRoot,
+      manifest,
+    });
+    validations[bundle] = transport;
+    for (const entry of transportTelemetryFiles(transport)) {
+      telemetryByPath.set(`/model/${bundle}/${entry.path}`, {
+        artifact_bundle: bundle,
+        artifact_component: entry.component,
+        artifact_components: entry.components,
+        artifact_logical_paths: entry.logical_paths,
+        shared_physical_part: entry.shared_physical_part,
+        physical_transport_part: true,
+      });
+    }
     manifests[bundle] = {
       root: bundleRoot,
       path,
       bytes: bytes.length,
       sha256: createHash("sha256").update(bytes).digest("hex"),
       content_digest: manifest.content_digest,
+      logical_artifacts: transport.logical,
+      direct_artifacts: transport.direct,
+      physical_transport: transport.transport,
+      transport_sidecar: transport.sidecar,
     };
   }
-  return manifests;
+  return { manifests, telemetryByPath, validations };
 }
 
 async function validatePackage(wwwOut) {
   const javascriptPath = join(wwwOut, "bevy_burn_image.js");
   const wasmPath = join(wwwOut, "bevy_burn_image_bg.wasm");
-  const [javascript, webassembly] = await Promise.all([
+  const iconPath = join(wwwOut, "burn-image-icon.png");
+  const [javascript, webassembly, icon] = await Promise.all([
     identifyFile(javascriptPath),
     identifyFile(wasmPath),
+    identifyFile(iconPath),
   ]);
   const javascriptSource = await readFile(javascriptPath, "utf8");
   if (!javascriptSource.includes("export function start_boogu_web()")) {
@@ -228,6 +256,7 @@ async function validatePackage(wwwOut) {
   return {
     javascript: { path: javascriptPath, ...javascript },
     webassembly: { path: wasmPath, ...webassembly },
+    icon: { path: iconPath, content_type: "image/png", ...icon },
   };
 }
 
@@ -241,6 +270,8 @@ async function validateSources() {
         parityFixtureSource: "crates/bevy_image/src/browser_parity_fixture.rs",
         parityWorkflowSource: ".github/workflows/parity.yml",
         harnessSource: "crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs",
+        transportContractSource:
+          "crates/bevy_image/tests/artifact_transport_contract.mjs",
       }).map(async ([name, path]) => [name, await readFile(join(repoRoot, path), "utf8")]),
     ),
   );
@@ -299,11 +330,12 @@ function parseRange(value, size) {
   return { start, end, length: end - start + 1 };
 }
 
-async function startServer({ artifactRoot, fixtureDir, wwwOut }) {
+async function startServer({ artifactRoot, fixtureDir, wwwOut, artifactTelemetryByPath }) {
   const html = await readFile(htmlPath);
   const requests = [];
   const recordRequest = (event) => {
-    requests.push({ at_ms: Date.now(), ...event });
+    const telemetry = artifactTelemetryByPath.get(event.path) ?? {};
+    requests.push({ at_ms: Date.now(), ...event, ...telemetry });
     if (requests.length > MAX_SERVER_REQUEST_EVENTS) requests.shift();
   };
   const sockets = new Set();
@@ -340,7 +372,13 @@ async function startServer({ artifactRoot, fixtureDir, wwwOut }) {
       }
       if (url.pathname.startsWith("/app/out/")) {
         const name = url.pathname.slice("/app/out/".length);
-        if (!new Set(["bevy_burn_image.js", "bevy_burn_image_bg.wasm"]).has(name)) {
+        if (
+          !new Set([
+            "bevy_burn_image.js",
+            "bevy_burn_image_bg.wasm",
+            "burn-image-icon.png",
+          ]).has(name)
+        ) {
           response.writeHead(404, cors());
           response.end();
           return;
@@ -476,7 +514,17 @@ async function startServer({ artifactRoot, fixtureDir, wwwOut }) {
   };
 }
 
-async function validateTransport(origin) {
+async function validateTransport(origin, artifactValidations, browserPackage) {
+  const iconResponse = await fetch(`${origin}/app/out/burn-image-icon.png`);
+  const iconBytes = Buffer.from(await iconResponse.arrayBuffer());
+  if (
+    !iconResponse.ok ||
+    iconResponse.headers.get("content-type") !== "image/png" ||
+    iconBytes.length !== browserPackage.icon.bytes ||
+    createHash("sha256").update(iconBytes).digest("hex") !== browserPackage.icon.sha256
+  ) {
+    throw new Error("browser package server failed the exact icon MIME/size/SHA-256 self-test");
+  }
   const range = await fetch(`${origin}/fixture/tensors.safetensors`, {
     headers: { Range: "bytes=0-7" },
   });
@@ -493,7 +541,35 @@ async function validateTransport(origin) {
     if (!manifest.ok || !(await manifest.text()).includes(BUNDLES[bundle].content_digest)) {
       throw new Error(`model server failed the ${bundle} manifest self-test`);
     }
+    const validation = artifactValidations[bundle];
+    const representativePart = transportTelemetryFiles(validation)[0];
+    for (const probe of [
+      { path: ARTIFACT_TRANSPORT_LAYOUT_PATH, size: validation.sidecar.size },
+      representativePart,
+    ]) {
+      if (!probe) throw new Error(`${bundle} has no physical transport part`);
+      const response = await fetch(`${origin}/model/${bundle}/${probe.path}`, {
+        headers: { Range: `bytes=0-${Math.min(7, probe.size - 1)}` },
+      });
+      if (
+        response.status !== 206 ||
+        Number(response.headers.get("content-length")) !== Math.min(8, probe.size) ||
+        (await response.arrayBuffer()).byteLength !== Math.min(8, probe.size)
+      ) {
+        throw new Error(`model server failed the ${bundle}/${probe.path} Range self-test`);
+      }
+    }
   }
+  return {
+    policy: "manifest-sealed-part-only-browser-cache-transport-v1",
+    bundles: Object.entries(artifactValidations).map(([bundle, validation]) => ({
+      bundle,
+      logical_artifacts: validation.logical,
+      physical_transport: validation.transport,
+      transport_sidecar: validation.sidecar,
+    })),
+    validated: true,
+  };
 }
 
 function exactIntegerForJson(value) {
@@ -1098,7 +1174,7 @@ try {
     requireDirectory(fixtureDirInput, FIXTURE_DIR_ENV),
     requireDirectory(wwwOutInput, WWW_OUT_DIR_ENV),
   ]);
-  const [manifests, fixture, browserPackage, sources] = await Promise.all([
+  const [artifactValidation, fixture, browserPackage, sources] = await Promise.all([
     validateArtifacts(artifactRoot),
     validateFixture(fixtureDir),
     validatePackage(wwwOut),
@@ -1109,7 +1185,7 @@ try {
     started_at: startedAt,
     validate_only: validateOnly,
     probe_url: null,
-    manifests,
+    manifests: artifactValidation.manifests,
     fixture_files: fixture.files,
     browser_package: browserPackage,
     sources,
@@ -1130,8 +1206,17 @@ try {
       );
     }
   }
-  server = await startServer({ artifactRoot, fixtureDir, wwwOut });
-  await validateTransport(server.origin);
+  server = await startServer({
+    artifactRoot,
+    fixtureDir,
+    wwwOut,
+    artifactTelemetryByPath: artifactValidation.telemetryByPath,
+  });
+  inputEvidence.transport_validation = await validateTransport(
+    server.origin,
+    artifactValidation.validations,
+    browserPackage,
+  );
   const modelBase = `${server.origin}/model/boogu-image-0.1-turbo`;
   const fixtureBase = `${server.origin}/fixture`;
   const query = new URLSearchParams({

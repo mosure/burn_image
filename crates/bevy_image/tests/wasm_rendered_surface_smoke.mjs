@@ -5,6 +5,8 @@
 //     --no-default-features --features web --locked --lib
 //   wasm-bindgen --target web --out-dir crates/bevy_image/www/out \
 //     --out-name bevy_burn_image target/wasm32-unknown-unknown/wasm-release/bevy_burn_image.wasm
+//   install -m 0644 crates/bevy_image/www/burn-image-icon.png \
+//     crates/bevy_image/www/out/burn-image-icon.png
 //   BURN_IMAGE_RENDERED_SURFACE_SMOKE=1 \
 //     node crates/bevy_image/tests/wasm_rendered_surface_smoke.mjs
 //
@@ -59,6 +61,8 @@ import {
   GENERIC_WEB_REQUIRED_DEVICE_FEATURES,
   GPU_INTERVAL_AGGREGATION_POLICY,
   gpuTerminalDiagnostic,
+  captureCdpNetworkRequestContext,
+  cdpNetworkLoadingFailedDiagnostic,
   LOW_VRAM_DEVICE_CAP_BYTES,
   LOW_VRAM_BACKEND,
   LOW_VRAM_PUBLIC_SELECTOR,
@@ -98,6 +102,11 @@ import {
   validateTurbo1024ModelEvidence,
   validateTurbo1024MultiRequestEvidence,
 } from "./wasm_rendered_surface_contract.mjs";
+import {
+  ARTIFACT_TRANSPORT_LAYOUT_PATH,
+  validateArtifactBundleTransport,
+  transportTelemetryFiles,
+} from "./artifact_transport_contract.mjs";
 
 const ENABLE_ENV = "BURN_IMAGE_RENDERED_SURFACE_SMOKE";
 const VALIDATE_ONLY_ENV = "BURN_IMAGE_RENDERED_SURFACE_VALIDATE_ONLY";
@@ -141,10 +150,13 @@ const controlsSourcePath = join(crateDir, "src/controls.rs");
 const displaySourcePath = join(crateDir, "src/display.rs");
 const booguSourcePath = join(crateDir, "src/boogu.rs");
 const browserBooguSourcePath = join(crateDir, "src/browser_boogu.rs");
+const artifactStreamSourcePath = join(crateDir, "src/artifact_stream.rs");
 const vaeDecoderSourcePath = join(repoRoot, "crates/burn_flux_vae/src/decoder.rs");
 const modelSelectorSourcePath = join(crateDir, "www/model_selector.mjs");
+const appIconPath = join(crateDir, "www/burn-image-icon.png");
 const renderedHarnessSourcePath = fileURLToPath(import.meta.url);
 const renderedContractSourcePath = join(testsDir, "wasm_rendered_surface_contract.mjs");
+const artifactTransportContractSourcePath = join(testsDir, "artifact_transport_contract.mjs");
 const TURBO_BUNDLE = "boogu-image-0.1-turbo";
 const QWEN_BUNDLE = "qwen3-vl-8b-base-boogu-image-0.1";
 const VAE_BUNDLE = "flux1-vae-boogu-image-0.1";
@@ -196,10 +208,12 @@ async function collectTestedPackageIdentity(wwwOutDir) {
     javascript,
     webassembly,
     modelSelector,
+    appIcon,
     browserRuntimeSource,
     vaeDecoderSource,
     renderedHarnessSource,
     renderedContractSource,
+    artifactTransportContractSource,
   ] = await Promise.all([
     exactFileIdentity(
       join(wwwOutDir, "bevy_burn_image.js"),
@@ -215,6 +229,11 @@ async function collectTestedPackageIdentity(wwwOutDir) {
       modelSelectorSourcePath,
       repoRoot,
       "crates/bevy_image/www/model_selector.mjs",
+    ),
+    exactFileIdentity(
+      join(wwwOutDir, "burn-image-icon.png"),
+      wwwOutDir,
+      "burn-image-icon.png",
     ),
     exactFileIdentity(
       browserBooguSourcePath,
@@ -236,16 +255,22 @@ async function collectTestedPackageIdentity(wwwOutDir) {
       repoRoot,
       "crates/bevy_image/tests/wasm_rendered_surface_contract.mjs",
     ),
+    exactFileIdentity(
+      artifactTransportContractSourcePath,
+      repoRoot,
+      "crates/bevy_image/tests/artifact_transport_contract.mjs",
+    ),
   ]);
   return {
     policy: "exact-local-package-and-runtime-source-bytes-served-to-browser",
-    generated_package: { javascript, webassembly },
+    generated_package: { javascript, webassembly, app_icon: appIcon },
     page_modules: { model_selector: modelSelector },
     sources: {
       browser_runtime: browserRuntimeSource,
       vae_decoder: vaeDecoderSource,
       rendered_harness: renderedHarnessSource,
       rendered_contract: renderedContractSource,
+      artifact_transport_contract: artifactTransportContractSource,
     },
     validated: true,
   };
@@ -298,10 +323,12 @@ async function validateCommittedSources() {
     displaySourceBytes,
     booguSourceBytes,
     browserBooguSourceBytes,
+    artifactStreamSourceBytes,
     vaeDecoderSourceBytes,
     renderedHarnessSourceBytes,
     renderedContractSourceBytes,
     modelSelectorSourceBytes,
+    appIconBytes,
   ] = await Promise.all([
     readFile(committedIndexPath),
     readFile(appSourcePath),
@@ -309,10 +336,12 @@ async function validateCommittedSources() {
     readFile(displaySourcePath),
     readFile(booguSourcePath),
     readFile(browserBooguSourcePath),
+    readFile(artifactStreamSourcePath),
     readFile(vaeDecoderSourcePath),
     readFile(renderedHarnessSourcePath),
     readFile(renderedContractSourcePath),
     readFile(modelSelectorSourcePath),
+    readFile(appIconPath),
   ]);
   const indexSource = indexBytes.toString("utf8");
   const appSource = appSourceBytes.toString("utf8");
@@ -320,6 +349,7 @@ async function validateCommittedSources() {
   const displaySource = displaySourceBytes.toString("utf8");
   const booguSource = booguSourceBytes.toString("utf8");
   const browserBooguSource = browserBooguSourceBytes.toString("utf8");
+  const artifactStreamSource = artifactStreamSourceBytes.toString("utf8");
   const vaeDecoderSource = vaeDecoderSourceBytes.toString("utf8");
   const renderedHarnessSource = renderedHarnessSourceBytes.toString("utf8");
   const renderedContractSource = renderedContractSourceBytes.toString("utf8");
@@ -329,12 +359,17 @@ async function validateCommittedSources() {
     'id="burn-image"',
     'import init, { provide_reference_image } from "./out/bevy_burn_image.js"',
     'import { configureModelReleaseSelector } from "./model_selector.mjs"',
+    'rel="icon" type="image/png" sizes="512x512" href="./out/burn-image-icon.png"',
     'case "packed_f16_resource_plan"',
     'case "packed_f16_denoiser_preload"',
     'case "packed_f16_denoiser_lifecycle"',
     'case "packed_f16_dmd_vae_handoff"',
     'case "surface_inference_suspended"',
     'case "surface_inference_resumed"',
+    "surfaceInferenceSuspended = true",
+    "surfaceInferenceSuspended = false",
+    "hideLoaderPanelIfSafe",
+    "Rendered Bevy surface paused for exclusive model work",
     'html[data-surface-inference="suspended"] *',
     "animation-play-state: paused !important",
     "transition: none !important",
@@ -343,6 +378,18 @@ async function validateCommittedSources() {
     "bottom: 0.55rem",
   ]) {
     if (!indexSource.includes(required)) failures.push(`www/index.html omits ${required}`);
+  }
+  const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  if (
+    appIconBytes.length <= 25 ||
+    !appIconBytes.subarray(0, pngSignature.length).equals(pngSignature) ||
+    appIconBytes.toString("ascii", 12, 16) !== "IHDR" ||
+    appIconBytes.readUInt32BE(16) !== 512 ||
+    appIconBytes.readUInt32BE(20) !== 512 ||
+    appIconBytes[24] !== 8 ||
+    appIconBytes[25] !== 2
+  ) {
+    failures.push("www/burn-image-icon.png is not an exact 512x512 8-bit RGB PNG");
   }
   for (const required of [
     "MODEL_RELEASES",
@@ -463,6 +510,131 @@ async function validateCommittedSources() {
     if (!browserBooguSource.includes(required)) {
       failures.push(`src/browser_boogu.rs omits ${required}`);
     }
+  }
+  const transportBootstrapCount = browserBooguSource.split(
+    ".with_manifest_transport_layout(",
+  ).length - 1;
+  if (transportBootstrapCount < MODEL_BUNDLES.length) {
+    failures.push(
+      `src/browser_boogu.rs authenticates ${transportBootstrapCount} transport layouts; expected pipeline, Qwen, and VAE`,
+    );
+  }
+  for (const required of [
+    "fetch_browser_transport_layout",
+    "fetch_browser_range_with_total(request, Some(object_size))",
+    "fetch_browser_complete_file",
+    "BROWSER_ARTIFACT_PART_CACHE_NAME",
+    "browser_part_cache_key",
+    "fetch_transport_part_complete_attempt",
+    "fetch_and_cache_transport_part",
+    "browser_complete_file_transport_required",
+    "fetch_direct_complete_file_attempt",
+    "fetch_and_cache_direct_complete_file",
+    "read_browser_response_body_bounded",
+    "read_browser_complete_response_body_bounded",
+    "validate_browser_content_length",
+    "validate_browser_content_length_if_exposed",
+    "validate_browser_content_encoding",
+    "RequestCache::NoStore",
+    "actual.is_some_and",
+    '!actual.eq_ignore_ascii_case("identity")',
+    "response.blob()",
+    "let blob_size = blob.size();",
+    "blob.array_buffer()",
+    "Uint8Array::new(&buffer)",
+    "validate_browser_response_size",
+    "transport_object_for_file",
+    "fetch_verified_transport_part_bytes",
+    "verify_browser_transport_part_bytes",
+    "verify_browser_transport_reconstruction",
+    "protect_verified_transport_part(part)",
+    "ARTIFACT_TRANSPORT_TARGET_PART_BYTES.min(ARTIFACT_TRANSPORT_MAX_PART_BYTES)",
+    "BrowserTransportObjectMissing",
+  ]) {
+    if (!artifactStreamSource.includes(required)) {
+      failures.push(`src/artifact_stream.rs omits ${required}`);
+    }
+  }
+  if (artifactStreamSource.includes("response.array_buffer()")) {
+    failures.push(
+      "src/artifact_stream.rs copies a network Response through unbounded array_buffer()",
+    );
+  }
+  if (artifactStreamSource.includes("probe_browser_file_size")) {
+    failures.push(
+      "src/artifact_stream.rs still performs a serial one-byte range probe before bounded compact-file fetches",
+    );
+  }
+  const boundedBodyStart = artifactStreamSource.indexOf(
+    "async fn read_browser_response_body_bounded(",
+  );
+  const boundedBodyEnd = artifactStreamSource.indexOf("\n#[cfg(", boundedBodyStart);
+  const boundedBodySource = artifactStreamSource.slice(boundedBodyStart, boundedBodyEnd);
+  const contentLengthGate = boundedBodySource.indexOf("validate_browser_content_length(");
+  const encodingGate = boundedBodySource.indexOf("validate_browser_content_encoding(");
+  const responseBlob = boundedBodySource.indexOf("response.blob()");
+  const blobSizeGate = boundedBodySource.indexOf("blob.size()");
+  const blobCopy = boundedBodySource.indexOf("blob.array_buffer()");
+  const typedArrayLengthGate = boundedBodySource.indexOf(
+    "validate_browser_response_size(expected_bytes, u64::from(bytes.length()))",
+  );
+  if (
+    boundedBodyStart < 0 ||
+    boundedBodyEnd < 0 ||
+    !(
+      contentLengthGate >= 0 &&
+      contentLengthGate < encodingGate &&
+      encodingGate < responseBlob &&
+      responseBlob < blobSizeGate &&
+      blobSizeGate < blobCopy &&
+      blobCopy < typedArrayLengthGate
+    )
+  ) {
+    failures.push(
+      "src/artifact_stream.rs must validate exact identity framing, gate browser Blob size before its bounded Wasm copy, and recheck the typed-array length",
+    );
+  }
+  if (
+    boundedBodySource.includes("ReadableStreamDefaultReader") ||
+    boundedBodySource.includes("response.body()") ||
+    boundedBodySource.includes("reader.read()")
+  ) {
+    failures.push(
+      "src/artifact_stream.rs uses the abort-prone manual ReadableStream path for bounded 206 responses",
+    );
+  }
+  const contentLengthValidatorStart = artifactStreamSource.indexOf(
+    "fn validate_browser_content_length(",
+  );
+  const contentLengthValidatorEnd = artifactStreamSource.indexOf(
+    "\n#[cfg(",
+    contentLengthValidatorStart,
+  );
+  const contentLengthValidatorSource = artifactStreamSource.slice(
+    contentLengthValidatorStart,
+    contentLengthValidatorEnd,
+  );
+  for (const required of [
+    "actual.is_some_and",
+    "parsed == expected",
+    "parsed.to_string() == actual",
+  ]) {
+    if (!contentLengthValidatorSource.includes(required)) {
+      failures.push(
+        `src/artifact_stream.rs Content-Length validator does not require exact canonical framing: missing ${required}`,
+      );
+    }
+  }
+  const boundedRangeResponseReadCount = artifactStreamSource.split(
+    "read_browser_response_body_bounded(&response,",
+  ).length - 1;
+  const boundedCompleteResponseReadCount = artifactStreamSource.split(
+    "read_browser_complete_response_body_bounded(&response,",
+  ).length - 1;
+  if (boundedRangeResponseReadCount < 1 || boundedCompleteResponseReadCount < 1) {
+    failures.push(
+      `src/artifact_stream.rs has ${boundedRangeResponseReadCount} bounded range reads and ${boundedCompleteResponseReadCount} bounded complete-object reads; expected both transport paths`,
+    );
   }
   const packedPreDmdCleanupPrimitives = [
     "instruction.into_data_async()",
@@ -650,6 +822,13 @@ async function validateCommittedSources() {
     "page_modules",
     "outputJobIdMatchesNumericRunId",
     "resolveTurboSecondRequestRunReadyUiContract",
+    'message.method === "Network.requestWillBeSent"',
+    "captureCdpNetworkRequestContext(message.params, previous)",
+    'message.method === "Network.loadingFailed"',
+    "cdpNetworkLoadingFailedDiagnostic(",
+    "diagnostic.proven_benign_favicon",
+    "networkFailures.push(diagnostic)",
+    "ignoredBenignNetworkFailures.push(diagnostic)",
   ]) {
     if (!renderedHarnessSource.includes(required)) {
       failures.push(`rendered harness omits ${required}`);
@@ -722,6 +901,10 @@ async function validateCommittedSources() {
     "TURBO_SECOND_REQUEST_RUN_READY_POLICY",
     "resolveTurboSecondRequestRunReadyUiContract",
     "fallback_exact_last_pre_boundary_ready",
+    "captureCdpNetworkRequestContext",
+    "cdpNetworkLoadingFailedDiagnostic",
+    "isProvenBenignFaviconFailure",
+    "validateCdpNetworkFailureEvidence",
   ]) {
     if (!renderedContractSource.includes(required)) {
       failures.push(`rendered contract omits ${required}`);
@@ -740,10 +923,13 @@ async function validateCommittedSources() {
     display_source_sha256: sha256(displaySourceBytes),
     boogu_frontend_source_sha256: sha256(booguSourceBytes),
     browser_runtime_source_sha256: sha256(browserBooguSourceBytes),
+    artifact_stream_source_sha256: sha256(artifactStreamSourceBytes),
     vae_decoder_source_sha256: sha256(vaeDecoderSourceBytes),
     rendered_harness_source_sha256: sha256(renderedHarnessSourceBytes),
     rendered_contract_source_sha256: sha256(renderedContractSourceBytes),
     model_selector_source_sha256: sha256(modelSelectorSourceBytes),
+    app_icon_bytes: appIconBytes.length,
+    app_icon_sha256: sha256(appIconBytes),
     validated: true,
   };
 }
@@ -755,6 +941,7 @@ function contentType(pathname) {
   }
   if (pathname.endsWith(".json")) return "application/json";
   if (pathname.endsWith(".wasm")) return "application/wasm";
+  if (pathname.endsWith(".png")) return "image/png";
   return "application/octet-stream";
 }
 
@@ -774,6 +961,7 @@ async function createAppServer(indexBytes, wwwOutDir, artifactRoot = undefined) 
   const generated = new Map([
     ["/out/bevy_burn_image.js", join(wwwOutDir, "bevy_burn_image.js")],
     ["/out/bevy_burn_image_bg.wasm", join(wwwOutDir, "bevy_burn_image_bg.wasm")],
+    ["/out/burn-image-icon.png", join(wwwOutDir, "burn-image-icon.png")],
   ]);
   const pageModules = new Map([["/model_selector.mjs", modelSelectorSourcePath]]);
   const outRoot = await realpath(wwwOutDir);
@@ -803,7 +991,6 @@ async function createAppServer(indexBytes, wwwOutDir, artifactRoot = undefined) 
     }
     pageModuleMetadata.set(route, { path: canonical, bytes: metadata.size });
   }
-
   let canonicalArtifactRoot;
   if (artifactRoot) {
     canonicalArtifactRoot = await realpath(artifactRoot);
@@ -943,7 +1130,8 @@ async function createAppServer(indexBytes, wwwOutDir, artifactRoot = undefined) 
       })();
       return;
     }
-    const file = generatedMetadata.get(url.pathname) ?? pageModuleMetadata.get(url.pathname);
+    const file =
+      generatedMetadata.get(url.pathname) ?? pageModuleMetadata.get(url.pathname);
     if (request.method === "OPTIONS") {
       response.writeHead(405, { Allow: "GET, HEAD" });
       response.end();
@@ -1032,6 +1220,29 @@ async function validateServedApp(baseUrl, sourceEvidence, testedPackageIdentity)
       "served model_selector.mjs MIME, bytes, or SHA-256 differ from the exact tested package identity",
     );
   }
+  const appIconResponse = await fetch(`${baseUrl}/out/burn-image-icon.png`, {
+    cache: "no-store",
+  });
+  const appIconBytes = Buffer.from(await appIconResponse.arrayBuffer());
+  const appIconIdentity = testedPackageIdentity.generated_package.app_icon;
+  const appIconDeclaredBytes = Number(appIconResponse.headers.get("content-length"));
+  const appIconContentType = appIconResponse.headers.get("content-type");
+  if (
+    !appIconResponse.ok ||
+    appIconContentType !== "image/png" ||
+    appIconDeclaredBytes !== appIconIdentity.bytes ||
+    appIconBytes.length !== appIconIdentity.bytes ||
+    sha256(appIconBytes) !== appIconIdentity.sha256
+  ) {
+    throw new Error(
+      "served burn-image-icon.png MIME, bytes, or SHA-256 differ from the exact tested package identity",
+    );
+  }
+  generated["burn-image-icon.png"] = {
+    bytes: appIconBytes.length,
+    sha256: sha256(appIconBytes),
+    content_type: appIconContentType,
+  };
   return {
     exact_committed_index_sha256: sourceEvidence.committed_index_sha256,
     exact_committed_index_bytes: servedIndex.length,
@@ -1049,8 +1260,12 @@ async function validateServedApp(baseUrl, sourceEvidence, testedPackageIdentity)
 
 async function validateModelArtifactTransport(baseUrl, artifactRoot) {
   const bundles = [];
-  let totalFiles = 0;
-  let totalDeclaredBytes = 0;
+  const transportTelemetryByPath = new Map();
+  let totalLogicalFiles = 0;
+  let totalLogicalBytes = 0;
+  let totalPhysicalParts = 0;
+  let totalPhysicalPartBytes = 0;
+  let maximumPhysicalPartBytes = 0;
   for (const bundle of MODEL_BUNDLES) {
     const localRoot = join(artifactRoot, bundle);
     const localManifestBytes = await readFile(join(localRoot, "manifest.json"));
@@ -1076,6 +1291,10 @@ async function validateModelArtifactTransport(baseUrl, artifactRoot) {
     } else if ((manifest.dependencies ?? []).length !== 0) {
       throw new Error(`modular leaf ${bundle} must not declare dependencies`);
     }
+    const localTransport = await validateArtifactBundleTransport({
+      bundleRoot: localRoot,
+      manifest,
+    });
 
     const manifestUrl = `${baseUrl}/model/${bundle}/manifest.json`;
     const response = await fetch(manifestUrl, { cache: "no-store" });
@@ -1098,7 +1317,7 @@ async function validateModelArtifactTransport(baseUrl, artifactRoot) {
       throw new Error(`served ${bundle} does not provide the required Range/CORS preflight`);
     }
 
-    for (const file of manifest.files) {
+    for (const file of manifest.files.filter((entry) => entry.role !== "weights")) {
       const localPath = join(localRoot, file.path);
       const metadata = await stat(localPath);
       if (!metadata.isFile() || metadata.size !== file.size) {
@@ -1118,11 +1337,17 @@ async function validateModelArtifactTransport(baseUrl, artifactRoot) {
       ) {
         throw new Error(`served modular HEAD contract failed for ${bundle}/${file.path}`);
       }
-      totalFiles += 1;
-      totalDeclaredBytes += file.size;
     }
 
-    for (const file of [manifest.files[0], manifest.files.at(-1)]) {
+    const representativePart = transportTelemetryFiles(localTransport)[0];
+    if (!representativePart) {
+      throw new Error(`${bundle} has no physical transport part to probe`);
+    }
+    const servedProbes = [
+      manifest.files.find((file) => file.path === ARTIFACT_TRANSPORT_LAYOUT_PATH),
+      representativePart,
+    ];
+    for (const file of servedProbes) {
       const end = Math.min(7, file.size - 1);
       const range = await fetch(`${baseUrl}/model/${bundle}/${file.path}`, {
         headers: {
@@ -1148,18 +1373,45 @@ async function validateModelArtifactTransport(baseUrl, artifactRoot) {
     bundles.push({
       bundle,
       content_digest: manifest.content_digest,
-      files: manifest.files.length,
-      declared_bytes: manifest.files.reduce((sum, file) => sum + file.size, 0),
+      logical_artifacts: localTransport.logical,
+      direct_artifacts: localTransport.direct,
+      physical_transport: localTransport.transport,
+      transport_sidecar: localTransport.sidecar,
       manifest_sha256: sha256(localManifestBytes),
     });
+    for (const entry of transportTelemetryFiles(localTransport)) {
+      transportTelemetryByPath.set(`/model/${bundle}/${entry.path}`, {
+        bundle,
+        component: entry.component,
+        components: entry.components,
+        logical_paths: entry.logical_paths,
+        shared_physical_part: entry.shared_physical_part,
+      });
+    }
+    totalLogicalFiles += localTransport.logical.file_count;
+    totalLogicalBytes += localTransport.logical.bytes;
+    totalPhysicalParts += localTransport.transport.unique_part_count;
+    totalPhysicalPartBytes += localTransport.transport.unique_part_bytes;
+    maximumPhysicalPartBytes = Math.max(
+      maximumPhysicalPartBytes,
+      localTransport.transport.max_part_bytes,
+    );
   }
-  return {
-    policy: "exact-local-modular-parent-plus-qwen-vae-siblings-range-cors",
+  const evidence = {
+    policy: "exact-local-modular-part-only-parent-plus-qwen-vae-siblings-range-cors",
     bundles,
-    total_files: totalFiles,
-    total_declared_bytes: totalDeclaredBytes,
+    total_logical_artifact_files: totalLogicalFiles,
+    total_logical_artifact_bytes: totalLogicalBytes,
+    total_physical_transport_parts: totalPhysicalParts,
+    total_physical_transport_part_bytes: totalPhysicalPartBytes,
+    maximum_physical_transport_part_bytes: maximumPhysicalPartBytes,
     validated: true,
   };
+  Object.defineProperty(evidence, "transportTelemetryByPath", {
+    value: transportTelemetryByPath,
+    enumerable: false,
+  });
+  return evidence;
 }
 
 async function executable(path) {
@@ -2141,6 +2393,9 @@ async function openCdp(url) {
   const pending = new Map();
   const pageErrors = [];
   const gpuErrors = [];
+  const networkFailures = [];
+  const ignoredBenignNetworkFailures = [];
+  const networkRequestContexts = new Map();
   const events = [];
   const record = (kind, message) => {
     const rendered = String(message ?? "unknown browser error");
@@ -2165,7 +2420,20 @@ async function openCdp(url) {
       return;
     }
     events.push({ at_ms: Date.now(), method: message.method, params: message.params });
-    if (message.method === "Runtime.exceptionThrown") {
+    if (message.method === "Network.requestWillBeSent") {
+      const requestId = message.params?.requestId;
+      if (typeof requestId !== "string" || requestId.length === 0) {
+        record("page", "CDP Network.requestWillBeSent omitted requestId");
+      } else {
+        const previous = networkRequestContexts.get(requestId) ?? null;
+        networkRequestContexts.set(
+          requestId,
+          captureCdpNetworkRequestContext(message.params, previous),
+        );
+      }
+    } else if (message.method === "Network.loadingFinished") {
+      networkRequestContexts.delete(message.params?.requestId);
+    } else if (message.method === "Runtime.exceptionThrown") {
       const details = message.params?.exceptionDetails;
       record("page", details?.exception?.description ?? details?.text ?? "uncaught exception");
     } else if (message.method === "Runtime.consoleAPICalled") {
@@ -2178,7 +2446,19 @@ async function openCdp(url) {
       if (entry?.level === "error") record("page", entry.text);
       if (gpuTerminalDiagnostic(entry?.text)) record("gpu", entry.text);
     } else if (message.method === "Network.loadingFailed") {
-      record("page", `network request failed: ${message.params?.errorText}`);
+      const requestId = message.params?.requestId;
+      const requestContext = networkRequestContexts.get(requestId) ?? null;
+      const diagnostic = cdpNetworkLoadingFailedDiagnostic(
+        message.params,
+        requestContext,
+      );
+      networkRequestContexts.delete(requestId);
+      if (diagnostic.proven_benign_favicon) {
+        ignoredBenignNetworkFailures.push(diagnostic);
+      } else {
+        networkFailures.push(diagnostic);
+        record("page", `network request failed: ${JSON.stringify(diagnostic)}`);
+      }
     } else if (message.method === "Network.responseReceived") {
       const response = message.params?.response;
       if (response?.status >= 400 && !response?.url?.endsWith("/favicon.ico")) {
@@ -2217,6 +2497,8 @@ async function openCdp(url) {
     call,
     pageErrors,
     gpuErrors,
+    networkFailures,
+    ignoredBenignNetworkFailures,
     events,
     get socketError() {
       return socketError;
@@ -3628,6 +3910,7 @@ async function main() {
         cdp.events,
         firstEndSnapshot,
         modelBaseUrls,
+        modelTransport.transportTelemetryByPath,
       );
       const firstRequestSnapshot = {
         ...firstEndSnapshot,
@@ -3640,11 +3923,13 @@ async function main() {
         cdp.events,
         firstRequestSnapshot,
         modelBaseUrls,
+        modelTransport.transportTelemetryByPath,
       );
       const firstCdpDmdNetworkTraffic = summarizeTurboDmdCdpNetwork(
         cdp.events,
         firstRequestSnapshot,
         modelBaseUrls,
+        modelTransport.transportTelemetryByPath,
       );
       firstRequestDraft = {
         request_ordinal: 1,
@@ -3970,11 +4255,13 @@ async function main() {
             cdp.events,
             secondRequestSnapshot,
             modelBaseUrls,
+            modelTransport.transportTelemetryByPath,
           ),
           cdp_dmd_network_traffic: summarizeTurboDmdCdpNetwork(
             cdp.events,
             secondRequestSnapshot,
             modelBaseUrls,
+            modelTransport.transportTelemetryByPath,
           ),
           dmd_runtime_io_attestation: {
             policy: TURBO_DMD_RUNTIME_ZERO_IO_POLICY,
@@ -4175,6 +4462,8 @@ async function main() {
       stable_surface_ms: readySurface.stable_ms,
       page_errors: [...cdp.pageErrors],
       gpu_errors: [...cdp.gpuErrors],
+      network_failures: [...cdp.networkFailures],
+      ignored_benign_network_failures: [...cdp.ignoredBenignNetworkFailures],
       chrome_stderr: browser.child.capturedStderr,
       screenshot_path: screenshot.path,
       screenshot_bytes: screenshot.bytes,
@@ -4351,6 +4640,7 @@ async function main() {
                     cdp?.events ?? [],
                     failureSnapshot,
                     modelBaseUrls ?? [],
+                    modelTransport?.transportTelemetryByPath,
                   );
                 } catch {
                   return null;
@@ -4366,6 +4656,7 @@ async function main() {
                     cdp?.events ?? [],
                     failureSnapshot,
                     modelBaseUrls ?? [],
+                    modelTransport?.transportTelemetryByPath,
                   );
                 } catch {
                   return null;
@@ -4396,6 +4687,8 @@ async function main() {
       native_gpu_attestation: gpuAttestation ?? null,
       page_errors: cdp?.pageErrors ?? [],
       gpu_errors: cdp?.gpuErrors ?? [],
+      network_failures: cdp?.networkFailures ?? [],
+      ignored_benign_network_failures: cdp?.ignoredBenignNetworkFailures ?? [],
       screenshot: screenshot ?? null,
       error: failure.stack ?? failure.message,
       elapsed_ms: Date.now() - startedAt,

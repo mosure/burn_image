@@ -27,6 +27,8 @@ mod browser_turbo_first_dmd_fixture;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub mod native_artifact_cache;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
+pub mod native_automation;
+#[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub mod native_boogu;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub mod native_output_qualification;
@@ -57,6 +59,8 @@ pub use browser_boogu::*;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub use native_artifact_cache::*;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
+pub use native_automation::*;
+#[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub use native_boogu::*;
 #[cfg(all(feature = "boogu-native", not(target_arch = "wasm32")))]
 pub use native_output_qualification::*;
@@ -65,6 +69,10 @@ use bevy::prelude::*;
 
 /// Human-readable application name used by native and browser shells.
 pub const APP_NAME: &str = "burn image";
+
+/// Internal stage prefix used to carry native model-switch setup detail through the existing
+/// model-neutral progress channel without presenting the encoded stage name to users.
+pub(crate) const MODEL_SWITCH_PROGRESS_STAGE_PREFIX: &str = "model-switch-progress:";
 
 /// Preferred user-facing selector for the parity-qualified mixed-F16 storage profile.
 #[cfg(feature = "boogu")]
@@ -1007,21 +1015,117 @@ mod web_shell_tests {
             "transferredBytes",
             "Reload runtime",
             "id=\"burn-image-reference-input\"",
+            ".JPG",
+            "HEIC/HEIF decoding is not available in this build",
             "id=\"model-release\"",
             "id=\"model-release-note\"",
             "configureModelReleaseSelector",
             "./model_selector.mjs",
+            "rel=\"icon\"",
+            "./out/burn-image-icon.png",
             "loadReferenceFile",
             "MAX_REFERENCE_BYTES",
             "failRun",
         ] {
             assert!(html.contains(required), "web shell omits {required}");
         }
-        assert!(html.contains("loaded into WebGPU according"));
+        assert!(
+            html.contains("Verified CDN parts are cached and applied to WebGPU stage by stage")
+        );
         assert!(html.contains("case \"low_vram_resource_plan\""));
         assert!(html.contains("case \"artifact_traffic\""));
         assert!(html.contains("persistent-cache hits"));
         assert!(html.contains("conservative WebGPU plan (not measured)"));
+        for aggregate_progress_contract in [
+            "detail.transfer",
+            "request_activity",
+            "Applying verified cached model stages",
+            "logical_objects_completed",
+            "physical_parts_completed",
+            "requestActivity.bounded_ranges_processed",
+            "physical_parts_total",
+            "panel.hidden = true",
+            "burn-image-backend",
+            "handleBackendEvent",
+            "overlayHandoffBlocked",
+            "backendReady",
+            "surfaceInferenceSuspended",
+            "hideLoaderPanelIfSafe",
+            "Rendered Bevy surface paused for exclusive model work",
+            "blockOverlayHandoff();",
+        ] {
+            assert!(
+                html.contains(aggregate_progress_contract),
+                "web shell omits aggregate progress behavior {aggregate_progress_contract}"
+            );
+        }
+        assert!(
+            !html.contains("shard ${"),
+            "web shell must not present stage-local semantic file counts as transfer shards"
+        );
+        assert!(
+            !html.contains("requestAnimationFrame(() => requestAnimationFrame(resolve))"),
+            "web shell must not hide the bootstrap overlay on an arbitrary frame delay"
+        );
+        assert_eq!(
+            html.matches("panel.hidden = true").count(),
+            1,
+            "one guarded helper must own every overlay handoff to Bevy"
+        );
+        let backend_listener = html
+            .find("window.addEventListener(\"burn-image-backend\", handleBackendEvent)")
+            .expect("web shell omits backend event listener");
+        let wasm_init = html
+            .find("await init()")
+            .expect("web shell omits Wasm init");
+        assert!(
+            backend_listener < wasm_init,
+            "backend listener must be installed before Wasm can dispatch readiness"
+        );
+        let suspended = html
+            .find("case \"surface_inference_suspended\"")
+            .expect("web shell omits surface suspension handling");
+        let resumed = html
+            .find("case \"surface_inference_resumed\"")
+            .expect("web shell omits surface resume handling");
+        assert!(
+            html[suspended..resumed].contains("revealLoaderPanel();"),
+            "surface suspension must reveal the DOM fallback while Bevy cannot render"
+        );
+        let resumed_case = &html[resumed..];
+        assert!(
+            resumed_case.contains("hideLoaderPanelIfSafe();"),
+            "surface resume must return progress ownership to Bevy"
+        );
+        let reference_error = html
+            .split("const showReferenceError")
+            .nth(1)
+            .and_then(|section| section.split("const supportedReferenceFile").next())
+            .expect("web shell omits bounded reference error handling");
+        assert!(reference_error.contains("revealLoaderPanel();"));
+        assert!(
+            !reference_error.contains("blockOverlayHandoff();"),
+            "a corrected reference selection must be able to hand progress back to Bevy"
+        );
+    }
+
+    #[test]
+    fn canonical_turbo_transfer_plan_uses_only_executable_artifacts_correctness() {
+        let source = include_str!("browser_boogu.rs");
+        for required in [
+            "BROWSER_TURBO_ACTIVE_LOGICAL_OBJECTS: u32 = 186",
+            "BROWSER_TURBO_ACTIVE_UNIQUE_TRANSPORT_PARTS: u32 = 1_751",
+            "BROWSER_TURBO_ACTIVE_TRANSPORT_BYTES: u64 = 35_106_151_424",
+            "active_manifest_weight_artifacts",
+            "browser_resident_artifact_required",
+            "retain_transfer_logical_objects",
+            "validate_browser_turbo_active_transfer_plan",
+        ] {
+            assert!(
+                source.contains(required),
+                "canonical Turbo active transfer contract omits {required}"
+            );
+        }
     }
 
     #[test]

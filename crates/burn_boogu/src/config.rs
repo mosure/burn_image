@@ -34,6 +34,8 @@ pub enum BooguTask {
 /// Autotune contract attached to a parity- and performance-qualified native policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeAutotunePolicy {
+    /// Shape-bucketed CubeCL tuning for interactive latency and cache reuse across nearby shapes.
+    Balanced,
     /// Exhaustive CubeCL candidate search configured before WGPU device creation.
     Full,
 }

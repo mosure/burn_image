@@ -54,9 +54,17 @@ import {
   denoiserResidencyPolicyForMode,
   selectBrowser1k5ChromeSharedMemoryPolicy,
   validateBrowser1k5LowVramResourcePlan,
+  validateBrowser1k5TransportValidation,
   validateDenoiserResidencyPolicy,
 } from "./wasm_browser_1k5_contract.mjs";
 import { attestCalibratedBrowserWebGpuScope } from "./wasm_browser_1k5_scope.mjs";
+import {
+  ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES,
+  ARTIFACT_TRANSPORT_LAYOUT_PATH,
+  ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+  transportTelemetryFiles,
+  validateArtifactBundleTransport,
+} from "./artifact_transport_contract.mjs";
 
 const ENABLE_ENV = "BURN_IMAGE_BROWSER_1K5_PARITY";
 const VAE_REFERENCE_ENV = "BURN_IMAGE_BROWSER_1K5_VAE_REFERENCE";
@@ -119,7 +127,7 @@ const CANONICAL_MODEL_REVISION = "60981c49e48cffadf2c169532a4ba3f6108afd5e";
 const CANONICAL_UPSTREAM_SOURCE_REVISION = "25f8f888298224a94e5ec2abafb98abea9031a0d";
 const CANONICAL_PROFILE = "f16-qwen-vision-f32";
 const CANONICAL_ARTIFACT_CONTENT_DIGEST =
-  "4eb95001708becebeab5bb7417b02003e9dbe704775bb49557b681a5b617fd5a";
+  "7d81dacfedc71c50639d303c52f035813a6f4cc0125166bd7c8879c8314dd620";
 // Provenance of the schema-v1 flat closure used for the calibrated VAE envelope. This is not the
 // canonical transport identity; a successful run of this harness requalifies the modular closure.
 const LEGACY_FLAT_QUALIFIED_ARTIFACT_CONTENT_DIGEST =
@@ -465,10 +473,17 @@ function createWorkloadTelemetry(denoiserResidencyPolicy) {
     },
     configureArtifactInventory(bundles) {
       artifactComponentsByPath.clear();
-      for (const { prefix, files } of bundles) {
+      for (const { prefix, bundle, files } of bundles) {
         for (const file of files) {
           if (typeof file?.path !== "string" || typeof file?.component !== "string") continue;
-          artifactComponentsByPath.set(`/${prefix}/${file.path}`, file.component);
+          artifactComponentsByPath.set(`/${prefix}/${file.path}`, {
+            bundle,
+            component: file.component,
+            components: [...(file.components ?? [file.component])].sort(),
+            logical_paths: file.logical_paths ?? [file.logical_path ?? file.path],
+            shared_physical_part: file.shared_physical_part === true,
+            physical_transport_part: file.physical_transport_part === true,
+          });
         }
       }
     },
@@ -498,7 +513,13 @@ function createWorkloadTelemetry(denoiserResidencyPolicy) {
       } catch {
         // requestRoute already records this as invalid.
       }
-      event.artifact_component = artifactComponentsByPath.get(pathname) ?? null;
+      const artifactIdentity = artifactComponentsByPath.get(pathname) ?? null;
+      event.artifact_bundle = artifactIdentity?.bundle ?? null;
+      event.artifact_component = artifactIdentity?.component ?? null;
+      event.artifact_components = artifactIdentity?.components ?? [];
+      event.artifact_logical_paths = artifactIdentity?.logical_paths ?? [];
+      event.shared_physical_part = artifactIdentity?.shared_physical_part ?? false;
+      event.physical_transport_part = artifactIdentity?.physical_transport_part ?? false;
       incrementHttpCounters(totals, event);
       const routeCounters = countersFor(byRoute, route);
       if (routeCounters) incrementHttpCounters(routeCounters, event);
@@ -507,7 +528,7 @@ function createWorkloadTelemetry(denoiserResidencyPolicy) {
         `${event.parity_milestone}|${route}`,
       );
       if (milestoneCounters) incrementHttpCounters(milestoneCounters, event);
-      if (event.artifact_component?.startsWith("boogu-")) {
+      if (event.artifact_components.some((component) => component.startsWith("boogu-"))) {
         const denoiserCounters = countersFor(
           denoiserByParityMilestone,
           event.parity_milestone,
@@ -898,44 +919,23 @@ async function readSafeTensorsLayout(path, expectedSize) {
 }
 
 async function validateArtifactInventory(manifest, artifactDir) {
-  const canonicalRoot = await realpath(artifactDir);
-  const seen = new Set();
-  let totalBytes = 0;
-  let maximumBytes = 0;
-  let weightFiles = 0;
-  for (const entry of manifest.files) {
-    if (
-      typeof entry?.path !== "string" ||
-      entry.path.length === 0 ||
-      isAbsolute(entry.path) ||
-      !Number.isSafeInteger(entry.size) ||
-      entry.size < 0 ||
-      !/^[0-9a-f]{64}$/.test(entry.sha256 ?? "") ||
-      seen.has(entry.path)
-    ) {
-      throw new Error(`canonical manifest has an invalid file entry: ${JSON.stringify(entry)}`);
-    }
-    seen.add(entry.path);
-    const localPath = await realpath(resolve(canonicalRoot, entry.path));
-    if (!isWithinRoot(canonicalRoot, localPath)) {
-      throw new Error(`canonical manifest path escapes the artifact root: ${entry.path}`);
-    }
-    const localMetadata = await stat(localPath);
-    if (!localMetadata.isFile() || localMetadata.size !== entry.size) {
-      throw new Error(
-        `${entry.path} has size ${localMetadata.size}, expected manifest size ${entry.size}`,
-      );
-    }
-    totalBytes += entry.size;
-    maximumBytes = Math.max(maximumBytes, entry.size);
-    if (entry.role === "weights") weightFiles += 1;
-  }
-  if (maximumBytes > CANONICAL_MAX_ARTIFACT_FILE_BYTES) {
+  const validation = await validateArtifactBundleTransport({
+    bundleRoot: artifactDir,
+    manifest,
+  });
+  if (validation.logical.max_file_bytes > CANONICAL_MAX_ARTIFACT_FILE_BYTES) {
     throw new Error(
-      `canonical artifact inventory has ${maximumBytes}-byte object above ${CANONICAL_MAX_ARTIFACT_FILE_BYTES}`,
+      `canonical logical artifact inventory has ${validation.logical.max_file_bytes}-byte object above ${CANONICAL_MAX_ARTIFACT_FILE_BYTES}`,
     );
   }
-  return { files: manifest.files.length, totalBytes, maximumBytes, weightFiles };
+  if (
+    validation.transport.target_part_bytes !== ARTIFACT_TRANSPORT_TARGET_PART_BYTES ||
+    validation.transport.hard_max_part_bytes !== ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES ||
+    validation.transport.max_part_bytes > ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES
+  ) {
+    throw new Error("canonical physical transport does not enforce exact 20 MiB / 25000000-byte bounds");
+  }
+  return validation;
 }
 
 async function validateServer(baseUrl, artifactDir, fixtureDir, workloadTelemetry) {
@@ -944,6 +944,7 @@ async function validateServer(baseUrl, artifactDir, fixtureDir, workloadTelemetr
     ["/harness/wasm_browser_1k5_parity.html", "text/html"],
     ["/app/out/bevy_burn_image.js", "text/javascript"],
     ["/app/out/bevy_burn_image_bg.wasm", "application/wasm"],
+    ["/app/out/burn-image-icon.png", "image/png"],
   ]) {
     const url = `${baseUrl}${route}`;
     const response = await assertResponse(
@@ -1046,25 +1047,64 @@ async function validateServer(baseUrl, artifactDir, fixtureDir, workloadTelemetr
     dependencies.push({ dependency, manifest: child, dir: dependencyDir });
   }
 
-  workloadTelemetry.configureArtifactInventory([
-    { prefix: "artifacts", files: manifest.files },
-    ...dependencies.map(({ dependency, manifest: child }) => ({
-      prefix: dependency.bundle,
-      files: child.files,
-    })),
-  ]);
   const parentInventory = await validateArtifactInventory(manifest, artifactDir);
   const dependencyInventories = await Promise.all(
     dependencies.map(({ manifest: child, dir }) => validateArtifactInventory(child, dir)),
   );
+  const validatedBundles = [
+    {
+      prefix: "artifacts",
+      bundle: manifest.bundle,
+      manifest,
+      dir: artifactDir,
+      validation: parentInventory,
+    },
+    ...dependencies.map(({ dependency, manifest: child, dir }, index) => ({
+      prefix: dependency.bundle,
+      bundle: dependency.bundle,
+      manifest: child,
+      dir,
+      validation: dependencyInventories[index],
+    })),
+  ];
+  workloadTelemetry.configureArtifactInventory(
+    validatedBundles.map(({ prefix, bundle, validation }) => ({
+      prefix,
+      bundle,
+      files: transportTelemetryFiles(validation),
+    })),
+  );
   const artifactInventory = [parentInventory, ...dependencyInventories].reduce(
     (total, inventory) => ({
-      files: total.files + inventory.files,
-      totalBytes: total.totalBytes + inventory.totalBytes,
-      maximumBytes: Math.max(total.maximumBytes, inventory.maximumBytes),
-      weightFiles: total.weightFiles + inventory.weightFiles,
+      files: total.files + inventory.logical.file_count,
+      totalBytes: total.totalBytes + inventory.logical.bytes,
+      maximumBytes: Math.max(total.maximumBytes, inventory.logical.max_file_bytes),
+      weightFiles: total.weightFiles + inventory.logical.weight_file_count,
     }),
     { files: 0, totalBytes: 0, maximumBytes: 0, weightFiles: 0 },
+  );
+  const physicalTransportInventory = [parentInventory, ...dependencyInventories].reduce(
+    (total, inventory) => ({
+      partReferences: total.partReferences + inventory.transport.part_reference_count,
+      uniqueParts: total.uniqueParts + inventory.transport.unique_part_count,
+      reconstructedBytes: total.reconstructedBytes + inventory.transport.reconstructed_bytes,
+      uniquePartBytes: total.uniquePartBytes + inventory.transport.unique_part_bytes,
+      maximumPartBytes: Math.max(
+        total.maximumPartBytes,
+        inventory.transport.max_part_bytes,
+      ),
+      directFiles: total.directFiles + inventory.direct.file_count,
+      directBytes: total.directBytes + inventory.direct.bytes,
+    }),
+    {
+      partReferences: 0,
+      uniqueParts: 0,
+      reconstructedBytes: 0,
+      uniquePartBytes: 0,
+      maximumPartBytes: 0,
+      directFiles: 0,
+      directBytes: 0,
+    },
   );
   if (
     artifactInventory.files !== CANONICAL_ARTIFACT_FILE_COUNT ||
@@ -1073,6 +1113,18 @@ async function validateServer(baseUrl, artifactDir, fixtureDir, workloadTelemetr
   ) {
     throw new Error(
       `canonical modular artifact closure differs from the pinned release: ${JSON.stringify(artifactInventory)}`,
+    );
+  }
+  const logicalWeightBytes = [parentInventory, ...dependencyInventories].reduce(
+    (total, inventory) => total + inventory.logical.weight_bytes,
+    0,
+  );
+  if (
+    physicalTransportInventory.reconstructedBytes !== logicalWeightBytes ||
+    physicalTransportInventory.maximumPartBytes > ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES
+  ) {
+    throw new Error(
+      `physical transport does not exactly cover the logical weight closure: ${JSON.stringify({ logicalWeightBytes, physicalTransportInventory })}`,
     );
   }
   const vaeManifest = dependencies.find(({ dependency }) => dependency.role === "vae");
@@ -1086,24 +1138,12 @@ async function validateServer(baseUrl, artifactDir, fixtureDir, workloadTelemetr
   if (vaeEncoderWeightFiles.length === 0 || !Number.isSafeInteger(vaeEncoderWeightBytes)) {
     throw new Error("canonical artifact manifest has no bounded FLUX VAE encoder stage");
   }
-  for (const { prefix, child, dir } of [
-    { prefix: "artifacts", child: manifest, dir: artifactDir },
-    ...dependencies.map(({ dependency, manifest: child, dir }) => ({
-      prefix: dependency.bundle,
-      child,
-      dir,
-    })),
-  ]) {
-    const rangedArtifact = child.files.find(
-      (entry) =>
-        entry.role === "weights" &&
-        Number.isSafeInteger(entry?.size) &&
-        entry.size >= 8 &&
-        typeof entry.path === "string" &&
-        existsSync(join(dir, entry.path)),
+  for (const { prefix, bundle, dir, validation } of validatedBundles) {
+    const rangedArtifact = transportTelemetryFiles(validation).find(
+      (entry) => Number.isSafeInteger(entry?.size) && entry.size >= 8,
     );
     if (!rangedArtifact) {
-      throw new Error(`${child.bundle} has no range-testable weight object`);
+      throw new Error(`${bundle} has no range-testable physical transport part`);
     }
     await validateRangeResponse(
       `${baseUrl}/${prefix}/${rangedArtifact.path.split("/").map(encodeURIComponent).join("/")}`,
@@ -1194,8 +1234,23 @@ async function validateServer(baseUrl, artifactDir, fixtureDir, workloadTelemetr
     artifact_content_digest: manifest.content_digest ?? null,
     artifact_file_count: artifactInventory.files,
     artifact_weight_file_count: artifactInventory.weightFiles,
+    artifact_weight_bytes: logicalWeightBytes,
     artifact_bytes: artifactInventory.totalBytes,
     artifact_max_file_bytes: artifactInventory.maximumBytes,
+    transport_layout_path: ARTIFACT_TRANSPORT_LAYOUT_PATH,
+    physical_transport_part_reference_count: physicalTransportInventory.partReferences,
+    physical_transport_unique_part_count: physicalTransportInventory.uniqueParts,
+    physical_transport_reconstructed_bytes: physicalTransportInventory.reconstructedBytes,
+    physical_transport_unique_part_bytes: physicalTransportInventory.uniquePartBytes,
+    physical_transport_max_part_bytes: physicalTransportInventory.maximumPartBytes,
+    physical_transport_target_part_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+    physical_transport_hard_max_part_bytes: ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES,
+    direct_artifact_file_count: physicalTransportInventory.directFiles,
+    direct_artifact_bytes: physicalTransportInventory.directBytes,
+    transport_sidecars: validatedBundles.map(({ bundle, validation }) => ({
+      bundle,
+      ...validation.sidecar,
+    })),
     vae_encoder_weight_file_count: vaeEncoderWeightFiles.length,
     vae_encoder_weight_bytes: vaeEncoderWeightBytes,
     vae_encoder_weight_objects: vaeEncoderWeightFiles
@@ -2923,14 +2978,16 @@ function validateVaeReferenceTraffic(requestEvents, workloadTelemetry, transport
       );
     }
     const events = successfulArtifactGets.filter(
-      (event) => event.parity_milestone === phase && event.artifact_component !== null,
+      (event) =>
+        event.parity_milestone === phase &&
+        (event.artifact_components?.length ?? 0) > 0,
     );
     const bytes = events.reduce(
       (total, event) => total + event.response_content_length_bytes,
       0,
     );
     const unexpected = events.filter(
-      (event) => event.artifact_component !== "flux-vae-encoder",
+      (event) => !event.artifact_components.includes("flux-vae-encoder"),
     );
     if (bytes !== transportValidation.vae_encoder_weight_bytes) {
       failures.push(
@@ -2939,18 +2996,18 @@ function validateVaeReferenceTraffic(requestEvents, workloadTelemetry, transport
     }
     if (unexpected.length > 0) {
       failures.push(
-        `VAE repeat ${index} fetched non-encoder components: ${JSON.stringify(Array.from(new Set(unexpected.map((event) => event.artifact_component))))}`,
+        `VAE repeat ${index} fetched physical parts not attributed to the encoder: ${JSON.stringify(unexpected.map((event) => event.artifact_components))}`,
       );
     }
     repeats.push({
       index,
       successful_component_get_requests: events.length,
       response_content_length_bytes: bytes,
-      components: Array.from(new Set(events.map((event) => event.artifact_component))).sort(),
+      components: Array.from(new Set(events.flatMap((event) => event.artifact_components))).sort(),
     });
   }
   const executedWeightEvents = successfulArtifactGets.filter(
-    (event) => event.artifact_component !== null,
+    (event) => (event.artifact_components?.length ?? 0) > 0,
   );
   const outsideRepeats = executedWeightEvents.filter(
     (event) => !/^repeat-[0-2]-start$/.test(event.parity_milestone),
@@ -4063,6 +4120,7 @@ async function main() {
       join(testsDir, harnessFileName),
       join(wwwOutDir, "bevy_burn_image.js"),
       join(wwwOutDir, "bevy_burn_image_bg.wasm"),
+      join(wwwOutDir, "burn-image-icon.png"),
       join(artifactDir, "manifest.json"),
       join(dirname(artifactDir), CANONICAL_QWEN_BUNDLE, "manifest.json"),
       join(dirname(artifactDir), CANONICAL_VAE_BUNDLE, "manifest.json"),
@@ -4104,6 +4162,13 @@ async function main() {
       fixtureDir,
       workloadTelemetry,
     );
+    const transportValidationFailures =
+      validateBrowser1k5TransportValidation(transportValidation);
+    if (transportValidationFailures.length > 0) {
+      throw new Error(
+        `browser 1.5K physical transport contract failed:\n${transportValidationFailures.join("\n")}`,
+      );
+    }
     if (validateOnly) {
       outcome = {
         schema_version: 1,

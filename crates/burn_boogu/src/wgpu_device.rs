@@ -1,6 +1,28 @@
 //! Native hardware-adapter selection for standalone WGPU tools.
 
 use crate::BooguError;
+#[cfg(all(feature = "autotune", not(target_arch = "wasm32")))]
+use crate::NativeAutotunePolicy;
+
+/// Configure CubeCL's native autotune policy before any WGPU device is initialized.
+///
+/// Interactive applications should use [`NativeAutotunePolicy::Balanced`], which buckets nearby
+/// tensor shapes so a new prompt or reference does not trigger an exact-shape tuning storm. Full
+/// autotune remains available for synchronized performance qualification and long-running,
+/// fixed-shape throughput workloads.
+#[cfg(all(feature = "autotune", not(target_arch = "wasm32")))]
+pub fn configure_native_autotune(policy: NativeAutotunePolicy) {
+    use burn_cubecl::cubecl::config::{
+        CubeClRuntimeConfig, RuntimeConfig, autotune::AutotuneLevel,
+    };
+
+    let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
+    config.autotune.level = match policy {
+        NativeAutotunePolicy::Balanced => AutotuneLevel::Balanced,
+        NativeAutotunePolicy::Full => AutotuneLevel::Full,
+    };
+    CubeClRuntimeConfig::set(config);
+}
 
 /// Select CubeCL's exhaustive autotune search before any native WGPU device is initialized.
 ///
@@ -8,15 +30,37 @@ use crate::BooguError;
 /// candidate search. Call this once, on the main thread, before Bevy/Burn creates or imports a
 /// WGPU device. CubeCL deliberately rejects configuration changes after its global runtime
 /// configuration has been observed.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "autotune", not(target_arch = "wasm32")))]
 pub fn configure_native_full_autotune() {
+    configure_native_autotune(NativeAutotunePolicy::Full);
+}
+
+/// Require that the process selected the requested CubeCL autotune policy.
+#[cfg(all(feature = "autotune", not(target_arch = "wasm32")))]
+pub fn require_native_autotune_configured(
+    expected: NativeAutotunePolicy,
+) -> Result<(), BooguError> {
     use burn_cubecl::cubecl::config::{
         CubeClRuntimeConfig, RuntimeConfig, autotune::AutotuneLevel,
     };
 
-    let mut config = CubeClRuntimeConfig::from_current_dir().override_from_env();
-    config.autotune.level = AutotuneLevel::Full;
-    CubeClRuntimeConfig::set(config);
+    let config = CubeClRuntimeConfig::get();
+    let matches = matches!(
+        (&expected, &config.autotune.level),
+        (NativeAutotunePolicy::Balanced, AutotuneLevel::Balanced)
+            | (NativeAutotunePolicy::Full, AutotuneLevel::Full)
+    );
+    if matches {
+        Ok(())
+    } else {
+        Err(BooguError::InvalidConfig(format!(
+            "native execution requires CubeCL {} autotune configured before creating a WGPU device",
+            match expected {
+                NativeAutotunePolicy::Balanced => "balanced",
+                NativeAutotunePolicy::Full => "full",
+            }
+        )))
+    }
 }
 
 /// Require that the process selected CubeCL's exhaustive autotune search.
@@ -24,22 +68,15 @@ pub fn configure_native_full_autotune() {
 /// This check intentionally observes the global runtime configuration. Call
 /// [`configure_native_full_autotune`] before any device is created; an embedding that omits that
 /// setup fails closed instead of reporting a calibrated production policy.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "autotune", not(target_arch = "wasm32")))]
 pub fn require_native_full_autotune_configured() -> Result<(), BooguError> {
-    use burn_cubecl::cubecl::config::{
-        CubeClRuntimeConfig, RuntimeConfig, autotune::AutotuneLevel,
-    };
-
-    let config = CubeClRuntimeConfig::get();
-    if matches!(&config.autotune.level, AutotuneLevel::Full) {
-        Ok(())
-    } else {
-        Err(BooguError::InvalidConfig(
+    require_native_autotune_configured(NativeAutotunePolicy::Full).map_err(|_| {
+        BooguError::InvalidConfig(
             "the qualified native high-VRAM mixed-F16 policy requires CubeCL full autotune; call \
              configure_native_full_autotune() before creating a WGPU device"
                 .into(),
-        ))
-    }
+        )
+    })
 }
 
 /// Initialize Burn WGPU on a native hardware adapter and reject CPU/software adapters.

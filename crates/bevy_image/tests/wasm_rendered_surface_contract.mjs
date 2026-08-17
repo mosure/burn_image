@@ -1,3 +1,9 @@
+import {
+  ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES,
+  ARTIFACT_TRANSPORT_LAYOUT_PATH,
+  ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+} from "./artifact_transport_contract.mjs";
+
 export const BACKEND_EVENT_NAME = "burn-image-backend";
 export const RUNTIME_EVENT_NAME = "burn-image-runtime";
 export const PROGRESS_EVENT_NAME = "burn-image-progress";
@@ -10,7 +16,7 @@ export const BROWSER_WEBGPU_ENABLED_FEATURE_BASELINE = Object.freeze([
 ]);
 export const TURBO_MODEL_ID = "Boogu/Boogu-Image-0.1-Turbo";
 export const TURBO_PRODUCTION_CONTENT_DIGEST =
-  "555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36";
+  "32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a";
 export const LOW_VRAM_PUBLIC_SELECTOR =
   "low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser";
 export const LOW_VRAM_BACKEND =
@@ -46,7 +52,7 @@ export const TURBO_RENDERED_SERIALIZED_DIAGNOSTIC_TEST =
 export const TURBO_RENDERED_SERIALIZED_MULTI_REQUEST_DIAGNOSTIC_TEST =
   "burn_image_browser_rendered_turbo_1024_multi_request_qwen_block0_serialized_diagnostic";
 export const TURBO_LOW_VRAM_WEIGHT_TRAFFIC_CONTRACT =
-  "persistent-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage";
+  "persistent-part-cache+legacy-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage";
 export const TURBO_PACKED_F16_CACHED_STAGES = 46;
 export const TURBO_PACKED_F16_CACHED_OBJECTS = 106;
 export const TURBO_PACKED_F16_CACHED_TENSORS = 912;
@@ -85,16 +91,16 @@ export const TURBO_PACKED_F16_PRELOAD_MESSAGE =
 export const TURBO_DENOISER_PRELOAD_TRAFFIC = Object.freeze({
   object_reads: 106,
   object_read_bytes: 19_870_166_528,
-  range_reads: 4_780,
+  range_reads: 1_001,
   range_read_bytes: 19_870_166_528,
   verified_objects: 106,
-  cache_lookups: 4_780,
+  cache_lookups: 1_001,
   cache_hits: 0,
-  cache_misses: 4_780,
+  cache_misses: 1_001,
   cache_read_bytes: 0,
-  network_requests: 4_780,
+  network_requests: 1_001,
   network_response_bytes: 19_870_166_528,
-  cache_writes: 4_780,
+  cache_writes: 1_001,
   cache_write_bytes: 19_870_166_528,
   cache_evictions: 0,
   cache_evicted_entries: 0,
@@ -104,16 +110,16 @@ export const TURBO_DENOISER_PRELOAD_TRAFFIC = Object.freeze({
 export const TURBO_GENERATE_REQUEST_TRAFFIC = Object.freeze({
   object_reads: 80,
   object_read_bytes: 15_235_984_896,
-  range_reads: 3_709,
+  range_reads: 750,
   range_read_bytes: 15_235_984_896,
   verified_objects: 80,
-  cache_lookups: 3_709,
+  cache_lookups: 750,
   cache_hits: 0,
-  cache_misses: 3_709,
+  cache_misses: 750,
   cache_read_bytes: 0,
-  network_requests: 3_709,
+  network_requests: 750,
   network_response_bytes: 15_235_984_896,
-  cache_writes: 3_709,
+  cache_writes: 750,
   cache_write_bytes: 15_235_984_896,
   cache_evictions: 0,
   cache_evicted_entries: 0,
@@ -123,11 +129,11 @@ export const TURBO_GENERATE_REQUEST_TRAFFIC = Object.freeze({
 export const TURBO_REPEAT_GENERATE_REQUEST_TRAFFIC = Object.freeze({
   object_reads: 186,
   object_read_bytes: 35_106_151_424,
-  range_reads: 8_489,
+  range_reads: 1_751,
   range_read_bytes: 35_106_151_424,
   verified_objects: 186,
-  cache_lookups: 8_489,
-  cache_hits: 8_489,
+  cache_lookups: 1_751,
+  cache_hits: 1_751,
   cache_misses: 0,
   cache_read_bytes: 35_106_151_424,
   network_requests: 0,
@@ -142,11 +148,11 @@ export const TURBO_REPEAT_GENERATE_REQUEST_TRAFFIC = Object.freeze({
 export const TURBO_DENOISER_REHYDRATION_TRAFFIC = Object.freeze({
   object_reads: 106,
   object_read_bytes: 19_870_166_528,
-  range_reads: 4_780,
+  range_reads: 1_001,
   range_read_bytes: 19_870_166_528,
   verified_objects: 106,
-  cache_lookups: 4_780,
-  cache_hits: 4_780,
+  cache_lookups: 1_001,
+  cache_hits: 1_001,
   cache_misses: 0,
   cache_read_bytes: 19_870_166_528,
   network_requests: 0,
@@ -792,6 +798,125 @@ function responseHeader(headers, name) {
   return undefined;
 }
 
+function networkRequestPathIdentity(url) {
+  try {
+    const parsed = new URL(url);
+    return {
+      protocol: parsed.protocol,
+      pathname: parsed.pathname,
+      search: parsed.search,
+      hash: parsed.hash,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Bind a CDP requestId to the exact request context needed to diagnose a later loadingFailed. */
+export function captureCdpNetworkRequestContext(params, previous = null) {
+  const request = params?.request;
+  const requestId = typeof params?.requestId === "string" ? params.requestId : null;
+  const url = typeof request?.url === "string" ? request.url : null;
+  const method = typeof request?.method === "string" ? request.method : null;
+  const rangeHeader = responseHeader(request?.headers, "Range") ?? null;
+  const path = url === null ? null : networkRequestPathIdentity(url);
+  return {
+    request_id: requestId,
+    url,
+    method,
+    range_header: rangeHeader,
+    request_type: typeof params?.type === "string" ? params.type : null,
+    document_url: typeof params?.documentURL === "string" ? params.documentURL : null,
+    initiator_type:
+      typeof params?.initiator?.type === "string" ? params.initiator.type : null,
+    redirect_count:
+      previous?.request_id === requestId && Number.isSafeInteger(previous?.redirect_count)
+        ? previous.redirect_count + 1
+        : 0,
+    model_artifact_request: path?.pathname.startsWith("/model/") === true,
+  };
+}
+
+/** Produce a stable, structured failure record from loadingFailed plus its request context. */
+export function cdpNetworkLoadingFailedDiagnostic(params, requestContext = null) {
+  const requestId = typeof params?.requestId === "string" ? params.requestId : null;
+  const contextBound =
+    requestId !== null && requestContext?.request_id === requestId;
+  const diagnostic = {
+    request_id: requestId,
+    context_bound: contextBound,
+    url: contextBound ? requestContext.url : null,
+    method: contextBound ? requestContext.method : null,
+    range_header: contextBound ? requestContext.range_header : null,
+    request_type: contextBound ? requestContext.request_type : null,
+    type: typeof params?.type === "string" ? params.type : null,
+    errorText: typeof params?.errorText === "string" ? params.errorText : null,
+    failure_type: typeof params?.type === "string" ? params.type : null,
+    error_text: typeof params?.errorText === "string" ? params.errorText : null,
+    canceled: params?.canceled === true,
+    blocked_reason:
+      typeof params?.blockedReason === "string" ? params.blockedReason : null,
+    cors_error_status: params?.corsErrorStatus ?? null,
+    model_artifact_request:
+      contextBound && requestContext.model_artifact_request === true,
+    redirect_count:
+      contextBound && Number.isSafeInteger(requestContext.redirect_count)
+        ? requestContext.redirect_count
+        : null,
+  };
+  return {
+    ...diagnostic,
+    proven_benign_favicon: isProvenBenignFaviconFailure(diagnostic),
+  };
+}
+
+/** The only ignored loading failure: an exact canceled GET for the implicit root favicon. */
+export function isProvenBenignFaviconFailure(diagnostic) {
+  const path = networkRequestPathIdentity(diagnostic?.url);
+  return (
+    diagnostic?.context_bound === true &&
+    diagnostic?.model_artifact_request === false &&
+    diagnostic?.method === "GET" &&
+    diagnostic?.range_header === null &&
+    diagnostic?.failure_type === "Other" &&
+    diagnostic?.error_text === "net::ERR_ABORTED" &&
+    diagnostic?.canceled === true &&
+    /^https?:$/.test(path?.protocol ?? "") &&
+    path?.pathname === "/favicon.ico" &&
+    path?.search === "" &&
+    path?.hash === ""
+  );
+}
+
+export function validateCdpNetworkFailureEvidence(failures, ignoredFailures) {
+  const validationFailures = [];
+  if (!Array.isArray(failures)) {
+    validationFailures.push("CDP network_failures is not an array");
+  } else {
+    for (const failure of failures) {
+      if (failure?.proven_benign_favicon === true) {
+        validationFailures.push("a proven benign favicon failure was not separated");
+      } else {
+        validationFailures.push(
+          `CDP network failure: ${JSON.stringify(failure)}`,
+        );
+      }
+    }
+  }
+  if (!Array.isArray(ignoredFailures)) {
+    validationFailures.push("CDP ignored_benign_network_failures is not an array");
+  } else {
+    for (const failure of ignoredFailures) {
+      if (!isProvenBenignFaviconFailure(failure)) {
+        validationFailures.push(
+          `CDP ignored a network failure without exact favicon proof: ${JSON.stringify(failure)}`,
+        );
+      }
+    }
+  }
+  return validationFailures;
+}
+
 function exactModelResponseUrl(url, modelBaseUrls) {
   return modelBaseUrls.some((baseUrl) => url.startsWith(`${baseUrl}/`));
 }
@@ -820,6 +945,7 @@ function summarizeCdpNetworkWindow(
   windowEndEpochMs,
   policy,
   terminalEvent,
+  transportTelemetryByPath,
 ) {
   if (!Array.isArray(events)) throw new Error("CDP events are not an array");
   const exactBaseUrls = exactModelBaseUrls(modelBaseUrls);
@@ -837,13 +963,24 @@ function summarizeCdpNetworkWindow(
     window_end_epoch_ms: windowEndEpochMs,
     terminal_event: terminalEvent,
     model_response_count: 0,
+    http_200_complete_part_response_count: 0,
     http_206_response_count: 0,
+    complete_object_validated_response_count: 0,
     content_range_validated_response_count: 0,
     response_body_bytes: 0,
     unexpected_status_response_count: 0,
     missing_content_length_count: 0,
     invalid_content_range_response_count: 0,
   };
+  const componentTraffic = new Map();
+  if (transportTelemetryByPath instanceof Map) {
+    Object.assign(summary, {
+      physical_transport_response_count: 0,
+      physical_transport_response_bytes: 0,
+      unmapped_physical_transport_response_count: 0,
+      logical_component_traffic: {},
+    });
+  }
   for (const event of events) {
     if (
       event?.method !== "Network.responseReceived" ||
@@ -857,11 +994,21 @@ function summarizeCdpNetworkWindow(
     const url = String(response?.url ?? "");
     if (!exactModelResponseUrl(url, exactBaseUrls)) continue;
     summary.model_response_count += 1;
-    if (response?.status !== 206) {
+    let pathname = "";
+    try {
+      pathname = new URL(url).pathname;
+    } catch {
+      // exactModelResponseUrl already constrained the response to a model base.
+    }
+    const physicalTransportPart =
+      pathname.includes("/transport/") && pathname.endsWith(".part");
+    const expectedStatus = physicalTransportPart ? 200 : 206;
+    if (response?.status !== expectedStatus) {
       summary.unexpected_status_response_count += 1;
       continue;
     }
-    summary.http_206_response_count += 1;
+    if (physicalTransportPart) summary.http_200_complete_part_response_count += 1;
+    else summary.http_206_response_count += 1;
     const contentLengthText = responseHeader(response.headers, "Content-Length");
     const contentLength = Number(contentLengthText);
     if (!/^[1-9][0-9]*$/.test(contentLengthText ?? "") || !positiveInteger(contentLength)) {
@@ -869,6 +1016,36 @@ function summarizeCdpNetworkWindow(
       continue;
     }
     summary.response_body_bytes += contentLength;
+    if (transportTelemetryByPath instanceof Map) {
+      if (physicalTransportPart) {
+        summary.physical_transport_response_count += 1;
+        summary.physical_transport_response_bytes += contentLength;
+        const identity = transportTelemetryByPath.get(pathname);
+        if (!identity) {
+          summary.unmapped_physical_transport_response_count += 1;
+        } else {
+          const components = [...(identity.components ?? [identity.component])].sort();
+          const logicalPaths = [...(identity.logical_paths ?? [])].sort();
+          const key = `${identity.bundle}\u0000${components.join("\u0000")}`;
+          const counters = componentTraffic.get(key) ?? {
+            bundle: identity.bundle,
+            component: identity.component,
+            components,
+            logical_paths: logicalPaths,
+            shared_physical_part: identity.shared_physical_part === true,
+            response_count: 0,
+            response_bytes: 0,
+          };
+          counters.response_count += 1;
+          counters.response_bytes += contentLength;
+          componentTraffic.set(key, counters);
+        }
+      }
+    }
+    if (physicalTransportPart) {
+      summary.complete_object_validated_response_count += 1;
+      continue;
+    }
     const contentRange = responseHeader(response.headers, "Content-Range");
     const match = /^bytes ([0-9]+)-([0-9]+)\/([1-9][0-9]*)$/.exec(contentRange ?? "");
     if (!match) {
@@ -890,10 +1067,26 @@ function summarizeCdpNetworkWindow(
     }
     summary.content_range_validated_response_count += 1;
   }
+  if (transportTelemetryByPath instanceof Map) {
+    summary.logical_component_traffic = Object.fromEntries(
+      [...componentTraffic.values()]
+        .sort(
+          (left, right) =>
+            left.bundle.localeCompare(right.bundle) ||
+            left.component.localeCompare(right.component),
+        )
+        .map((entry) => [`${entry.bundle}/${entry.component}`, entry]),
+    );
+  }
   return summary;
 }
 
-export function summarizeTurboPreloadCdpNetwork(events, snapshot, modelBaseUrls) {
+export function summarizeTurboPreloadCdpNetwork(
+  events,
+  snapshot,
+  modelBaseUrls,
+  transportTelemetryByPath,
+) {
   const timeOrigin = snapshot?.time_origin_epoch_ms;
   if (!positiveFinite(timeOrigin)) throw new Error("browser performance time origin is missing");
   const started = snapshot?.runtime_events?.find(
@@ -917,10 +1110,16 @@ export function summarizeTurboPreloadCdpNetwork(events, snapshot, modelBaseUrls)
     timeOrigin + terminal.at_ms,
     TURBO_CDP_PRELOAD_NETWORK_POLICY,
     terminal.event,
+    transportTelemetryByPath,
   );
 }
 
-export function summarizeTurboRequestCdpNetwork(events, snapshot, modelBaseUrls) {
+export function summarizeTurboRequestCdpNetwork(
+  events,
+  snapshot,
+  modelBaseUrls,
+  transportTelemetryByPath,
+) {
   const timeOrigin = snapshot?.time_origin_epoch_ms;
   if (!positiveFinite(timeOrigin)) throw new Error("browser performance time origin is missing");
   const started = snapshot?.progress_events?.find(
@@ -949,10 +1148,16 @@ export function summarizeTurboRequestCdpNetwork(events, snapshot, modelBaseUrls)
     timeOrigin + terminal.at_ms,
     TURBO_CDP_REQUEST_NETWORK_POLICY,
     terminal.event,
+    transportTelemetryByPath,
   );
 }
 
-export function summarizeTurboDmdCdpNetwork(events, snapshot, modelBaseUrls) {
+export function summarizeTurboDmdCdpNetwork(
+  events,
+  snapshot,
+  modelBaseUrls,
+  transportTelemetryByPath,
+) {
   const timeOrigin = snapshot?.time_origin_epoch_ms;
   if (!positiveFinite(timeOrigin)) throw new Error("browser performance time origin is missing");
   const started = snapshot?.progress_events?.find(
@@ -978,6 +1183,7 @@ export function summarizeTurboDmdCdpNetwork(events, snapshot, modelBaseUrls) {
     timeOrigin + terminal.at_ms,
     TURBO_CDP_DMD_NETWORK_POLICY,
     "stage_completed:dmd",
+    transportTelemetryByPath,
   );
 }
 
@@ -1480,6 +1686,11 @@ export function validateTestedPackageIdentity(identity, servedTransport) {
       "crates/bevy_image/www/model_selector.mjs",
     ],
     [
+      "generated_package.app_icon",
+      identity.generated_package?.app_icon,
+      "burn-image-icon.png",
+    ],
+    [
       "sources.browser_runtime",
       identity.sources?.browser_runtime,
       "crates/bevy_image/src/browser_boogu.rs",
@@ -1493,6 +1704,11 @@ export function validateTestedPackageIdentity(identity, servedTransport) {
       "sources.rendered_contract",
       identity.sources?.rendered_contract,
       "crates/bevy_image/tests/wasm_rendered_surface_contract.mjs",
+    ],
+    [
+      "sources.artifact_transport_contract",
+      identity.sources?.artifact_transport_contract,
+      "crates/bevy_image/tests/artifact_transport_contract.mjs",
     ],
   ];
   for (const [label, entry, expectedRelativePath] of expected) {
@@ -1536,6 +1752,18 @@ export function validateTestedPackageIdentity(identity, servedTransport) {
   ) {
     failures.push(
       "served model_selector.mjs MIME, bytes, or SHA-256 do not match its exact tested identity",
+    );
+  }
+  const localIcon = identity.generated_package?.app_icon;
+  const servedIcon = servedTransport?.generated?.["burn-image-icon.png"];
+  if (
+    !servedIcon ||
+    servedIcon.bytes !== localIcon?.bytes ||
+    servedIcon.sha256 !== localIcon?.sha256 ||
+    servedIcon.content_type !== "image/png"
+  ) {
+    failures.push(
+      "served burn-image-icon.png MIME, bytes, or SHA-256 do not match its exact tested identity",
     );
   }
   return failures;
@@ -1601,6 +1829,10 @@ export function validateRenderedSurfaceEvidence(evidence) {
     ...validateTestedPackageIdentity(
       evidence?.tested_package_identity,
       evidence?.served_transport,
+    ),
+    ...validateCdpNetworkFailureEvidence(
+      evidence?.network_failures,
+      evidence?.ignored_benign_network_failures,
     ),
   ];
 
@@ -2813,7 +3045,9 @@ function validateCdpNetworkAgainstRust(cdp, traffic, policy, terminalEvent, labe
   }
   for (const field of [
     "model_response_count",
+    "http_200_complete_part_response_count",
     "http_206_response_count",
+    "complete_object_validated_response_count",
     "content_range_validated_response_count",
     "response_body_bytes",
     "unexpected_status_response_count",
@@ -2826,10 +3060,13 @@ function validateCdpNetworkAgainstRust(cdp, traffic, policy, terminalEvent, labe
   }
   if (
     cdp.model_response_count !== traffic?.network_requests ||
-    cdp.http_206_response_count !== traffic?.network_requests ||
-    cdp.content_range_validated_response_count !== traffic?.network_requests
+    cdp.http_200_complete_part_response_count + cdp.http_206_response_count !==
+      traffic?.network_requests ||
+    cdp.complete_object_validated_response_count +
+        cdp.content_range_validated_response_count !==
+      traffic?.network_requests
   ) {
-    failures.push(`${label} CDP exact 206 response count does not match Rust network_requests`);
+    failures.push(`${label} CDP exact bounded response count does not match Rust network_requests`);
   }
   if (cdp.response_body_bytes !== traffic?.network_response_bytes) {
     failures.push(`${label} CDP exact Content-Length bytes do not match Rust network_response_bytes`);
@@ -2846,8 +3083,89 @@ function validateCdpNetworkAgainstRust(cdp, traffic, policy, terminalEvent, labe
   return failures;
 }
 
+export function validateRenderedModelTransportEvidence(transport) {
+  const failures = [];
+  if (
+    transport?.policy !==
+    "exact-local-modular-part-only-parent-plus-qwen-vae-siblings-range-cors"
+  ) {
+    failures.push("model transport does not identify the canonical part-only modular policy");
+  }
+  if (!Array.isArray(transport?.bundles) || transport.bundles.length !== 3) {
+    return [...failures, "model transport does not contain exactly three modular bundles"];
+  }
+  const expectedBundles = new Set([
+    "boogu-image-0.1-turbo",
+    "qwen3-vl-8b-base-boogu-image-0.1",
+    "flux1-vae-boogu-image-0.1",
+  ]);
+  let logicalFiles = 0;
+  let logicalBytes = 0;
+  let physicalParts = 0;
+  let physicalBytes = 0;
+  let maximumPhysicalPartBytes = 0;
+  for (const bundle of transport.bundles) {
+    if (!expectedBundles.delete(bundle?.bundle)) {
+      failures.push(`model transport contains unexpected bundle ${report(bundle?.bundle)}`);
+    }
+    if (
+      bundle?.transport_sidecar?.path !== ARTIFACT_TRANSPORT_LAYOUT_PATH ||
+      bundle?.transport_sidecar?.authenticated !== true ||
+      !/^[0-9a-f]{64}$/.test(bundle?.transport_sidecar?.sha256 ?? "")
+    ) {
+      failures.push(`${report(bundle?.bundle)} transport sidecar is not SHA-256 authenticated`);
+    }
+    const logical = bundle?.logical_artifacts;
+    const physical = bundle?.physical_transport;
+    if (
+      !positiveInteger(logical?.file_count) ||
+      !positiveInteger(logical?.weight_file_count) ||
+      !positiveInteger(logical?.bytes) ||
+      !positiveInteger(logical?.weight_bytes)
+    ) {
+      failures.push(`${report(bundle?.bundle)} logical artifact inventory is invalid`);
+    }
+    if (
+      physical?.target_part_bytes !== ARTIFACT_TRANSPORT_TARGET_PART_BYTES ||
+      physical?.hard_max_part_bytes !== ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES ||
+      !positiveInteger(physical?.unique_part_count) ||
+      !positiveInteger(physical?.unique_part_bytes) ||
+      !positiveInteger(physical?.max_part_bytes) ||
+      physical.max_part_bytes > ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES ||
+      physical?.reconstructed_bytes !== logical?.weight_bytes ||
+      physical?.every_part_statted !== true ||
+      physical?.part_sha256_policy !== "verified-by-browser-runtime-before-use"
+    ) {
+      failures.push(`${report(bundle?.bundle)} physical transport inventory is invalid`);
+    }
+    logicalFiles += logical?.file_count ?? 0;
+    logicalBytes += logical?.bytes ?? 0;
+    physicalParts += physical?.unique_part_count ?? 0;
+    physicalBytes += physical?.unique_part_bytes ?? 0;
+    maximumPhysicalPartBytes = Math.max(
+      maximumPhysicalPartBytes,
+      physical?.max_part_bytes ?? 0,
+    );
+  }
+  if (expectedBundles.size !== 0) failures.push("model transport omits a required modular bundle");
+  for (const [field, expected] of [
+    ["total_logical_artifact_files", logicalFiles],
+    ["total_logical_artifact_bytes", logicalBytes],
+    ["total_physical_transport_parts", physicalParts],
+    ["total_physical_transport_part_bytes", physicalBytes],
+    ["maximum_physical_transport_part_bytes", maximumPhysicalPartBytes],
+  ]) {
+    if (transport?.[field] !== expected) {
+      failures.push(`model transport ${field}=${report(transport?.[field])}, expected ${expected}`);
+    }
+  }
+  if (transport?.validated !== true) failures.push("model transport is not validated");
+  return failures;
+}
+
 export function validateTurbo1024ModelEvidence(evidence) {
   const failures = [];
+  failures.push(...validateRenderedModelTransportEvidence(evidence?.modular_artifact_transport));
   failures.push(
     ...validateRenderedRuntimeWebGpuEvidence(
       evidence?.bevy_backend_ready,
@@ -3746,7 +4064,9 @@ function validateZeroDmdCdpNetwork(cdp, label) {
   }
   for (const field of [
     "model_response_count",
+    "http_200_complete_part_response_count",
     "http_206_response_count",
+    "complete_object_validated_response_count",
     "content_range_validated_response_count",
     "response_body_bytes",
     "unexpected_status_response_count",
@@ -4497,6 +4817,12 @@ export function validateTurbo1024MultiRequestEvidence(evidence) {
   }
   if (JSON.stringify(first?.served_transport) !== JSON.stringify(second?.served_transport)) {
     failures.push("per-request served package transport identities differ");
+  }
+  if (
+    JSON.stringify(first?.modular_artifact_transport) !==
+    JSON.stringify(second?.modular_artifact_transport)
+  ) {
+    failures.push("per-request physical model transport identities differ");
   }
   const deterministicQwenDigests = (request) => ({
     host_embedding_host:

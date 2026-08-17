@@ -180,7 +180,7 @@ jobs:
           cargo test -p burn_qwen3_vl --all-features --locked
           cargo test -p burn_flux_vae --all-features --locked
           cargo test -p burn_boogu --all-features --lib --tests --locked
-          cargo test -p burn_boogu --features runtime,import,wgpu,ndarray --bins --locked
+          cargo test -p burn_boogu --features runtime,import,wgpu,ndarray,autotune --bins --locked
           cargo test -p bevy_burn_image --all-features \
             --lib \
             --bin burn-image-viewer \
@@ -197,6 +197,7 @@ jobs:
           cargo check -p bevy_burn_image --no-default-features --lib --locked
           cargo check -p bevy_burn_image --no-default-features --features boogu --lib --locked
           cargo check -p bevy_burn_image --no-default-features --features boogu-native --all-targets --locked
+          cargo check -p bevy_burn_image --no-default-features --features boogu-native,native-autotune --all-targets --locked
 
       - name: Build and inspect publishable crate archives
         shell: bash
@@ -392,6 +393,8 @@ jobs:
       - name: Check browser qualification harness
         run: |
           set -euo pipefail
+          node --check crates/bevy_image/tests/artifact_transport_contract.mjs
+          node --check crates/bevy_image/tests/artifact_transport_contract.test.mjs
           node --check crates/bevy_image/tests/wasm_browser_1k5_parity.mjs
           node --check crates/bevy_image/tests/wasm_browser_1k5_contract.mjs
           node --check crates/bevy_image/tests/wasm_browser_1k5_contract.test.mjs
@@ -405,6 +408,7 @@ jobs:
           node --check crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs
           node --check crates/bevy_image/www/model_selector.mjs
           node --check crates/bevy_image/tests/web_model_selector.test.mjs
+          node --test crates/bevy_image/tests/artifact_transport_contract.test.mjs
           node --test crates/bevy_image/tests/wasm_browser_1k5_contract.test.mjs
           node --test crates/bevy_image/tests/wasm_browser_1k5_scope.test.mjs
           node --test crates/bevy_image/tests/wasm_rendered_surface_contract.test.mjs
@@ -433,15 +437,20 @@ jobs:
             --out-dir "$output_dir" \
             --out-name bevy_burn_image \
             "$wasm_input"
+          install -m 0644 crates/bevy_image/www/burn-image-icon.png \
+            "$output_dir/burn-image-icon.png"
 
           js_output="$output_dir/bevy_burn_image.js"
           wasm_output="$output_dir/bevy_burn_image_bg.wasm"
+          icon_output="$output_dir/burn-image-icon.png"
           test -s "$js_output"
           test -s "$wasm_output"
+          test -s "$icon_output"
+          cmp -s crates/bevy_image/www/burn-image-icon.png "$icon_output"
           grep -Eq '^export function start_boogu_web\(\)' "$js_output"
           grep -Eq '^export function provide_reference_image\(bytes\)' "$js_output"
           grep -Fq 'wasm.__wbindgen_start()' "$js_output"
-          wc -c "$js_output" "$wasm_output"
+          wc -c "$js_output" "$wasm_output" "$icon_output"
 
   model-msrv:
     runs-on: ubuntu-latest

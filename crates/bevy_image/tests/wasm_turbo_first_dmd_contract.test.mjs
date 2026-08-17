@@ -427,6 +427,8 @@ test("source contract pins the release fixture and exactly-one-predict scope", a
         parityFixtureSource: "crates/bevy_image/src/browser_parity_fixture.rs",
         parityWorkflowSource: ".github/workflows/parity.yml",
         harnessSource: "crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs",
+        transportContractSource:
+          "crates/bevy_image/tests/artifact_transport_contract.mjs",
       }).map(async ([name, path]) => [name, await readFile(join(repoRoot, path), "utf8")]),
     ),
   );
@@ -443,6 +445,8 @@ test("source contract rejects unadmitted storage, temp defaults, weak cleanup, a
         parityFixtureSource: "crates/bevy_image/src/browser_parity_fixture.rs",
         parityWorkflowSource: ".github/workflows/parity.yml",
         harnessSource: "crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs",
+        transportContractSource:
+          "crates/bevy_image/tests/artifact_transport_contract.mjs",
       }).map(async ([name, path]) => [name, await readFile(join(repoRoot, path), "utf8")]),
     ),
   );
@@ -513,6 +517,8 @@ test("source contract rejects an extra predict and coupling to the 1.5K reader",
         parityFixtureSource: "crates/bevy_image/src/browser_parity_fixture.rs",
         parityWorkflowSource: ".github/workflows/parity.yml",
         harnessSource: "crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs",
+        transportContractSource:
+          "crates/bevy_image/tests/artifact_transport_contract.mjs",
       }).map(async ([name, path]) => [name, await readFile(join(repoRoot, path), "utf8")]),
     ),
   );
@@ -543,6 +549,8 @@ test("source contract rejects rendered Turbo workflow mode drift", async () => {
         parityFixtureSource: "crates/bevy_image/src/browser_parity_fixture.rs",
         parityWorkflowSource: ".github/workflows/parity.yml",
         harnessSource: "crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs",
+        transportContractSource:
+          "crates/bevy_image/tests/artifact_transport_contract.mjs",
       }).map(async ([name, path]) => [name, await readFile(join(repoRoot, path), "utf8")]),
     ),
   );

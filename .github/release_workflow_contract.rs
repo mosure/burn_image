@@ -87,6 +87,45 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
         );
     }
 
+    for transport_contract in [
+        "readonly transport_part_target_bytes=$((20 * 1024 * 1024))",
+        "readonly max_transport_shard_bytes=25000000",
+        "transport_layout_path='metadata/transport-layout.json'",
+        ".metadata.transport_parts_required == \"true\"",
+        "--transport-layout \"$layout_file\"",
+        ".transport_layout_verified == true",
+        ".transport_payloads_verified == false",
+        "((expected_size <= max_transport_shard_bytes))",
+        "[[ \"$path\" =~ ^transport/[0-9a-f]{64}\\.part$ ]]",
+        "test \"${path#transport/}\" = \"$expected_sha256.part\"",
+    ] {
+        assert!(
+            DEPLOY_WORKFLOW.contains(transport_contract),
+            "browser transport-shard gate is missing: {transport_contract}"
+        );
+    }
+    assert!(!DEPLOY_WORKFLOW.contains("readonly max_payload_bytes=$((256 * 1024 * 1024))"));
+
+    let complete_object_contract = section(
+        DEPLOY_WORKFLOW,
+        "          require_single_exact_header() {",
+        "          verify_manifest_contract() {",
+    );
+    for required in [
+        "require_identity_content_encoding()",
+        "verify_complete_object_contract()",
+        "test \"$status\" = 200",
+        "test \"$downloaded_bytes\" = \"$expected_size\"",
+        "\"$complete_headers\" content-length \"$expected_size\"",
+        "count == 0 || (count == 1 && value == \"identity\")",
+        "! grep -Eqi '^content-range:' \"$complete_headers\"",
+    ] {
+        assert!(
+            complete_object_contract.contains(required),
+            "browser exact complete-object framing gate is missing: {required}"
+        );
+    }
+
     let authentication = section(
         DEPLOY_WORKFLOW,
         "          authenticate_remote_payloads() {",
@@ -95,7 +134,7 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
     for required in [
         "sort -u \"$payload_inventory\"",
         "remote payload URL has conflicting size/SHA-256 contracts",
-        "((expected_size <= max_payload_bytes))",
+        "((expected_size <= max_transport_shard_bytes))",
         "curl --fail --silent --show-error",
         "--speed-time 120",
         "tee \"$payload_file\" | sha256sum",
@@ -146,4 +185,25 @@ fn package_outputs_do_not_pollute_the_native_target_cache_correctness() {
         .find("mv -- \"$package_directory\"")
         .expect("inspected package output relocation must remain present");
     assert!(verified < relocated);
+}
+
+#[test]
+fn every_browser_package_carries_the_exact_app_icon_correctness() {
+    for (name, workflow) in [
+        ("CI", CI_WORKFLOW),
+        ("release parity", PARITY_WORKFLOW),
+        ("Pages deploy", DEPLOY_WORKFLOW),
+    ] {
+        for required in [
+            "install -m 0644 crates/bevy_image/www/burn-image-icon.png",
+            "burn-image-icon.png",
+            "cmp -s crates/bevy_image/www/burn-image-icon.png",
+        ] {
+            assert!(
+                workflow.contains(required),
+                "{name} browser package omits exact app-icon contract: {required}"
+            );
+        }
+    }
+    assert!(DEPLOY_WORKFLOW.contains("./out/burn-image-icon.png"));
 }

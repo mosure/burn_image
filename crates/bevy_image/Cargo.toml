@@ -17,6 +17,8 @@ publish = false
 default = ["app", "gpu-interop", "native-io"]
 app = [
   "dep:bevy_pancam",
+  "dep:rand",
+  "dep:winit",
   "bevy/async_executor",
   "bevy/bevy_camera",
   "bevy/bevy_core_pipeline",
@@ -58,6 +60,13 @@ boogu-native = [
   "dep:clap",
   "dep:serde_json",
   "dep:ureq",
+]
+# Optional CubeCL candidate tuning for long-running or qualification workloads. The interactive
+# default deliberately uses static kernels so first-use latency is predictable.
+native-autotune = [
+  "boogu-native",
+  "burn_boogu/autotune",
+  "burn-wgpu/autotune",
 ]
 # Concrete browser-local runtime over bounded HTTP Range readers and asynchronous semantic
 # Qwen/VAE/denoiser sources. Production defaults to the bounded low-VRAM policy; explicit resident
@@ -134,6 +143,7 @@ web-sys = { workspace = true, features = [
   "Location",
   "Node",
   "Request",
+  "RequestCache",
   "RequestInit",
   "Response",
   "ResponseInit",
@@ -141,6 +151,9 @@ web-sys = { workspace = true, features = [
   "UrlSearchParams",
   "Window",
 ] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+winit = { version = "=0.30.13", default-features = false, optional = true }
 
 [lib]
 crate-type = ["rlib", "cdylib"]

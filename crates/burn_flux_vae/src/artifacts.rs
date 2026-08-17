@@ -27,7 +27,7 @@ use thiserror::Error;
 
 use crate::{AutoencoderKl, AutoencoderKlConfig, TensorInventory, TensorSpec};
 
-const FLUX_VAE_METADATA_VALUES: [(&str, &str); 9] = [
+const FLUX_VAE_METADATA_VALUES: [(&str, &str); 17] = [
     ("component_bundle", "true"),
     ("component_kind", "flux1-vae"),
     ("artifact_layout", "semantic-burnpack-v1"),
@@ -37,12 +37,21 @@ const FLUX_VAE_METADATA_VALUES: [(&str, &str); 9] = [
     ("stored_tensor_count", "244"),
     ("tensor_inventory_entries", "244"),
     ("omitted_tensor_count", "0"),
+    ("physical_shards_bounded", "true"),
+    ("target_max_shard_bytes", "268435456"),
+    ("transport_layout_path", "metadata/transport-layout.json"),
+    ("transport_layout_schema", "1"),
+    ("transport_parts_required", "true"),
+    ("transport_part_target_bytes", "20971520"),
+    ("target_max_transport_shard_bytes", "25000000"),
+    ("semantic_object_max_bytes", "268435456"),
 ];
 
-const FLUX_VAE_METADATA_PATHS: [&str; 3] = [
+const FLUX_VAE_METADATA_PATHS: [&str; 4] = [
     "metadata/tensor-inventory.json",
     "metadata/source-files.json",
     "metadata/source/vae/config.json",
+    "metadata/transport-layout.json",
 ];
 
 pub const FLUX_VAE_ENCODER_STAGE: &str = "flux-vae-encoder";
@@ -56,7 +65,7 @@ pub const FLUX_VAE_COMPONENT_MODEL_REVISION: &str =
     "5f9271cca82f45ef89910f1a5a4a775745dca788f518d25d93afe5bae9e6b8b8";
 /// Exact sealed digest of the canonical reusable FLUX VAE component manifest.
 pub const FLUX_VAE_COMPONENT_CONTENT_DIGEST: &str =
-    "8ff1043ac3d47e6addbb5e07f437c04585f678819ffd0e505ac46effdf1c31d6";
+    "a7a4758d3334bf3c2749cc9e84bed748fd0dc9b982299708748e1343b08efab9";
 
 /// Construct the complete immutable dependency pin for the released FLUX VAE component.
 pub fn flux_vae_component_dependency() -> ArtifactDependency {
@@ -465,11 +474,8 @@ impl<B: Backend> VerifiedBurnpackFluxVaeStageSource<B, DirectoryArtifactShardRea
     ) -> Result<Self, FluxVaeArtifactError> {
         let directory = VerifiedArtifactDirectory::open(root.as_ref().to_owned())?;
         let contract = FluxVaeComponentContract::new(directory.manifest().clone(), config)?;
-        Ok(Self::new(
-            contract,
-            device,
-            DirectoryArtifactShardReader::new(root.as_ref()),
-        ))
+        let reader = directory.shard_reader()?;
+        Ok(Self::new(contract, device, reader))
     }
 }
 

@@ -175,9 +175,9 @@ pub fn verify_native_output_artifacts(
     })
 }
 
-/// Construct one released exact request. Edit inputs are decoded through the same bounded native
-/// upload path as the UI while the report retains the SHA-256 of the original selected file.
-pub fn prepare_native_output_qualification_request(
+/// Construct one released native request. Edit inputs are decoded through the same bounded native
+/// upload path as the UI while the identity retains the SHA-256 of the original selected file.
+pub fn prepare_native_output_request(
     variant: BooguVariant,
     prompt: String,
     seed: u64,
@@ -206,21 +206,21 @@ pub fn prepare_native_output_qualification_request(
             None,
         ),
         (BooguVariant::Image01Turbo, Some(_)) => {
-            return Err("Turbo output qualification forbids a source image".into());
+            return Err("Turbo native output forbids a source image".into());
         }
         (BooguVariant::Image01EditTurbo | BooguVariant::Image01EditTurbo1k5, Some(source_path)) => {
             let source_path = fs::canonicalize(&source_path).map_err(|error| {
                 format!(
-                    "canonicalize qualification source {}: {error}",
+                    "canonicalize native source {}: {error}",
                     source_path.display()
                 )
             })?;
             let bytes = read_bounded_qualification_source(&source_path)?;
             let source = decode_input_image(&bytes, None)
-                .map_err(|error| format!("decode bounded qualification source image: {error}"))?;
+                .map_err(|error| format!("decode bounded native source image: {error}"))?;
             let source_dimensions = source
                 .dimensions()
-                .ok_or_else(|| "decoded qualification source omits dimensions".to_owned())?;
+                .ok_or_else(|| "decoded native source omits dimensions".to_owned())?;
             let identity = NativeOutputSourceIdentity {
                 path: source_path,
                 bytes: bytes.len() as u64,
@@ -241,7 +241,7 @@ pub fn prepare_native_output_qualification_request(
             )
         }
         (BooguVariant::Image01EditTurbo | BooguVariant::Image01EditTurbo1k5, None) => {
-            return Err("Edit output qualification requires an explicit source image path".into());
+            return Err("Edit native output requires an explicit source image path".into());
         }
     };
     descriptor
@@ -272,22 +272,27 @@ pub fn prepare_native_output_qualification_request(
     ))
 }
 
+/// Backward-compatible qualification entry point for one exact released native request.
+pub fn prepare_native_output_qualification_request(
+    variant: BooguVariant,
+    prompt: String,
+    seed: u64,
+    width: u32,
+    height: u32,
+    source_path: Option<PathBuf>,
+) -> Result<(ImageRequest, NativeOutputQualificationRequestIdentity), String> {
+    prepare_native_output_request(variant, prompt, seed, width, height, source_path)
+}
+
 fn read_bounded_qualification_source(path: &Path) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(|error| {
-        format!(
-            "open qualification source image {}: {error}",
-            path.display()
-        )
-    })?;
-    let metadata = file.metadata().map_err(|error| {
-        format!(
-            "inspect qualification source image {}: {error}",
-            path.display()
-        )
-    })?;
+    let file = fs::File::open(path)
+        .map_err(|error| format!("open native source image {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect native source image {}: {error}", path.display()))?;
     if !metadata.is_file() {
         return Err(format!(
-            "qualification source image {} is not a regular file",
+            "native source image {} is not a regular file",
             path.display()
         ));
     }
@@ -306,14 +311,11 @@ fn read_bounded_qualification_source_handle(
     path: &Path,
 ) -> Result<Vec<u8>, String> {
     if preflight_bytes == 0 {
-        return Err(format!(
-            "qualification source image {} is empty",
-            path.display()
-        ));
+        return Err(format!("native source image {} is empty", path.display()));
     }
     if preflight_bytes > max_bytes {
         return Err(format!(
-            "qualification source image {} is {preflight_bytes} bytes; limit is {max_bytes} bytes",
+            "native source image {} is {preflight_bytes} bytes; limit is {max_bytes} bytes",
             path.display()
         ));
     }
@@ -321,25 +323,20 @@ fn read_bounded_qualification_source_handle(
     // Continue reading from the already-inspected handle. The handle survives a path replacement,
     // while MAX+1 detects growth of that same file after the metadata preflight.
     let capacity = usize::try_from(preflight_bytes)
-        .map_err(|_| "qualification source size does not fit host memory".to_owned())?;
+        .map_err(|_| "native source size does not fit host memory".to_owned())?;
     let mut bytes = Vec::with_capacity(capacity);
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|error| {
-            format!(
-                "read qualification source image {}: {error}",
-                path.display()
-            )
-        })?;
+        .map_err(|error| format!("read native source image {}: {error}", path.display()))?;
     if bytes.is_empty() {
         return Err(format!(
-            "qualification source image {} became empty while reading",
+            "native source image {} became empty while reading",
             path.display()
         ));
     }
     if bytes.len() as u64 > max_bytes {
         return Err(format!(
-            "qualification source image {} grew beyond the {max_bytes}-byte limit while reading",
+            "native source image {} grew beyond the {max_bytes}-byte limit while reading",
             path.display()
         ));
     }

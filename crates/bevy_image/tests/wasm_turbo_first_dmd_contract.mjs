@@ -7,7 +7,7 @@ export const TURBO_MODEL_REVISION = "53ad54522023f64d049f7f38e4d679359ef3fb92";
 export const TURBO_UPSTREAM_SOURCE_REVISION =
   "25f8f888298224a94e5ec2abafb98abea9031a0d";
 export const TURBO_ARTIFACT_CONTENT_DIGEST =
-  "555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36";
+  "32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a";
 export const TURBO_RESIDENCY =
   "browser-low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser";
 export const TURBO_STORAGE_POLICY =
@@ -603,6 +603,7 @@ export function validateTurboFirstDmdSourceContract({
   parityFixtureSource,
   parityWorkflowSource,
   harnessSource,
+  transportContractSource,
 }) {
   const failures = [];
   for (const required of [
@@ -702,8 +703,25 @@ export function validateTurboFirstDmdSourceContract({
     "inspectTurboFirstDmdStorageAdmission",
     "selectTurboFirstDmdChromeSharedMemoryPolicy",
     "turboFirstDmdChromeLaunchEvidence",
+    "validateArtifactBundleTransport",
+    "transportTelemetryFiles",
+    "physical_transport_part",
+    'join(wwwOut, "burn-image-icon.png")',
+    'content_type: "image/png"',
+    "browser package server failed the exact icon MIME/size/SHA-256 self-test",
   ]) {
     if (!harnessSource.includes(required)) failures.push(`Node harness omits ${required}`);
+  }
+  for (const required of [
+    "ARTIFACT_TRANSPORT_TARGET_PART_BYTES = 20 * 1024 * 1024",
+    "ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES = 25_000_000",
+    "metadata/transport-layout.json",
+    "verified-by-browser-runtime-before-use",
+    "explicit-legacy-direct-layout-no-browser-cache-shard-claim",
+  ]) {
+    if (!transportContractSource?.includes(required)) {
+      failures.push(`transport contract omits ${required}`);
+    }
   }
   if (
     !/if \(sharedMemoryPolicy\.disable_dev_shm_usage\) \{\s*arguments_\.push\("--disable-dev-shm-usage"\);\s*\}/.test(

@@ -262,6 +262,7 @@ modular low-VRAM 1536x1536 has its scoped no-surface numerical/memory pass. Othe
 explicit resident mode, rendered 1.5K behavior, synchronized performance, and cross-stack
 portability still require their own attested gates.
 
-Canonical browser/publication evidence uses the separate schema-v2 modular root. As of 2026-08-14,
-its public CDN deployment remains blocked because the prepared entries return HTTP 403 without the
-required Range/`Content-Range` CORS policy; verified local-bundle results do not waive that gate.
+Canonical browser/publication evidence uses the separate schema-v2 modular root. As of 2026-08-16,
+its public CDN is readable and a real-browser probe verified authenticated cold whole-part loading
+and warm CacheStorage resume. Pages remains fail-closed until reusable manifests change from
+`immutable` to `no-cache`; verified transport does not replace generation/parity evidence.

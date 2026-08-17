@@ -297,7 +297,8 @@ qualified only for 1K; splitting the double-stream shared projection was effecti
 ## Performance gates
 
 - No CPU tensor backend may be selected by a WGPU/WebGPU test.
-- No whole-checkpoint host copy or whole-response browser `ArrayBuffer` is allowed.
+- No whole-checkpoint host copy or unbounded-response browser `ArrayBuffer` is allowed; only one
+  exact-size bounded range may cross from its verified browser-owned `Blob` into Wasm at a time.
 - Warm p50 and p95 are reported separately; at least one warmup and five measured samples are used.
 - Every resolution-specific variant must pass its own numerical gate; 1K evidence cannot qualify
   the 1.5K runtime.
@@ -308,8 +309,13 @@ qualified only for 1K; splitting the double-stream shared projection was effecti
 
 The native viewer defaults to `native-high-vram`: every required Qwen/VAE stage and the denoiser
 are verified and resident before **Ready**, so measured forward execution contains no model-weight
-filesystem/decode/upload traffic. Native `low-vram` instead streams Qwen per semantic stage and the
-required VAE half per phase while retaining one mixed-F16 denoiser across all four DMD steps;
+filesystem/decode/upload traffic. Ordinary viewer builds use static kernels without autotune.
+Shape-bucketed balanced tuning requires an opt-in `boogu-native,native-autotune` build with
+`--autotune balanced`; exact-shape full tuning uses `--autotune full` in the same build and remains
+the policy for synchronized qualification. An uncached feature-enabled request benchmarks many
+Qwen/VAE kernel shapes and is not an interactive latency sample. Native `low-vram` instead streams
+Qwen per semantic stage and the required VAE half per phase while retaining one mixed-F16 denoiser
+across all four DMD steps;
 `diagnostic-layer-streamed` additionally reloads the denoiser per step and remains an explicit
 local-only diagnostic.
 
@@ -403,9 +409,10 @@ performance row.
 
 The browser measurements used quota-aware Chrome shared-memory admission: BigInt `statfs` plus a
 real bounded 256 MiB write/`fsync`/delete probe admitted `/dev/shm`, rejected quota-limited `/tmp`,
-and therefore omitted `--disable-dev-shm-usage`. As of 2026-08-14, canonical CDN/Pages deployment is
-still blocked by HTTP 403 responses and missing Range/`Content-Range` CORS exposure; local modular
-measurements do not waive that publication gate.
+and therefore omitted `--disable-dev-shm-usage`. As of 2026-08-16, the canonical CDN is readable and
+a real-browser probe verified cold whole-part streaming plus warm CacheStorage resume. Pages still
+fails closed because reusable manifest URLs are marked `immutable` instead of `no-cache`; the probe
+does not replace a full generation or parity measurement.
 
 Native 1K Edit and browser 1K Edit low-VRAM qualification remain pending. Native Turbo has
 the artifact/output/memory candidate recorded above but still lacks an exact-noise full-chain

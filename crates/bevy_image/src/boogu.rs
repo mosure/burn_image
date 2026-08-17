@@ -277,6 +277,15 @@ pub trait BooguRuntime: Send + Sync + 'static {
 /// Returning `Ok(None)` is the only pending state. Returning a runtime makes
 /// the exact supported descriptors visible and enables request dispatch.
 pub trait BooguRuntimeFactory: Send + Sync + 'static {
+    /// Release selected before asynchronous artifact loading begins, when the factory owns one.
+    ///
+    /// The app shell uses this only as an initialization hint so an Edit-only release never
+    /// appears as Generate while its verified closure is being cached. Runtime capabilities still
+    /// come from [`BooguRuntime::variants`] and remain the authority once construction completes.
+    fn initialization_variant(&self) -> Option<BooguVariant> {
+        None
+    }
+
     fn start(&mut self, context: BooguFactoryContext) -> Result<(), RuntimeError>;
 
     fn poll(&mut self) -> Result<Option<Box<dyn BooguRuntime>>, RuntimeError>;
@@ -397,6 +406,15 @@ impl<F: BooguRuntimeFactory> Plugin for BooguAdapterPlugin<F> {
             .take()
             .expect("a BooguAdapterPlugin can only be installed once");
 
+        #[cfg(feature = "app")]
+        if let Some(variant) = factory.initialization_variant()
+            && let Some(mut editor) = app
+                .world_mut()
+                .get_resource_mut::<crate::ImageEditorState>()
+        {
+            seed_editor_for_initialization(&mut editor, variant);
+        }
+
         app.insert_resource(ImageRunnerStatus::initializing(
             "Boogu runtime is waiting for the shared WGPU device",
         ))
@@ -425,6 +443,33 @@ impl<F: BooguRuntimeFactory> Plugin for BooguAdapterPlugin<F> {
                     .chain()
                     .in_set(ImageFrontendSet::Dispatch),
             );
+    }
+}
+
+#[cfg(feature = "app")]
+fn seed_editor_for_initialization(editor: &mut crate::ImageEditorState, variant: BooguVariant) {
+    if editor.model.is_some() {
+        return;
+    }
+    editor.model = Some(boogu_model_id(variant));
+    editor.mode = if variant.is_edit() {
+        crate::EditorMode::Edit
+    } else {
+        crate::EditorMode::Generate
+    };
+    if editor.options.dimensions.is_none() {
+        let edge = if variant == BooguVariant::Image01EditTurbo1k5 {
+            1536
+        } else {
+            1024
+        };
+        editor.options.dimensions = Some(
+            burn_image::Dimensions::new(edge, edge)
+                .expect("canonical Boogu initialization dimensions are valid"),
+        );
+    }
+    if editor.options.seed.is_none() {
+        editor.options.seed = Some(0);
     }
 }
 
@@ -1746,6 +1791,47 @@ mod tests {
                 ..GenerationOptions::default()
             },
         })
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn initialization_variant_seeds_supported_editor_mode_before_runtime_ready_correctness() {
+        for (variant, expected_mode, expected_edge) in [
+            (
+                BooguVariant::Image01Turbo,
+                crate::EditorMode::Generate,
+                1024,
+            ),
+            (
+                BooguVariant::Image01EditTurbo,
+                crate::EditorMode::Edit,
+                1024,
+            ),
+            (
+                BooguVariant::Image01EditTurbo1k5,
+                crate::EditorMode::Edit,
+                1536,
+            ),
+        ] {
+            let mut editor = crate::ImageEditorState::default();
+            seed_editor_for_initialization(&mut editor, variant);
+            assert_eq!(editor.model, Some(boogu_model_id(variant)));
+            assert_eq!(editor.mode, expected_mode);
+            assert_eq!(
+                editor.options.dimensions,
+                Some(burn_image::Dimensions::new(expected_edge, expected_edge).unwrap())
+            );
+            assert_eq!(editor.options.seed, Some(0));
+        }
+
+        let configured_model = burn_image::ModelId::new("custom/model").unwrap();
+        let mut configured = crate::ImageEditorState {
+            model: Some(configured_model.clone()),
+            ..Default::default()
+        };
+        seed_editor_for_initialization(&mut configured, BooguVariant::Image01EditTurbo);
+        assert_eq!(configured.model, Some(configured_model));
+        assert_eq!(configured.mode, crate::EditorMode::Generate);
     }
 
     fn spawn_primary_surface(world: &mut World) -> (Entity, Entity, Entity) {

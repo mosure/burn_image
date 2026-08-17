@@ -40,10 +40,12 @@ contain Boogu prompts, schedules, size policy, CDN URLs, or Bevy types.
 - Manifests include every tensor, config, tokenizer/template, size, dtype, quantization scheme,
   conversion version, and SHA-256 digest.
 - Reject duplicate, unknown, missing, or shape-incompatible tensors.
-- Publish Burnpack weights as immutable content-addressed objects. Compact configs, tokenizers,
-  templates, and inventories may retain semantic `metadata/...` paths only inside a single-use
-  immutable bundle prefix and must be exact-size/SHA-256-bound by the sealed manifest. Commit only
-  compact manifests/evidence.
+- Represent Burnpack weights as immutable content-addressed logical objects, but publish canonical
+  browser/CDN payloads only as sealed immutable content-addressed transport parts; direct logical
+  Burnpack files must be absent from a part-only tree. Compact configs, tokenizers, templates, and
+  inventories may retain semantic `metadata/...` paths only inside a single-use immutable bundle
+  prefix and must be exact-size/SHA-256-bound by the sealed manifest. Commit only compact
+  manifests/evidence.
 
 ## Validation
 

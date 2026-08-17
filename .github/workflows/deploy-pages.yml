@@ -65,11 +65,11 @@ jobs:
         shell: bash
         env:
           MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-turbo
-          MODEL_CONTENT_DIGEST: 555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36
+          MODEL_CONTENT_DIGEST: 32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a
           EDIT_MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-edit-turbo
-          EDIT_MODEL_CONTENT_DIGEST: 28b1b51f2fb152557b11a9f0ef8e872ae7d163bcab7abd42f9eaf4bfef10e7aa
+          EDIT_MODEL_CONTENT_DIGEST: 6f2f56a1c13418aea6985dfd1922f2e724577a1067123535fba90f88886f5335
           EDIT_1K5_MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-edit-turbo-1k5
-          EDIT_1K5_MODEL_CONTENT_DIGEST: 4eb95001708becebeab5bb7417b02003e9dbe704775bb49557b681a5b617fd5a
+          EDIT_1K5_MODEL_CONTENT_DIGEST: 7d81dacfedc71c50639d303c52f035813a6f4cc0125166bd7c8879c8314dd620
         run: |
           set -euo pipefail
           scratch="$(mktemp -d)"
@@ -78,7 +78,9 @@ jobs:
           model_root_url="${MODEL_BASE_URL%/*}"
           manifest_verifier="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/boogu-verify-artifacts"
           payload_inventory="$scratch/remote-payloads.tsv"
-          readonly max_payload_bytes=$((256 * 1024 * 1024))
+          readonly transport_part_target_bytes=$((20 * 1024 * 1024))
+          readonly max_transport_shard_bytes=25000000
+          readonly transport_layout_path='metadata/transport-layout.json'
           test -x "$manifest_verifier"
           : > "$payload_inventory"
 
@@ -132,38 +134,84 @@ jobs:
              all(.files[]; .role != "weights" or ((.component // "") | startswith("boogu-")))' \
             "$manifest_file" >/dev/null
 
-          verify_range_contract() {
+          require_single_exact_header() {
+            local headers="$1"
+            local required_header="${2,,}"
+            local expected_value="$3"
+
+            awk -v required="$required_header" -v expected="$expected_value" '
+              {
+                separator = index($0, ":")
+                if (separator == 0) {
+                  next
+                }
+                name = tolower(substr($0, 1, separator - 1))
+                if (name != required) {
+                  next
+                }
+                count += 1
+                value = substr($0, separator + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                matched = value == expected
+              }
+              END { exit(count == 1 && matched ? 0 : 1) }
+            ' "$headers"
+          }
+
+          require_identity_content_encoding() {
+            local headers="$1"
+
+            awk '
+              {
+                separator = index($0, ":")
+                if (separator == 0) {
+                  next
+                }
+                name = tolower(substr($0, 1, separator - 1))
+                if (name != "content-encoding") {
+                  next
+                }
+                count += 1
+                value = tolower(substr($0, separator + 1))
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+              }
+              END { exit(count == 0 || (count == 1 && value == "identity") ? 0 : 1) }
+            ' "$headers"
+          }
+
+          verify_complete_object_contract() {
             local url="$1"
             local cache_policy="$2"
             local expected_size="$3"
             local downloaded_bytes
             local response_metrics
             local status
-            local range_headers="$scratch/range.headers"
+            local complete_headers="$scratch/complete.headers"
             [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
             response_metrics="$(
               curl --silent --show-error \
                 --output /dev/null \
-                --dump-header "$range_headers" \
+                --dump-header "$complete_headers" \
                 --write-out $'%{http_code}\t%{size_download}' \
                 --header 'Origin: https://mosure.github.io' \
                 --header 'Accept-Encoding: identity' \
-                --header 'Range: bytes=0-0' \
                 "$url"
             )"
             IFS=$'\t' read -r status downloaded_bytes <<< "$response_metrics"
-            test "$status" = 206
-            test "$downloaded_bytes" = 1
-            tr -d '\r' < "$range_headers" > "$range_headers.normalized"
-            mv "$range_headers.normalized" "$range_headers"
+            test "$status" = 200
+            test "$downloaded_bytes" = "$expected_size"
+            tr -d '\r' < "$complete_headers" > "$complete_headers.normalized"
+            mv "$complete_headers.normalized" "$complete_headers"
             grep -Eqi '^access-control-allow-origin: (https://mosure\.github\.io|\*)$' \
-              "$range_headers"
-            grep -Eqi '^access-control-expose-headers:.*(content-range|\*)' "$range_headers"
-            grep -Eqi "^content-range: bytes 0-0/${expected_size}$" "$range_headers"
+              "$complete_headers"
+            require_single_exact_header \
+              "$complete_headers" content-length "$expected_size"
+            require_identity_content_encoding "$complete_headers"
+            ! grep -Eqi '^content-range:' "$complete_headers"
             if [[ "$cache_policy" == immutable ]]; then
-              grep -Eqi '^cache-control:.*immutable' "$range_headers"
+              grep -Eqi '^cache-control:.*immutable' "$complete_headers"
             elif [[ "$cache_policy" == no-cache ]]; then
-              grep -Eqi '^cache-control:.*no-cache' "$range_headers"
+              grep -Eqi '^cache-control:.*no-cache' "$complete_headers"
             else
               echo "unknown cache policy $cache_policy for $url" >&2
               return 1
@@ -173,9 +221,18 @@ jobs:
           verify_manifest_contract() {
             local manifest="$1"
             local base_url="$2"
+            local bundle_name
+            local layout_file
+            local layout_manifest_size
+            local layout_manifest_sha256
+            local layout_actual_size
+            local layout_actual_sha256
+            local layout_report
             local manifest_size
             local declared_files=0
+            local declared_transport_parts=0
             local path
+            local role
             local expected_size
             local expected_sha256
 
@@ -189,26 +246,91 @@ jobs:
                 (.size == (.size | floor)) and
                 ((.sha256 | type) == "string") and
                 (.sha256 | test("^[0-9a-f]{64}$"))) and
-              (([.files[].path] | unique | length) == (.files | length))
+              (([.files[].path] | unique | length) == (.files | length)) and
+              .metadata.transport_layout_path == "metadata/transport-layout.json" and
+              .metadata.transport_layout_schema == "1" and
+              .metadata.transport_parts_required == "true" and
+              .metadata.transport_part_target_bytes == "20971520" and
+              .metadata.target_max_transport_shard_bytes == "25000000" and
+              .metadata.semantic_object_max_bytes == "268435456" and
+              .metadata.target_max_shard_bytes == "268435456" and
+              ([.files[] | select(.path == "metadata/transport-layout.json" and .role == "metadata")] | length) == 1
             ' "$manifest" >/dev/null
             manifest_size="$(stat --format='%s' "$manifest")"
-            verify_range_contract "$base_url/manifest.json" no-cache "$manifest_size"
-            while IFS=$'\t' read -r path expected_size expected_sha256; do
+            verify_complete_object_contract "$base_url/manifest.json" no-cache "$manifest_size"
+
+            bundle_name="${base_url##*/}"
+            layout_file="$scratch/$bundle_name.transport-layout.json"
+            IFS=$'\t' read -r layout_manifest_size layout_manifest_sha256 < <(
+              jq -er --arg path "$transport_layout_path" '
+                .files[] | select(.path == $path and .role == "metadata") |
+                [(.size | tostring), .sha256] | @tsv
+              ' "$manifest"
+            )
+            [[ "$layout_manifest_size" =~ ^[1-9][0-9]*$ ]]
+            ((layout_manifest_size <= max_transport_shard_bytes))
+            [[ "$layout_manifest_sha256" =~ ^[0-9a-f]{64}$ ]]
+            curl --fail --silent --show-error \
+              --output "$layout_file" \
+              --header 'Origin: https://mosure.github.io' \
+              --header 'Accept-Encoding: identity' \
+              "$base_url/$transport_layout_path"
+            layout_actual_size="$(stat --format='%s' "$layout_file")"
+            layout_actual_sha256="$(sha256sum "$layout_file" | awk '{print $1}')"
+            test "$layout_actual_size" = "$layout_manifest_size"
+            test "$layout_actual_sha256" = "$layout_manifest_sha256"
+            layout_report="$layout_file.verification.json"
+            "$manifest_verifier" \
+              --manifest-only "$manifest" \
+              --transport-layout "$layout_file" > "$layout_report"
+            jq -e \
+              --argjson target "$transport_part_target_bytes" \
+              --argjson maximum "$max_transport_shard_bytes" '
+                .sealed_manifest_verified == true and
+                .transport_layout_verified == true and
+                .transport_payloads_verified == false and
+                .transport_part_target_bytes == $target and
+                .maximum_transport_part_bytes == $maximum and
+                .transport_part_count > 0 and
+                .largest_transport_part_bytes <= $maximum
+              ' "$layout_report" >/dev/null
+
+            while IFS=$'\t' read -r path role expected_size expected_sha256; do
               [[ "$path" =~ ^[A-Za-z0-9._/-]+$ ]]
               [[ "$path" != /* ]]
               [[ "$path" != *//* ]]
               [[ "/$path/" != */../* ]]
               [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
-              ((expected_size <= max_payload_bytes))
               [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
-              verify_range_contract "$base_url/$path" immutable "$expected_size"
+              if [[ "$role" == weights ]]; then
+                declared_files=$((declared_files + 1))
+                continue
+              fi
+              ((expected_size <= max_transport_shard_bytes))
+              verify_complete_object_contract "$base_url/$path" immutable "$expected_size"
               printf '%s\t%s\t%s\n' \
                 "$base_url/$path" "$expected_size" "$expected_sha256" >> "$payload_inventory"
               declared_files=$((declared_files + 1))
             done < <(
-              jq -er '.files[] | [.path, (.size | tostring), .sha256] | @tsv' "$manifest"
+              jq -er '.files[] | [.path, .role, (.size | tostring), .sha256] | @tsv' "$manifest"
             )
             test "$declared_files" -gt 0
+
+            while IFS=$'\t' read -r path expected_size expected_sha256; do
+              [[ "$path" =~ ^transport/[0-9a-f]{64}\.part$ ]]
+              [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
+              ((expected_size <= transport_part_target_bytes))
+              ((expected_size <= max_transport_shard_bytes))
+              [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
+              test "${path#transport/}" = "$expected_sha256.part"
+              verify_complete_object_contract "$base_url/$path" immutable "$expected_size"
+              printf '%s\t%s\t%s\n' \
+                "$base_url/$path" "$expected_size" "$expected_sha256" >> "$payload_inventory"
+              declared_transport_parts=$((declared_transport_parts + 1))
+            done < <(
+              jq -er '.objects[].parts[] | [.path, (.size | tostring), .sha256] | @tsv' "$layout_file"
+            )
+            test "$declared_transport_parts" -gt 0
           }
 
           authenticate_remote_payloads() {
@@ -239,7 +361,7 @@ jobs:
             while IFS=$'\t' read -r url expected_size expected_sha256; do
               [[ "$url" == https://* ]]
               [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
-              ((expected_size <= max_payload_bytes))
+              ((expected_size <= max_transport_shard_bytes))
               [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
               authenticated=0
               for attempt in 1 2 3; do
@@ -388,6 +510,8 @@ jobs:
             --out-dir crates/bevy_image/www/out \
             --out-name bevy_burn_image \
             "$wasm_input"
+          install -m 0644 crates/bevy_image/www/burn-image-icon.png \
+            crates/bevy_image/www/out/burn-image-icon.png
 
       - name: inspect pages artifact
         shell: bash
@@ -397,6 +521,8 @@ jobs:
 
           test -s crates/bevy_image/www/index.html
           test -s crates/bevy_image/www/model_selector.mjs
+          test -s crates/bevy_image/www/burn-image-icon.png
+          test -s crates/bevy_image/www/out/burn-image-icon.png
           test -s crates/bevy_image/www/out/bevy_burn_image.js
           test -s crates/bevy_image/www/out/bevy_burn_image_bg.wasm
           grep -Eq '^export function start_boogu_web\(\)' \
@@ -408,6 +534,11 @@ jobs:
           grep -Fq 'burn-image-progress' crates/bevy_image/www/index.html
           grep -Fq 'id="artifact-progress"' crates/bevy_image/www/index.html
           grep -Fq './model_selector.mjs' crates/bevy_image/www/index.html
+          grep -Fq './out/burn-image-icon.png' crates/bevy_image/www/index.html
+          cmp -s crates/bevy_image/www/burn-image-icon.png \
+            crates/bevy_image/www/out/burn-image-icon.png
+          file crates/bevy_image/www/out/burn-image-icon.png \
+            | grep -Fq 'PNG image data, 512 x 512, 8-bit/color RGB'
           node --check crates/bevy_image/www/model_selector.mjs
 
           sed -n '/<script type="module">/,/<\/script>/p' crates/bevy_image/www/index.html \

@@ -42,19 +42,19 @@ pub fn validate_supported_bundle_converter_version(actual: &str) -> Result<(), B
 }
 /// Exact sealed mixed-F16 Turbo bundle qualified for the canonical production release.
 pub const TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
-    "555019af867a80bb4d7cec5dc2f0ba60ae799071994a5fd24d7e71918cb9ce36";
+    "32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a";
 /// Exact sealed hybrid-Q8 Turbo legacy bundle retained as evidence.
 pub const TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "8685559e73cf836e98e1ebdf80815e3d66765f7d620624408148d5f98c87c0dd";
 /// Exact sealed mixed-F16 Edit-Turbo 1K bundle qualified for the canonical production release.
 pub const EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
-    "28b1b51f2fb152557b11a9f0ef8e872ae7d163bcab7abd42f9eaf4bfef10e7aa";
+    "6f2f56a1c13418aea6985dfd1922f2e724577a1067123535fba90f88886f5335";
 /// Exact sealed hybrid-Q8 Edit-Turbo 1K legacy bundle retained as evidence.
 pub const EDIT_TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "ffde989bb66df3a541d44957422f996790633dab46ca3547a59dfdfb871f0b7a";
 /// Exact sealed mixed-F16 Edit-Turbo 1.5K bundle qualified for the canonical production release.
 pub const EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
-    "4eb95001708becebeab5bb7417b02003e9dbe704775bb49557b681a5b617fd5a";
+    "7d81dacfedc71c50639d303c52f035813a6f4cc0125166bd7c8879c8314dd620";
 /// Storage-policy marker for the opt-in 1.5K VAE encoder F32 A/B artifact.
 ///
 /// This is deliberately metadata rather than a production storage profile: callers must
@@ -78,7 +78,7 @@ pub const LEGACY_EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
 /// Legacy descriptive mixed-F16 Edit-Turbo 1.5K digest accepted only for explicit/local migration.
 pub const LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "4e8b12ac5ca95272f9009080a23baf1bc52d1b0e7aebf2e9e5f394a492369213";
-/// Largest physical Burnpack object accepted for browser-deployable releases.
+/// Largest logical Burnpack object accepted by the browser semantic loader.
 pub const BOOGU_RELEASE_MAX_SHARD_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest compact config, tokenizer, template, or inventory object accepted in a release.
 pub const BOOGU_RELEASE_MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
@@ -1319,8 +1319,11 @@ mod loading {
         AutoencoderKl, AutoencoderKlConfig, FLUX_VAE_COMPONENT_ROLE, FluxVaeComponentContract,
     };
     use burn_image::{
-        ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactVerifier, IntegrityPolicy,
+        ArtifactFile, ArtifactFileRole, ArtifactManifest,
+        ArtifactShardReader as ModelNeutralArtifactShardReader, ArtifactVerifier,
+        DirectoryArtifactShardReader as ModelNeutralDirectoryShardReader, IntegrityPolicy,
         NumericFormat, Sha256Digest, VerificationStatus, VerifiedArtifact,
+        VerifiedArtifactDirectory as ModelNeutralVerifiedArtifactDirectory,
     };
     use burn_qwen3_vl::{
         AsyncQwen3VlCausalLmStageSource, AsyncQwen3VlStageSource, EmbeddingRowChunk,
@@ -1741,7 +1744,7 @@ mod loading {
     ///
     /// The default preserves allocator caching for existing native/high-VRAM callers. A bounded
     /// residency runtime can explicitly synchronize and release wholly unused upload and allocator
-    /// pages after each physical shard, preventing transient buffers from accumulating until the
+    /// pages after each logical Burnpack object, preventing transient buffers from accumulating until the
     /// complete model is loaded.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     #[non_exhaustive]
@@ -1749,7 +1752,7 @@ mod loading {
         /// Preserve the backend allocator cache until the complete resident model is loaded.
         #[default]
         PreserveAllocatorCache,
-        /// Synchronize and release transient backend pages after each verified physical shard.
+        /// Synchronize and release transient backend pages after each verified logical Burnpack object.
         ReleaseTransientBuffersPerShard,
     }
 
@@ -1877,7 +1880,7 @@ mod loading {
     /// Auditable staged load statistics.
     #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct BooguLoadReport {
-        /// Number of accepted physical shards.
+        /// Number of accepted logical Burnpack objects.
         pub shards: usize,
         /// Number of applied tensors.
         pub tensors: usize,
@@ -1896,13 +1899,13 @@ mod loading {
         pub verified_files: usize,
         /// Sum of authenticated manifest payload sizes.
         pub verified_bytes: u64,
-        /// Physical Burnpack objects parsed and checked.
+        /// Logical Burnpack objects parsed and checked.
         pub verified_weight_objects: usize,
         /// Stored tensor entries checked against Burnpack names, shapes, dtypes, and payload hashes.
         pub verified_tensors: usize,
-        /// Largest physical object read during verification.
+        /// Largest logical Burnpack object read during verification.
         pub largest_object_bytes: u64,
-        /// Exact declared physical-object ceiling.
+        /// Exact declared logical semantic-object ceiling.
         pub max_shard_bytes: u64,
     }
 
@@ -1917,13 +1920,13 @@ mod loading {
         pub verified_files: usize,
         /// Sum of authenticated payload sizes.
         pub verified_bytes: u64,
-        /// Physical Burnpack objects parsed and checked.
+        /// Logical Burnpack objects parsed and checked.
         pub verified_weight_objects: usize,
         /// Stored tensor entries checked through the exact model-owned inventory.
         pub verified_tensors: usize,
-        /// Largest physical object read during verification.
+        /// Largest logical Burnpack object read during verification.
         pub largest_object_bytes: u64,
-        /// Exact declared physical-object ceiling.
+        /// Exact declared logical semantic-object ceiling.
         pub max_shard_bytes: u64,
     }
 
@@ -1996,7 +1999,7 @@ mod loading {
         },
     }
 
-    /// Supplies one physical shard at a time to the verified semantic-stage loader.
+    /// Supplies one logical Burnpack object at a time to the verified semantic-stage loader.
     ///
     /// The loader, rather than the reader, checks the sealed manifest size and SHA-256 contract.
     /// A browser integration can implement this over a bounded cache; a native integration can
@@ -2110,7 +2113,7 @@ mod loading {
     /// Futures intentionally do not require [`Send`]: browser fetch/cache handles and WebGPU
     /// resources commonly remain on one JavaScript event loop. `max_bytes` is supplied before
     /// the read starts so an HTTP/range implementation can abort a response before it exceeds the
-    /// release's sealed physical-shard bound. Verified sources independently check the response
+    /// release's sealed logical semantic-object bound. Verified sources independently check the response
     /// cap and either validate typed SHA-256 evidence or hash an unverified response before parsing
     /// any payload.
     #[allow(async_fn_in_trait)]
@@ -2228,21 +2231,43 @@ mod loading {
     #[derive(Debug, Clone)]
     pub struct DirectoryStageShardReader {
         root: PathBuf,
+        reader: Option<ModelNeutralDirectoryShardReader>,
     }
 
     impl DirectoryStageShardReader {
         /// Use `root` as the directory containing the sealed manifest's relative paths.
         pub fn new(root: impl Into<PathBuf>) -> Self {
-            Self { root: root.into() }
+            Self {
+                root: root.into(),
+                reader: None,
+            }
+        }
+
+        fn reader(&mut self) -> Result<&mut ModelNeutralDirectoryShardReader, BooguError> {
+            if self.reader.is_none() {
+                let directory =
+                    ModelNeutralVerifiedArtifactDirectory::open(&self.root).map_err(|error| {
+                        BooguError::Artifact(format!(
+                            "failed to open sealed artifact directory {}: {error}",
+                            self.root.display()
+                        ))
+                    })?;
+                self.reader = Some(
+                    directory
+                        .shard_reader()
+                        .map_err(|error| BooguError::Artifact(error.to_string()))?,
+                );
+            }
+            self.reader.as_mut().ok_or_else(|| {
+                BooguError::Artifact("artifact directory reader initialization failed".into())
+            })
         }
     }
 
     impl StageShardReader for DirectoryStageShardReader {
         fn read_shard(&mut self, file: &ArtifactFile) -> Result<Vec<u8>, BooguError> {
-            let path = self.root.join(file.path.as_str());
-            fs::read(&path).map_err(|error| {
-                BooguError::Artifact(format!("failed to read {}: {error}", path.display()))
-            })
+            ModelNeutralArtifactShardReader::read_shard(self.reader()?, file)
+                .map_err(|error| BooguError::Artifact(error.to_string()))
         }
     }
 
@@ -2322,7 +2347,7 @@ mod loading {
     /// Verification is deliberately stricter than opening a generic [`ArtifactManifest`]. It
     /// proves the canonical Boogu release identity and profile, parses the pinned source configs,
     /// reconstructs the exact compiled tensor inventory, checks every source range, requires the
-    /// browser-safe physical-object bound, then parses and authenticates one Burnpack object at a
+    /// browser-safe logical semantic-object bound, then parses and authenticates one Burnpack object at a
     /// time. No more than one declared shard enters host memory.
     pub fn verify_release_artifact_directory(
         root: impl AsRef<Path>,
@@ -2782,7 +2807,7 @@ mod loading {
         let max_shard_bytes = declared_target_max_shard_bytes(manifest)?;
         if max_shard_bytes > BOOGU_RELEASE_MAX_SHARD_BYTES {
             return Err(BooguArtifactLoadError::Identity(format!(
-                "declared shard bound {max_shard_bytes} exceeds browser release maximum {BOOGU_RELEASE_MAX_SHARD_BYTES}"
+                "declared semantic-object bound {max_shard_bytes} exceeds browser maximum {BOOGU_RELEASE_MAX_SHARD_BYTES}"
             )));
         }
         for file in &manifest.files {
@@ -3299,8 +3324,9 @@ mod loading {
 
     /// Async verified source for independently loading the FLUX VAE encoder and decoder.
     ///
-    /// Only the selected half is populated. Physical Burnpacks are fetched, bounded, verified,
-    /// applied, and released sequentially; the opposite half remains lazy and unfetched.
+    /// Only the selected half is populated. Logical Burnpacks are fetched (and may be reconstructed
+    /// from physical transport parts), bounded, verified, applied, and released sequentially; the
+    /// opposite half remains lazy and unfetched.
     pub struct VerifiedAsyncBurnpackVaeStageSource<B: Backend, R> {
         config: burn_flux_vae::AutoencoderKlConfig,
         device: B::Device,
@@ -3540,7 +3566,7 @@ mod loading {
     /// Hash-verifying one-block-at-a-time source for [`crate::StreamingBooguDenoiser`].
     ///
     /// The source validates the sealed manifest once. Every stage then reads, verifies, applies,
-    /// and drops one physical Burnpack shard before reading the next. Returned modules contain
+    /// and drops one logical Burnpack object before reading the next. Returned modules contain
     /// exactly one refiner/block (or the small prelude/tail), so the executor never constructs the
     /// complete 10B denoiser.
     pub struct VerifiedBurnpackStageSource<B: Backend, R> {
@@ -3558,7 +3584,7 @@ mod loading {
     }
 
     impl<B: Backend, R: StageShardReader> VerifiedBurnpackStageSource<B, R> {
-        /// Validate a sealed release manifest and attach a bounded physical-shard reader.
+        /// Validate a sealed release manifest and attach a bounded logical-object reader.
         #[allow(clippy::too_many_arguments)]
         pub fn new(
             identity: &BooguReleaseIdentity,
@@ -4377,7 +4403,7 @@ mod loading {
     /// Construction fetches and verifies only the two sealed metadata inventories. Every load
     /// thereafter requests one exact manifest file with the manifest's byte cap, verifies its
     /// length and SHA-256, applies it to a fresh lazy module, and drops its host bytes before the
-    /// following physical shard is requested.
+    /// following logical Burnpack object is requested.
     pub struct VerifiedAsyncBurnpackQwenStageSource<B: Backend, R> {
         config: burn_qwen3_vl::Qwen3VlConfig,
         plan: Qwen3VlStreamingPlan,
@@ -4852,7 +4878,7 @@ mod loading {
     /// Load the complete denoiser from a sealed native Burnpack artifact directory.
     ///
     /// This is the all-resident path for native parity and high-memory deployments. Files are
-    /// still read, SHA-256 verified, parsed, applied, synchronized, and dropped one physical shard
+    /// still read, SHA-256 verified, parsed, applied, synchronized, and dropped one logical object
     /// at a time. Browser deployments should use [`VerifiedBurnpackStageSource`] with
     /// [`crate::StreamingBooguDenoiser`] so they never allocate all denoiser parameters.
     #[allow(clippy::too_many_arguments)]
@@ -4911,7 +4937,7 @@ mod loading {
     /// [`BooguResidentLoadMemoryPolicy::ReleaseTransientBuffersPerShard`] is intended for a
     /// strictly bounded native initialization path. It preserves the loaded model and numerical
     /// policy, but retires completed materialization/upload work and releases wholly unused backend
-    /// pages before reading the next physical shard.
+    /// pages before reading the next logical Burnpack object.
     #[allow(clippy::too_many_arguments)]
     pub fn load_resident_denoiser_from_directory_with_memory_policy<B: Backend>(
         identity: &BooguReleaseIdentity,
@@ -5096,7 +5122,7 @@ mod loading {
             if memory_policy.releases_transient_buffers() {
                 // `apply` queues tensor materialization and upload work. Drain it on this loader
                 // thread, then release only wholly unused transient pages and wait for cleanup
-                // before parsing and uploading the next physical shard.
+                // before parsing and uploading the next logical Burnpack object.
                 drop(result);
                 drop(store);
                 B::sync(device).map_err(|error| {
@@ -5640,7 +5666,7 @@ mod loading {
     /// Async hash-verifying one-block-at-a-time denoiser source for browser execution.
     ///
     /// The source retains only sealed metadata and file descriptors between calls. A load awaits,
-    /// verifies, applies, and releases each physical Burnpack before requesting the next one; the
+    /// verifies, applies, and releases each logical Burnpack before requesting the next one; the
     /// returned device module therefore contains exactly one semantic denoiser stage.
     pub struct VerifiedAsyncBurnpackDenoiserStageSource<B: Backend, R> {
         config: BooguConfig,

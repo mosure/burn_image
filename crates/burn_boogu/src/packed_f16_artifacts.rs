@@ -38,7 +38,7 @@ pub type PackedF16DenoiserBackend = CubeBackend<WgpuRuntime, f32, i32, u32>;
 pub const TURBO_PACKED_F16_STAGE_COUNT: usize = 46;
 /// Canonical F16 tensors used by ordinary Boogu Image Turbo.
 pub const TURBO_PACKED_F16_TENSOR_COUNT: usize = 912;
-/// Physical Burnpack objects containing those tensors.
+/// Logical Burnpack objects containing those tensors.
 pub const TURBO_PACKED_F16_OBJECT_COUNT: usize = 106;
 /// Authenticated compact F16 payload bytes before device-alignment padding.
 pub const TURBO_PACKED_F16_COMPACT_PAYLOAD_BYTES: u64 = 19_869_996_096;
@@ -277,7 +277,7 @@ impl<R: AsyncStageShardReader> VerifiedAsyncPackedF16DenoiserStageSource<R> {
         self.audit.cached_stage_count
     }
 
-    /// Number of physical objects retained by the current cache.
+    /// Number of logical Burnpack objects retained by the current cache.
     pub const fn cached_object_count(&self) -> usize {
         self.audit.cached_object_count
     }

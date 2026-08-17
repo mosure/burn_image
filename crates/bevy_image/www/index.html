@@ -4,6 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#090b0f" />
+    <meta name="application-name" content="burn image" />
+    <link rel="icon" type="image/png" sizes="512x512" href="./out/burn-image-icon.png" />
+    <link rel="apple-touch-icon" sizes="512x512" href="./out/burn-image-icon.png" />
     <title>burn image</title>
     <style>
       :root {
@@ -47,8 +51,8 @@
         z-index: 10;
         top: 1rem;
         right: 1rem;
-        width: min(25rem, calc(100vw - 2rem));
-        padding: 1rem;
+        width: min(23rem, calc(100vw - 2rem));
+        padding: 0.9rem;
         overflow: hidden;
         color: #f6faf8;
         background: rgb(16 20 24 / 94%);
@@ -98,7 +102,7 @@
 
       .loader-header {
         display: flex;
-        align-items: flex-start;
+        align-items: center;
         justify-content: space-between;
         gap: 1rem;
       }
@@ -115,9 +119,9 @@
       #status {
         display: block;
         margin: 0;
-        max-width: 19rem;
+        max-width: 17rem;
         color: #f7fbf9;
-        font-size: 1rem;
+        font-size: 0.92rem;
         font-weight: 680;
         line-height: 1.35;
       }
@@ -187,7 +191,7 @@
         display: block;
         width: 100%;
         height: 0.52rem;
-        margin: 0.9rem 0 0.65rem;
+        margin: 0.75rem 0 0.52rem;
         overflow: hidden;
         appearance: none;
         background: #252b2d;
@@ -246,14 +250,14 @@
 
       .progress-primary {
         color: #dce9e3;
-        font-size: 0.82rem;
+        font-size: 0.78rem;
       }
 
       .progress-secondary {
         min-height: 1.25rem;
         margin-top: 0.15rem;
         color: #91a49c;
-        font-size: 0.75rem;
+        font-size: 0.7rem;
       }
 
       .inventory-note {
@@ -398,13 +402,12 @@
         <p id="model-release-note" class="release-control-note"></p>
       </div>
 
-      <progress id="artifact-progress" aria-label="Current model object or inference stage"></progress>
+      <progress id="artifact-progress" aria-label="Aggregate model transfer or inference progress"></progress>
       <p id="progress-primary" class="progress-primary">Preparing the browser runtime</p>
       <p id="progress-secondary" class="progress-secondary"></p>
       <p id="inventory-note" class="inventory-note" hidden></p>
       <p class="model-note">
-        Large model objects are range-streamed, SHA-256 verified, and loaded into WebGPU according
-        to the selected residency policy. Keep this tab open while the runtime is active.
+        Verified CDN parts are cached and applied to WebGPU stage by stage.
       </p>
 
       <details>
@@ -420,7 +423,7 @@
     <input
       id="burn-image-reference-input"
       type="file"
-      accept="image/png,image/jpeg,image/webp"
+      accept="image/png,image/jpeg,image/webp,.png,.PNG,.jpg,.JPG,.jpeg,.JPEG,.webp,.WEBP"
       aria-label="Choose an edit reference image"
     />
     <canvas id="burn-image"></canvas>
@@ -443,6 +446,7 @@
       const modelRelease = document.querySelector("#model-release");
       const modelReleaseNote = document.querySelector("#model-release-note");
       const MAX_REFERENCE_BYTES = 64 * 1024 * 1024;
+      const headless = new URLSearchParams(location.search).has("headless");
 
       configureModelReleaseSelector({
         select: modelRelease,
@@ -451,14 +455,32 @@
       });
 
       const transfer = {
-        current: null,
+        aggregate: null,
         transferredBytes: 0,
         verifiedObjects: 0,
-        samples: [],
         observedEvent: false,
       };
       let renderPending = false;
       let renderEpoch = 0;
+      let overlayHandoffBlocked = false;
+      let backendReady = false;
+      let surfaceInferenceSuspended = false;
+
+      const revealLoaderPanel = () => {
+        panel.hidden = false;
+        panel.removeAttribute("aria-hidden");
+      };
+
+      const blockOverlayHandoff = () => {
+        overlayHandoffBlocked = true;
+        revealLoaderPanel();
+      };
+
+      const hideLoaderPanelIfSafe = () => {
+        if (headless || !backendReady || surfaceInferenceSuspended || overlayHandoffBlocked) return;
+        panel.hidden = true;
+        panel.setAttribute("aria-hidden", "true");
+      };
 
       const formatBytes = (bytes) => {
         const value = Number(bytes) || 0;
@@ -521,7 +543,6 @@
       const invalidateTransferRender = () => {
         renderEpoch += 1;
         renderPending = false;
-        transfer.current = null;
       };
 
       const logActivity = (message) => {
@@ -532,52 +553,63 @@
       };
 
       const resetRunTransfer = () => {
-        transfer.current = null;
-        transfer.transferredBytes = 0;
-        transfer.verifiedObjects = 0;
-        transfer.samples = [];
-      };
-
-      const sampleTransfer = () => {
-        const now = performance.now();
-        transfer.samples.push({ at: now, bytes: transfer.transferredBytes });
-        while (transfer.samples.length > 2 && now - transfer.samples[0].at > 5000) {
-          transfer.samples.shift();
-        }
-      };
-
-      const currentTransferRate = () => {
-        if (transfer.samples.length < 2) return 0;
-        const first = transfer.samples[0];
-        const last = transfer.samples.at(-1);
-        const seconds = (last.at - first.at) / 1000;
-        return seconds > 0 ? Math.max(0, (last.bytes - first.bytes) / seconds) : 0;
+        // Transfer accounting spans bootstrap and inference. A request boundary must not reset the
+        // closure-wide denominator or make repeated semantic-stage reads look like a loop.
       };
 
       const renderTransfer = (epoch) => {
         if (epoch !== renderEpoch) return;
         renderPending = false;
-        const current = transfer.current;
-        if (!current) return;
+        const aggregate = transfer.aggregate;
+        if (!aggregate) return;
 
-        setDeterminate(current.loadedBytes, current.totalBytes);
-        const component = humanize(current.component || "model object");
-        const shard =
-          current.fileCount > 1
-            ? ` - shard ${current.fileIndex + 1} of ${current.fileCount}`
+        const requestActivity = aggregate.request_activity;
+        if (
+          requestActivity &&
+          Number(aggregate.total_bytes) > 0 &&
+          Number(aggregate.loaded_bytes) >= Number(aggregate.total_bytes)
+        ) {
+          setIndeterminate();
+          const activityComponent = requestActivity.component || aggregate.component;
+          const component = activityComponent ? ` - ${humanize(activityComponent)}` : "";
+          primary.textContent = `${
+            requestActivity.phase || "Applying verified cached model stages"
+          }${component}`;
+          primary.title = requestActivity.current_path || "";
+          const current = requestActivity.current_path
+            ? ` | ${shortPath(requestActivity.current_path)}`
             : "";
-        primary.textContent = `${component}${shard} - ${shortPath(current.path)}`;
-        primary.title = current.path;
+          secondary.textContent = `${formatBytes(
+            requestActivity.processed_bytes,
+          )} from cache | ${requestActivity.logical_objects_completed || 0} objects | ${
+            requestActivity.bounded_ranges_processed || 0
+          } reads${current}`;
+          return;
+        }
 
-        const rate = currentTransferRate();
-        const remaining = Math.max(0, current.totalBytes - current.loadedBytes);
-        const rateText = rate > 0 ? ` - ${formatBytes(rate)}/s transfer rate` : "";
-        const etaText = rate > 0 && remaining > 0 ? ` - object ETA ${formatDuration(remaining / rate)}` : "";
-        secondary.textContent = `${formatBytes(current.loadedBytes)} / ${formatBytes(
-          current.totalBytes,
-        )}${rateText}${etaText} - ${formatBytes(transfer.transferredBytes)} transferred - ${
-          transfer.verifiedObjects
-        } verified`;
+        setDeterminate(aggregate.loaded_bytes, aggregate.total_bytes);
+        const component = aggregate.component ? ` - ${humanize(aggregate.component)}` : "";
+        primary.textContent = `${aggregate.phase || "Model transfer"}${component}`;
+        primary.removeAttribute("title");
+
+        const rateText = aggregate.bytes_per_second
+          ? ` | ${formatBytes(aggregate.bytes_per_second)}/s`
+          : "";
+        const etaText = aggregate.eta_seconds
+          ? ` | ETA ${formatDuration(aggregate.eta_seconds)}`
+          : "";
+        secondary.textContent = `${formatBytes(aggregate.loaded_bytes)} / ${formatBytes(
+          aggregate.total_bytes,
+        )} | ${aggregate.physical_parts_completed}/${aggregate.physical_parts_total} parts${rateText}${etaText}`;
+      };
+
+      const updateAggregateTransfer = (detail) => {
+        if (!detail || typeof detail !== "object") return false;
+        transfer.aggregate = detail;
+        transfer.transferredBytes = Number(detail.loaded_bytes) || 0;
+        transfer.verifiedObjects = Number(detail.logical_objects_completed) || 0;
+        scheduleTransferRender();
+        return true;
       };
 
       const scheduleTransferRender = () => {
@@ -589,6 +621,7 @@
 
       const fail = (message, retryable = true) => {
         invalidateTransferRender();
+        blockOverlayHandoff();
         panel.dataset.compact = "false";
         setBusy(false);
         setSummary("Model runtime failed", "FAILED", "error");
@@ -601,6 +634,7 @@
 
       const failRun = (message) => {
         invalidateTransferRender();
+        blockOverlayHandoff();
         panel.dataset.compact = "false";
         setBusy(false);
         setSummary("Generation failed", "FAILED", "error");
@@ -612,6 +646,7 @@
       };
 
       const showReferenceError = (message) => {
+        revealLoaderPanel();
         panel.dataset.compact = "false";
         errorMessage.textContent = String(message);
         errorMessage.hidden = false;
@@ -627,10 +662,20 @@
         );
       };
 
+      const heifReferenceFile = (file) => {
+        const type = String(file?.type || "").toLowerCase();
+        const name = String(file?.name || "").toLowerCase();
+        return ["image/heic", "image/heif"].includes(type) || /\.(heic|heif)$/.test(name);
+      };
+
       const loadReferenceFile = async (file) => {
         if (!file) return;
         if (!supportedReferenceFile(file)) {
-          showReferenceError("Choose a PNG, JPEG, or WebP image.");
+          showReferenceError(
+            heifReferenceFile(file)
+              ? "HEIC/HEIF decoding is not available in this build. Convert the image to JPEG, PNG, or WebP."
+              : "Choose a PNG, JPEG, or WebP image.",
+          );
           return;
         }
         if (!Number.isFinite(file.size) || file.size < 1 || file.size > MAX_REFERENCE_BYTES) {
@@ -641,6 +686,7 @@
           provide_reference_image(new Uint8Array(await file.arrayBuffer()));
           errorMessage.hidden = true;
           logActivity("Reference image selected");
+          hideLoaderPanelIfSafe();
         } catch (error) {
           showReferenceError(`Reference load failed: ${error}`);
         }
@@ -665,12 +711,22 @@
         transfer.observedEvent = true;
         switch (detail.event) {
           case "surface_inference_suspended":
+            surfaceInferenceSuspended = true;
+            revealLoaderPanel();
+            panel.dataset.compact = "false";
+            setBusy(true);
+            setSummary("Exclusive WebGPU model work", "WORKING");
+            setIndeterminate();
+            primary.textContent = "Rendered Bevy surface paused for exclusive model work";
+            secondary.textContent = "Progress continues here until Bevy rendering resumes";
             document.documentElement.dataset.surfaceInference = "suspended";
             logActivity("Rendered surface paused for request-scoped WebGPU inference");
             break;
           case "surface_inference_resumed":
+            surfaceInferenceSuspended = false;
             delete document.documentElement.dataset.surfaceInference;
             logActivity("Rendered surface resumed after the runtime terminal");
+            hideLoaderPanelIfSafe();
             break;
           case "preparing":
             panel.dataset.compact = "false";
@@ -717,7 +773,7 @@
             setSummary("Denoiser preload verified", "PRELOADED");
             setDeterminate(detail.retained_stages, 46);
             primary.textContent = `${detail.retained_stages}/46 denoiser stages retained on WebGPU`;
-            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network ranges - ${formatBytes(
+            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network requests - ${formatBytes(
               detail.traffic.network_response_bytes,
             )} network`;
             logActivity("Retained denoiser preload verified");
@@ -742,7 +798,7 @@
             setSummary("Packed-F16 denoiser preload verified", "PRELOADED");
             setDeterminate(detail.cached_stages, 46);
             primary.textContent = `${detail.cached_stages}/46 stages - ${detail.cached_objects}/106 authenticated objects retained`;
-            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network ranges - ${formatBytes(
+            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network requests - ${formatBytes(
               detail.cached_bytes,
             )} packed-F16 on WebGPU`;
             logActivity(
@@ -776,7 +832,7 @@
             primary.textContent = `${detail.traffic.verified_objects} objects - ${formatBytes(
               detail.traffic.object_read_bytes,
             )} authenticated request bytes`;
-            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network ranges - ${formatBytes(
+            secondary.textContent = `${detail.traffic.cache_hits}/${detail.traffic.cache_lookups} persistent-cache hits - ${detail.traffic.network_requests} network requests - ${formatBytes(
               detail.traffic.network_response_bytes,
             )} network`;
             logActivity("Per-request logical, persistent-cache, and network traffic recorded");
@@ -819,58 +875,20 @@
             logActivity("Generation request started");
             break;
           case "artifact_started": {
-            transfer.current = {
-              path: detail.path,
-              component: detail.component,
-              fileIndex: Number(detail.file_index) || 0,
-              fileCount: Math.max(1, Number(detail.file_count) || 1),
-              loadedBytes: 0,
-              totalBytes: Number(detail.total_bytes) || 0,
-            };
-            transfer.samples = [];
-            sampleTransfer();
             setBusy(true);
-            setSummary(`Streaming ${humanize(detail.component || "model object")}`, "LOADING");
+            setSummary("Streaming model data", "LOADING");
             logActivity(`Started ${shortPath(detail.path)}`);
-            scheduleTransferRender();
+            updateAggregateTransfer(detail.transfer);
             break;
           }
           case "artifact_progress": {
-            if (!transfer.current || transfer.current.path !== detail.path) {
-              transfer.current = {
-                path: detail.path,
-                component: null,
-                fileIndex: 0,
-                fileCount: 1,
-                loadedBytes: 0,
-                totalBytes: Number(detail.total_bytes) || 0,
-              };
-            }
-            const loaded = Math.min(
-              Number(detail.total_bytes) || 0,
-              Math.max(0, Number(detail.loaded_bytes) || 0),
-            );
-            const delta = Math.max(0, loaded - transfer.current.loadedBytes);
-            transfer.current.loadedBytes = loaded;
-            transfer.current.totalBytes = Number(detail.total_bytes) || transfer.current.totalBytes;
-            transfer.transferredBytes += delta;
-            sampleTransfer();
-            scheduleTransferRender();
+            updateAggregateTransfer(detail.transfer);
             break;
           }
           case "artifact_verified":
-            if (transfer.current?.path === detail.path) {
-              const delta = Math.max(
-                0,
-                transfer.current.totalBytes - transfer.current.loadedBytes,
-              );
-              transfer.transferredBytes += delta;
-              transfer.current.loadedBytes = transfer.current.totalBytes;
-            }
-            transfer.verifiedObjects += 1;
+            updateAggregateTransfer(detail.transfer);
             setSummary("Model object verified", "VERIFIED");
             logActivity(`Verified ${shortPath(detail.path)}`);
-            scheduleTransferRender();
             break;
           case "stage_started":
             invalidateTransferRender();
@@ -879,9 +897,9 @@
             primary.textContent = detail.total_steps
               ? `${humanize(detail.stage)} - ${detail.total_steps} steps`
               : humanize(detail.stage);
-            secondary.textContent = `${formatBytes(transfer.transferredBytes)} transferred - ${
+            secondary.textContent = `${formatBytes(transfer.transferredBytes)} model data | ${
               transfer.verifiedObjects
-            } objects verified`;
+            } objects`;
             detail.total_steps ? setDeterminate(0, detail.total_steps) : setIndeterminate();
             logActivity(`${humanize(detail.stage)} started`);
             break;
@@ -893,9 +911,9 @@
             );
             setDeterminate(detail.step, detail.total_steps);
             primary.textContent = humanize(detail.stage);
-            secondary.textContent = `${formatBytes(transfer.transferredBytes)} transferred - ${
+            secondary.textContent = `${formatBytes(transfer.transferredBytes)} model data | ${
               transfer.verifiedObjects
-            } objects verified`;
+            } objects`;
             break;
           case "stage_completed":
             invalidateTransferRender();
@@ -931,6 +949,21 @@
         }
       };
 
+      const handleBackendEvent = (event) => {
+        const detail = event.detail;
+        if (!detail || typeof detail.event !== "string") return;
+        if (detail.event === "failed") {
+          backendReady = false;
+          fail(detail.message || "Shared WebGPU backend failed");
+          return;
+        }
+        if (detail.event === "ready") {
+          backendReady = true;
+          hideLoaderPanelIfSafe();
+        }
+      };
+
+      window.addEventListener("burn-image-backend", handleBackendEvent);
       window.addEventListener("burn-image-runtime", handleRuntimeEvent);
       window.addEventListener("burn-image-progress", handleProgressEvent);
       retryButton.addEventListener("click", () => location.reload());

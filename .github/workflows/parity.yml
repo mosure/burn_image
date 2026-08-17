@@ -363,7 +363,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu \
+          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu,autotune \
             --bin boogu-full-parity -- \
             --artifacts "$BURN_IMAGE_TURBO_FLAT_PARITY_ARTIFACTS" \
             --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/turbo" \
@@ -387,7 +387,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu \
+          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu,autotune \
             --bin boogu-full-parity -- \
             --artifacts "$BURN_IMAGE_EDIT_FLAT_PARITY_ARTIFACTS" \
             --fixture "$BURN_IMAGE_REFERENCE_FIXTURES/edit" \
@@ -411,7 +411,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu \
+          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu,autotune \
             --bin boogu-full-parity -- \
             --artifacts "$BURN_IMAGE_EDIT_1K5_FLAT_PARITY_ARTIFACTS" \
             --fixture "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
@@ -439,7 +439,7 @@ jobs:
           set -euo pipefail
           output_dir="$RUNNER_TEMP/burn-image-native-low-vram-1k5"
           mkdir -p "$output_dir"
-          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu \
+          cargo run -p burn_boogu --release --locked --features runtime,import,wgpu,autotune \
             --bin boogu-full-parity -- \
             --artifacts "$BURN_IMAGE_EDIT_1K5_FLAT_PARITY_ARTIFACTS" \
             --fixture "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
@@ -487,14 +487,22 @@ jobs:
             --out-dir "$www_out" \
             --out-name bevy_burn_image \
             "$wasm_input"
+          install -m 0644 crates/bevy_image/www/burn-image-icon.png \
+            "$www_out/burn-image-icon.png"
 
           test -s "$www_out/bevy_burn_image.js"
           test -s "$www_out/bevy_burn_image_bg.wasm"
+          test -s "$www_out/burn-image-icon.png"
+          cmp -s crates/bevy_image/www/burn-image-icon.png \
+            "$www_out/burn-image-icon.png"
           grep -Eq '^export function start_boogu_web\(\)' "$www_out/bevy_burn_image.js"
           grep -Eq '^export function provide_reference_image\(bytes\)' \
             "$www_out/bevy_burn_image.js"
           grep -Fq 'wasm.__wbindgen_start()' "$www_out/bevy_burn_image.js"
-          sha256sum "$www_out/bevy_burn_image.js" "$www_out/bevy_burn_image_bg.wasm"
+          sha256sum \
+            "$www_out/bevy_burn_image.js" \
+            "$www_out/bevy_burn_image_bg.wasm" \
+            "$www_out/burn-image-icon.png"
 
       - name: Browser Turbo 1024 first-DMD packed-F16 dense-F32-per-stage diagnostic
         id: browser_turbo_first_dmd_1024
@@ -611,7 +619,7 @@ jobs:
             "const MODEL_PROMPT = \"$qualification_prompt\";" \
             crates/bevy_image/tests/wasm_rendered_surface_smoke.mjs
           cargo run -p bevy_burn_image --release --locked \
-            --features boogu-native \
+            --features boogu-native,native-autotune \
             --bin burn-image-viewer -- \
             --artifacts "$artifact_root/boogu-image-0.1-turbo" \
             --variant turbo \

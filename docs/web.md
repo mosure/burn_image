@@ -12,6 +12,8 @@ mkdir -p crates/bevy_image/www/out
 wasm-bindgen --target web --out-dir crates/bevy_image/www/out \
   --out-name bevy_burn_image \
   target/wasm32-unknown-unknown/wasm-release/bevy_burn_image.wasm
+install -m 0644 crates/bevy_image/www/burn-image-icon.png \
+  crates/bevy_image/www/out/burn-image-icon.png
 rg '^export function (start_boogu_web|provide_reference_image)' \
   crates/bevy_image/www/out/bevy_burn_image.js
 npx --yes serve crates/bevy_image/www --listen 8080
@@ -53,23 +55,27 @@ Open a URL with the remote sealed bundle and release selection:
 http://localhost:8080/?variant=turbo&profile=production
 ```
 
-The tracked static host lives in `crates/bevy_image/www/`; generated bindgen JavaScript and Wasm
-remain under the ignored `www/out/` directory. `.github/workflows/deploy-pages.yml` mirrors the
+The tracked static host lives in `crates/bevy_image/www/`; generated bindgen JavaScript and Wasm,
+plus an exact copy of the tracked app icon, remain under the ignored `www/out/` directory.
+`.github/workflows/deploy-pages.yml` mirrors the
 repository's local package command and never copies model objects into the Pages artifact. Manual
 dispatch runs the complete deployment; `main` pushes deploy automatically only after the
 repository variable `BURN_IMAGE_PAGES_READY=true` is set. Before setting it, publish all five
 canonical CDN entries and enable Pages with **GitHub Actions** as its source. The deploy job probes
-all five manifests and every declared metadata or weight payload for the exact `206`, CORS,
-exposed `Content-Range`, manifest `no-cache`, and payload `immutable` headers required by the
-bounded Range reader. A missing/private entry or incomplete CDN header policy therefore blocks
-deployment instead of publishing a page that cannot load its model. The expected project URL is
+all five manifests, every directly stored non-weight payload, and every sealed-layout physical part
+as exact HTTP 200 complete objects with canonical `Content-Length`, absent-or-identity
+`Content-Encoding`, cross-origin readability, manifest `no-cache`, and payload `immutable` caching.
+It authenticates the sidecar and its complete logical reconstruction contract
+instead of requesting absent logical Burnpack URLs. A missing/private entry or incomplete CDN
+header policy therefore blocks deployment instead of publishing a page that cannot load its model.
+The expected project URL is
 `https://mosure.github.io/burn_image/`.
 
-As of the 2026-08-14 qualification checkpoint, deployment remains blocked: the prepared canonical
-model entry URLs return HTTP 403, and the CDN response policy does not expose the required
-Range/`Content-Range` headers through CORS. The exact modular qualification below used the verified
-local modular bundle server; it is runtime evidence, not evidence that the canonical CDN is
-publicly deployable.
+As of 2026-08-16 the canonical model URLs are public. A real-browser transport probe authenticated
+the Turbo/Qwen/VAE manifests and layouts, verified cold whole-part downloads, and resumed from warm
+CacheStorage. Pages remains fail-closed because the public CDN currently marks reusable manifest
+URLs `immutable` instead of the required `no-cache`; this transport probe is not a full generation
+or numerical-parity claim.
 
 On Linux, the browser harnesses do not choose shared-memory backing from nominal free blocks alone.
 They use BigInt `statfs` arithmetic and a real bounded 256 MiB write/`fsync`/delete probe to catch
@@ -93,8 +99,9 @@ runtime-Q8/F32 denoiser for four DMD passes, while Turbo initially preloads 46 p
 widens one dense-F32 semantic stage at a time during DMD, and evicts the packed cache before VAE
 decode. Compact/ready loader status sits at the bottom-right
 so it does not obscure Bevy's GPU status line; expanded, loading, and error states remain top-right.
-`aria-live` announcements occur at lifecycle boundaries, while high-frequency 4 MiB range updates
-are coalesced to animation frames.
+`aria-live` announcements occur at lifecycle boundaries, while high-frequency range updates are
+coalesced to animation frames. The ordinary persistent cache stores independently authenticated
+entries no larger than 4 MiB, not complete 20 MiB physical parts or 256 MiB semantic objects.
 
 With `artifacts` omitted, that selection resolves exactly to
 `https://aberration.technology/model/boogu-image-0.1-turbo`.
@@ -132,9 +139,11 @@ denoiser retention, not a substitute for the mandatory low-VRAM numerical and me
 The ordinary UI's all-stage `resident` mode is a separate pending run.
 Descriptor support for the other released shapes does not establish rendered operation,
 performance, or cross-stack portability.
-WebGPU requires a secure context (`https://` or localhost).
-The artifact server must allow the `Range` request header through CORS, return `206`, and expose
-`Content-Range` to browser code.
+WebGPU requires a secure context (`https://` or localhost). Canonical part-only artifacts require
+cross-origin HTTP 200 reads with exact physical bytes; `Content-Encoding` must be absent or
+`identity`. Exposed `Content-Length` is checked early when available, while exact `Blob.size` and
+SHA-256 checks remain the authority. Legacy direct Burnpacks additionally require exact HTTP 206
+range framing and exposed `Content-Range`.
 
 ## implemented contracts
 
@@ -186,11 +195,16 @@ The artifact server must allow the `Range` request header through CORS, return `
 - The retired `low-vram-retained-q8-dense-f32-per-stage-denoiser` selector fails closed. Its
   real-browser first-DMD output was non-finite; it is neither a compatibility fallback nor an
   alternate supported Turbo mode.
-- `fetch_browser_range` performs the actual browser `fetch`, requires HTTP 206 and a matching
-  exposed `Content-Range`, enforces the 16 MiB response cap, and returns one requested chunk.
-- `BrowserStageShardReader` aggregates at most one sealed semantic object (hard cap 256 MiB),
-  verifies its exact size and SHA-256, uploads/materializes it, and releases its host bytes. Wasm
-  linear memory never holds a complete bundle even though initialized modules accumulate on GPU.
+- Canonical physical parts and compact declared files use one HTTP 200 complete-object fetch and
+  one CacheStorage entry. The reader checks any exposed exact `Content-Length`, verifies
+  `Blob.size` before `Blob.arrayBuffer()` enters Wasm, and authenticates SHA-256. The legacy
+  `fetch_browser_range` path retains exact HTTP 206/`Content-Range` framing and 4 MiB cache entries.
+- `BrowserStageShardReader` authenticates the manifest-sealed transport layout, reconstructs one
+  logical Burnpack from content-addressed physical parts targeting 20,971,520 bytes and hard-capped
+  at 25,000,000 bytes, then verifies the logical object's exact size and SHA-256. It aggregates at
+  most one sealed semantic object (hard cap 256 MiB), uploads/materializes it, and releases its host
+  bytes. Wasm linear memory never holds a complete bundle even though initialized modules
+  accumulate on GPU.
 - Async loading suspends at network boundaries, reports artifact/stage progress to both Bevy and
   the DOM loading panel, and checks cancellation before every range and semantic boundary.
   Ordinary resident forward execution uses the preloaded graph; low-VRAM execution reports exact
@@ -671,8 +685,11 @@ selected SwiftShader remains excluded from hardware evidence.
 
 ### limits and remaining runtime gates
 
-Transport remains bounded by a 4 MiB default chunk, 16 MiB hard response cap, 4 MiB manifest cap,
-and 256 MiB hard semantic-object cap. That object cap is not a WGPU binding limit. The largest
+The artifact layers have separate bounds: logical Burnpacks have a 256 MiB semantic cap; physical
+CDN parts target 20,971,520 bytes and have an exact decimal 25,000,000-byte hard cap; each part is
+one complete authenticated CacheStorage entry, while legacy network ranges remain at most 4 MiB;
+and the manifest plus sealed transport sidecar each have a 4 MiB bootstrap cap. The
+semantic-object cap is not a WGPU binding limit. The largest
 post-load Qwen tensor is a 25,323 by 4,096 embedding row adapted to F32, or 414,892,032 bytes. The
 Boogu app requests a shape-aware 1,217,126,400-byte minimum storage-buffer/buffer limit, covering
 the largest released 1.5K striped-tail plan; the model-neutral app keeps WebGPU's portable

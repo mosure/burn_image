@@ -467,8 +467,9 @@ pub fn materialize_packed_f16_object<R: CubeRuntime>(
 
 /// Materialize a batch of independently bounded packed objects.
 ///
-/// One output arena and one dispatch are created per object. This preserves physical Burnpack
-/// object boundaries, ensuring no combined stage buffer can cross the WebGPU binding ceiling.
+/// One output arena and one dispatch are created per logical Burnpack object. This preserves
+/// semantic object boundaries, ensuring no combined stage buffer can cross the WebGPU binding
+/// ceiling.
 pub fn materialize_packed_f16_objects<R: CubeRuntime>(
     objects: &[PackedF16Object<R>],
 ) -> Result<Vec<MaterializedF32Object<R>>, PackedF16Error> {

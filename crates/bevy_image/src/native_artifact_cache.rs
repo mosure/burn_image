@@ -2,8 +2,9 @@
 //!
 //! The cache mirrors the immutable CDN tree under
 //! `~/.burn_image/models/<bundle-id>`. A manifest is installed only after its seal and exact
-//! variant/profile/bundle identity validate. Every declared payload is streamed through the
-//! manifest's size and SHA-256 contract before an atomic rename makes it visible to the runtime.
+//! variant/profile/bundle identity validate. Every direct payload or manifest-sealed transport
+//! part is streamed through its size and SHA-256 contract before an atomic rename makes it visible
+//! to the runtime.
 
 use std::{
     fs,
@@ -19,9 +20,10 @@ use burn_boogu::artifacts::{
 };
 use burn_boogu::{BooguVariant, artifacts::BooguStorageProfile, boogu_model_descriptor};
 use burn_image::{
-    ArtifactBundleFetcher, ArtifactBundleId, ArtifactDependency, ArtifactFile, ArtifactManifest,
-    ArtifactPath, ArtifactReadError, ArtifactSource, ArtifactVerifier, FilesystemArtifactCache,
-    IntegrityPolicy, NumericFormat, RemoteBaseUrl,
+    ArtifactBundleFetcher, ArtifactBundleId, ArtifactDependency, ArtifactFile, ArtifactFileRole,
+    ArtifactManifest, ArtifactPath, ArtifactReadError, ArtifactSource, ArtifactTransportLayout,
+    ArtifactTransportObject, ArtifactTransportPart, ArtifactVerifier, FilesystemArtifactCache,
+    IntegrityPolicy, NumericFormat, RemoteBaseUrl, Sha256Digest, VerifiedArtifactTransportLayout,
 };
 use thiserror::Error;
 
@@ -317,11 +319,30 @@ where
             }
         };
 
+    let transport = resolve_cached_or_remote_transport_layout(cache_root, base_url, &manifest)?;
     let total_files = manifest.files.len();
     let mut cached_files = 0usize;
     for file in &manifest.files {
         let path = cache_root.join(file.path.as_str());
-        if cached_file_matches(&path, file)? {
+        let transport_object = match (file.role, transport.as_ref()) {
+            (ArtifactFileRole::Weights, Some(layout)) => {
+                Some(layout.object(&file.path).ok_or_else(|| {
+                    NativeArtifactCacheError::message(format!(
+                        "verified transport layout omits logical artifact {}",
+                        file.path
+                    ))
+                })?)
+            }
+            _ => None,
+        };
+        let cached = if let Some(object) = transport_object {
+            fs::symlink_metadata(&path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                && cached_transport_object_matches(cache_root, object)?
+        } else {
+            cached_file_matches(&path, file)?
+        };
+        if cached {
             cached_files += 1;
             continue;
         }
@@ -345,8 +366,13 @@ where
             file.path,
             file.size
         ));
-        let url = base_url.resolve(&file.path);
-        download_verified_file_with_retries(&url, &path, file)?;
+        if let Some(object) = transport_object {
+            download_verified_transport_parts(base_url, cache_root, file, object)?;
+            remove_stale_cached_logical_weight(&path)?;
+        } else {
+            let url = base_url.resolve(&file.path);
+            download_verified_file_with_retries(&url, &path, file)?;
+        }
         cached_files += 1;
     }
     if manifest_needs_commit {
@@ -554,8 +580,9 @@ impl ArtifactBundleFetcher for UreqSiblingBundleFetcher {
         let url = base.resolve(
             &ArtifactPath::new("manifest.json").expect("canonical manifest path is valid"),
         );
-        fetch_bounded_with_retries(&url, maximum_bytes, "dependency manifest")
-            .map_err(|error| ArtifactReadError::transport(error.to_string()))
+        let bytes = fetch_bounded_with_retries(&url, maximum_bytes, "dependency manifest")
+            .map_err(|error| ArtifactReadError::transport(error.to_string()))?;
+        Ok(bytes)
     }
 
     fn fetch_file(
@@ -744,7 +771,7 @@ fn parse_expected_manifest(
 }
 
 fn cached_file_matches(path: &Path, file: &ArtifactFile) -> Result<bool, NativeArtifactCacheError> {
-    let metadata = match fs::metadata(path) {
+    let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => {
@@ -754,7 +781,7 @@ fn cached_file_matches(path: &Path, file: &ArtifactFile) -> Result<bool, NativeA
             )));
         }
     };
-    if !metadata.is_file() || metadata.len() != file.size {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != file.size {
         return Ok(false);
     }
     let mut reader = fs::File::open(path).map_err(|error| {
@@ -780,6 +807,158 @@ fn cached_file_matches(path: &Path, file: &ArtifactFile) -> Result<bool, NativeA
         }
     }
     Ok(verifier.finish().is_ok())
+}
+
+fn resolve_cached_or_remote_transport_layout(
+    cache_root: &Path,
+    base_url: &RemoteBaseUrl,
+    manifest: &ArtifactManifest,
+) -> Result<Option<VerifiedArtifactTransportLayout>, NativeArtifactCacheError> {
+    let Some(file) = ArtifactTransportLayout::declared_file(manifest)
+        .map_err(|error| NativeArtifactCacheError::message(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let cached_path = cache_root.join(file.path.as_str());
+    if cached_file_matches(&cached_path, file)? {
+        let bytes = fs::read(&cached_path).map_err(|error| {
+            NativeArtifactCacheError::message(format!(
+                "read cached transport layout {}: {error}",
+                cached_path.display()
+            ))
+        })?;
+        let layout = ArtifactTransportLayout::parse_and_validate(manifest, &bytes)
+            .map_err(|error| NativeArtifactCacheError::message(error.to_string()))?;
+        return Ok(Some(layout));
+    }
+    fetch_remote_transport_layout(base_url, manifest)
+}
+
+fn fetch_remote_transport_layout(
+    base_url: &RemoteBaseUrl,
+    manifest: &ArtifactManifest,
+) -> Result<Option<VerifiedArtifactTransportLayout>, NativeArtifactCacheError> {
+    let Some(file) = ArtifactTransportLayout::declared_file(manifest)
+        .map_err(|error| NativeArtifactCacheError::message(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let url = base_url.resolve(&file.path);
+    let bytes = fetch_bounded_with_retries(&url, file.size, "artifact transport layout")?;
+    ArtifactTransportLayout::parse_and_validate(manifest, &bytes)
+        .map(Some)
+        .map_err(|error| NativeArtifactCacheError::message(error.to_string()))
+}
+
+fn fetch_verified_transport_part_with_retries(
+    base_url: &RemoteBaseUrl,
+    part: &ArtifactTransportPart,
+) -> Result<Vec<u8>, NativeArtifactCacheError> {
+    let url = base_url.resolve(&part.path);
+    let mut last_error = None;
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match fetch_bounded(&url, part.size) {
+            Ok(bytes)
+                if u64::try_from(bytes.len()).ok() == Some(part.size)
+                    && Sha256Digest::calculate(&bytes) == part.sha256 =>
+            {
+                return Ok(bytes);
+            }
+            Ok(bytes) => {
+                last_error = Some(format!(
+                    "transport part integrity mismatch: expected {}/{} bytes, found {}/{}",
+                    part.sha256,
+                    part.size,
+                    Sha256Digest::calculate(&bytes),
+                    bytes.len()
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        if attempt < DOWNLOAD_ATTEMPTS {
+            thread::sleep(retry_delay(attempt));
+        }
+    }
+    Err(NativeArtifactCacheError::message(format!(
+        "failed to authenticate transport part `{url}` after {DOWNLOAD_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "unknown transport error".into())
+    )))
+}
+
+fn cached_transport_object_matches(
+    cache_root: &Path,
+    object: &ArtifactTransportObject,
+) -> Result<bool, NativeArtifactCacheError> {
+    for part in &object.parts {
+        if !cached_file_matches(
+            &cache_root.join(part.path.as_str()),
+            &transport_part_file(part),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn download_verified_transport_parts(
+    base_url: &RemoteBaseUrl,
+    cache_root: &Path,
+    file: &ArtifactFile,
+    object: &ArtifactTransportObject,
+) -> Result<(), NativeArtifactCacheError> {
+    if object.path != file.path || object.size != file.size || object.sha256 != file.sha256 {
+        return Err(NativeArtifactCacheError::message(format!(
+            "transport object identity differs from sealed logical artifact {}",
+            file.path
+        )));
+    }
+    for part in &object.parts {
+        let physical = transport_part_file(part);
+        let path = cache_root.join(part.path.as_str());
+        if cached_file_matches(&path, &physical)? {
+            continue;
+        }
+        let bytes = fetch_verified_transport_part_with_retries(base_url, part)?;
+        install_bytes_atomically(&path, &bytes)?;
+        if !cached_file_matches(&path, &physical)? {
+            return Err(NativeArtifactCacheError::message(format!(
+                "installed transport part {} failed its sealed identity",
+                part.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn transport_part_file(part: &ArtifactTransportPart) -> ArtifactFile {
+    ArtifactFile {
+        path: part.path.clone(),
+        size: part.size,
+        sha256: part.sha256,
+        role: ArtifactFileRole::Other,
+        component: None,
+        shard: None,
+    }
+}
+
+fn remove_stale_cached_logical_weight(path: &Path) -> Result<(), NativeArtifactCacheError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(NativeArtifactCacheError::message(format!(
+            "cached logical weight path is a directory: {}",
+            path.display()
+        ))),
+        Ok(_) => fs::remove_file(path).map_err(|error| {
+            NativeArtifactCacheError::message(format!(
+                "remove stale cached logical weight {}: {error}",
+                path.display()
+            ))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(NativeArtifactCacheError::message(format!(
+            "inspect stale cached logical weight {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn download_verified_file_with_retries(
@@ -1198,6 +1377,119 @@ mod tests {
         manifest
     }
 
+    fn write_tiny_transport_bundle(
+        root: &Path,
+        profile: BooguStorageProfile,
+        bundle: &str,
+        model: &str,
+        model_revision: &str,
+        payload: &[u8],
+    ) -> ArtifactManifest {
+        use burn_image::{
+            ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
+            ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY, ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY,
+            ARTIFACT_TRANSPORT_LAYOUT_PATH, ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY,
+            ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
+            ARTIFACT_TRANSPORT_MAX_PART_BYTES, ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY,
+            ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY, ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+            ArtifactTransportLayout, ArtifactTransportObject, ArtifactTransportPart,
+        };
+
+        let logical_path = ArtifactPath::new("objects/tiny.bpk").unwrap();
+        let digest = Sha256Digest::calculate(payload);
+        let part_path = ArtifactPath::new(format!("transport/{digest}.part")).unwrap();
+        fs::create_dir_all(root.join("transport")).unwrap();
+        fs::create_dir_all(root.join("metadata")).unwrap();
+        fs::write(root.join(part_path.as_str()), payload).unwrap();
+        let layout = ArtifactTransportLayout {
+            schema_version: ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
+            bundle: ArtifactBundleId::new(bundle).unwrap(),
+            profile: ArtifactProfileId::new(boogu_profile_slug(profile)).unwrap(),
+            model: ModelId::new(model).unwrap(),
+            model_revision: model_revision.into(),
+            target_part_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+            hard_max_part_bytes: ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+            objects: vec![ArtifactTransportObject {
+                path: logical_path.clone(),
+                size: payload.len() as u64,
+                sha256: digest,
+                parts: vec![ArtifactTransportPart {
+                    path: part_path,
+                    offset: 0,
+                    size: payload.len() as u64,
+                    sha256: digest,
+                }],
+            }],
+        };
+        let layout_bytes = serde_json::to_vec_pretty(&layout).unwrap();
+        fs::write(root.join(ARTIFACT_TRANSPORT_LAYOUT_PATH), &layout_bytes).unwrap();
+        let mut metadata = BTreeMap::from([
+            (
+                ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY.into(),
+                ARTIFACT_TRANSPORT_LAYOUT_PATH.into(),
+            ),
+            (
+                ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY.into(),
+                ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION.to_string(),
+            ),
+            (ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY.into(), "true".into()),
+            (
+                ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY.into(),
+                ARTIFACT_TRANSPORT_TARGET_PART_BYTES.to_string(),
+            ),
+            (
+                ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY.into(),
+                ARTIFACT_TRANSPORT_MAX_PART_BYTES.to_string(),
+            ),
+            (
+                ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY.into(),
+                ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
+            ),
+            (
+                ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+                ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
+            ),
+        ]);
+        let mut manifest = ArtifactManifest {
+            schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
+            bundle: layout.bundle.clone(),
+            profile: layout.profile.clone(),
+            model: layout.model.clone(),
+            model_revision: layout.model_revision.clone(),
+            numeric_format: numeric_format(profile),
+            components: Vec::new(),
+            files: vec![
+                ArtifactFile {
+                    path: logical_path,
+                    size: payload.len() as u64,
+                    sha256: digest,
+                    role: ArtifactFileRole::Weights,
+                    component: None,
+                    shard: None,
+                },
+                ArtifactFile {
+                    path: ArtifactPath::new(ARTIFACT_TRANSPORT_LAYOUT_PATH).unwrap(),
+                    size: layout_bytes.len() as u64,
+                    sha256: Sha256Digest::calculate(&layout_bytes),
+                    role: ArtifactFileRole::Metadata,
+                    component: None,
+                    shard: None,
+                },
+            ],
+            dependencies: Vec::new(),
+            metadata: std::mem::take(&mut metadata),
+            content_digest: None,
+        };
+        manifest.seal().unwrap();
+        layout.validate_for_manifest(&manifest).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        manifest
+    }
+
     #[test]
     fn explicit_source_accepts_legacy_descriptive_bundle_identity_correctness() {
         let temp = tempfile::tempdir().unwrap();
@@ -1553,6 +1845,103 @@ mod tests {
         assert_eq!(
             fs::read(resolved.vae_root().join("objects/tiny.bpk")).unwrap(),
             b"vae payload"
+        );
+    }
+
+    #[test]
+    fn native_remote_pipeline_cache_commits_transport_parts_and_reopens_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote");
+        let variant = BooguVariant::Image01Turbo;
+        let profile = BooguStorageProfile::F16QwenVisionF32;
+        let bundle = boogu_bundle_id(variant, profile);
+        let descriptor = boogu_model_descriptor(variant);
+        let payload = b"part-only native pipeline payload";
+        let remote_bundle = remote.join(&bundle);
+        fs::create_dir_all(&remote_bundle).unwrap();
+        write_tiny_transport_bundle(
+            &remote_bundle,
+            profile,
+            &bundle,
+            descriptor.id.as_str(),
+            &descriptor.revision,
+            payload,
+        );
+
+        let server = TestServer::serve(remote);
+        let base = RemoteBaseUrl::new(format!("{}/{}", server.base_url, bundle)).unwrap();
+        let cache = temp.path().join("cache").join(&bundle);
+        let manifest =
+            cache_remote_bundle(variant, profile, &base, &cache, false, &|_| {}).unwrap();
+        assert!(
+            ArtifactTransportLayout::declared_file(&manifest)
+                .unwrap()
+                .is_some()
+        );
+        let digest = Sha256Digest::calculate(payload);
+        let part_path = format!("transport/{digest}.part");
+        assert_eq!(fs::read(cache.join(&part_path)).unwrap(), payload);
+        assert!(!cache.join("objects/tiny.bpk").exists());
+        assert!(!remote_bundle.join("objects/tiny.bpk").exists());
+        assert!(cache.join("metadata/transport-layout.json").is_file());
+        server.requests.store(0, Ordering::SeqCst);
+        cache_remote_bundle(variant, profile, &base, &cache, false, &|_| {}).unwrap();
+        assert_eq!(server.requests.load(Ordering::SeqCst), 0);
+        let directory = burn_image::VerifiedArtifactDirectory::open(&cache).unwrap();
+        let logical = directory
+            .manifest()
+            .files
+            .iter()
+            .find(|file| file.role == ArtifactFileRole::Weights)
+            .unwrap();
+        let mut reader = directory.shard_reader().unwrap();
+        assert_eq!(
+            burn_image::ArtifactShardReader::read_shard(&mut reader, logical).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn native_remote_dependency_cache_commits_transport_parts_and_reopens_correctness() {
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote");
+        let payload = b"part-only native dependency payload";
+        let bundle = "transport-dependency";
+        let remote_bundle = remote.join(bundle);
+        fs::create_dir_all(&remote_bundle).unwrap();
+        let manifest = write_tiny_transport_bundle(
+            &remote_bundle,
+            BooguStorageProfile::F16,
+            bundle,
+            "test/transport-dependency",
+            "exact-transport-revision",
+            payload,
+        );
+        let dependency = tiny_dependency("qwen", &manifest);
+        let server = TestServer::serve(remote);
+        let pipeline_base = RemoteBaseUrl::new(format!("{}/pipeline", server.base_url)).unwrap();
+        let cache =
+            FilesystemArtifactCache::new(temp.path().join("cache"), 4 * 1024 * 1024).unwrap();
+        let mut fetcher = UreqSiblingBundleFetcher::new(pipeline_base);
+        let directory = cache.ensure_dependency(&dependency, &mut fetcher).unwrap();
+        let digest = Sha256Digest::calculate(payload);
+        let part_path = format!("transport/{digest}.part");
+        assert_eq!(
+            fs::read(directory.root().join(&part_path)).unwrap(),
+            payload
+        );
+        assert!(!directory.root().join("objects/tiny.bpk").exists());
+        assert!(!remote_bundle.join("objects/tiny.bpk").exists());
+        let logical = directory
+            .manifest()
+            .files
+            .iter()
+            .find(|file| file.role == ArtifactFileRole::Weights)
+            .unwrap();
+        let mut reader = directory.shard_reader().unwrap();
+        assert_eq!(
+            burn_image::ArtifactShardReader::read_shard(&mut reader, logical).unwrap(),
+            payload
         );
     }
 

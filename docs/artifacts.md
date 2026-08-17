@@ -5,7 +5,7 @@ enough information to prove exactly what was loaded and to stream only the compo
 
 ## Production storage policy
 
-The CDN publishes one production policy per model. Viewer and browser entry points select it with
+The CDN release contract defines one production policy per model. Viewer and browser entry points select it with
 `--profile production` or `profile=production`; its precise sealed manifest profile remains
 `f16-qwen-vision-f32` for provenance and compatibility. Low-level conversion and parity binaries
 continue to accept the precise name because their reports must bind the immutable storage identity.
@@ -139,10 +139,17 @@ The converter inventories every tensor before writing anything, then assigns it 
 - Boogu embedding/refiner, each dual-stream block, each single-stream block, and final projection.
 
 Stage boundaries are semantic. Lexical filename order is never used to decide runtime residency.
-The default physical shard target is 256 MiB. Production conversion rejects any tensor that cannot
-fit that bound; the released Qwen vocabulary tables use row-sliced stages for this reason. The
-diagnostic `--allow-oversized-tensors` escape hatch permits one tensor to occupy an explicitly
-oversized native-only shard, which the browser's 256 MiB semantic-object limit will reject.
+The default logical Burnpack object ceiling is 256 MiB (268,435,456 bytes). Production conversion
+rejects any tensor that cannot fit that semantic bound; the released Qwen vocabulary tables use
+row-sliced stages for this reason. The diagnostic `--allow-oversized-tensors` escape hatch permits
+one tensor to occupy an explicitly oversized native-only semantic object, which the browser rejects.
+
+CDN storage is a separate physical layer. Each logical weight object is reconstructed from
+content-addressed `transport/<sha256>.part` files declared by the manifest-sealed
+`metadata/transport-layout.json` sidecar. Non-final parts are exactly 20,971,520 bytes (20 MiB), the
+final part is at most that target, and every physical part has an exact decimal 25,000,000-byte hard
+maximum. The browser reads each part as ranges no larger than 4 MiB, so a CacheStorage entry is never
+the full 20 MiB part and never exceeds 4 MiB.
 
 ## Manifest invariants
 
@@ -172,11 +179,10 @@ sealed manifest `bundle` id. The production release has five entries:
 | `boogu-image-0.1-edit-turbo` | 1K Edit denoiser/composition files plus the same dependency pins | 2 |
 | `boogu-image-0.1-edit-turbo-1k5` | 1.5K Edit denoiser/composition files plus the same dependency pins | 2 |
 
-The five-entry upload is prepared but not publicly deployed at the 2026-08-14 documentation checkpoint.
-Canonical model entry probes currently return HTTP 403, and the CDN response policy does not expose
-the Range/`Content-Range` headers required by browser CORS. This blocks both canonical browser
-loading and the Pages deployment gate; local modular qualification evidence does not imply public
-CDN availability.
+The five-entry upload is public as of 2026-08-16. A real-browser probe authenticated the composed
+Turbo manifest, both dependency manifests, all three transport layouts, cold whole-part downloads,
+and a warm CacheStorage resume. The remaining publication-policy defect is that reusable
+`manifest.json` URLs are marked `immutable`; Pages stays fail-closed until they use `no-cache`.
 
 The Linux browser evidence harnesses separately protect host transport from quota surprises: BigInt
 `statfs` accounting is combined with a real bounded 256 MiB write/`fsync`/delete probe. Current runs
@@ -200,24 +206,33 @@ The derived component model revisions are
 recomputes each as SHA-256 over the compact JSON array of owner-filtered source-file declarations,
 sorted by path with fields `path`, `size`, `sha256`, followed by one LF byte.
 
-Publish the sealed manifest and every declared payload beneath that immutable, single-use bundle
-prefix. Burnpack weight objects use their SHA-256 digest as the filename; the sealed manifest binds
-metadata paths to their exact sizes and SHA-256 digests. Servers should support byte ranges.
-Payloads are immutable; manifests are revalidated so publication can commit them last:
+Publish the sealed manifest, every directly stored non-weight payload, the transport-layout
+sidecar, and every layout-declared physical part beneath that immutable, single-use bundle prefix.
+Logical Burnpack entries retain `objects/<sha256>.bpk` identities in the manifest but are
+deliberately absent from the part-only upload tree. The sidecar binds their exact reconstruction to
+content-addressed `transport/<sha256>.part` files. Canonical clients fetch physical objects whole;
+servers may retain byte-range support for legacy direct Burnpacks. Direct payloads and transport
+parts are immutable; manifests are revalidated so publication can commit them last:
 
 ```text
 Access-Control-Allow-Origin: *
-Access-Control-Expose-Headers: Content-Range
-Accept-Ranges: bytes
+Content-Length: <exact physical-object byte count>
+Content-Encoding: identity
 Payload Cache-Control: public, max-age=31536000,immutable
 Manifest Cache-Control: no-cache
 Content-Type: application/octet-stream
 Cross-Origin-Resource-Policy: cross-origin
 ```
 
+`Content-Encoding` may be omitted for an identity response, but an intermediary must never change
+the sealed physical bytes. Exposing `Content-Length` and `Content-Encoding` lets the browser reject
+bad framing before buffering; exact `Blob.size` and SHA-256 checks remain mandatory when CORS hides
+those headers.
+
 Keep converted bundles outside Git, one directory per exact manifest bundle id. The verifier
 detects a schema-v2 parent, resolves its sibling Qwen/VAE directories, validates both model-owned
-component contracts, and then checks all 223 Burnpacks and 1,940 stored tensor entries:
+component contracts, authenticates every physical part, reconstructs every logical Burnpack
+digest, and checks the complete 223-object / 1,940-tensor semantic closure:
 
 ```bash
 cargo run --release --locked -p burn_boogu --features import \
@@ -246,7 +261,9 @@ The tool requires all three pinned legacy digests and authenticates every legacy
 promotion. It proves Qwen/VAE declaration and upstream-source equality, denoiser disjointness, and
 that each modular closure reconstructs the old flat tensor/source contract. New owner-filtered
 inventories and the normalized VAE config are written as distinct files; no hardlinked source file
-is ever mutated. It then runs the strict modular semantic verifier for every parent.
+is ever mutated. It then emits the sealed 20 MiB-target transport layout, removes direct logical
+Burnpacks from the upload tree, and runs the strict semantic-plus-physical verifier for every
+parent.
 
 Output lives at
 `.artifacts/cdn-upload-modular/aberration.technology/model/<bundle-id>/`. The upload plan is
@@ -258,33 +275,20 @@ This staging tree, converted weights, manifests, reports, and upload plans are g
 outputs and stay outside Git. A hardlinked staging tree must remain on the artifact filesystem;
 create an independent copy only when required.
 
-Upload in the four phases recorded by the plan:
+Upload the physical files in the four phases recorded by the plan:
 
-1. Qwen and VAE payloads, excluding their manifests.
+1. Qwen and VAE direct metadata and transport parts, excluding their manifests.
 2. Qwen and VAE manifests after every dependency payload is readable.
-3. All three parent payload sets, excluding their manifests.
+3. All three parent direct metadata and transport-part sets, excluding their manifests.
 4. Parent manifests only after their dependency manifests and own payloads are readable.
 
 For S3-compatible storage, require an empty immutable destination for every prefix. Payloads use
 one-year immutable caching. Manifests are committed last with `no-cache` so an incomplete graph is
-never advertised. For example, after publishing both dependencies, a parent upload is:
-
-```bash
-export BUNDLE=boogu-image-0.1-turbo
-export ARTIFACT_DIR=".artifacts/cdn-upload-modular/aberration.technology/model/$BUNDLE"
-export DESTINATION="s3://example-models/model/$BUNDLE"
-cargo run --release --locked -p burn_boogu --features import \
-  --bin boogu-verify-artifacts -- \
-  --artifacts "$ARTIFACT_DIR" --require-published-release
-test "$(aws s3api list-objects-v2 \
-  --bucket example-models --prefix "model/$BUNDLE/" --max-keys 1 \
-  --query KeyCount --output text)" = 0
-aws s3 sync "$ARTIFACT_DIR/" "$DESTINATION/" \
-  --exclude manifest.json --cache-control public,max-age=31536000,immutable
-aws s3 cp "$ARTIFACT_DIR/manifest.json" "$DESTINATION/manifest.json" \
-  --content-type application/json \
-  --cache-control no-cache
-```
+never advertised. Do not use a recursive directory upload: a publisher must consume the generated
+`upload-plan.json` allowlist, upload only manifest-declared non-weight payloads and
+sidecar-declared physical parts, and refuse a declared layout if any logical weight is
+materialized. The storage-specific publisher is intentionally separate from the repository; its
+recorded operations must preserve the plan's dependency-first, payload-first, manifest-last order.
 
 The destination prefix is part of the release identity and must never be reused, even to resume a
 partial failed publication; retry with a fresh prefix. Publish updates under a new release id.
@@ -292,12 +296,18 @@ Configure CORS/Range behavior on the bucket or CDN separately using the headers 
 publishing principal needs `s3:ListBucket` for the destination-prefix preflight and `s3:PutObject`
 for uploads; use one publisher per prefix.
 
-`bevy_burn_image` exposes a generic bounded range loader that incrementally verifies SHA-256 and
-commits through a transactional sink. Its concrete browser model reader performs HTTP 206 range
-fetches, validates each `Content-Range`, and aggregates at most one bounded semantic object before
-verifying its complete SHA-256. The contract forbids retaining a multi-gigabyte response as one
-`ArrayBuffer`. Every released object is below the 256 MiB semantic-object ceiling; transport uses
-4 MiB ranges with a 16 MiB hard response cap, and `manifest.json` is below its 4 MiB bootstrap cap.
+`bevy_burn_image` exposes a generic bounded range loader for legacy artifacts. Its canonical browser
+reader authenticates the sealed transport sidecar and fetches one physical part at a time as an
+HTTP 200 complete object. It validates any exposed canonical `Content-Length`, rejects visible
+non-identity `Content-Encoding`, and always checks exact `Blob.size` and SHA-256 before the bounded
+copy into Wasm through `Blob.arrayBuffer()`.
+The reader then reconstructs at most one bounded semantic object before verifying its complete
+SHA-256. Physical parts target 20,971,520 bytes and are hard-capped at 25,000,000 bytes.
+CacheStorage uses one independently authenticated entry per physical part; legacy ranges remain no
+larger than 4 MiB. Every logical object remains below the 256 MiB semantic
+ceiling, while `manifest.json` and the transport sidecar each remain below their 4 MiB bootstrap
+caps. The contract forbids an unbounded response or complete bundle from becoming one
+`ArrayBuffer`.
 Asynchronous Qwen, VAE, and denoiser stage sources then apply that verified object, synchronize
 execution, and release it before fetching the next stage. The native directory sources remain
 synchronous and are not compiled into the browser factory.
@@ -318,7 +328,9 @@ still resolve from `BURN_IMAGE_MODEL_BASE_URL` or the selected source base.
 
 ## Conversion guarantees
 
-Shard publication is atomic, but a complete conversion is intentionally not restartable in place.
+Semantic Burnpack creation and physical-part staging are fail-closed, but a complete conversion is
+intentionally not restartable in place. Remote discovery is committed only when the manifest is
+uploaded last; the preceding physical uploads are not described as an atomic publication.
 The importer refuses an existing destination, so an interrupted output directory must be inspected
 and moved or removed before retrying with a fresh destination. During one conversion, each temporary
 shard is hashed and validated before it is renamed into the output tree, and the sealed manifest is
@@ -328,12 +340,13 @@ when its size and digest match; conflicting paths are rejected rather than overw
 Source downloads are pinned with `huggingface-cli`/`hf download --revision <commit>`. Mutable
 branches are accepted only as a discovery input; their resolved commit is what enters the manifest.
 
-## Verified production bundles
+## Pre-transport semantic baseline
 
-The 2026-08-13 preparation gate authenticated all five sealed entries and all three composed
-closures. Each closure contains 253 files, 223 Burnpacks, and 1,940 stored tensor entries. Qwen and
-VAE manifests are schema v1 and dependency-free; parents are schema v2 and pin both complete child
-identities.
+The following 2026-08-13 results are the logical semantic baseline that preceded the sealed
+part-only transport layout. They authenticated all five entries and all three composed closures,
+but their direct 256 MiB-class Burnpack upload shape is not the current browser-cache-friendly CDN
+contract and does not establish public deployment. The regenerated transport release must publish
+new manifest/report digests and physical-part counts before promotion.
 
 | Canonical entry | Content digest | Files / Burnpacks | Declared payload bytes |
 | --- | --- | ---: | ---: |

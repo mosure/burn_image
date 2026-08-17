@@ -22,4 +22,5 @@ docs/reports/raw/
 crates/bevy_image/www/out/
 boogu-output.png
 burn-image-*.png
+!crates/bevy_image/www/burn-image-icon.png
 /artifacts/reference/boogu_turbo_seed42_256.png

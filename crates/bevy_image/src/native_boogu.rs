@@ -23,9 +23,10 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, SyncSender, TryRecvError},
+        mpsc::{self, Receiver, TryRecvError},
     },
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use burn::{nn::RmsNorm, prelude::Backend};
@@ -54,8 +55,10 @@ use burn_flux_vae::{
     VerifiedBurnpackFluxVaeStageSource,
 };
 use burn_image::{
-    ArtifactSource, CancellationToken, DirectoryArtifactShardReader, ImageModel, ImageOutput,
-    ImageRuntime, IntegrityPolicy, ProgressEvent, RuntimeConfig, RuntimeError,
+    ArtifactSource, CancellationToken, ColorSpace, Dimensions, DirectoryArtifactShardReader,
+    EditRequest, GenerationOptions, ImageModel, ImageOutput, ImageRequest, ImageRuntime,
+    InputImage, IntegrityPolicy, PixelBuffer, PixelFormat, ProgressEvent, Prompt, RunId,
+    RuntimeConfig, RuntimeError,
 };
 use burn_qwen3_vl::{
     EmbeddingRowChunk, Qwen3VlArtifactFloatPolicy, Qwen3VlConfig, Qwen3VlDecoderLayer,
@@ -69,7 +72,8 @@ use burn_qwen3_vl::{
 use crate::{
     BooguFactoryContext, BooguRuntime, BooguRuntimeFactory, BooguRuntimeJob, ImageJobId,
     ImageRunnerEvent, WgpuExecutionKind, boogu_bundle_id, boogu_legacy_bundle_id,
-    boogu_profile_slug, native_boogu_source_requires_canonical_digest,
+    boogu_profile_slug, default_native_boogu_model_base_url,
+    native_boogu_source_requires_canonical_digest, prepare_runtime_job,
     resolve_native_boogu_artifact_directory,
 };
 
@@ -82,6 +86,7 @@ type LegacyNativeVaeSource = VerifiedDirectoryVaeStageSource<NativeBackend>;
 type ComponentNativeVaeSource = FluxVaeStageSourceAdapter<
     VerifiedBurnpackFluxVaeStageSource<NativeBackend, DirectoryArtifactShardReader>,
 >;
+type NativeRuntimeLoad = Result<(NativeBooguRuntime, BooguFactoryContext), RuntimeError>;
 
 enum NativeQwenSource {
     Legacy(Box<LegacyNativeQwenSource>),
@@ -325,14 +330,16 @@ fn native_low_vram_resource_plan_with_budget(
 /// Loads one pinned Boogu release from a local sealed directory, then runs requests sequentially on
 /// a dedicated native worker thread.
 ///
-/// Embedders selecting a qualified native mixed-F16 policy (high- or low-VRAM) must call
-/// [`burn_boogu::configure_native_full_autotune`] before Bevy creates or imports its WGPU device.
-/// Construction fails closed when that process-global policy was not configured in time. The
-/// packaged `burn-image-viewer` binary performs this setup automatically.
+/// Builds with `native-autotune` must configure the selected CubeCL policy before Bevy creates or
+/// imports its WGPU device. Builds without that opt-in feature use static kernels and skip tuning,
+/// which keeps interactive first-use latency predictable. The packaged `burn-image-viewer`
+/// performs the feature-enabled setup automatically.
 pub struct NativeBooguFactory {
     variant: BooguVariant,
+    variants: Vec<BooguVariant>,
     residency: NativeBooguResidencyPolicy,
-    loading: Mutex<Option<Receiver<Result<NativeBooguRuntime, RuntimeError>>>>,
+    autotune: NativeAutotunePolicy,
+    loading: Mutex<Option<Receiver<NativeRuntimeLoad>>>,
     progress: Mutex<Option<Receiver<String>>>,
 }
 
@@ -344,12 +351,40 @@ impl NativeBooguFactory {
 
     /// Select one immutable release and explicit weight-residency policy.
     pub fn with_residency(variant: BooguVariant, residency: NativeBooguResidencyPolicy) -> Self {
+        Self::with_residency_and_autotune(variant, residency, NativeAutotunePolicy::Full)
+    }
+
+    /// Select one immutable release, weight-residency policy, and native autotune policy.
+    pub fn with_residency_and_autotune(
+        variant: BooguVariant,
+        residency: NativeBooguResidencyPolicy,
+        autotune: NativeAutotunePolicy,
+    ) -> Self {
         Self {
             variant,
+            variants: vec![variant],
             residency,
+            autotune,
             loading: Mutex::new(None),
             progress: Mutex::new(None),
         }
+    }
+
+    /// Load one canonical release initially while exposing all three canonical releases to the
+    /// UI. The returned runtime keeps only one release resident and switches lazily on the next
+    /// request, so model selection does not triple startup traffic or GPU residency.
+    pub fn with_canonical_model_switching(
+        variant: BooguVariant,
+        residency: NativeBooguResidencyPolicy,
+        autotune: NativeAutotunePolicy,
+    ) -> Self {
+        let mut factory = Self::with_residency_and_autotune(variant, residency, autotune);
+        factory.variants = vec![
+            BooguVariant::Image01Turbo,
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ];
+        factory
     }
 
     /// Whether this exact variant/residency/profile tuple selects the full-autotune native policy.
@@ -361,12 +396,21 @@ impl NativeBooguFactory {
         residency: NativeBooguResidencyPolicy,
         profile: BooguStorageProfile,
     ) -> bool {
-        qualified_native_execution_policy(variant, residency, profile)
-            .is_some_and(|policy| matches!(policy.autotune, NativeAutotunePolicy::Full))
+        cfg!(feature = "native-autotune")
+            && qualified_native_execution_policy(variant, residency, profile)
+                .is_some_and(|policy| matches!(policy.autotune, NativeAutotunePolicy::Full))
     }
 }
 
+fn isolates_interactive_compute(variants: &[BooguVariant]) -> bool {
+    variants.len() > 1
+}
+
 impl BooguRuntimeFactory for NativeBooguFactory {
+    fn initialization_variant(&self) -> Option<BooguVariant> {
+        Some(self.variant)
+    }
+
     fn start(&mut self, context: BooguFactoryContext) -> Result<(), RuntimeError> {
         if context.execution != WgpuExecutionKind::NativeWgpu {
             return Err(execution_error(
@@ -374,7 +418,15 @@ impl BooguRuntimeFactory for NativeBooguFactory {
                 "the local-directory Boogu factory is native-only",
             ));
         }
-        crate::boogu::validate_variant_profile(self.variant, context.settings.storage_profile)?;
+        for variant in self.variants.iter().copied() {
+            crate::boogu::validate_variant_profile(variant, context.settings.storage_profile)?;
+        }
+        if self.variants.len() > 1 && self.residency == NativeBooguResidencyPolicy::LayerStreamed {
+            return Err(execution_error(
+                self.variant,
+                "UI model switching is unavailable for diagnostic layer streaming",
+            ));
+        }
         if self.residency == NativeBooguResidencyPolicy::LowVram {
             // Validate the exact supported profile and the static <32-GB plan before artifact
             // resolution, thread creation, or any model/device allocation.
@@ -405,12 +457,15 @@ impl BooguRuntimeFactory for NativeBooguFactory {
                 "the native Boogu factory refuses a CPU Burn device",
             ));
         }
-        if Self::requires_full_autotune(
+        #[cfg(feature = "native-autotune")]
+        if qualified_native_execution_policy(
             self.variant,
             self.residency,
             context.settings.storage_profile,
-        ) {
-            burn_boogu::require_native_full_autotune_configured()
+        )
+        .is_some()
+        {
+            burn_boogu::require_native_autotune_configured(self.autotune)
                 .map_err(|error| execution_error(self.variant, error))?;
         }
         if context.settings.integrity != IntegrityPolicy::RequireSha256 {
@@ -451,17 +506,41 @@ impl BooguRuntimeFactory for NativeBooguFactory {
         let (progress_tx, progress_rx) = mpsc::channel();
         let variant = self.variant;
         let residency = self.residency;
+        let autotune = self.autotune;
+        let isolate_interactive_compute = isolates_interactive_compute(&self.variants);
         thread::Builder::new()
             .name("burn-image-boogu-loader".into())
             .spawn(move || {
+                let mut context = context;
+                if isolate_interactive_compute {
+                    let _ = progress_tx.send(
+                        "Model setup: creating an isolated GPU compute queue so window rendering remains responsive"
+                            .into(),
+                    );
+                    context.device = match burn_boogu::require_native_wgpu_device() {
+                        Ok(device) => device,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(execution_error(variant, error)));
+                            return;
+                        }
+                    };
+                }
                 let cleanup_device = context.device.clone();
-                let mut result = load_native_runtime(context, variant, residency, |message| {
-                    let _ = progress_tx.send(message);
-                });
+                let retained_context = context.clone();
+                let mut result = load_native_runtime_for_interactive(
+                    context,
+                    variant,
+                    residency,
+                    autotune,
+                    |message| {
+                        let _ = progress_tx.send(message);
+                    },
+                )
+                .map(|runtime| (runtime, retained_context));
                 if result.is_err()
                     && residency == NativeBooguResidencyPolicy::LowVram
                     && let Err(cleanup_error) =
-                        cleanup_failed_low_vram_load(&cleanup_device, variant)
+                        cleanup_native_device_allocations(&cleanup_device, variant)
                     && let Err(load_error) = result
                 {
                     result = Err(execution_error(
@@ -500,9 +579,18 @@ impl BooguRuntimeFactory for NativeBooguFactory {
             ));
         };
         match receiver.try_recv() {
-            Ok(Ok(runtime)) => {
+            Ok(Ok((runtime, context))) => {
                 *loading = None;
-                Ok(Some(Box::new(runtime)))
+                if self.variants.len() == 1 {
+                    return Ok(Some(Box::new(runtime)));
+                }
+                Ok(Some(Box::new(NativeSwitchableBooguRuntime::spawn(
+                    runtime,
+                    context,
+                    self.variants.clone(),
+                    self.residency,
+                    self.autotune,
+                )?)))
             }
             Ok(Err(error)) => {
                 *loading = None;
@@ -538,10 +626,7 @@ impl BooguRuntimeFactory for NativeBooguFactory {
 }
 
 enum WorkerCommand {
-    Infer {
-        job: Box<BooguRuntimeJob>,
-        started: SyncSender<Result<CancellationToken, RuntimeError>>,
-    },
+    Infer { job: Box<BooguRuntimeJob> },
     Shutdown,
 }
 
@@ -551,6 +636,7 @@ pub struct NativeBooguRuntime {
     commands: mpsc::Sender<WorkerCommand>,
     events: Mutex<Receiver<ImageRunnerEvent>>,
     busy: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     active: Option<(ImageJobId, CancellationToken)>,
     worker: Option<JoinHandle<()>>,
 }
@@ -560,6 +646,7 @@ impl NativeBooguRuntime {
     where
         M: ImageModel<Output = ImageOutput> + Send + 'static,
     {
+        let cancellation = runtime.cancellation_token();
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let busy = Arc::new(AtomicBool::new(false));
@@ -578,9 +665,32 @@ impl NativeBooguRuntime {
             commands: command_tx,
             events: Mutex::new(event_rx),
             busy,
+            cancellation,
             active: None,
             worker: Some(worker),
         })
+    }
+
+    /// Retire an idle resident runtime before another release is allocated on the same device.
+    ///
+    /// Model switching already runs on its own worker, so waiting here cannot block Bevy's event
+    /// loop. Joining is essential: the model and all retained GPU module handles are owned by the
+    /// inference worker and are not guaranteed to drop merely because this outer handle is gone.
+    fn retire_before_model_switch(mut self) -> Result<(), RuntimeError> {
+        if let Some((_, token)) = self.active.take() {
+            token.cancel();
+        }
+        let _ = self.commands.send(WorkerCommand::Shutdown);
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            return Err(execution_error(
+                self.variant,
+                "the previous native inference worker panicked while retiring its resident model",
+            ));
+        }
+        self.busy.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -602,13 +712,11 @@ impl BooguRuntime for NativeBooguRuntime {
             ));
         }
         let id = job.id;
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        self.cancellation.reset();
+        let token = self.cancellation.clone();
         if self
             .commands
-            .send(WorkerCommand::Infer {
-                job: Box::new(job),
-                started: started_tx,
-            })
+            .send(WorkerCommand::Infer { job: Box::new(job) })
             .is_err()
         {
             self.busy.store(false, Ordering::Release);
@@ -617,13 +725,6 @@ impl BooguRuntime for NativeBooguRuntime {
                 "native Boogu inference worker is unavailable",
             ));
         }
-        let token = started_rx.recv().map_err(|_| {
-            self.busy.store(false, Ordering::Release);
-            execution_error(
-                self.variant,
-                "native Boogu worker exited before accepting the request",
-            )
-        })??;
         self.active = Some((id, token.clone()));
         Ok(token)
     }
@@ -682,6 +783,322 @@ impl Drop for NativeBooguRuntime {
     }
 }
 
+enum SwitchableWorkerCommand {
+    Infer {
+        job: Box<BooguRuntimeJob>,
+        cancellation: CancellationToken,
+    },
+    Shutdown,
+}
+
+/// Long-lived native UI runtime that keeps one dense release resident and swaps it only when the
+/// next submitted request selects a different canonical model.
+pub struct NativeSwitchableBooguRuntime {
+    variants: Vec<BooguVariant>,
+    commands: mpsc::Sender<SwitchableWorkerCommand>,
+    events: Mutex<Receiver<ImageRunnerEvent>>,
+    active: Option<(ImageJobId, CancellationToken)>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl NativeSwitchableBooguRuntime {
+    fn spawn(
+        runtime: NativeBooguRuntime,
+        context: BooguFactoryContext,
+        variants: Vec<BooguVariant>,
+        residency: NativeBooguResidencyPolicy,
+        autotune: NativeAutotunePolicy,
+    ) -> Result<Self, RuntimeError> {
+        let (command_tx, command_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker = thread::Builder::new()
+            .name("burn-image-boogu-model-switcher".into())
+            .spawn(move || {
+                run_switchable_worker(runtime, context, residency, autotune, command_rx, event_tx)
+            })
+            .map_err(|error| {
+                execution_error(
+                    variants
+                        .first()
+                        .copied()
+                        .unwrap_or(BooguVariant::Image01Turbo),
+                    format!("could not spawn native Boogu model-switch worker: {error}"),
+                )
+            })?;
+        Ok(Self {
+            variants,
+            commands: command_tx,
+            events: Mutex::new(event_rx),
+            active: None,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl BooguRuntime for NativeSwitchableBooguRuntime {
+    fn variants(&self) -> Vec<BooguVariant> {
+        self.variants.clone()
+    }
+
+    fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError> {
+        if self.active.is_some() {
+            return Err(execution_error(
+                job.variant,
+                "the native model-switch runtime executes one request at a time",
+            ));
+        }
+        if !self.variants.contains(&job.variant) {
+            return Err(execution_error(
+                job.variant,
+                "the selected release is not available to this native runtime",
+            ));
+        }
+        let id = job.id;
+        let cancellation = CancellationToken::default();
+        self.commands
+            .send(SwitchableWorkerCommand::Infer {
+                job: Box::new(job),
+                cancellation: cancellation.clone(),
+            })
+            .map_err(|_| {
+                execution_error(
+                    self.variants[0],
+                    "native Boogu model-switch worker is unavailable",
+                )
+            })?;
+        self.active = Some((id, cancellation.clone()));
+        Ok(cancellation)
+    }
+
+    fn cancel(&mut self, id: ImageJobId) -> Result<(), RuntimeError> {
+        if let Some((active_id, cancellation)) = &self.active
+            && *active_id == id
+        {
+            cancellation.cancel();
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self, emit: &mut dyn FnMut(ImageRunnerEvent)) {
+        for _ in 0..MAX_EVENTS_PER_POLL {
+            let event = match self.events.lock() {
+                Ok(receiver) => receiver.try_recv(),
+                Err(_) => return,
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let terminal_id = match &event {
+                ImageRunnerEvent::Completed { id, .. }
+                | ImageRunnerEvent::Failed { id, .. }
+                | ImageRunnerEvent::Cancelled { id } => Some(*id),
+                ImageRunnerEvent::Progress { .. } => None,
+            };
+            if terminal_id.is_some_and(|id| {
+                self.active
+                    .as_ref()
+                    .is_some_and(|(active_id, _)| *active_id == id)
+            }) {
+                self.active = None;
+            }
+            emit(event);
+        }
+    }
+}
+
+impl Drop for NativeSwitchableBooguRuntime {
+    fn drop(&mut self) {
+        let was_active = self.active.is_some();
+        if let Some((_, cancellation)) = self.active.take() {
+            cancellation.cancel();
+        }
+        let _ = self.commands.send(SwitchableWorkerCommand::Shutdown);
+        if !was_active && let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_switchable_worker(
+    initial_runtime: NativeBooguRuntime,
+    base_context: BooguFactoryContext,
+    residency: NativeBooguResidencyPolicy,
+    autotune: NativeAutotunePolicy,
+    commands: Receiver<SwitchableWorkerCommand>,
+    events: mpsc::Sender<ImageRunnerEvent>,
+) {
+    let mut runtime = Some(initial_runtime);
+    while let Ok(command) = commands.recv() {
+        let SwitchableWorkerCommand::Infer {
+            mut job,
+            cancellation,
+        } = command
+        else {
+            break;
+        };
+        let id = job.id;
+        if cancellation.is_cancelled() {
+            let _ = events.send(ImageRunnerEvent::Cancelled { id });
+            continue;
+        }
+
+        let target = job.variant;
+        let target_context = match native_switch_context(&base_context, target) {
+            Ok(context) => context,
+            Err(error) => {
+                let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                continue;
+            }
+        };
+        job.runtime_config = target_context.settings.runtime_config(target);
+        let current = runtime.as_ref().map(|runtime| runtime.variant);
+        if current != Some(target) {
+            let run_id = RunId(id.0);
+            let setup_steps = native_setup_step_count(residency);
+            let _ = events.send(ImageRunnerEvent::Progress {
+                id,
+                event: ProgressEvent::StageStarted {
+                    run_id,
+                    stage: "model-switch".into(),
+                    total_steps: None,
+                },
+            });
+            let switch_started = Instant::now();
+            let _ = events.send(model_switch_progress_event(
+                id,
+                run_id,
+                setup_steps,
+                "Unloading the previous model from GPU memory".into(),
+            ));
+            let retirement = runtime
+                .take()
+                .map_or(Ok(()), NativeBooguRuntime::retire_before_model_switch);
+            // The old worker owns every retained module. Only clean the allocator after it has
+            // joined and dropped those handles, so old and new release residency cannot overlap.
+            let cleanup = cleanup_native_device_allocations(&target_context.device, target);
+            if let Err(error) = retirement {
+                let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                continue;
+            }
+            if let Err(error) = cleanup {
+                let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                continue;
+            }
+            bevy::log::info!(
+                "switching resident native Boogu model to {:?}; only this release will remain on the GPU",
+                target
+            );
+            let progress_events = events.clone();
+            let loaded = load_native_runtime_for_interactive(
+                target_context,
+                target,
+                residency,
+                autotune,
+                move |message| {
+                    bevy::log::info!("model switch: {message}");
+                    let _ = progress_events.send(model_switch_progress_event(
+                        id,
+                        run_id,
+                        setup_steps,
+                        message,
+                    ));
+                },
+            );
+            let loaded = match loaded {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                    continue;
+                }
+            };
+            runtime = Some(loaded);
+            let _ = events.send(ImageRunnerEvent::Progress {
+                id,
+                event: ProgressEvent::StageCompleted {
+                    run_id,
+                    stage: "model-switch".into(),
+                    elapsed_micros: u64::try_from(switch_started.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                },
+            });
+        }
+
+        let Some(active_runtime) = runtime.as_mut() else {
+            let _ = events.send(ImageRunnerEvent::Failed {
+                id,
+                error: execution_error(target, "native model switch did not produce a runtime"),
+            });
+            continue;
+        };
+        let inner_token = match active_runtime.submit(*job) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                continue;
+            }
+        };
+        let mut terminal = false;
+        while !terminal {
+            if cancellation.is_cancelled() {
+                inner_token.cancel();
+                let _ = active_runtime.cancel(id);
+            }
+            active_runtime.poll(&mut |event| {
+                terminal = matches!(
+                    event,
+                    ImageRunnerEvent::Completed { .. }
+                        | ImageRunnerEvent::Failed { .. }
+                        | ImageRunnerEvent::Cancelled { .. }
+                );
+                let _ = events.send(event);
+            });
+            if !terminal {
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+fn model_switch_progress_event(
+    id: ImageJobId,
+    run_id: RunId,
+    setup_steps: u32,
+    message: String,
+) -> ImageRunnerEvent {
+    ImageRunnerEvent::Progress {
+        id,
+        event: ProgressEvent::StageStarted {
+            run_id,
+            stage: format!(
+                "{}{setup_steps}:{message}",
+                crate::MODEL_SWITCH_PROGRESS_STAGE_PREFIX
+            ),
+            total_steps: None,
+        },
+    }
+}
+
+fn native_switch_context(
+    base: &BooguFactoryContext,
+    variant: BooguVariant,
+) -> Result<BooguFactoryContext, RuntimeError> {
+    let mut context = base.clone();
+    if matches!(
+        context.settings.artifact_source,
+        ArtifactSource::Remote { .. }
+    ) {
+        context.settings.artifact_source = ArtifactSource::Remote {
+            base_url: default_native_boogu_model_base_url(
+                variant,
+                context.settings.storage_profile,
+            )
+            .map_err(|error| execution_error(variant, error))?,
+        };
+    }
+    Ok(context)
+}
+
 fn run_worker<M>(
     variant: BooguVariant,
     mut runtime: ImageRuntime<M>,
@@ -692,17 +1109,15 @@ fn run_worker<M>(
     M: ImageModel<Output = ImageOutput>,
 {
     while let Ok(command) = commands.recv() {
-        let WorkerCommand::Infer { job, started } = command else {
+        let WorkerCommand::Infer { job } = command else {
             break;
         };
         if let Err(error) = validate_job(variant, runtime.config(), &job) {
-            let _ = started.send(Err(error));
+            let _ = events.send(ImageRunnerEvent::Failed { id: job.id, error });
             busy.store(false, Ordering::Release);
             continue;
         }
 
-        let token = runtime.cancellation_token();
-        token.reset();
         let id = job.id;
         let progress_events = events.clone();
         runtime.set_observer(Arc::new(move |event: &ProgressEvent| {
@@ -711,11 +1126,6 @@ fn run_worker<M>(
                 event: event.clone(),
             });
         }));
-        if started.send(Ok(token)).is_err() {
-            busy.store(false, Ordering::Release);
-            continue;
-        }
-
         let event = match runtime.infer(&job.request) {
             Ok(output) => ImageRunnerEvent::Completed { id, output },
             Err(RuntimeError::Cancelled) => ImageRunnerEvent::Cancelled { id },
@@ -747,39 +1157,148 @@ fn validate_job(
     Ok(())
 }
 
-fn cleanup_failed_low_vram_load(
+fn cleanup_native_device_allocations(
     device: &burn_wgpu::WgpuDevice,
     variant: BooguVariant,
 ) -> Result<(), RuntimeError> {
     <NativeBackend as Backend>::sync(device).map_err(|error| {
         execution_error(
             variant,
-            format!(
-                "backend synchronization before failed low-VRAM loader cleanup failed: {error}"
-            ),
+            format!("backend synchronization before native model cleanup failed: {error}"),
         )
     })?;
     <NativeBackend as Backend>::memory_cleanup(device);
     <NativeBackend as Backend>::sync(device).map_err(|error| {
         execution_error(
             variant,
-            format!("backend synchronization after failed low-VRAM loader cleanup failed: {error}"),
+            format!("backend synchronization after native model cleanup failed: {error}"),
         )
     })?;
     Ok(())
+}
+
+fn load_native_runtime_for_interactive(
+    context: BooguFactoryContext,
+    variant: BooguVariant,
+    residency: NativeBooguResidencyPolicy,
+    autotune: NativeAutotunePolicy,
+    report_progress: impl Fn(String),
+) -> Result<NativeBooguRuntime, RuntimeError> {
+    let settings = context.settings.clone();
+    let mut runtime = load_native_runtime(context, variant, residency, autotune, &report_progress)?;
+    if cfg!(feature = "native-autotune")
+        && variant == BooguVariant::Image01EditTurbo
+        && residency == NativeBooguResidencyPolicy::HighVram
+        && autotune == NativeAutotunePolicy::Balanced
+    {
+        report_progress(
+            "Optimizing resident Edit 1K GPU kernels before the first interactive request".into(),
+        );
+        match warm_native_edit_runtime(&mut runtime, &settings) {
+            Ok(()) => report_progress("Edit 1K GPU warmup complete; runtime ready".into()),
+            Err(error) => {
+                // Prewarming is a latency optimization, never a new availability gate. The
+                // worker is still usable after a model-level warmup error and the real request
+                // remains fully validated on its own input.
+                bevy::log::warn!("Edit 1K GPU warmup did not complete: {error}");
+                report_progress("Edit 1K runtime ready; optional GPU warmup was skipped".into());
+            }
+        }
+    }
+    Ok(runtime)
+}
+
+fn warm_native_edit_runtime(
+    runtime: &mut NativeBooguRuntime,
+    settings: &crate::BooguAdapterSettings,
+) -> Result<(), RuntimeError> {
+    const EDGE: u32 = 1_024;
+    const WARMUP_TIMEOUT: Duration = Duration::from_secs(180);
+    let dimensions = Dimensions::new(EDGE, EDGE)
+        .map_err(|error| execution_error(BooguVariant::Image01EditTurbo, error))?;
+    // A spatially and chromatically varying input avoids the degenerate all-constant image path
+    // while still being deterministic and entirely in-memory.
+    let mut pixels = Vec::with_capacity((EDGE as usize) * (EDGE as usize) * 4);
+    for y in 0..EDGE {
+        for x in 0..EDGE {
+            let checker = if ((x / 128) + (y / 128)) % 2 == 0 {
+                32
+            } else {
+                0
+            };
+            pixels.extend_from_slice(&[
+                ((x * 191 / (EDGE - 1)) + checker).min(255) as u8,
+                ((y * 191 / (EDGE - 1)) + checker).min(255) as u8,
+                (((x + y) * 95 / (EDGE - 1)) + 32).min(255) as u8,
+                255,
+            ]);
+        }
+    }
+    let source = InputImage::Pixels(
+        PixelBuffer::new(dimensions, PixelFormat::Rgba8, ColorSpace::Srgb, pixels)
+            .map_err(|error| execution_error(BooguVariant::Image01EditTurbo, error))?,
+    );
+    let request = ImageRequest::Edit(EditRequest {
+        source,
+        instruction: Prompt::new("Preserve the reference image while applying a subtle warm tone")
+            .map_err(|error| execution_error(BooguVariant::Image01EditTurbo, error))?,
+        negative_prompt: None,
+        mask: None,
+        strength: None,
+        options: GenerationOptions {
+            dimensions: Some(dimensions),
+            steps: Some(4),
+            guidance_scale: Some(1.0),
+            seed: Some(0),
+            batch_size: 1,
+        },
+    });
+    let id = ImageJobId(0);
+    let job = prepare_runtime_job(id, BooguVariant::Image01EditTurbo, request, settings)?;
+    runtime.submit(job)?;
+    let started = Instant::now();
+    let mut outcome = None;
+    while outcome.is_none() && started.elapsed() < WARMUP_TIMEOUT {
+        runtime.poll(&mut |event| match event {
+            ImageRunnerEvent::Completed { output, .. } => {
+                outcome = Some(output.validate().map_err(RuntimeError::from));
+            }
+            ImageRunnerEvent::Failed { error, .. } => outcome = Some(Err(error)),
+            ImageRunnerEvent::Cancelled { .. } => outcome = Some(Err(RuntimeError::Cancelled)),
+            ImageRunnerEvent::Progress { .. } => {}
+        });
+        if outcome.is_none() {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let result = outcome.unwrap_or_else(|| {
+        Err(execution_error(
+            BooguVariant::Image01EditTurbo,
+            "interactive Edit 1K GPU warmup exceeded 180 seconds",
+        ))
+    });
+    while runtime.busy.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    result
+}
+
+const fn native_setup_step_count(residency: NativeBooguResidencyPolicy) -> u32 {
+    match residency {
+        NativeBooguResidencyPolicy::HighVram => 5,
+        NativeBooguResidencyPolicy::LowVram => 4,
+        NativeBooguResidencyPolicy::LayerStreamed => 3,
+    }
 }
 
 fn load_native_runtime(
     context: BooguFactoryContext,
     variant: BooguVariant,
     residency: NativeBooguResidencyPolicy,
+    autotune: NativeAutotunePolicy,
     report_progress: impl Fn(String),
 ) -> Result<NativeBooguRuntime, RuntimeError> {
-    let setup_steps = match residency {
-        NativeBooguResidencyPolicy::HighVram => 5,
-        NativeBooguResidencyPolicy::LowVram => 4,
-        NativeBooguResidencyPolicy::LayerStreamed => 3,
-    };
+    let setup_steps = native_setup_step_count(residency);
     report_progress(format!(
         "Model setup 0/{setup_steps}: resolving and verifying sealed artifacts"
     ));
@@ -789,6 +1308,8 @@ fn load_native_runtime(
     );
     let native_policy =
         qualified_native_execution_policy(variant, residency, context.settings.storage_profile);
+    let qwen_query_chunk_size = native_policy
+        .map(|policy| native_qwen_query_chunk_size(variant, residency, autotune, policy));
     let artifact_directories = resolve_native_boogu_artifact_directory(
         variant,
         context.settings.storage_profile,
@@ -889,6 +1410,11 @@ fn load_native_runtime(
     let denoiser_config = BooguConfig::default();
     let inventory = BooguArtifactInventory::new(&qwen_config, &denoiser_config, &vae_config)
         .map_err(|error| execution_error(variant, error))?;
+    let device_scope = if matches!(context.device, burn_wgpu::WgpuDevice::DefaultDevice) {
+        "isolated-interactive-device"
+    } else {
+        "shared-bevy-device"
+    };
     let device = context.device;
     let profile = context.settings.storage_profile;
     let low_vram_plan = if residency == NativeBooguResidencyPolicy::LowVram {
@@ -1008,11 +1534,15 @@ fn load_native_runtime(
     .map_err(|error| execution_error(variant, error))?;
     let runtime_config = context.settings.runtime_config(variant);
     let backend_policy = match (residency, native_policy) {
-        (NativeBooguResidencyPolicy::HighVram, Some(policy)) => policy.provenance_label.to_owned(),
+        (NativeBooguResidencyPolicy::HighVram, Some(policy)) => native_runtime_policy_label(
+            policy,
+            autotune,
+            qwen_query_chunk_size.expect("qualified native policy supplies a Qwen chunk"),
+        ),
         (NativeBooguResidencyPolicy::LowVram, Some(policy)) => format!(
             "{}/denoiser-per-physical-shard-upload-flush-allocator-cleanup/qwen-direct-release-dtype-embedding-upload/qwen-streamed-per-stage-allocator-cleanup/vae-exact-transient-allocation-pre-tail-cleanup/phase-boundary-allocator-cleanup/qualified-native-kernels={}",
             residency.label(),
-            native_kernel_policy_label(variant, policy)
+            native_kernel_policy_label(variant, policy, autotune)
         ),
         _ => residency.label().to_owned(),
     };
@@ -1028,7 +1558,7 @@ fn load_native_runtime(
     let metadata = BooguRuntimeMetadata {
         numeric_format: numeric_format(profile),
         backend: format!(
-            "burn-wgpu-native/shared-bevy-device/{}/{backend_policy}{resource_policy}",
+            "burn-wgpu-native/{device_scope}/{}/{backend_policy}{resource_policy}",
             residency.weight_traffic_contract(profile == BooguStorageProfile::F16QwenVisionF32)
         ),
         artifact_content_digest: Some(content_digest),
@@ -1084,7 +1614,7 @@ fn load_native_runtime(
             )
             .map_err(|error| execution_error(variant, error))?;
             bevy::log::info!(
-                "native Qwen preload complete: {retained_qwen_stages} semantic stages resident on the shared WGPU device"
+                "native Qwen preload complete: {retained_qwen_stages} semantic stages resident on the inference WGPU device"
             );
             let mut qwen = StreamingQwen3Vl::new(qwen_plan, qwen_source);
             let mut vae = RetainingBooguVaeStageSource::new(vae);
@@ -1106,11 +1636,13 @@ fn load_native_runtime(
                 )
             })?;
             bevy::log::info!(
-                "native VAE preload complete: {} required halves resident on the shared WGPU device",
+                "native VAE preload complete: {} required halves resident on the inference WGPU device",
                 vae.cached_stage_count()
             );
             if let Some(policy) = native_policy {
-                qwen.set_query_chunk_size(policy.qwen_query_chunk_size);
+                qwen.set_query_chunk_size(
+                    qwen_query_chunk_size.expect("qualified native policy supplies a Qwen chunk"),
+                );
                 denoiser.set_attention_query_chunk_size(policy.denoiser_query_chunk_size);
                 let denoiser_rms_norm_policy = match policy.denoiser_rms_norm {
                     NativeDenoiserRmsNormPolicy::StrictF32 => DenoiserRmsNormPolicy::StrictF32,
@@ -1415,17 +1947,85 @@ fn qualified_native_execution_policy(
     }
 }
 
+/// Interactive 1K Edit has a 4K-token vision/text sequence. The qualified q128 policy creates
+/// dozens of small attention submissions per layer, leaving a large native GPU dispatch-bound.
+/// Balanced autotune is already the explicitly unqualified interactive policy, so use a larger
+/// query tile only for its resident 1K path. Full qualification, low-VRAM streaming, and 1.5K
+/// retain their exact q128 contract.
+const NATIVE_BALANCED_1K_QWEN_QUERY_CHUNK_SIZE: usize = 1_024;
+
+const fn native_qwen_query_chunk_size(
+    variant: BooguVariant,
+    residency: NativeBooguResidencyPolicy,
+    autotune: NativeAutotunePolicy,
+    policy: NativeHighVramPolicy,
+) -> usize {
+    if matches!(
+        variant,
+        BooguVariant::Image01Turbo | BooguVariant::Image01EditTurbo
+    ) && matches!(residency, NativeBooguResidencyPolicy::HighVram)
+        && (!cfg!(feature = "native-autotune")
+            || matches!(autotune, NativeAutotunePolicy::Balanced))
+    {
+        NATIVE_BALANCED_1K_QWEN_QUERY_CHUNK_SIZE
+    } else {
+        policy.qwen_query_chunk_size
+    }
+}
+
 fn native_kernel_policy_label(
     variant: BooguVariant,
     _policy: NativeHighVramPolicy,
-) -> &'static str {
-    match variant {
+    autotune: NativeAutotunePolicy,
+) -> String {
+    let suffix = match variant {
         BooguVariant::Image01Turbo | BooguVariant::Image01EditTurbo => {
-            "full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum"
+            "1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum"
         }
         BooguVariant::Image01EditTurbo1k5 => {
-            "full-autotune/1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum"
+            "1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum"
         }
+    };
+    format!("{}/{suffix}", native_autotune_label(autotune))
+}
+
+fn native_runtime_policy_label(
+    policy: NativeHighVramPolicy,
+    autotune: NativeAutotunePolicy,
+    qwen_query_chunk_size: usize,
+) -> String {
+    let label = if !cfg!(feature = "native-autotune") {
+        policy
+            .provenance_label
+            .replacen("full-autotune", "no-autotune-static-kernels", 1)
+    } else {
+        match autotune {
+            NativeAutotunePolicy::Full => policy.provenance_label.to_owned(),
+            NativeAutotunePolicy::Balanced => {
+                policy
+                    .provenance_label
+                    .replacen("full-autotune", "balanced-autotune", 1)
+            }
+        }
+    };
+    if qwen_query_chunk_size == policy.qwen_query_chunk_size {
+        label
+    } else {
+        label.replacen(
+            &format!("qwen-q{}", policy.qwen_query_chunk_size),
+            &format!("qwen-q{qwen_query_chunk_size}"),
+            1,
+        )
+    }
+}
+
+fn native_autotune_label(autotune: NativeAutotunePolicy) -> &'static str {
+    if !cfg!(feature = "native-autotune") {
+        return "no-autotune-static-kernels";
+    }
+    match autotune {
+        NativeAutotunePolicy::Balanced => "balanced-autotune",
+        NativeAutotunePolicy::Full => "full-autotune",
     }
 }
 
@@ -1620,9 +2220,92 @@ mod tests {
     }
 
     #[test]
+    fn model_switch_setup_messages_are_forwarded_to_the_active_job_correctness() {
+        let event = model_switch_progress_event(
+            ImageJobId(9),
+            RunId(9),
+            5,
+            "Model setup 3/5: loading Qwen stages to GPU".into(),
+        );
+        let ImageRunnerEvent::Progress {
+            id,
+            event:
+                ProgressEvent::StageStarted {
+                    run_id,
+                    stage,
+                    total_steps,
+                },
+        } = event
+        else {
+            panic!("expected model-switch progress event");
+        };
+        assert_eq!(id, ImageJobId(9));
+        assert_eq!(run_id, RunId(9));
+        assert_eq!(total_steps, None);
+        assert_eq!(
+            stage,
+            format!(
+                "{}5:Model setup 3/5: loading Qwen stages to GPU",
+                crate::MODEL_SWITCH_PROGRESS_STAGE_PREFIX
+            )
+        );
+    }
+
+    #[test]
+    fn model_switch_joins_and_cleans_the_old_runtime_before_new_residency_correctness() {
+        let source = include_str!("native_boogu.rs");
+        let switch_start = source.find("fn run_switchable_worker(").unwrap();
+        let switch_end = source[switch_start..]
+            .find("fn model_switch_progress_event(")
+            .map(|offset| switch_start + offset)
+            .unwrap();
+        let switch = &source[switch_start..switch_end];
+        assert!(
+            switch.find("retire_before_model_switch").unwrap()
+                < switch.find("cleanup_native_device_allocations").unwrap()
+        );
+        assert!(
+            switch.find("cleanup_native_device_allocations").unwrap()
+                < switch.find("load_native_runtime_for_interactive").unwrap()
+        );
+        let retire_start = source.find("fn retire_before_model_switch").unwrap();
+        let retire_end = source[retire_start..]
+            .find("impl BooguRuntime for NativeBooguRuntime")
+            .map(|offset| retire_start + offset)
+            .unwrap();
+        assert!(source[retire_start..retire_end].contains("worker.join()"));
+    }
+
+    #[test]
+    fn native_submit_only_enqueues_and_never_waits_on_the_inference_worker_correctness() {
+        let source = include_str!("native_boogu.rs");
+        let implementation = source
+            .split_once("impl BooguRuntime for NativeBooguRuntime")
+            .unwrap()
+            .1
+            .split_once("impl Drop for NativeBooguRuntime")
+            .unwrap()
+            .0;
+        let submit = implementation
+            .split_once("fn submit(")
+            .unwrap()
+            .1
+            .split_once("fn cancel(")
+            .unwrap()
+            .0;
+        assert!(submit.contains("WorkerCommand::Infer"));
+        assert!(submit.contains(".send("));
+        assert!(submit.contains("self.cancellation.clone()"));
+        assert!(!submit.contains("recv("));
+        assert!(!submit.contains("sync_channel"));
+    }
+
+    #[test]
     fn native_factory_defaults_to_retained_qwen_and_resident_denoiser_correctness() {
         let factory = NativeBooguFactory::new(BooguVariant::Image01Turbo);
         assert_eq!(factory.residency, NativeBooguResidencyPolicy::HighVram);
+        assert_eq!(factory.autotune, NativeAutotunePolicy::Full);
+        assert_eq!(factory.variants, vec![BooguVariant::Image01Turbo]);
         assert!(factory.residency.is_gpu_resident());
         assert_eq!(
             factory.residency.label(),
@@ -1658,6 +2341,73 @@ mod tests {
         );
         assert!(!NativeBooguResidencyPolicy::LowVram.is_gpu_resident());
         assert!(!NativeBooguResidencyPolicy::LayerStreamed.is_gpu_resident());
+
+        let interactive = NativeBooguFactory::with_residency_and_autotune(
+            BooguVariant::Image01EditTurbo,
+            NativeBooguResidencyPolicy::HighVram,
+            NativeAutotunePolicy::Balanced,
+        );
+        assert_eq!(interactive.autotune, NativeAutotunePolicy::Balanced);
+        let interactive_qwen_chunk = native_qwen_query_chunk_size(
+            BooguVariant::Image01EditTurbo,
+            interactive.residency,
+            interactive.autotune,
+            BOOGU_1K_NATIVE_POLICY,
+        );
+        assert_eq!(interactive_qwen_chunk, 1_024);
+        assert_eq!(
+            native_runtime_policy_label(
+                BOOGU_1K_NATIVE_POLICY,
+                interactive.autotune,
+                interactive_qwen_chunk,
+            ),
+            format!(
+                "native-high-vram-retained-qwen-deferred-sync/{}/1k-mixed-f16/qwen-q1024/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum",
+                if cfg!(feature = "native-autotune") {
+                    "balanced-autotune"
+                } else {
+                    "no-autotune-static-kernels"
+                }
+            )
+        );
+        assert_eq!(
+            native_qwen_query_chunk_size(
+                BooguVariant::Image01EditTurbo,
+                NativeBooguResidencyPolicy::HighVram,
+                NativeAutotunePolicy::Full,
+                BOOGU_1K_NATIVE_POLICY,
+            ),
+            if cfg!(feature = "native-autotune") {
+                128
+            } else {
+                1_024
+            }
+        );
+
+        let switchable = NativeBooguFactory::with_canonical_model_switching(
+            BooguVariant::Image01EditTurbo,
+            NativeBooguResidencyPolicy::HighVram,
+            NativeAutotunePolicy::Balanced,
+        );
+        assert!(!isolates_interactive_compute(&interactive.variants));
+        assert!(isolates_interactive_compute(&switchable.variants));
+        assert_eq!(
+            switchable.variants,
+            vec![
+                BooguVariant::Image01Turbo,
+                BooguVariant::Image01EditTurbo,
+                BooguVariant::Image01EditTurbo1k5,
+            ]
+        );
+        assert_eq!(
+            native_qwen_query_chunk_size(
+                BooguVariant::Image01EditTurbo1k5,
+                NativeBooguResidencyPolicy::HighVram,
+                NativeAutotunePolicy::Balanced,
+                EDIT_TURBO_1K5_NATIVE_POLICY,
+            ),
+            128
+        );
     }
 
     #[test]
@@ -1756,11 +2506,14 @@ mod tests {
             NativeBooguResidencyPolicy::LowVram,
         ] {
             for variant in [BooguVariant::Image01Turbo, BooguVariant::Image01EditTurbo] {
-                assert!(NativeBooguFactory::requires_full_autotune(
-                    variant,
-                    residency,
-                    BooguStorageProfile::F16QwenVisionF32,
-                ));
+                assert_eq!(
+                    NativeBooguFactory::requires_full_autotune(
+                        variant,
+                        residency,
+                        BooguStorageProfile::F16QwenVisionF32,
+                    ),
+                    cfg!(feature = "native-autotune")
+                );
                 assert_eq!(
                     qualified_native_execution_policy(
                         variant,
@@ -1778,11 +2531,14 @@ mod tests {
                 ),
                 Some(EDIT_TURBO_1K5_NATIVE_POLICY)
             );
-            assert!(NativeBooguFactory::requires_full_autotune(
-                BooguVariant::Image01EditTurbo1k5,
-                residency,
-                BooguStorageProfile::F16QwenVisionF32,
-            ));
+            assert_eq!(
+                NativeBooguFactory::requires_full_autotune(
+                    BooguVariant::Image01EditTurbo1k5,
+                    residency,
+                    BooguStorageProfile::F16QwenVisionF32,
+                ),
+                cfg!(feature = "native-autotune")
+            );
         }
 
         for variant in [

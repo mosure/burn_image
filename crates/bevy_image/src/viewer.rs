@@ -3,17 +3,17 @@
 use bevy::{
     camera::{Viewport, visibility::RenderLayers},
     input::{gestures::PinchGesture, mouse::MouseWheel},
-    input_focus::InputFocus,
     prelude::*,
-    text::EditableText,
     window::PrimaryWindow,
 };
 use bevy_pancam::{DirectionKeys, PanCam, PanCamPlugin, PanCamSystems};
 use burn_image::{Dimensions, HostImage, InputImage};
 
 use crate::{
-    ImageBytesLoaded, ImageDisplayReady, ImageFrontendSet, ImageIoId, LatestGeneratedImageView,
-    controls::image_control_panel_layout, host_image_to_bevy_image,
+    ImageBytesLoaded, ImageDisplayReady, ImageEditorState, ImageFrontendSet, ImageIoId,
+    ImageRunnerStatus, LatestGeneratedImageView,
+    controls::{ImageControlPanel, image_control_panel_layout, reference_control_relevant},
+    host_image_to_bevy_image,
 };
 
 const IMAGE_RENDER_LAYER: usize = 1;
@@ -80,6 +80,7 @@ impl Plugin for ImageViewerPlugin {
                 (
                     sync_image_viewport,
                     preview_reference_image,
+                    sync_reference_preview_visibility,
                     capture_generated_image,
                     receive_view_requests,
                     apply_view_mode,
@@ -220,6 +221,27 @@ fn replace_reference_preview_image(
     handle
 }
 
+fn sync_reference_preview_visibility(
+    editor: Res<ImageEditorState>,
+    runner: Res<ImageRunnerStatus>,
+    preview: Res<ReferencePreviewImage>,
+    mut sprites: Query<(&Sprite, &mut Visibility), With<LatestGeneratedImageView>>,
+) {
+    let Some(preview_handle) = preview.handle.as_ref() else {
+        return;
+    };
+    let visibility = if reference_control_relevant(&editor, &runner.state) {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for (sprite, mut current) in &mut sprites {
+        if sprite.image.id() == preview_handle.id() && *current != visibility {
+            *current = visibility;
+        }
+    }
+}
+
 fn capture_generated_image(
     mut ready: MessageReader<ImageDisplayReady>,
     mut state: ResMut<ImageViewState>,
@@ -275,10 +297,9 @@ fn apply_view_mode(
 fn gate_image_camera_input(
     windows: Query<&Window, With<PrimaryWindow>>,
     mouse: Res<ButtonInput<MouseButton>>,
-    focus: Res<InputFocus>,
-    editable: Query<(), With<EditableText>>,
     mut wheel: MessageReader<MouseWheel>,
     mut pinch: MessageReader<PinchGesture>,
+    panels: Query<(&ComputedNode, &UiGlobalTransform), With<ImageControlPanel>>,
     mut capture: ResMut<ImageViewPointerCapture>,
     mut state: ResMut<ImageViewState>,
     mut cameras: Query<(&Camera, &mut PanCam), With<ImageViewCamera>>,
@@ -290,25 +311,28 @@ fn gate_image_camera_input(
     let any_pressed = mouse.pressed(MouseButton::Left) || mouse.pressed(MouseButton::Middle);
     let just_pressed =
         mouse.just_pressed(MouseButton::Left) || mouse.just_pressed(MouseButton::Middle);
-    let text_focused = focus.get().is_some_and(|entity| editable.contains(entity));
     let had_wheel = wheel.read().next().is_some();
     let had_pinch = pinch.read().next().is_some();
+    let cursor_over_ui = cursor.is_some_and(|cursor| {
+        panels
+            .iter()
+            .any(|(node, transform)| node.contains_point(*transform, cursor))
+    });
 
     for (camera, mut pan_cam) in &mut cameras {
-        let cursor_over = cursor
+        let cursor_over_viewport = cursor
             .zip(camera.logical_viewport_rect())
             .is_some_and(|(cursor, viewport)| viewport.contains(cursor));
-        let next_capture = if just_pressed {
-            cursor_over && !text_focused
-        } else if !any_pressed {
-            false
-        } else {
-            capture.0
-        };
+        let (next_capture, enabled) = image_camera_pointer_route(
+            cursor_over_viewport,
+            cursor_over_ui,
+            any_pressed,
+            just_pressed,
+            capture.0,
+        );
         if capture.0 != next_capture {
             capture.0 = next_capture;
         }
-        let enabled = !text_focused && (cursor_over || capture.0);
         if pan_cam.enabled != enabled {
             pan_cam.enabled = enabled;
         }
@@ -319,6 +343,38 @@ fn gate_image_camera_input(
             state.mode = ImageViewMode::Manual;
         }
     }
+}
+
+/// Resolve pointer ownership before `bevy_pancam` reads the frame's inputs.
+///
+/// A drag belongs to the surface where a grab button was first pressed. Moving a UI-started drag
+/// into the image therefore cannot begin panning, while an image-started drag remains captured
+/// until release. With no drag, wheel and pinch zoom are enabled only over the image viewport and
+/// never over the control panel. Persistent text-edit focus is intentionally irrelevant because
+/// keyboard movement is disabled on this camera.
+const fn image_camera_pointer_route(
+    cursor_over_viewport: bool,
+    cursor_over_ui: bool,
+    any_grab_pressed: bool,
+    grab_just_pressed: bool,
+    was_captured: bool,
+) -> (bool, bool) {
+    let over_image = cursor_over_viewport && !cursor_over_ui;
+    let captured = if !any_grab_pressed {
+        false
+    } else if was_captured {
+        true
+    } else if grab_just_pressed {
+        over_image
+    } else {
+        false
+    };
+    let enabled = if any_grab_pressed {
+        captured
+    } else {
+        over_image
+    };
+    (captured, enabled)
 }
 
 fn image_size(dimensions: Dimensions) -> Vec2 {
@@ -355,10 +411,41 @@ mod tests {
     }
 
     #[test]
+    fn pancam_pointer_routing_excludes_ui_and_preserves_drag_ownership_correctness() {
+        // Hovered image accepts wheel/pinch without requiring a click or clearing text focus.
+        assert_eq!(
+            image_camera_pointer_route(true, false, false, false, false),
+            (false, true)
+        );
+        // A press that starts on UI never turns into a pan merely by crossing into the viewport.
+        assert_eq!(
+            image_camera_pointer_route(false, true, true, true, false),
+            (false, false)
+        );
+        assert_eq!(
+            image_camera_pointer_route(true, false, true, false, false),
+            (false, false)
+        );
+        // A viewport-started drag stays captured across the panel and releases cleanly.
+        assert_eq!(
+            image_camera_pointer_route(true, false, true, true, false),
+            (true, true)
+        );
+        assert_eq!(
+            image_camera_pointer_route(false, true, true, false, true),
+            (true, true)
+        );
+        assert_eq!(
+            image_camera_pointer_route(false, true, false, false, true),
+            (false, false)
+        );
+    }
+
+    #[test]
     fn physical_viewport_respects_panel_and_scale_factor_correctness() {
         let viewport = image_viewport(UVec2::new(2560, 1600), 2.0).unwrap();
-        assert_eq!(viewport.physical_position, UVec2::new(768, 104));
-        assert_eq!(viewport.physical_size, UVec2::new(1768, 1472));
+        assert_eq!(viewport.physical_position, UVec2::new(808, 104));
+        assert_eq!(viewport.physical_size, UVec2::new(1728, 1472));
     }
 
     #[test]
@@ -387,5 +474,50 @@ mod tests {
         assert!(assets.get(second.id()).is_some());
         assert_eq!(preview.handle.as_ref().unwrap().id(), second.id());
         assert_eq!(assets.len(), 2);
+    }
+
+    #[test]
+    fn reference_preview_is_visible_only_for_a_capable_edit_selection_correctness() {
+        let handle = Handle::<Image>::default();
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus {
+            state: crate::ImageRunnerState::Ready {
+                capabilities: crate::runner::tests::test_capabilities("test/hybrid"),
+            },
+        })
+        .insert_resource(crate::ImageEditorState {
+            model: Some(burn_image::ModelId::new("test/hybrid").unwrap()),
+            ..Default::default()
+        })
+        .insert_resource(ReferencePreviewImage {
+            handle: Some(handle.clone()),
+        })
+        .add_systems(Update, sync_reference_preview_visibility);
+        let sprite = app
+            .world_mut()
+            .spawn((
+                Sprite {
+                    image: handle,
+                    ..Default::default()
+                },
+                Visibility::Visible,
+                LatestGeneratedImageView,
+            ))
+            .id();
+
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(sprite),
+            Some(&Visibility::Hidden)
+        );
+
+        app.world_mut()
+            .resource_mut::<crate::ImageEditorState>()
+            .mode = crate::EditorMode::Edit;
+        app.update();
+        assert_eq!(
+            app.world().get::<Visibility>(sprite),
+            Some(&Visibility::Visible)
+        );
     }
 }

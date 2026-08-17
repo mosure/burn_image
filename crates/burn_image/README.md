@@ -38,16 +38,22 @@ progress and cancellation.
 ## Artifact integrity
 
 Artifact manifests use validated relative paths, explicit byte lengths, SHA-256 digests,
-component-aware shard metadata, ordered shard hash chains, and a deterministic bundle content
-digest. `ArtifactVerifier` supports bounded sequential range verification so a web loader does not
-need to retain a complete shard in Wasm linear memory. `BundleVerifier` accepts completed files in
-any arrival order but yields a bundle only after every sealed-manifest file has been verified.
+component-aware semantic-object metadata, ordered hash chains, and a deterministic bundle content
+digest. A sealed transport sidecar can map each logical Burnpack to content-addressed physical CDN
+parts: the canonical target is 20,971,520 bytes, the exact hard maximum is 25,000,000 bytes, and the
+logical semantic ceiling remains a separate 256 MiB. `ArtifactVerifier` supports bounded sequential
+range verification so a web loader does not need to retain a complete bundle in Wasm linear memory.
+`BundleVerifier` accepts completed logical files in any arrival order but yields a bundle only after
+every sealed-manifest identity has been verified.
 
 Schema-v2 manifests can pin immutable sibling component bundles by role, identity, revision, and
 sealed digest. `ArtifactShardReader` and `AsyncArtifactShardReader` provide model-neutral bounded
-object reads, while `FilesystemArtifactCache` streams native downloads into a digest-keyed cache
-and writes `manifest.json` only after every payload verifies. Model crates own their tensor/stage
-semantics on top of these APIs; applications provide HTTP or browser transport adapters.
+logical-object reads; directory and remote adapters may reconstruct those bytes from verified
+physical parts. `FilesystemArtifactCache` streams native downloads into a digest-keyed cache and
+writes `manifest.json` only after every physical part and reconstructed logical identity verifies.
+Browser adapters cache canonical physical parts as individually authenticated complete objects;
+legacy range entries remain at or below 4 MiB. Model crates own their tensor/stage semantics on top
+of these APIs; applications provide HTTP or browser transport adapters.
 
 Integrity verification is strict by default. A loader must not make unverified artifacts equivalent
 to verified artifacts in logs or provenance.

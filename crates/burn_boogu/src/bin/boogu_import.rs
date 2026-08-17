@@ -55,7 +55,7 @@ struct Args {
     /// Numeric storage profile.
     #[arg(long, value_enum, default_value_t = ProfileArg::F16QwenVisionF32)]
     profile: ProfileArg,
-    /// Target maximum payload size per physical shard, in MiB.
+    /// Target maximum payload size per logical Burnpack object, in MiB.
     #[arg(long, default_value_t = DEFAULT_SHARD_MIB)]
     max_shard_mib: u64,
     /// Permit a tensor larger than the target limit to occupy one explicitly declared native-only
@@ -1225,7 +1225,7 @@ fn write_shard(
     if size > max_bytes && !oversized_tensor_exception {
         fs::remove_file(&temporary)?;
         return Err(format!(
-            "serialized Burnpack stage {} is {size} bytes, exceeding the declared {max_bytes}-byte physical shard limit",
+            "serialized Burnpack stage {} is {size} bytes, exceeding the declared {max_bytes}-byte semantic-object limit",
             shard.component
         )
         .into());
