@@ -1,7 +1,7 @@
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+#[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
 use bevy::render::renderer::RenderQueue;
 #[cfg(feature = "gpu-interop")]
 use bevy::render::{
@@ -14,21 +14,21 @@ use bevy::render::{
 /// The browser runtime uses this only for its fail-fast allocation preflight. Keeping these
 /// handles explicit prevents the probe from requesting a second adapter/device and makes the
 /// capacity check exercise the same WebGPU allocation domain that will execute the model.
-#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+#[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
 #[derive(Resource, Clone)]
 pub(crate) struct SharedWgpuAllocationDevice {
     device: RenderDevice,
     queue: RenderQueue,
 }
 
-#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+#[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
 impl std::fmt::Debug for SharedWgpuAllocationDevice {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SharedWgpuAllocationDevice")
     }
 }
 
-#[cfg(all(feature = "gpu-interop", target_arch = "wasm32"))]
+#[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
 impl SharedWgpuAllocationDevice {
     pub(crate) fn new(device: RenderDevice, queue: RenderQueue) -> Self {
         Self { device, queue }
@@ -202,7 +202,7 @@ fn finish_shared_backend(app: &mut App) {
         app.insert_resource(BackendStatus::failed(BackendFailure::RenderDeviceMissing));
         return;
     };
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
     let allocation_device = {
         let Some(render_queue) = render_app.world().get_resource::<RenderQueue>() else {
             app.insert_resource(BackendStatus::failed(BackendFailure::RenderQueueMissing));
@@ -225,7 +225,7 @@ fn finish_shared_backend(app: &mut App) {
         .get_resource::<bevy_burn::BurnDevice>()
         .is_some_and(bevy_burn::BurnDevice::is_ready);
     if burn_ready {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
         app.insert_resource(allocation_device);
         app.insert_resource(BackendStatus::ready(info));
     } else {
