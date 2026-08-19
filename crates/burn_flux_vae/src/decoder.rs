@@ -81,6 +81,49 @@ pub struct Decoder<B: Backend> {
     pub conv_out: nn::conv::Conv2d<B>,
 }
 
+/// Live state for an exact strict-F32 striped decode split at synchronization-safe stages.
+///
+/// The state owns only the current activation tensor. Decoder parameters remain borrowed from the
+/// resident [`Decoder`], so synchronizing and cleaning the backend allocator between advances can
+/// never evict model weights.
+pub struct StripedTailDecodeState<B: Backend> {
+    hidden: Option<Tensor<B, 4>>,
+    left: Option<Tensor<B, 4>>,
+    right: Option<Tensor<B, 4>>,
+    residual_left: Option<Tensor<B, 4>>,
+    residual_right: Option<Tensor<B, 4>>,
+    right_halo: Option<Tensor<B, 4>>,
+    norm_stats: Option<TwoWidthGroupNormStats<B>>,
+    split_width: usize,
+    next_stage: usize,
+    complete: bool,
+}
+
+struct TwoWidthGroupNormStats<B: Backend> {
+    mean: Tensor<B, 3>,
+    inverse_std: Tensor<B, 3>,
+    accumulation_dtype: FloatDType,
+    output_dtype: FloatDType,
+}
+
+const STRIPED_RESNET_STAGE_COUNT: usize = 15;
+const STRIPED_OUTPUT_STAGE_COUNT: usize = 7;
+
+impl<B: Backend> StripedTailDecodeState<B> {
+    /// Whether the exact output tensor is ready to consume.
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// Consume a completed staged decode and return its exact output tensor.
+    pub fn into_output(mut self) -> Tensor<B, 4> {
+        assert!(self.complete, "striped decoder output is not complete");
+        self.hidden
+            .take()
+            .expect("striped decoder complete state retains its output")
+    }
+}
+
 impl<B: Backend> Decoder<B> {
     pub fn new(device: &B::Device, config: &AutoencoderKlConfig) -> Self {
         let first_channels = config.block_out_channels[0];
@@ -209,6 +252,368 @@ impl<B: Backend> Decoder<B> {
         input: Tensor<B, 4>,
         split_width: usize,
     ) -> Tensor<B, 4> {
+        let mut state = self.begin_striped_tail_strict_f32(input, split_width);
+        while !state.is_complete() {
+            self.advance_striped_tail_strict_f32(&mut state);
+        }
+        state.into_output()
+    }
+
+    /// Begin an exact striped decode with only the initial convolution and middle block applied.
+    pub fn begin_striped_tail_strict_f32(
+        &self,
+        input: Tensor<B, 4>,
+        split_width: usize,
+    ) -> StripedTailDecodeState<B> {
+        self.validate_striped_tail_structure();
+        let hidden = self.mid_block.forward_with_group_norm_policy(
+            self.conv_in.forward(input),
+            DecoderGroupNormPolicy::StrictF32,
+        );
+        StripedTailDecodeState {
+            hidden: Some(hidden),
+            left: None,
+            right: None,
+            residual_left: None,
+            residual_right: None,
+            right_halo: None,
+            norm_stats: None,
+            split_width,
+            next_stage: 0,
+            complete: false,
+        }
+    }
+
+    /// Number of synchronization-safe advances after [`Self::begin_striped_tail_strict_f32`].
+    pub fn striped_tail_stage_count(&self) -> usize {
+        let final_block_index = self
+            .up_blocks
+            .len()
+            .checked_sub(1)
+            .expect("striped decoder requires an up block");
+        let upsample_block_index = final_block_index
+            .checked_sub(1)
+            .expect("striped decoder requires at least two up blocks");
+        let prefix_stages = self.up_blocks[..upsample_block_index]
+            .iter()
+            .try_fold(0_usize, |total, block| {
+                total.checked_add(block.resnets.len() + block.upsamplers.len())
+            })
+            .expect("striped decoder prefix stage count overflowed");
+        let transition_stages = self.up_blocks[upsample_block_index]
+            .resnets
+            .len()
+            .checked_add(1)
+            .expect("striped decoder transition stage count overflowed");
+        let resnet_stages = self.up_blocks[final_block_index]
+            .resnets
+            .len()
+            .checked_mul(STRIPED_RESNET_STAGE_COUNT)
+            .expect("striped decoder residual stage count overflowed");
+        prefix_stages
+            .checked_add(transition_stages)
+            .and_then(|value| value.checked_add(resnet_stages))
+            .and_then(|value| value.checked_add(STRIPED_OUTPUT_STAGE_COUNT))
+            .expect("striped decoder stage count overflowed")
+    }
+
+    /// Advance one exact decoder stage.
+    ///
+    /// The previous activation is dropped before this method returns. A browser caller may then
+    /// await its queue and clean unused allocator pages before advancing again.
+    pub fn advance_striped_tail_strict_f32(&self, state: &mut StripedTailDecodeState<B>) {
+        assert!(!state.complete, "striped decoder is already complete");
+        self.validate_striped_tail_structure();
+        let final_block_index = self.up_blocks.len() - 1;
+        let upsample_block_index = final_block_index - 1;
+        let prefix_stage_count = self.up_blocks[..upsample_block_index]
+            .iter()
+            .map(|block| block.resnets.len() + block.upsamplers.len())
+            .sum::<usize>();
+        let transition_resnets_start = prefix_stage_count;
+        let split_upsample_stage =
+            transition_resnets_start + self.up_blocks[upsample_block_index].resnets.len();
+        let resnet_start_stage = split_upsample_stage + 1;
+        let final_resnets = &self.up_blocks[final_block_index].resnets;
+        let output_start_stage =
+            resnet_start_stage + final_resnets.len() * STRIPED_RESNET_STAGE_COUNT;
+
+        if state.next_stage < prefix_stage_count {
+            let mut stage_start = 0_usize;
+            let mut advanced = false;
+            for block in &self.up_blocks[..upsample_block_index] {
+                let resnet_end = stage_start + block.resnets.len();
+                if state.next_stage < resnet_end {
+                    let hidden = state
+                        .hidden
+                        .take()
+                        .expect("striped decoder prefix retains its activation");
+                    state.hidden = Some(
+                        block.resnets[state.next_stage - stage_start]
+                            .forward_with_group_norm_policy(
+                                hidden,
+                                DecoderGroupNormPolicy::StrictF32,
+                            ),
+                    );
+                    advanced = true;
+                    break;
+                }
+                if state.next_stage == resnet_end {
+                    let hidden = state
+                        .hidden
+                        .take()
+                        .expect("striped decoder prefix upsample retains its activation");
+                    state.hidden = Some(
+                        block
+                            .upsamplers
+                            .first()
+                            .expect("validated prefix upsampler")
+                            .forward(hidden),
+                    );
+                    advanced = true;
+                    break;
+                }
+                stage_start = resnet_end + block.upsamplers.len();
+            }
+            assert!(advanced, "striped decoder prefix stage was not resolved");
+        } else if state.next_stage < split_upsample_stage {
+            let upsample_block = &self.up_blocks[upsample_block_index];
+            let hidden = state
+                .hidden
+                .take()
+                .expect("striped decoder transition retains its activation");
+            state.hidden = Some(
+                upsample_block.resnets[state.next_stage - transition_resnets_start]
+                    .forward_with_group_norm_policy(hidden, DecoderGroupNormPolicy::StrictF32),
+            );
+        } else if state.next_stage == split_upsample_stage {
+            let upsample_block = &self.up_blocks[upsample_block_index];
+            let hidden = state
+                .hidden
+                .take()
+                .expect("striped decoder split upsample retains its activation");
+            let (left, right) = upsample_two_width_slabs(
+                upsample_block
+                    .upsamplers
+                    .first()
+                    .expect("validated final upsampler"),
+                hidden,
+                state.split_width,
+            );
+            state.left = Some(left);
+            state.right = Some(right);
+        } else if state.next_stage < output_start_stage {
+            let relative_stage = state.next_stage - resnet_start_stage;
+            let resnet_index = relative_stage / STRIPED_RESNET_STAGE_COUNT;
+            let resnet_stage = relative_stage % STRIPED_RESNET_STAGE_COUNT;
+            let resnet = &final_resnets[resnet_index];
+            match resnet_stage {
+                0 => {
+                    let left = state.left.as_ref().expect("striped residual left input");
+                    let right = state.right.as_ref().expect("striped residual right input");
+                    assert!(
+                        state.residual_left.is_none() && state.residual_right.is_none(),
+                        "striped residual shortcut state leaked across blocks"
+                    );
+                    state.residual_left = Some(
+                        resnet
+                            .conv_shortcut
+                            .as_ref()
+                            .map(|shortcut| shortcut.forward(left.clone()))
+                            .unwrap_or_else(|| left.clone()),
+                    );
+                    state.residual_right = Some(
+                        resnet
+                            .conv_shortcut
+                            .as_ref()
+                            .map(|shortcut| shortcut.forward(right.clone()))
+                            .unwrap_or_else(|| right.clone()),
+                    );
+                }
+                1 => {
+                    state.norm_stats = Some(group_norm_two_width_slabs_stats_strict_f32(
+                        &resnet.norm1,
+                        state.left.as_ref().expect("striped norm1 left input"),
+                        state.right.as_ref().expect("striped norm1 right input"),
+                    ));
+                }
+                2 => {
+                    state.left = Some(apply_group_norm_width_slab_strict_f32(
+                        &resnet.norm1,
+                        state.left.take().expect("striped norm1 left input"),
+                        state.norm_stats.as_ref().expect("striped norm1 statistics"),
+                    ));
+                }
+                3 => {
+                    state.right = Some(apply_group_norm_width_slab_strict_f32(
+                        &resnet.norm1,
+                        state.right.take().expect("striped norm1 right input"),
+                        state.norm_stats.as_ref().expect("striped norm1 statistics"),
+                    ));
+                    state.norm_stats.take();
+                }
+                4 => {
+                    state.left = Some(silu(
+                        state.left.take().expect("striped conv1 left activation"),
+                    ));
+                }
+                5 => {
+                    state.right = Some(silu(
+                        state.right.take().expect("striped conv1 right activation"),
+                    ));
+                }
+                6 => {
+                    let (left, right_halo) = conv3_left_width_slab(
+                        &resnet.conv1,
+                        state.left.take().expect("striped conv1 left input"),
+                        state.right.as_ref().expect("striped conv1 right input"),
+                    );
+                    state.left = Some(left);
+                    state.right_halo = Some(right_halo);
+                }
+                7 => {
+                    state.right = Some(conv3_right_width_slab(
+                        &resnet.conv1,
+                        state.right.take().expect("striped conv1 right input"),
+                        state.right_halo.take().expect("striped conv1 right halo"),
+                    ));
+                }
+                8 => {
+                    state.norm_stats = Some(group_norm_two_width_slabs_stats_strict_f32(
+                        &resnet.norm2,
+                        state.left.as_ref().expect("striped norm2 left input"),
+                        state.right.as_ref().expect("striped norm2 right input"),
+                    ));
+                }
+                9 => {
+                    state.left = Some(apply_group_norm_width_slab_strict_f32(
+                        &resnet.norm2,
+                        state.left.take().expect("striped norm2 left input"),
+                        state.norm_stats.as_ref().expect("striped norm2 statistics"),
+                    ));
+                }
+                10 => {
+                    state.right = Some(apply_group_norm_width_slab_strict_f32(
+                        &resnet.norm2,
+                        state.right.take().expect("striped norm2 right input"),
+                        state.norm_stats.as_ref().expect("striped norm2 statistics"),
+                    ));
+                    state.norm_stats.take();
+                }
+                11 => {
+                    state.left = Some(silu(
+                        state.left.take().expect("striped conv2 left activation"),
+                    ));
+                }
+                12 => {
+                    state.right = Some(silu(
+                        state.right.take().expect("striped conv2 right activation"),
+                    ));
+                }
+                13 => {
+                    let (left, right_halo) = conv3_left_width_slab(
+                        &resnet.conv2,
+                        state.left.take().expect("striped conv2 left input"),
+                        state.right.as_ref().expect("striped conv2 right input"),
+                    );
+                    state.left = Some(
+                        state
+                            .residual_left
+                            .take()
+                            .expect("striped residual left shortcut")
+                            + left,
+                    );
+                    state.right_halo = Some(right_halo);
+                }
+                14 => {
+                    let right = conv3_right_width_slab(
+                        &resnet.conv2,
+                        state.right.take().expect("striped conv2 right input"),
+                        state.right_halo.take().expect("striped conv2 right halo"),
+                    );
+                    state.right = Some(
+                        state
+                            .residual_right
+                            .take()
+                            .expect("striped residual right shortcut")
+                            + right,
+                    );
+                }
+                _ => unreachable!("striped residual stage is bounded"),
+            }
+        } else {
+            match state.next_stage - output_start_stage {
+                0 => {
+                    state.norm_stats = Some(group_norm_two_width_slabs_stats_strict_f32(
+                        &self.conv_norm_out,
+                        state.left.as_ref().expect("striped output norm left input"),
+                        state
+                            .right
+                            .as_ref()
+                            .expect("striped output norm right input"),
+                    ));
+                }
+                1 => {
+                    state.left = Some(apply_group_norm_width_slab_strict_f32(
+                        &self.conv_norm_out,
+                        state.left.take().expect("striped output norm left input"),
+                        state
+                            .norm_stats
+                            .as_ref()
+                            .expect("striped output norm statistics"),
+                    ));
+                }
+                2 => {
+                    state.right = Some(apply_group_norm_width_slab_strict_f32(
+                        &self.conv_norm_out,
+                        state.right.take().expect("striped output norm right input"),
+                        state
+                            .norm_stats
+                            .as_ref()
+                            .expect("striped output norm statistics"),
+                    ));
+                    state.norm_stats.take();
+                }
+                3 => {
+                    state.left = Some(silu(
+                        state.left.take().expect("striped output left activation"),
+                    ));
+                }
+                4 => {
+                    state.right = Some(silu(
+                        state.right.take().expect("striped output right activation"),
+                    ));
+                }
+                5 => {
+                    let (left, right_halo) = conv3_left_width_slab(
+                        &self.conv_out,
+                        state.left.take().expect("striped output left input"),
+                        state.right.as_ref().expect("striped output right input"),
+                    );
+                    state.left = Some(left);
+                    state.right_halo = Some(right_halo);
+                }
+                6 => {
+                    let right = conv3_right_width_slab(
+                        &self.conv_out,
+                        state.right.take().expect("striped output right input"),
+                        state.right_halo.take().expect("striped output right halo"),
+                    );
+                    let left = state.left.take().expect("striped output left result");
+                    state.hidden = Some(Tensor::cat(vec![left, right], 3));
+                    state.complete = true;
+                }
+                _ => panic!("striped decoder stage index exceeds its exact plan"),
+            }
+        }
+        state.next_stage += 1;
+        debug_assert_eq!(
+            state.complete,
+            state.next_stage == self.striped_tail_stage_count()
+        );
+    }
+
+    fn validate_striped_tail_structure(&self) {
         let final_block_index = self
             .up_blocks
             .len()
@@ -232,47 +637,10 @@ impl<B: Backend> Decoder<B> {
             self.up_blocks[final_block_index].upsamplers.is_empty(),
             "striped decoder expects no upsampler in the final up block"
         );
-
-        let mut hidden = self.conv_in.forward(input);
-        hidden = self
-            .mid_block
-            .forward_with_group_norm_policy(hidden, DecoderGroupNormPolicy::StrictF32);
-        for block in &self.up_blocks[..upsample_block_index] {
-            hidden =
-                block.forward_with_group_norm_policy(hidden, DecoderGroupNormPolicy::StrictF32);
-        }
-
-        let upsample_block = &self.up_blocks[upsample_block_index];
-        for resnet in &upsample_block.resnets {
-            hidden =
-                resnet.forward_with_group_norm_policy(hidden, DecoderGroupNormPolicy::StrictF32);
-        }
-        let (left, right) = upsample_two_width_slabs(
-            upsample_block
-                .upsamplers
-                .first()
-                .expect("validated final upsampler"),
-            hidden,
-            split_width,
+        assert!(
+            !self.up_blocks[final_block_index].resnets.is_empty(),
+            "striped decoder final block requires a residual layer"
         );
-
-        let final_block = &self.up_blocks[final_block_index];
-        let first_resnet = final_block
-            .resnets
-            .first()
-            .expect("decoder up block contains a residual layer");
-        let (left, right) = resnet_two_width_slabs_strict_f32(first_resnet, left, right);
-        hidden = Tensor::cat(vec![left, right], 3);
-        for resnet in final_block.resnets.iter().skip(1) {
-            hidden =
-                resnet.forward_with_group_norm_policy(hidden, DecoderGroupNormPolicy::StrictF32);
-        }
-
-        self.conv_out.forward(silu(group_norm_with_policy(
-            &self.conv_norm_out,
-            hidden,
-            DecoderGroupNormPolicy::StrictF32,
-        )))
     }
 }
 
@@ -308,6 +676,7 @@ fn upsample_two_width_slabs<B: Backend>(
     )
 }
 
+#[cfg(test)]
 fn resnet_two_width_slabs_strict_f32<B: Backend>(
     resnet: &ResnetBlock2d<B>,
     left: Tensor<B, 4>,
@@ -331,10 +700,21 @@ fn resnet_two_width_slabs_strict_f32<B: Backend>(
     (residual_left + left, residual_right + right)
 }
 
+#[cfg(test)]
 fn conv3_two_width_slabs<B: Backend>(
     conv: &nn::conv::Conv2d<B>,
     left: Tensor<B, 4>,
     right: Tensor<B, 4>,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    let (left, right_halo) = conv3_left_width_slab(conv, left, &right);
+    let right = conv3_right_width_slab(conv, right, right_halo);
+    (left, right)
+}
+
+fn conv3_left_width_slab<B: Backend>(
+    conv: &nn::conv::Conv2d<B>,
+    left: Tensor<B, 4>,
+    right: &Tensor<B, 4>,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
     let [batch, channels, height, left_width] = left.dims();
     let [right_batch, right_channels, right_height, right_width] = right.dims();
@@ -343,6 +723,46 @@ fn conv3_two_width_slabs<B: Backend>(
         [right_batch, right_channels, right_height]
     );
     assert!(left_width > 0 && right_width > 0, "empty convolution slab");
+    validate_striped_conv3(conv);
+
+    let left_halo = right
+        .clone()
+        .slice([0..batch, 0..channels, 0..height, 0..1]);
+    let right_halo =
+        left.clone()
+            .slice([0..batch, 0..channels, 0..height, left_width - 1..left_width]);
+    let left = conv.forward(Tensor::cat(vec![left, left_halo], 3)).slice([
+        0..batch,
+        0..conv.weight.dims()[0],
+        0..height,
+        0..left_width,
+    ]);
+    (left, right_halo)
+}
+
+fn conv3_right_width_slab<B: Backend>(
+    conv: &nn::conv::Conv2d<B>,
+    right: Tensor<B, 4>,
+    right_halo: Tensor<B, 4>,
+) -> Tensor<B, 4> {
+    let [batch, channels, height, right_width] = right.dims();
+    assert_eq!(
+        right_halo.dims(),
+        [batch, channels, height, 1],
+        "striped convolution right halo mismatch"
+    );
+    assert!(right_width > 0, "empty convolution slab");
+    validate_striped_conv3(conv);
+    conv.forward(Tensor::cat(vec![right_halo, right], 3))
+        .slice([
+            0..batch,
+            0..conv.weight.dims()[0],
+            0..height,
+            1..right_width + 1,
+        ])
+}
+
+fn validate_striped_conv3<B: Backend>(conv: &nn::conv::Conv2d<B>) {
     assert_eq!(
         conv.kernel_size,
         [3, 3],
@@ -359,35 +779,26 @@ fn conv3_two_width_slabs<B: Backend>(
         "striped decoder requires unit convolution dilation"
     );
     assert_eq!(conv.padding, nn::PaddingConfig2d::Explicit(1, 1, 1, 1));
-
-    let left_halo = right
-        .clone()
-        .slice([0..batch, 0..channels, 0..height, 0..1]);
-    let right_halo =
-        left.clone()
-            .slice([0..batch, 0..channels, 0..height, left_width - 1..left_width]);
-    let left = conv.forward(Tensor::cat(vec![left, left_halo], 3)).slice([
-        0..batch,
-        0..conv.weight.dims()[0],
-        0..height,
-        0..left_width,
-    ]);
-    let right = conv
-        .forward(Tensor::cat(vec![right_halo, right], 3))
-        .slice([
-            0..batch,
-            0..conv.weight.dims()[0],
-            0..height,
-            1..right_width + 1,
-        ]);
-    (left, right)
 }
 
+#[cfg(test)]
 fn group_norm_two_width_slabs_strict_f32<B: Backend>(
     norm: &nn::GroupNorm<B>,
     left: Tensor<B, 4>,
     right: Tensor<B, 4>,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    let stats = group_norm_two_width_slabs_stats_strict_f32(norm, &left, &right);
+    (
+        apply_group_norm_width_slab_strict_f32(norm, left, &stats),
+        apply_group_norm_width_slab_strict_f32(norm, right, &stats),
+    )
+}
+
+fn group_norm_two_width_slabs_stats_strict_f32<B: Backend>(
+    norm: &nn::GroupNorm<B>,
+    left: &Tensor<B, 4>,
+    right: &Tensor<B, 4>,
+) -> TwoWidthGroupNormStats<B> {
     let [batch, channels, height, left_width] = left.dims();
     let [right_batch, right_channels, right_height, right_width] = right.dims();
     assert_eq!(
@@ -397,54 +808,77 @@ fn group_norm_two_width_slabs_strict_f32<B: Backend>(
     assert_eq!(channels, norm.num_channels, "GroupNorm channel mismatch");
     assert!(left_width > 0 && right_width > 0, "empty GroupNorm slab");
 
-    let dtype: FloatDType = left.dtype().into();
-    assert_eq!(dtype, right.dtype().into(), "GroupNorm slab dtype mismatch");
-    let accumulation_dtype = if matches!(dtype, FloatDType::F16 | FloatDType::BF16) {
+    let output_dtype: FloatDType = left.dtype().into();
+    assert_eq!(
+        output_dtype,
+        right.dtype().into(),
+        "GroupNorm slab dtype mismatch"
+    );
+    let accumulation_dtype = if matches!(output_dtype, FloatDType::F16 | FloatDType::BF16) {
         FloatDType::F32
     } else {
-        dtype
+        output_dtype
     };
     let group_channels = channels / norm.num_groups;
     let left_group_width = group_channels * height * left_width;
     let right_group_width = group_channels * height * right_width;
-    let left = left
-        .cast(accumulation_dtype)
-        .reshape([batch, norm.num_groups, left_group_width]);
-    let right = right
-        .cast(accumulation_dtype)
-        .reshape([batch, norm.num_groups, right_group_width]);
+    let left =
+        left.clone()
+            .cast(accumulation_dtype)
+            .reshape([batch, norm.num_groups, left_group_width]);
+    let right =
+        right
+            .clone()
+            .cast(accumulation_dtype)
+            .reshape([batch, norm.num_groups, right_group_width]);
     let mean = (left.clone().sum_dim(2) + right.clone().sum_dim(2))
         / (left_group_width + right_group_width) as f64;
-    let left = left - mean.clone();
-    let right = right - mean;
-    let variance = (left.clone().square().sum_dim(2) + right.clone().square().sum_dim(2))
-        / (left_group_width + right_group_width) as f64;
+    let left_variance = (left - mean.clone()).square().sum_dim(2);
+    let right_variance = (right - mean.clone()).square().sum_dim(2);
+    let variance = (left_variance + right_variance) / (left_group_width + right_group_width) as f64;
     let inverse_std = variance.add_scalar(norm.epsilon).sqrt().recip();
-    let left = left * inverse_std.clone();
-    let right = right * inverse_std;
+    TwoWidthGroupNormStats {
+        mean,
+        inverse_std,
+        accumulation_dtype,
+        output_dtype,
+    }
+}
 
-    let affine = |input: Tensor<B, 3>, width: usize| {
-        let input = input.reshape([batch, channels, height, width]);
-        if !norm.affine {
-            return input.cast(dtype);
-        }
-        let gamma = norm
-            .gamma
-            .as_ref()
-            .expect("affine GroupNorm gamma")
-            .val()
-            .cast(accumulation_dtype)
-            .reshape([1, channels, 1, 1]);
-        let beta = norm
-            .beta
-            .as_ref()
-            .expect("affine GroupNorm beta")
-            .val()
-            .cast(accumulation_dtype)
-            .reshape([1, channels, 1, 1]);
-        (input * gamma + beta).cast(dtype)
-    };
-    (affine(left, left_width), affine(right, right_width))
+fn apply_group_norm_width_slab_strict_f32<B: Backend>(
+    norm: &nn::GroupNorm<B>,
+    input: Tensor<B, 4>,
+    stats: &TwoWidthGroupNormStats<B>,
+) -> Tensor<B, 4> {
+    let [batch, channels, height, width] = input.dims();
+    assert_eq!(channels, norm.num_channels, "GroupNorm channel mismatch");
+    assert!(width > 0, "empty GroupNorm slab");
+    let group_width = channels / norm.num_groups * height * width;
+    let input =
+        ((input
+            .cast(stats.accumulation_dtype)
+            .reshape([batch, norm.num_groups, group_width])
+            - stats.mean.clone())
+            * stats.inverse_std.clone())
+        .reshape([batch, channels, height, width]);
+    if !norm.affine {
+        return input.cast(stats.output_dtype);
+    }
+    let gamma = norm
+        .gamma
+        .as_ref()
+        .expect("affine GroupNorm gamma")
+        .val()
+        .cast(stats.accumulation_dtype)
+        .reshape([1, channels, 1, 1]);
+    let beta = norm
+        .beta
+        .as_ref()
+        .expect("affine GroupNorm beta")
+        .val()
+        .cast(stats.accumulation_dtype)
+        .reshape([1, channels, 1, 1]);
+    (input * gamma + beta).cast(stats.output_dtype)
 }
 
 #[cfg(test)]

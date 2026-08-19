@@ -11,7 +11,7 @@ use burn::{
 
 use crate::{
     Qwen3VlError, QwenLinear, QwenLinearConfig, Result, config::Qwen3VlVisionConfig,
-    outputs::Qwen3VlVisionOutput, processor::Grid,
+    linear::qwen_linear_forward, outputs::Qwen3VlVisionOutput, processor::Grid,
 };
 
 const DEFAULT_QUERY_CHUNK_SIZE: usize = 128;
@@ -243,8 +243,11 @@ impl<B: Backend> Qwen3VlVisionMlp<B> {
     }
 
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.linear_fc2
-            .forward(self.activation.forward(self.linear_fc1.forward(input)))
+        qwen_linear_forward(
+            &self.linear_fc2,
+            self.activation
+                .forward(qwen_linear_forward(&self.linear_fc1, input)),
+        )
     }
 }
 
@@ -283,7 +286,7 @@ impl<B: Backend> Qwen3VlVisionAttention<B> {
         sin: Tensor<B, 2>,
     ) -> Tensor<B, 2> {
         let [sequence, hidden] = input.dims();
-        let qkv = self.qkv.forward(input);
+        let qkv = qwen_linear_forward(&self.qkv, input);
         let query = qkv
             .clone()
             .slice([0..sequence, 0..hidden])
@@ -343,7 +346,7 @@ impl<B: Backend> Qwen3VlVisionAttention<B> {
                     .reshape([frame_length, hidden]),
             );
         }
-        self.proj.forward(Tensor::cat(frame_outputs, 0))
+        qwen_linear_forward(&self.proj, Tensor::cat(frame_outputs, 0))
     }
 }
 
@@ -430,8 +433,11 @@ impl<B: Backend> Qwen3VlVisionPatchMerger<B> {
                 self.merged_hidden_size,
             ])
         };
-        self.linear_fc2
-            .forward(self.activation.forward(self.linear_fc1.forward(normalized)))
+        qwen_linear_forward(
+            &self.linear_fc2,
+            self.activation
+                .forward(qwen_linear_forward(&self.linear_fc1, normalized)),
+        )
     }
 }
 

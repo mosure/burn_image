@@ -20,6 +20,11 @@ const BURN_CUBECL_TENSOR_OPS: &str =
     include_str!("../patches/burn-cubecl-0.21.0/src/ops/tensor.rs");
 const BURN_CUBECL_MODULE_OPS: &str =
     include_str!("../patches/burn-cubecl-0.21.0/src/ops/module.rs");
+const BURN_CUBECL_QUANTIZED_OPS: &str =
+    include_str!("../patches/burn-cubecl-0.21.0/src/ops/qtensor.rs");
+const BURN_CUBECL_BASE_OPS: &str = include_str!("../patches/burn-cubecl-0.21.0/src/ops/base.rs");
+const BURN_CUBECL_SELECT: &str =
+    include_str!("../patches/burn-cubecl-0.21.0/src/kernel/index/select.rs");
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -29,6 +34,42 @@ fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .split(end)
         .next()
         .unwrap_or_else(|| panic!("source contract end marker is missing: {end}"))
+}
+
+#[test]
+fn packed_quantized_uploads_honor_the_declared_axis_correctness() {
+    let constructor = section(
+        BURN_CUBECL_QUANTIZED_OPS,
+        "fn new_quantized<R: CubeRuntime>(",
+        "impl<R, F, I, BT> QTensorOps<Self>",
+    );
+    assert!(constructor.contains("QuantStore::PackedU32(packed_dim)"));
+    assert!(constructor.contains(".checked_sub(packed_dim + 1)"));
+    assert!(constructor.contains("shape_value[packed_axis] ="));
+    assert!(!constructor.contains("shape_value[rank - 1] ="));
+
+    let reshape = section(
+        BURN_CUBECL_BASE_OPS,
+        "pub fn q_reshape<R: CubeRuntime>(",
+        "pub(crate) fn max_vector_size<R: CubeRuntime>",
+    );
+    assert!(reshape.contains("if curr_shape == &shape"));
+    assert!(reshape.contains("return tensor;"));
+
+    let select = section(
+        BURN_CUBECL_SELECT,
+        "fn quantized_select_rows_kernel<I: Numeric>(",
+        "/// Select rows from a packed block-quantized matrix",
+    );
+    assert!(select.contains("values[source_row * values.stride(0)"));
+    assert!(select.contains("scales[source_row * scales.stride(0)"));
+    let route = section(
+        BURN_CUBECL_QUANTIZED_OPS,
+        "    fn q_select(",
+        "    fn q_slice(",
+    );
+    assert!(route.contains("PackedU32(0)"));
+    assert!(route.contains("kernel::select_quantized_rows"));
 }
 
 #[test]

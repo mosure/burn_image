@@ -670,6 +670,31 @@ pub struct BooguPackedF16ResidentFootprint {
     pub total_payload_bytes: u64,
 }
 
+/// Inventory-derived resident parameter payload for packed Q4S/F32 execution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BooguPackedQ4ResidentFootprint {
+    /// Rank-two tensors retained as signed four-bit values.
+    pub packed_q4_tensor_count: usize,
+    /// Logical values represented by the packed Q4 tensors.
+    pub packed_q4_elements: u64,
+    /// Four-bit value payload, excluding scales.
+    pub packed_q4_value_bytes: u64,
+    /// F32 block-scale count across all Q4 tensors.
+    pub scale_count: u64,
+    /// Exact F32 scale payload.
+    pub scale_bytes: u64,
+    /// Rank-four convolution values retained in packed F16 storage.
+    pub packed_f16_elements: u64,
+    /// Exact fallback packed-F16 payload.
+    pub packed_f16_payload_bytes: u64,
+    /// Normalization, bias, and other F32 auxiliary values.
+    pub f32_auxiliary_elements: u64,
+    /// Exact F32 auxiliary payload.
+    pub f32_auxiliary_payload_bytes: u64,
+    /// Complete resident parameter payload, excluding allocator alignment and activations.
+    pub total_payload_bytes: u64,
+}
+
 fn qwen_specs(config: &Qwen3VlConfig) -> Vec<ArtifactTensorSpec> {
     QwenWeightInventory::for_config(config, true)
         .specs()
@@ -1492,6 +1517,131 @@ mod loading {
             }
             Ok(footprint)
         }
+
+        /// Derive the exact Turbo parameter payload for resident Q4S execution.
+        ///
+        /// Qwen text matrices and vocabulary rows use 128-value input blocks. Boogu row-layout
+        /// matrices use the largest exact input-axis block up to 128. The small VAE linear and
+        /// convolution weights remain packed F16; all auxiliaries execute in F32.
+        pub fn packed_q4_resident_footprint(
+            &self,
+            variant: BooguVariant,
+            profile: BooguStorageProfile,
+        ) -> Result<super::BooguPackedQ4ResidentFootprint, BooguError> {
+            if variant != BooguVariant::Image01Turbo
+                || profile != BooguStorageProfile::F16QwenVisionF32
+            {
+                return Err(BooguError::Artifact(
+                    "resident Q4S is currently restricted to the canonical Turbo production profile"
+                        .into(),
+                ));
+            }
+            let mut footprint = super::BooguPackedQ4ResidentFootprint::default();
+            for spec in self.tensors().iter().filter(|spec| {
+                spec.target_name != "lm_head.weight"
+                    && !spec.stage.starts_with("qwen-vision-")
+                    && spec.stage != "flux-vae-encoder"
+                    && !spec.stage.starts_with("boogu-reference-refiner-")
+            }) {
+                let elements = spec
+                    .target_shape
+                    .iter()
+                    .try_fold(1_u64, |total, &dimension| {
+                        total.checked_mul(dimension as u64)
+                    })
+                    .ok_or_else(|| {
+                        BooguError::Artifact(format!(
+                            "packed-Q4 resident element count overflowed for {}",
+                            spec.target_name
+                        ))
+                    })?;
+                let q4_block = if spec.target_shape.len() == 2 {
+                    match spec.owner {
+                        TensorOwner::Qwen3Vl => spec
+                            .target_shape
+                            .last()
+                            .copied()
+                            .and_then(|inner| inner.is_multiple_of(128).then_some(128_u64)),
+                        TensorOwner::BooguDenoiser => {
+                            let input = spec.target_shape[0];
+                            [128_usize, 64, 32, 16, 8]
+                                .into_iter()
+                                .find(|block| input.is_multiple_of(*block))
+                                .map(|block| block as u64)
+                        }
+                        TensorOwner::FluxVae => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(block) = q4_block {
+                    footprint.packed_q4_tensor_count = footprint
+                        .packed_q4_tensor_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            BooguError::Artifact("packed-Q4 tensor count overflowed".into())
+                        })?;
+                    footprint.packed_q4_elements = footprint
+                        .packed_q4_elements
+                        .checked_add(elements)
+                        .ok_or_else(|| {
+                            BooguError::Artifact("packed-Q4 element count overflowed".into())
+                        })?;
+                    footprint.scale_count = footprint
+                        .scale_count
+                        .checked_add(elements / block)
+                        .ok_or_else(|| {
+                            BooguError::Artifact("packed-Q4 scale count overflowed".into())
+                        })?;
+                } else if spec.target_shape.len() == 4
+                    || (spec.owner == TensorOwner::FluxVae && spec.target_shape.len() == 2)
+                {
+                    footprint.packed_f16_elements = footprint
+                        .packed_f16_elements
+                        .checked_add(elements)
+                        .ok_or_else(|| {
+                            BooguError::Artifact("packed-F16 fallback count overflowed".into())
+                        })?;
+                } else {
+                    footprint.f32_auxiliary_elements = footprint
+                        .f32_auxiliary_elements
+                        .checked_add(elements)
+                        .ok_or_else(|| {
+                            BooguError::Artifact("Q4 F32 auxiliary count overflowed".into())
+                        })?;
+                }
+            }
+            footprint.packed_q4_value_bytes = footprint.packed_q4_elements / 2;
+            footprint.scale_bytes = footprint.scale_count.checked_mul(4).ok_or_else(|| {
+                BooguError::Artifact("packed-Q4 scale byte count overflowed".into())
+            })?;
+            footprint.packed_f16_payload_bytes = footprint
+                .packed_f16_elements
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    BooguError::Artifact("packed-F16 fallback byte count overflowed".into())
+                })?;
+            footprint.f32_auxiliary_payload_bytes = footprint
+                .f32_auxiliary_elements
+                .checked_mul(4)
+                .ok_or_else(|| {
+                    BooguError::Artifact("Q4 F32 auxiliary byte count overflowed".into())
+                })?;
+            footprint.total_payload_bytes = footprint
+                .packed_q4_value_bytes
+                .checked_add(footprint.scale_bytes)
+                .and_then(|bytes| bytes.checked_add(footprint.packed_f16_payload_bytes))
+                .and_then(|bytes| bytes.checked_add(footprint.f32_auxiliary_payload_bytes))
+                .ok_or_else(|| {
+                    BooguError::Artifact("packed-Q4 total byte count overflowed".into())
+                })?;
+            if footprint.packed_q4_tensor_count == 0 || footprint.total_payload_bytes == 0 {
+                return Err(BooguError::Artifact(
+                    "packed-Q4 resident footprint contains no packed weights".into(),
+                ));
+            }
+            Ok(footprint)
+        }
     }
 
     /// Authenticated identity evidence for the opt-in 1.5K VAE encoder F32 A/B overlay.
@@ -1852,6 +2002,9 @@ mod loading {
         /// Execution remains F32. A backend selecting this policy must provide fused packed-F16
         /// linear, row-selection, and convolution operations; it is not a typed-F16 claim.
         PackedF16WeightsF32Auxiliaries,
+        /// Retain eligible matrices as packed signed Q4S with F32 block scales, keep convolution
+        /// weights packed F16, and widen normalization/bias auxiliaries to F32.
+        PackedQ4sWeightsF32Auxiliaries,
     }
 
     /// Policy for verified quantized snapshots when applying a Burnpack stage.
@@ -1910,6 +2063,9 @@ mod loading {
         /// Convert inventory-eligible F16/F32 denoiser matrices to Q8S block-32/F32 after
         /// integrity, dtype, shape, and inventory eligibility have been verified.
         Q8sBlock32F32,
+        /// Convert inventory-eligible row-layout denoiser matrices to packed signed Q4S with the
+        /// largest exact input-axis block up to 128 values and F32 scales.
+        Q4sBlockUpTo128F32,
     }
 
     impl BooguDenoiserRuntimeQuantizationPolicy {
@@ -1918,6 +2074,7 @@ mod loading {
             match self {
                 Self::Disabled => "disabled",
                 Self::Q8sBlock32F32 => "runtime-quantize-q8s-block32-f32",
+                Self::Q4sBlockUpTo128F32 => "runtime-quantize-q4s-block-up-to-128-f32",
             }
         }
     }
@@ -7181,21 +7338,28 @@ mod loading {
         variant: BooguVariant,
         stage: &str,
     ) -> Result<(), BooguError> {
-        if runtime_quantization_policy == BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32
+        if runtime_quantization_policy != BooguDenoiserRuntimeQuantizationPolicy::Disabled
             && !matches!(
                 profile,
                 BooguStorageProfile::F16 | BooguStorageProfile::F16QwenVisionF32
             )
         {
             return Err(BooguError::Artifact(format!(
-                "stage {stage} runtime Q8S quantization requires a sealed F16 production denoiser; profile {profile:?} already stores quantized tensors"
+                "stage {stage} runtime quantization requires a sealed F16 production denoiser; profile {profile:?} already stores quantized tensors"
             )));
         }
-        if runtime_quantization_policy == BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32
+        if runtime_quantization_policy != BooguDenoiserRuntimeQuantizationPolicy::Disabled
             && quantized_policy != BooguQuantizedLoadPolicy::Preserve
         {
             return Err(BooguError::Artifact(format!(
-                "stage {stage} runtime Q8S quantization requires the stored-payload quantized load policy Preserve"
+                "stage {stage} runtime quantization requires the stored-payload quantized load policy Preserve"
+            )));
+        }
+        if runtime_quantization_policy == BooguDenoiserRuntimeQuantizationPolicy::Q4sBlockUpTo128F32
+            && runtime_q8_scope != BooguRuntimeQ8Scope::AllInventoryEligible
+        {
+            return Err(BooguError::Artifact(format!(
+                "stage {stage} runtime Q4S quantization requires the complete inventory-eligible matrix scope"
             )));
         }
         runtime_q8_scope.validate_variant(variant)?;
@@ -7270,6 +7434,198 @@ mod loading {
         Ok(TensorData::quantized(quantized, shape, scheme, &scales))
     }
 
+    /// Quantize one row-major floating-point matrix with signed four-bit, 128-value blocks.
+    ///
+    /// Values stay packed eight-per-`u32` and scales remain F32, so WebGPU can consume the
+    /// result without the optional `shader-f16` feature. The block axis is the innermost matrix
+    /// dimension; callers must pass a shape whose final dimension is divisible by 128.
+    pub fn quantize_q4s_block128_f32(
+        values: Vec<f32>,
+        shape: Vec<usize>,
+    ) -> Result<TensorData, TensorSnapshotError> {
+        const BLOCK: usize = 128;
+        const VALUES_PER_WORD: usize = 8;
+
+        let elements = shape.iter().try_fold(1_usize, |product, dimension| {
+            product.checked_mul(*dimension)
+        });
+        if elements != Some(values.len()) {
+            return Err(TensorSnapshotError::DataError(format!(
+                "Q4S shape {shape:?} describes {elements:?} elements, received {} values",
+                values.len()
+            )));
+        }
+        let Some(&inner) = shape.last() else {
+            return Err(TensorSnapshotError::DataError(
+                "Q4S block tensor must have at least one dimension".into(),
+            ));
+        };
+        if !inner.is_multiple_of(BLOCK) {
+            return Err(TensorSnapshotError::DataError(format!(
+                "Q4S innermost dimension {inner} is not divisible by {BLOCK}"
+            )));
+        }
+
+        let mut packed = Vec::with_capacity(values.len() / VALUES_PER_WORD);
+        let mut scales = Vec::with_capacity(values.len() / BLOCK);
+        for block in values.chunks_exact(BLOCK) {
+            if block.iter().any(|value| !value.is_finite()) {
+                return Err(TensorSnapshotError::DataError(
+                    "cannot quantize a non-finite checkpoint value".into(),
+                ));
+            }
+            let alpha = block
+                .iter()
+                .fold(0.0_f32, |value, element| value.max(element.abs()));
+            let scale = if alpha == 0.0 {
+                f32::MIN_POSITIVE
+            } else {
+                alpha / 7.0
+            };
+            scales.push(scale);
+            let inverse = scale.recip();
+            for values in block.chunks_exact(VALUES_PER_WORD) {
+                let mut word = 0_u32;
+                for (lane, value) in values.iter().enumerate() {
+                    let quantized = (value * inverse).round().clamp(-7.0, 7.0) as i8;
+                    word |= u32::from((quantized as u8) & 0x0f) << (lane * 4);
+                }
+                packed.push(word);
+            }
+        }
+
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .with_level(QuantLevel::block([BLOCK as u8]))
+            .with_param(QuantParam::F32)
+            .with_store(QuantStore::PackedU32(0));
+        let mut bytes = Vec::with_capacity(
+            packed
+                .len()
+                .checked_mul(core::mem::size_of::<u32>())
+                .and_then(|bytes| {
+                    scales
+                        .len()
+                        .checked_mul(core::mem::size_of::<f32>())
+                        .and_then(|scales| bytes.checked_add(scales))
+                })
+                .ok_or_else(|| {
+                    TensorSnapshotError::DataError("Q4S payload byte count overflowed".into())
+                })?,
+        );
+        for word in packed {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        for scale in scales {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
+        Ok(TensorData::from_bytes(
+            Bytes::from_bytes_vec(bytes),
+            shape,
+            DType::QFloat(scheme),
+        ))
+    }
+
+    /// Quantize a verified Boogu row-layout matrix along its input-feature axis.
+    ///
+    /// The largest exact block in `128, 64, 32, 16, 8` is selected per matrix. Values remain
+    /// packed along the contiguous output-feature axis, while the scale grid is
+    /// `[input / block, output]`. This preserves Burn's `[input, output]` linear layout and avoids
+    /// a dense transpose or dequantized staging tensor on device.
+    pub fn quantize_row_layout_q4s_block_up_to128_f32(
+        data: TensorData,
+    ) -> Result<TensorData, TensorSnapshotError> {
+        const GROUPS: [usize; 5] = [128, 64, 32, 16, 8];
+        const VALUES_PER_WORD: usize = 8;
+
+        if !matches!(data.dtype, DType::F16 | DType::F32) {
+            return Err(TensorSnapshotError::DataError(format!(
+                "runtime Q4S denoiser quantization requires F16/F32, found {:?}",
+                data.dtype
+            )));
+        }
+        let shape = data.shape.to_vec();
+        let [input, output] = shape.as_slice() else {
+            return Err(TensorSnapshotError::DataError(format!(
+                "runtime Q4S denoiser quantization requires a rank-two matrix, found {shape:?}"
+            )));
+        };
+        if !output.is_multiple_of(VALUES_PER_WORD) {
+            return Err(TensorSnapshotError::DataError(format!(
+                "runtime Q4S denoiser output width {output} is not divisible by {VALUES_PER_WORD}"
+            )));
+        }
+        let block = GROUPS
+            .into_iter()
+            .find(|block| input.is_multiple_of(*block))
+            .ok_or_else(|| {
+                TensorSnapshotError::DataError(format!(
+                    "runtime Q4S denoiser input width {input} has no supported exact block"
+                ))
+            })?;
+        let values = data
+            .convert_dtype(DType::F32)
+            .to_vec::<f32>()
+            .map_err(|error| TensorSnapshotError::DataError(error.to_string()))?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(TensorSnapshotError::DataError(
+                "cannot quantize a non-finite denoiser checkpoint value".into(),
+            ));
+        }
+
+        let mut scales = vec![0.0_f32; input / block * output];
+        let mut quantized = vec![0_i8; values.len()];
+        for block_index in 0..input / block {
+            let input_start = block_index * block;
+            for output_index in 0..*output {
+                let alpha = (input_start..input_start + block)
+                    .map(|input_index| values[input_index * output + output_index].abs())
+                    .fold(0.0_f32, f32::max);
+                let scale = if alpha == 0.0 {
+                    f32::MIN_POSITIVE
+                } else {
+                    alpha / 7.0
+                };
+                scales[block_index * output + output_index] = scale;
+                let inverse = scale.recip();
+                for input_index in input_start..input_start + block {
+                    let index = input_index * output + output_index;
+                    quantized[index] = (values[index] * inverse).round().clamp(-7.0, 7.0) as i8;
+                }
+            }
+        }
+
+        // Matrix multiplication consumes the first axis as K. Pack eight K values for one output
+        // lane into each word, yielding the physical `[input / 8, output]` buffer expected by
+        // `PackedU32(1)`. Packing contiguous output lanes (`PackedU32(0)`) is a different tensor
+        // layout and produces numerically invalid row-layout matmuls even though the byte count is
+        // identical.
+        let mut bytes = Vec::with_capacity(values.len() / 2 + scales.len() * 4);
+        for input_start in (0..*input).step_by(VALUES_PER_WORD) {
+            for output_index in 0..*output {
+                let mut word = 0_u32;
+                for lane in 0..VALUES_PER_WORD {
+                    let value = quantized[(input_start + lane) * output + output_index];
+                    word |= u32::from((value as u8) & 0x0f) << (lane * 4);
+                }
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        for scale in scales {
+            bytes.extend_from_slice(&scale.to_le_bytes());
+        }
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q4S)
+            .with_level(QuantLevel::block([block as u8, 1]))
+            .with_param(QuantParam::F32)
+            .with_store(QuantStore::PackedU32(1));
+        Ok(TensorData::from_bytes(
+            Bytes::from_bytes_vec(bytes),
+            shape,
+            DType::QFloat(scheme),
+        ))
+    }
+
     pub(super) fn quantize_verified_float_q8s_block32_f32(
         data: TensorData,
     ) -> Result<TensorData, TensorSnapshotError> {
@@ -7294,6 +7650,8 @@ mod loading {
         pub(super) runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
         pub(super) runtime_quantizable_paths: Option<BTreeSet<String>>,
     }
+
+    type RuntimeQuantizer = Rc<dyn Fn(TensorData) -> Result<TensorData, TensorSnapshotError>>;
 
     pub(super) fn load_adapter(
         float_policy: BooguFloatLoadPolicy,
@@ -7392,15 +7750,15 @@ mod loading {
         let data = TensorData::new(dequantized, shape).convert_dtype(DType::F16);
         Ok(match float_policy {
             BooguFloatLoadPolicy::Preserve
-            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => data,
+            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+            | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => data,
             BooguFloatLoadPolicy::AdaptToF32 => data.convert_dtype(DType::F32),
         })
     }
 
     impl ModuleAdapter for ArtifactLoadAdapter {
         fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
-            if self.runtime_quantization_policy
-                == BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32
+            if self.runtime_quantization_policy != BooguDenoiserRuntimeQuantizationPolicy::Disabled
             {
                 let Some(runtime_quantizable_paths) = &self.runtime_quantizable_paths else {
                     return TensorSnapshot::from_closure(
@@ -7419,15 +7777,69 @@ mod loading {
                 };
                 if runtime_quantizable_paths.contains(&snapshot.full_path()) {
                     let data_fn = snapshot.clone_data_fn();
-                    return TensorSnapshot::from_closure(
-                        Rc::new(move || quantize_verified_float_q8s_block32_f32(data_fn()?)),
-                        DType::QFloat(
-                            QuantScheme::default()
-                                .with_value(QuantValue::Q8S)
-                                .with_level(QuantLevel::block([32]))
-                                .with_param(QuantParam::F32)
-                                .with_store(QuantStore::PackedU32(0)),
+                    let (dtype, quantize): (DType, RuntimeQuantizer) = match self
+                        .runtime_quantization_policy
+                    {
+                        BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32 => (
+                            DType::QFloat(
+                                QuantScheme::default()
+                                    .with_value(QuantValue::Q8S)
+                                    .with_level(QuantLevel::block([32]))
+                                    .with_param(QuantParam::F32)
+                                    .with_store(QuantStore::PackedU32(0)),
+                            ),
+                            Rc::new(quantize_verified_float_q8s_block32_f32),
                         ),
+                        BooguDenoiserRuntimeQuantizationPolicy::Q4sBlockUpTo128F32 => {
+                            let shape = snapshot.shape.clone();
+                            let [input, _output] = shape.as_slice() else {
+                                return TensorSnapshot::from_closure(
+                                    Rc::new(|| {
+                                        Err(TensorSnapshotError::DataError(
+                                            "runtime Q4S inventory path is not rank two".into(),
+                                        ))
+                                    }),
+                                    snapshot.dtype,
+                                    snapshot.shape.clone(),
+                                    snapshot.path_stack.clone().unwrap_or_default(),
+                                    snapshot.container_stack.clone().unwrap_or_default(),
+                                    snapshot.tensor_id.unwrap_or_default(),
+                                );
+                            };
+                            let Some(block) = [128_usize, 64, 32, 16, 8]
+                                .into_iter()
+                                .find(|block| input.is_multiple_of(*block))
+                            else {
+                                return TensorSnapshot::from_closure(
+                                    Rc::new(|| {
+                                        Err(TensorSnapshotError::DataError(
+                                            "runtime Q4S inventory path has no supported input-axis block"
+                                                .into(),
+                                        ))
+                                    }),
+                                    snapshot.dtype,
+                                    snapshot.shape.clone(),
+                                    snapshot.path_stack.clone().unwrap_or_default(),
+                                    snapshot.container_stack.clone().unwrap_or_default(),
+                                    snapshot.tensor_id.unwrap_or_default(),
+                                );
+                            };
+                            (
+                                DType::QFloat(
+                                    QuantScheme::default()
+                                        .with_value(QuantValue::Q4S)
+                                        .with_level(QuantLevel::block([block as u8, 1]))
+                                        .with_param(QuantParam::F32)
+                                        .with_store(QuantStore::PackedU32(1)),
+                                ),
+                                Rc::new(quantize_row_layout_q4s_block_up_to128_f32),
+                            )
+                        }
+                        BooguDenoiserRuntimeQuantizationPolicy::Disabled => unreachable!(),
+                    };
+                    return TensorSnapshot::from_closure(
+                        Rc::new(move || quantize(data_fn()?)),
+                        dtype,
                         snapshot.shape.clone(),
                         snapshot.path_stack.clone().unwrap_or_default(),
                         snapshot.container_stack.clone().unwrap_or_default(),
@@ -7442,7 +7854,8 @@ mod loading {
                         Rc::new(move || dequantize_q8s_block32(data_fn()?, float_policy)),
                         match float_policy {
                             BooguFloatLoadPolicy::Preserve
-                            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => DType::F16,
+                            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+                            | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => DType::F16,
                             BooguFloatLoadPolicy::AdaptToF32 => DType::F32,
                         },
                         snapshot.shape.clone(),
@@ -7454,15 +7867,17 @@ mod loading {
                 (DType::F16 | DType::BF16 | DType::F64, _, BooguFloatLoadPolicy::AdaptToF32) => {
                     DType::F32
                 }
-                (DType::F16, _, BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries)
-                    if !matches!(snapshot.shape.len(), 2 | 4) =>
-                {
-                    DType::F32
-                }
+                (
+                    DType::F16,
+                    _,
+                    BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+                    | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries,
+                ) if !matches!(snapshot.shape.len(), 2 | 4) => DType::F32,
                 (
                     DType::BF16 | DType::F64,
                     _,
-                    BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries,
+                    BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+                    | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries,
                 ) => DType::F32,
                 _ => return snapshot.clone(),
             };
@@ -7499,7 +7914,8 @@ pub use loading::{
     load_resident_denoiser_from_directory_with_policies, load_resident_qwen_base_from_directory,
     load_resident_vae_from_directory, load_vae_decoder, load_vae_decoder_from_directory,
     load_vae_encoder, load_vae_encoder_from_directory, preferred_artifact_bundle_id,
-    promotable_legacy_artifact_digest, quantize_q8s_block32_f32,
+    promotable_legacy_artifact_digest, quantize_q4s_block128_f32, quantize_q8s_block32_f32,
+    quantize_row_layout_q4s_block_up_to128_f32,
     stamp_edit_turbo_1k5_vae_encoder_f32_diagnostic_metadata,
     validate_canonical_release_artifact_digest, validate_edit_turbo_1k5_release_artifact_digest,
     validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest,
@@ -8337,6 +8753,92 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn packed_q4_resident_footprint_is_bounded_and_compositional_correctness() {
+        let inventory = BooguArtifactInventory::new(
+            &tiny_qwen_config(),
+            &BooguConfig::default(),
+            &AutoencoderKlConfig::tiny(),
+        )
+        .unwrap();
+        let q4 = inventory
+            .packed_q4_resident_footprint(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+        let f16 = inventory
+            .packed_f16_resident_footprint(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+
+        assert!(q4.packed_q4_tensor_count > 0);
+        assert!(q4.packed_q4_elements.is_multiple_of(2));
+        assert!(q4.scale_count > 0);
+        assert!(q4.packed_f16_payload_bytes > 0);
+        assert_eq!(q4.packed_q4_value_bytes, q4.packed_q4_elements / 2);
+        assert_eq!(q4.scale_bytes, q4.scale_count * 4);
+        assert_eq!(
+            q4.total_payload_bytes,
+            q4.packed_q4_value_bytes
+                + q4.scale_bytes
+                + q4.packed_f16_payload_bytes
+                + q4.f32_auxiliary_payload_bytes
+        );
+        assert!(q4.total_payload_bytes < f16.total_payload_bytes);
+        assert!(
+            inventory
+                .packed_q4_resident_footprint(
+                    BooguVariant::Image01EditTurbo,
+                    BooguStorageProfile::F16QwenVisionF32,
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    #[ignore = "requires BURN_BOOGU_MODULAR_ROOT pointing at the canonical modular CDN tree"]
+    fn released_turbo_packed_q4_resident_footprint_reference() {
+        let root = std::env::var_os("BURN_BOOGU_MODULAR_ROOT")
+            .map(std::path::PathBuf::from)
+            .expect("set BURN_BOOGU_MODULAR_ROOT");
+        let qwen = std::fs::read_to_string(
+            root.join("qwen3-vl-8b-base-boogu-image-0.1/metadata/source/mllm/config.json"),
+        )
+        .unwrap();
+        let vae = std::fs::read_to_string(
+            root.join("flux1-vae-boogu-image-0.1/metadata/source/vae/config.json"),
+        )
+        .unwrap();
+        let inventory = BooguArtifactInventory::new(
+            &Qwen3VlConfig::from_json(&qwen).unwrap(),
+            &BooguConfig::default(),
+            &AutoencoderKlConfig::from_diffusers_json(&vae).unwrap(),
+        )
+        .unwrap();
+        let footprint = inventory
+            .packed_q4_resident_footprint(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+        eprintln!("released Turbo packed-Q4 footprint: {footprint:?}");
+        assert_eq!(footprint.packed_q4_tensor_count, 738);
+        assert_eq!(footprint.packed_q4_elements, 17_501_245_440);
+        assert_eq!(footprint.packed_q4_value_bytes, 8_750_622_720);
+        assert_eq!(footprint.scale_count, 289_665_600);
+        assert_eq!(footprint.scale_bytes, 1_158_662_400);
+        assert_eq!(footprint.packed_f16_elements, 49_507_712);
+        assert_eq!(footprint.packed_f16_payload_bytes, 99_015_424);
+        assert_eq!(footprint.f32_auxiliary_elements, 2_195_875);
+        assert_eq!(footprint.f32_auxiliary_payload_bytes, 8_783_500);
+        assert_eq!(footprint.total_payload_bytes, 10_017_084_044);
     }
 
     #[cfg(feature = "burnpack")]
@@ -10424,6 +10926,286 @@ mod tests {
             .with_store(QuantStore::PackedU32(0));
         let q8 = TensorData::quantized(vec![0_i8; 32], [1, 32], scheme, &[1.0]);
         assert!(loading::quantize_verified_float_q8s_block32_f32(q8).is_err());
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn packed_q4s_block128_roundtrip_and_linear_module_error_correctness() {
+        use burn::tensor::{DType, quantization::QuantizedBytes};
+
+        let values = (0..(128 * 128))
+            .map(|index| {
+                let wave = ((index * 37 % 509) as f32 - 254.0) / 1536.0;
+                wave + ((index % 128) as f32 - 63.5) / 8192.0
+            })
+            .collect::<Vec<_>>();
+        let quantized = quantize_q4s_block128_f32(values.clone(), vec![128, 128]).unwrap();
+        let expected_bytes = values.len() / 2 + values.len() / 128 * 4;
+        assert_eq!(quantized.bytes.len(), expected_bytes);
+        let DType::QFloat(scheme) = quantized.dtype else {
+            panic!("Q4S helper must return a quantized dtype");
+        };
+        let (packed_values, qparams) = QuantizedBytes {
+            bytes: quantized.bytes,
+            scheme,
+            num_elements: values.len(),
+        }
+        .into_vec_i8();
+        let reconstructed = packed_values
+            .chunks_exact(128)
+            .zip(qparams.scales)
+            .flat_map(|(block, scale)| block.iter().map(move |value| f32::from(*value) * scale))
+            .collect::<Vec<_>>();
+
+        let input_values = (0..128)
+            .map(|index| ((index * 19 % 97) as f32 - 48.0) / 128.0)
+            .collect::<Vec<_>>();
+        let reference = (0..128)
+            .map(|output| {
+                (0..128)
+                    .map(|input| input_values[input] * values[input * 128 + output])
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        let actual = (0..128)
+            .map(|output| {
+                (0..128)
+                    .map(|input| input_values[input] * reconstructed[input * 128 + output])
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+
+        let relative_rmse = {
+            let error = actual
+                .iter()
+                .zip(&reference)
+                .map(|(actual, expected)| f64::from(actual - expected).powi(2))
+                .sum::<f64>();
+            let signal = reference
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>();
+            (error / signal).sqrt()
+        };
+        let cosine = {
+            let dot = actual
+                .iter()
+                .zip(&reference)
+                .map(|(actual, expected)| f64::from(*actual) * f64::from(*expected))
+                .sum::<f64>();
+            let actual_norm = actual
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let reference_norm = reference
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            dot / (actual_norm * reference_norm)
+        };
+        let max_weight_error = reconstructed
+            .iter()
+            .zip(&values)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_weight_error.is_finite() && max_weight_error < 0.025);
+        assert!(relative_rmse < 0.08, "relative RMSE {relative_rmse}");
+        assert!(cosine > 0.996, "cosine {cosine}");
+    }
+
+    #[cfg(all(feature = "burnpack", feature = "wgpu"))]
+    #[test]
+    #[ignore = "requires an explicitly selected native WGPU adapter"]
+    fn packed_q4s_block128_wgpu_matmul_reference() {
+        use burn::{
+            module::Param,
+            nn,
+            tensor::{Tensor, TensorData},
+        };
+
+        type WgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+        let device = crate::require_native_wgpu_device().unwrap();
+        let values = (0..(128 * 128))
+            .map(|index| {
+                ((index * 37 % 509) as f32 - 254.0) / 1536.0
+                    + ((index % 128) as f32 - 63.5) / 8192.0
+            })
+            .collect::<Vec<_>>();
+        let input = (0..128)
+            .map(|index| ((index * 19 % 97) as f32 - 48.0) / 128.0)
+            .collect::<Vec<_>>();
+        let reference = (0..128)
+            .map(|output| {
+                (0..128)
+                    .map(|inner| input[inner] * values[inner * 128 + output])
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        let weight = Tensor::<WgpuBackend, 2>::from_data(
+            quantize_q4s_block128_f32(values, vec![128, 128]).unwrap(),
+            &device,
+        );
+        let linear = nn::Linear {
+            weight: Param::from_tensor(weight),
+            bias: None,
+        };
+        let actual = crate::model::linear::linear_forward(
+            &linear,
+            Tensor::<WgpuBackend, 2>::from_data(TensorData::new(input.clone(), [1, 128]), &device),
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        let actual_rank3 = crate::model::linear::linear_forward(
+            &linear,
+            Tensor::<WgpuBackend, 3>::from_data(TensorData::new(input, [1, 1, 128]), &device),
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        assert_eq!(actual_rank3.len(), actual.len());
+        assert!(
+            actual_rank3
+                .iter()
+                .zip(&actual)
+                .all(|(rank3, rank2)| (rank3 - rank2).abs() < 1.0e-5)
+        );
+        let error = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(actual - expected).powi(2))
+            .sum::<f64>();
+        let signal = reference
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>();
+        let dot = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(*actual) * f64::from(*expected))
+            .sum::<f64>();
+        let actual_norm = actual
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let reference_norm = signal.sqrt();
+        let relative_rmse = (error / signal).sqrt();
+        let cosine = dot / (actual_norm * reference_norm);
+        eprintln!("WGPU F32 x packed-Q4S block-128: rel-RMSE={relative_rmse} cosine={cosine}");
+        assert!(actual.iter().all(|value| value.is_finite()));
+        assert!(relative_rmse < 0.08, "relative RMSE {relative_rmse}");
+        assert!(cosine > 0.996, "cosine {cosine}");
+    }
+
+    #[cfg(all(feature = "burnpack", feature = "wgpu"))]
+    #[test]
+    #[ignore = "requires BURN_BOOGU_HF_SNAPSHOT and an explicitly selected native WGPU adapter"]
+    fn released_boogu_x_embedder_packed_q4s_wgpu_module_reference() {
+        use std::{
+            fs::File,
+            io::{Read, Seek, SeekFrom},
+            path::PathBuf,
+        };
+
+        use burn::{
+            module::Param,
+            nn,
+            tensor::{DType, Tensor, TensorData},
+        };
+
+        const SOURCE_OFFSET: u64 = 9_998_304_600;
+        const INPUT_WIDTH: usize = 64;
+        const OUTPUT_WIDTH: usize = 3_360;
+        const SOURCE_BYTES: usize = INPUT_WIDTH * OUTPUT_WIDTH * 2;
+
+        type B = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+        let snapshot = PathBuf::from(
+            std::env::var_os("BURN_BOOGU_HF_SNAPSHOT")
+                .expect("set BURN_BOOGU_HF_SNAPSHOT to the pinned Turbo snapshot"),
+        );
+        let mut file = File::open(
+            snapshot.join("transformer/diffusion_pytorch_model-00001-of-00003.safetensors"),
+        )
+        .expect("open pinned Boogu transformer shard");
+        file.seek(SeekFrom::Start(SOURCE_OFFSET))
+            .expect("seek pinned x_embedder tensor");
+        let mut bytes = vec![0_u8; SOURCE_BYTES];
+        file.read_exact(&mut bytes)
+            .expect("read pinned x_embedder tensor");
+        let source = bytes
+            .chunks_exact(2)
+            .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
+            .collect::<Vec<_>>();
+        assert!(source.iter().all(|value| value.is_finite()));
+        let mut row_layout = Vec::with_capacity(source.len());
+        for input in 0..INPUT_WIDTH {
+            for output in 0..OUTPUT_WIDTH {
+                row_layout.push(source[output * INPUT_WIDTH + input]);
+            }
+        }
+        let input = (0..INPUT_WIDTH)
+            .map(|index| ((index * 19 % 61) as f32 - 30.0) / 64.0)
+            .collect::<Vec<_>>();
+        let reference = (0..OUTPUT_WIDTH)
+            .map(|output| {
+                (0..INPUT_WIDTH)
+                    .map(|inner| input[inner] * row_layout[inner * OUTPUT_WIDTH + output])
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        let quantized = quantize_row_layout_q4s_block_up_to128_f32(
+            TensorData::new(row_layout, [INPUT_WIDTH, OUTPUT_WIDTH]).convert_dtype(DType::F16),
+        )
+        .unwrap();
+        let device = crate::require_native_wgpu_device().unwrap();
+        let linear = nn::Linear {
+            weight: Param::from_tensor(Tensor::<B, 2>::from_data(quantized, &device)),
+            bias: None,
+        };
+        let actual = crate::model::linear::linear_forward(
+            &linear,
+            Tensor::<B, 2>::from_data(TensorData::new(input, [1, INPUT_WIDTH]), &device),
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        let squared_error = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(actual - expected).powi(2))
+            .sum::<f64>();
+        let signal = reference
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>();
+        let dot = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(*actual) * f64::from(*expected))
+            .sum::<f64>();
+        let actual_norm = actual
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let relative_rmse = (squared_error / signal).sqrt();
+        let cosine = dot / (actual_norm * signal.sqrt());
+        eprintln!("released Boogu x_embedder packed-Q4S: rel-RMSE={relative_rmse} cosine={cosine}");
+        assert!(actual.iter().all(|value| value.is_finite()));
+        assert!(relative_rmse < 0.15, "relative RMSE {relative_rmse}");
+        assert!(cosine > 0.985, "cosine {cosine}");
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn packed_q4s_rejects_invalid_sources_correctness() {
+        assert!(quantize_q4s_block128_f32(vec![f32::NAN; 128], vec![1, 128]).is_err());
+        assert!(quantize_q4s_block128_f32(vec![0.0; 127], vec![1, 127]).is_err());
+        assert!(quantize_q4s_block128_f32(vec![0.0; 128], vec![2, 128]).is_err());
+        assert!(quantize_q4s_block128_f32(Vec::new(), Vec::new()).is_err());
     }
 
     #[cfg(feature = "burnpack")]

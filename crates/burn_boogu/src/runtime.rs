@@ -69,12 +69,14 @@ impl BooguRuntimeDTypes {
         let vae = match vae_policy {
             BooguFloatLoadPolicy::Preserve => DType::F16,
             BooguFloatLoadPolicy::AdaptToF32
-            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => DType::F32,
+            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+            | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => DType::F32,
         };
         let denoiser = match denoiser_policy {
             BooguFloatLoadPolicy::Preserve => DType::F16,
             BooguFloatLoadPolicy::AdaptToF32
-            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => DType::F32,
+            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+            | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => DType::F32,
         };
         Self::new(qwen_visual, vae, denoiser)
     }

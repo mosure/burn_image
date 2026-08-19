@@ -7,7 +7,7 @@ use burn::{
 use crate::{
     blocks::{DecoderGroupNormPolicy, conv1},
     config::{AutoencoderKlConfig, AutoencoderKlConfigError},
-    decoder::Decoder,
+    decoder::{Decoder, StripedTailDecodeState},
     distribution::DiagonalGaussian,
     encoder::Encoder,
 };
@@ -120,6 +120,19 @@ impl<B: Backend> AutoencoderKl<B> {
         latents: Tensor<B, 4>,
         split_width: usize,
     ) -> Tensor<B, 4> {
+        let mut state = self.begin_decode_striped_tail_strict_f32(latents, split_width);
+        while !state.is_complete() {
+            self.advance_decode_striped_tail_strict_f32(&mut state);
+        }
+        state.into_output()
+    }
+
+    /// Begin an exact strict-F32 striped decode at a synchronization-safe stage boundary.
+    pub fn begin_decode_striped_tail_strict_f32(
+        &self,
+        latents: Tensor<B, 4>,
+        split_width: usize,
+    ) -> StripedTailDecodeState<B> {
         assert_eq!(
             latents.dims()[1],
             self.latent_channels,
@@ -131,7 +144,12 @@ impl<B: Backend> AutoencoderKl<B> {
             .map(|conv| conv.forward(latents.clone()))
             .unwrap_or(latents);
         self.decoder
-            .forward_striped_tail_strict_f32(latents, split_width)
+            .begin_striped_tail_strict_f32(latents, split_width)
+    }
+
+    /// Advance one exact strict-F32 striped decoder stage.
+    pub fn advance_decode_striped_tail_strict_f32(&self, state: &mut StripedTailDecodeState<B>) {
+        self.decoder.advance_striped_tail_strict_f32(state);
     }
 
     /// Apply FLUX pipeline latent normalization: `(latents - shift_factor) * scaling_factor`.
@@ -382,5 +400,24 @@ mod tests {
     #[test]
     fn striped_tail_matches_full_decoder_ragged_parity() {
         assert_striped_tail_matches_full([1, 4, 3, 5], 4);
+    }
+
+    #[test]
+    fn striped_tail_staged_decode_has_exact_plan_and_output_correctness() {
+        let device = Default::default();
+        let model = AutoencoderKlConfig::tiny().init::<TestBackend>(&device);
+        let latents = Tensor::random([1, 4, 4, 4], Distribution::Default, &device);
+        let expected = model.decode(latents.clone());
+        let mut state = model.begin_decode_striped_tail_strict_f32(latents, 4);
+        let mut stages = 0;
+        while !state.is_complete() {
+            model.advance_decode_striped_tail_strict_f32(&mut state);
+            stages += 1;
+        }
+        assert_eq!(stages, model.decoder.striped_tail_stage_count());
+        let actual = state.into_output();
+        assert_eq!(expected.dims(), actual.dims());
+        let max_abs = (expected - actual).abs().max().into_scalar();
+        assert!(max_abs <= 1.0e-5, "staged decoder max_abs={max_abs}");
     }
 }

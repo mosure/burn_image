@@ -122,6 +122,7 @@ enum BrowserHeadlessMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BrowserResidencySelector {
     Resident,
+    ResidentQ4,
     ResidentDenseF32,
     QualificationF32,
     #[default]
@@ -153,6 +154,9 @@ fn parse_browser_residency(value: Option<&str>) -> Result<BrowserResidencySelect
         Some("resident") | Some("high-vram-resident-packed-f16") => {
             Ok(BrowserResidencySelector::Resident)
         }
+        Some("resident-q4") | Some("resident-packed-q4s") => {
+            Ok(BrowserResidencySelector::ResidentQ4)
+        }
         Some("high-vram-resident-dense-f32") => Ok(BrowserResidencySelector::ResidentDenseF32),
         Some("qualification-f32")
         | Some("qualification-per-request-f32-denoiser-retained") => {
@@ -162,7 +166,7 @@ fn parse_browser_residency(value: Option<&str>) -> Result<BrowserResidencySelect
             Ok(BrowserResidencySelector::LayerStreamedDiagnostic)
         }
         Some(_) => Err(
-            "unsupported browser residency; use residency=resident, residency=high-vram-resident-dense-f32, residency=qualification-f32, residency=low-vram, residency=low-vram-runtime-q8-denoiser, residency=low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser, or the explicit residency=layer-streamed-diagnostic"
+            "unsupported browser residency; use residency=resident, residency=resident-q4, residency=high-vram-resident-dense-f32, residency=qualification-f32, residency=low-vram, residency=low-vram-runtime-q8-denoiser, residency=low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser, or the explicit residency=layer-streamed-diagnostic"
                 .into(),
         ),
     }
@@ -449,6 +453,13 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
                 "ordinary Turbo rejects residency=low-vram-runtime-q8-denoiser because its direct-Q8 path is not numerically qualified; use residency=low-vram",
             ));
         }
+        if variant != burn_boogu::BooguVariant::Image01Turbo
+            && residency == BrowserResidencySelector::ResidentQ4
+        {
+            return Err(JsValue::from_str(
+                "residency=resident-q4 is currently restricted to Turbo generation",
+            ));
+        }
         let profile_selector = params
             .get("profile")
             .unwrap_or_else(|| BOOGU_PRODUCTION_PROFILE_SELECTOR.to_owned());
@@ -644,6 +655,9 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
                 BrowserResidencySelector::Resident => {
                     BrowserBooguResidencyPolicy::HighVramResidentPackedF16
                 }
+                BrowserResidencySelector::ResidentQ4 => {
+                    BrowserBooguResidencyPolicy::ResidentPackedQ4s
+                }
                 BrowserResidencySelector::ResidentDenseF32 => {
                     BrowserBooguResidencyPolicy::HighVramResidentDenseF32
                 }
@@ -797,6 +811,7 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
                     .await
                 }
                 BrowserResidencySelector::Resident
+                | BrowserResidencySelector::ResidentQ4
                 | BrowserResidencySelector::ResidentDenseF32
                 | BrowserResidencySelector::PreloadedPackedF16
                 | BrowserResidencySelector::LayerStreamedDiagnostic => {
@@ -831,6 +846,10 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         BrowserResidencySelector::Resident => BrowserBooguFactory::with_residency(
             variant,
             BrowserBooguResidencyPolicy::HighVramResidentPackedF16,
+        ),
+        BrowserResidencySelector::ResidentQ4 => BrowserBooguFactory::with_residency(
+            variant,
+            BrowserBooguResidencyPolicy::ResidentPackedQ4s,
         ),
         BrowserResidencySelector::ResidentDenseF32 => BrowserBooguFactory::with_residency(
             variant,

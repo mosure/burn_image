@@ -6,13 +6,14 @@
 //! equivalent parameter mappers omit `Backend::sync`: browser synchronization is owned by the
 //! asynchronous stage executor, and a blocking sync cannot be implemented without wasm threads.
 
-use burn::{config::Config, module::Initializer, tensor::backend::Backend};
+use burn::{
+    config::Config,
+    module::Initializer,
+    tensor::{DType, Shape, Tensor, backend::Backend},
+};
 
 #[cfg(target_arch = "wasm32")]
-use burn::{
-    module::{Module, Param},
-    tensor::{Tensor, module::linear},
-};
+use burn::module::{Module, Param};
 
 /// Qwen linear projection with a raw checkpoint weight shape of `[d_output, d_input]`.
 ///
@@ -92,13 +93,49 @@ impl QwenLinearConfig {
 
 #[cfg(target_arch = "wasm32")]
 impl<B: Backend> QwenLinear<B> {
-    /// Apply `output = input * weight + bias` using Burn's ordinary linear tensor primitive.
+    /// Apply `output = input * weight + bias` without dequantizing a packed QFloat weight.
     pub fn forward<const D: usize>(&self, input: Tensor<B, D>) -> Tensor<B, D> {
-        linear(
-            input,
-            self.weight.val(),
-            self.bias.as_ref().map(|bias| bias.val()),
-        )
+        qwen_linear_forward(self, input)
+    }
+}
+
+/// Apply a Qwen projection while preserving packed quantized weight storage through matmul.
+///
+/// Burn's released linear helper requests an ordinary floating primitive and therefore widens a
+/// QFloat parameter before dispatch. Ordinary F16/F32 modules retain the released path exactly;
+/// only a quantized weight takes the mixed `Float x QFloat` backend operation.
+pub fn qwen_linear_forward<B: Backend, const D: usize>(
+    linear: &QwenLinear<B>,
+    input: Tensor<B, D>,
+) -> Tensor<B, D> {
+    if !matches!(linear.weight.val().dtype(), DType::QFloat(_)) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            return linear.forward(input);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            return burn::tensor::module::linear(
+                input,
+                linear.weight.val(),
+                linear.bias.as_ref().map(|bias| bias.val()),
+            );
+        }
+    }
+
+    assert!(D >= 2, "Qwen linear projections require rank >= 2");
+    let [input_width, output_width] = linear.weight.dims();
+    let mut weight_shape = vec![1; D];
+    weight_shape[D - 2] = input_width;
+    weight_shape[D - 1] = output_width;
+    let output = input.matmul(linear.weight.val().reshape(Shape::from(weight_shape)));
+    match &linear.bias {
+        Some(bias) => {
+            let mut bias_shape = vec![1; D];
+            bias_shape[D - 1] = output_width;
+            output + bias.val().reshape(Shape::from(bias_shape))
+        }
+        None => output,
     }
 }
 

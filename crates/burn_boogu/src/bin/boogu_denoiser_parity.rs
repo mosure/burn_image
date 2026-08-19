@@ -332,6 +332,9 @@ fn run<B: Backend>(
             BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
                 "packed-f16-weights-f32-auxiliaries"
             }
+            BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => {
+                "packed-q4s-weights-f32-auxiliaries"
+            }
         }
         .into(),
         quantized_load_policy: match quantized_policy {

@@ -311,6 +311,13 @@ pub fn q_reshape<R: CubeRuntime>(mut tensor: CubeTensor<R>, shape: Shape) -> Cub
     let scheme = *tensor.scheme();
     let curr_shape = tensor.meta.shape();
 
+    // Generic linear helpers normalize a rank-two weight through `reshape` even when the shape
+    // is already exact. This is an identity operation and must not be rejected merely because
+    // the quantized values use sub-byte storage.
+    if curr_shape == &shape {
+        return tensor;
+    }
+
     let shape_values = match scheme.store {
         QuantStore::Native => shape.clone(),
         QuantStore::PackedNative(packed_dim) | QuantStore::PackedU32(packed_dim) => {

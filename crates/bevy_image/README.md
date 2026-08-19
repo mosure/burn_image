@@ -237,6 +237,12 @@ weights remain F32. Before **Ready**, the loader verifies and uploads one bounde
 a time and releases its host payload. Forward execution performs no model-weight download,
 verification, widening, or upload and never falls back to CPU.
 
+For memory-constrained Turbo generation, explicit `residency=resident-q4` keeps the full pipeline
+warm while storing Qwen matrices/embedding rows and Boogu matrices as signed Q4S with F32 block
+scales. VAE convolutions remain packed F16. The qualified 1024-square run used 10,017,084,044 bytes
+of resident parameters and peaked at 15,360,589,824 Chrome GPU-process bytes; this opt-in path is a
+memory/output qualification and is not a numerical-parity or throughput claim.
+
 The optimized source-bound Turbo 1024 browser qualification retained 35,110,256,204 parameter
 bytes and used a 43,408,096,844-byte weights-plus-activation preflight plan. Portable denoiser
 attention now requests q1024 and adaptively retains at least four query partitions for every

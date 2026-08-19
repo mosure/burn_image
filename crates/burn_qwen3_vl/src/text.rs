@@ -10,7 +10,7 @@ use burn::{
 
 use crate::{
     MropePositionIds, Qwen3VlError, QwenLinear, QwenLinearConfig, Result,
-    config::Qwen3VlTextConfig, outputs::Qwen3VlTextOutput,
+    config::Qwen3VlTextConfig, linear::qwen_linear_forward, outputs::Qwen3VlTextOutput,
 };
 
 const DEFAULT_QUERY_CHUNK_SIZE: usize = 128;
@@ -44,8 +44,10 @@ impl<B: Backend> Qwen3VlTextMlp<B> {
     }
 
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        self.down_proj.forward(
-            activation::silu(self.gate_proj.forward(input.clone())) * self.up_proj.forward(input),
+        qwen_linear_forward(
+            &self.down_proj,
+            activation::silu(qwen_linear_forward(&self.gate_proj, input.clone()))
+                * qwen_linear_forward(&self.up_proj, input),
         )
     }
 }
@@ -106,23 +108,23 @@ impl<B: Backend> Qwen3VlTextAttention<B> {
         attention_mask: Option<&Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let [batch, sequence, _] = hidden_states.dims();
-        let query = self
-            .q_norm
-            .forward(self.q_proj.forward(hidden_states.clone()).reshape([
+        let query = self.q_norm.forward(
+            qwen_linear_forward(&self.q_proj, hidden_states.clone()).reshape([
                 batch,
                 sequence,
                 self.num_heads,
                 self.head_dim,
-            ]));
-        let key = self
-            .k_norm
-            .forward(self.k_proj.forward(hidden_states.clone()).reshape([
+            ]),
+        );
+        let key = self.k_norm.forward(
+            qwen_linear_forward(&self.k_proj, hidden_states.clone()).reshape([
                 batch,
                 sequence,
                 self.num_key_value_heads,
                 self.head_dim,
-            ]));
-        let value = self.v_proj.forward(hidden_states).reshape([
+            ]),
+        );
+        let value = qwen_linear_forward(&self.v_proj, hidden_states).reshape([
             batch,
             sequence,
             self.num_key_value_heads,
@@ -186,7 +188,7 @@ impl<B: Backend> Qwen3VlTextAttention<B> {
             sequence,
             self.num_heads * self.head_dim,
         ]);
-        self.o_proj.forward(output)
+        qwen_linear_forward(&self.o_proj, output)
     }
 }
 

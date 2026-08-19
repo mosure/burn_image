@@ -13,7 +13,10 @@ use std::{
 use burn::{
     nn::{RmsNorm, RmsNormConfig},
     prelude::Backend,
-    tensor::{Bytes, DType, Tensor, TensorData},
+    tensor::{
+        Bytes, DType, Tensor, TensorData,
+        quantization::{QuantLevel, QuantParam, QuantScheme, QuantStore, QuantValue},
+    },
 };
 use burn_image::{
     ARTIFACT_MANIFEST_SCHEMA_V1, ArtifactBundleId, ArtifactComponentId, ArtifactDependency,
@@ -23,6 +26,7 @@ use burn_image::{
 };
 use burn_store::{
     ApplyResult, BurnpackStore, ModuleAdapter, ModuleSnapshot, ModuleStore, TensorSnapshot,
+    TensorSnapshotError,
 };
 use thiserror::Error;
 
@@ -148,6 +152,12 @@ pub enum Qwen3VlArtifactFloatPolicy {
     /// This policy is for F32-activation backends that can bind F16 bytes but do not expose a
     /// typed F16 shader feature. It never changes the sealed artifact representation.
     PackedF16WeightsF32Auxiliaries,
+    /// Convert authenticated rank-two weights to packed signed Q4S block-128/F32 storage while
+    /// keeping normalization parameters and biases in F32.
+    ///
+    /// Execution uses F32 activations and a quantization-aware matmul. Embedding row objects stay
+    /// F16 because browser execution selects the required rows on the host before upload.
+    PackedQ4sBlock128WeightsF32Auxiliaries,
 }
 
 /// Failure while validating or applying a standalone Qwen component bundle.
@@ -1012,8 +1022,16 @@ fn parse_row_object<B: Backend>(
     device: &B::Device,
 ) -> Result<Tensor<B, 2>, Qwen3VlArtifactError> {
     let mut data = parse_row_object_data(file, bytes, target, spec)?;
-    if float_policy == Qwen3VlArtifactFloatPolicy::AdaptToF32 {
-        data = data.convert_dtype(DType::F32);
+    match float_policy {
+        Qwen3VlArtifactFloatPolicy::AdaptToF32 => {
+            data = data.convert_dtype(DType::F32);
+        }
+        Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries => {
+            data = quantize_q4s_block128_f32(data)
+                .map_err(|error| contract("qwen-embedding", error.to_string()))?;
+        }
+        Qwen3VlArtifactFloatPolicy::Preserve
+        | Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries => {}
     }
     let dtype = data.dtype;
     Ok(Tensor::from_data(data, (device, dtype)))
@@ -1140,11 +1158,102 @@ fn validate_apply(
     Ok(())
 }
 
+fn quantize_q4s_block128_f32(data: TensorData) -> Result<TensorData, TensorSnapshotError> {
+    const BLOCK: usize = 128;
+    const VALUES_PER_WORD: usize = 8;
+
+    if !matches!(data.dtype, DType::F16 | DType::F32) {
+        return Err(TensorSnapshotError::DataError(format!(
+            "Qwen runtime Q4S quantization requires F16/F32, found {:?}",
+            data.dtype
+        )));
+    }
+    let shape = data.shape.to_vec();
+    let Some(&inner) = shape.last() else {
+        return Err(TensorSnapshotError::DataError(
+            "Qwen runtime Q4S tensor has no dimensions".into(),
+        ));
+    };
+    if !inner.is_multiple_of(BLOCK) {
+        return Err(TensorSnapshotError::DataError(format!(
+            "Qwen runtime Q4S innermost dimension {inner} is not divisible by {BLOCK}"
+        )));
+    }
+    let values = data
+        .convert_dtype(DType::F32)
+        .to_vec::<f32>()
+        .map_err(|error| TensorSnapshotError::DataError(error.to_string()))?;
+    let mut packed = Vec::with_capacity(values.len() / VALUES_PER_WORD);
+    let mut scales = Vec::with_capacity(values.len() / BLOCK);
+    for block in values.chunks_exact(BLOCK) {
+        if block.iter().any(|value| !value.is_finite()) {
+            return Err(TensorSnapshotError::DataError(
+                "cannot quantize a non-finite Qwen checkpoint value".into(),
+            ));
+        }
+        let alpha = block
+            .iter()
+            .fold(0.0_f32, |value, element| value.max(element.abs()));
+        let scale = if alpha == 0.0 {
+            f32::MIN_POSITIVE
+        } else {
+            alpha / 7.0
+        };
+        scales.push(scale);
+        let inverse = scale.recip();
+        for values in block.chunks_exact(VALUES_PER_WORD) {
+            let mut word = 0_u32;
+            for (lane, value) in values.iter().enumerate() {
+                let quantized = (value * inverse).round().clamp(-7.0, 7.0) as i8;
+                word |= u32::from((quantized as u8) & 0x0f) << (lane * 4);
+            }
+            packed.push(word);
+        }
+    }
+    let scheme = QuantScheme::default()
+        .with_value(QuantValue::Q4S)
+        .with_level(QuantLevel::block([BLOCK as u8]))
+        .with_param(QuantParam::F32)
+        .with_store(QuantStore::PackedU32(0));
+    let mut bytes = Vec::with_capacity(values.len() / 2 + scales.len() * 4);
+    for word in packed {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for scale in scales {
+        bytes.extend_from_slice(&scale.to_le_bytes());
+    }
+    Ok(TensorData::from_bytes(
+        Bytes::from_bytes_vec(bytes),
+        shape,
+        DType::QFloat(scheme),
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FloatAdapter(Qwen3VlArtifactFloatPolicy);
 
 impl ModuleAdapter for FloatAdapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
+        if self.0 == Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries
+            && matches!(snapshot.dtype, DType::F16 | DType::F32)
+            && snapshot.shape.len() == 2
+        {
+            let data = snapshot.clone_data_fn();
+            return TensorSnapshot::from_closure(
+                Rc::new(move || quantize_q4s_block128_f32(data()?)),
+                DType::QFloat(
+                    QuantScheme::default()
+                        .with_value(QuantValue::Q4S)
+                        .with_level(QuantLevel::block([128]))
+                        .with_param(QuantParam::F32)
+                        .with_store(QuantStore::PackedU32(0)),
+                ),
+                snapshot.shape.clone(),
+                snapshot.path_stack.clone().unwrap_or_default(),
+                snapshot.container_stack.clone().unwrap_or_default(),
+                snapshot.tensor_id.unwrap_or_default(),
+            );
+        }
         if snapshot.dtype != DType::F16 {
             return snapshot.clone();
         }
@@ -1157,6 +1266,7 @@ impl ModuleAdapter for FloatAdapter {
                 return snapshot.clone();
             }
             Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries => DType::F32,
+            Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries => DType::F32,
         };
         let data = snapshot.clone_data_fn();
         TensorSnapshot::from_closure(
@@ -1330,6 +1440,322 @@ mod tests {
         // The Qwen patch Conv3d remains an F32 auxiliary until a mixed-input Conv3d kernel is
         // admitted; keeping it explicit avoids silently routing an unsupported F16 activation.
         assert_eq!(adapter.adapt(&convolution).dtype, DType::F32);
+    }
+
+    #[test]
+    fn packed_q4s_adapter_packs_matrix_and_widens_auxiliary_correctness() {
+        use burn::tensor::quantization::QuantizedBytes;
+
+        let matrix = TensorSnapshot::from_data(
+            TensorData::new(
+                (0..(128 * 2))
+                    .map(|index| (index as f32 - 127.5) / 512.0)
+                    .collect::<Vec<_>>(),
+                [2, 128],
+            )
+            .convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let bias = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 2], [2]).convert_dtype(DType::F16),
+            vec!["bias".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let adapter =
+            FloatAdapter(Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries);
+        let packed = adapter.adapt(&matrix);
+        let packed = (packed.clone_data_fn())().unwrap();
+        let DType::QFloat(scheme) = packed.dtype else {
+            panic!("matrix must be QFloat");
+        };
+        let (values, qparams) = QuantizedBytes {
+            bytes: packed.bytes,
+            scheme,
+            num_elements: 256,
+        }
+        .into_vec_i8();
+        assert_eq!(values.len(), 256);
+        assert_eq!(qparams.scales.len(), 2);
+        assert_eq!(adapter.adapt(&bias).dtype, DType::F32);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "requires an explicitly selected native WGPU adapter"]
+    fn packed_q4s_column_layout_wgpu_module_reference() {
+        use burn::tensor::{Tensor, TensorData, quantization::QuantizedBytes};
+
+        type B = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+        let device = burn_wgpu::WgpuDevice::default();
+        let input_width = 128;
+        let output_width = 256;
+        let raw = (0..(output_width * input_width))
+            .map(|index| {
+                ((index * 37 % 509) as f32 - 254.0) / 1536.0
+                    + ((index % input_width) as f32 - 63.5) / 8192.0
+            })
+            .collect::<Vec<_>>();
+        let input = (0..input_width)
+            .map(|index| ((index * 19 % 97) as f32 - 48.0) / 128.0)
+            .collect::<Vec<_>>();
+        let reference = (0..output_width)
+            .map(|output| {
+                raw[output * input_width..(output + 1) * input_width]
+                    .iter()
+                    .zip(&input)
+                    .map(|(weight, input)| weight * input)
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        let quantized_data = quantize_q4s_block128_f32(
+            TensorData::new(raw.clone(), [output_width, input_width]).convert_dtype(DType::F16),
+        )
+        .unwrap();
+        let DType::QFloat(scheme) = quantized_data.dtype else {
+            panic!("Q4S helper must return QFloat");
+        };
+        let (quantized_values, qparams) = QuantizedBytes {
+            bytes: quantized_data.bytes,
+            scheme,
+            num_elements: raw.len(),
+        }
+        .into_vec_i8();
+        let reconstructed = quantized_values
+            .chunks_exact(128)
+            .zip(qparams.scales)
+            .flat_map(|(block, scale)| block.iter().map(move |value| f32::from(*value) * scale))
+            .collect::<Vec<_>>();
+        let selected_rows = [2_i32, 0_i32];
+        let selected = Tensor::<B, 2>::from_data(
+            quantize_q4s_block128_f32(
+                TensorData::new(raw.clone(), [output_width, input_width]).convert_dtype(DType::F16),
+            )
+            .unwrap(),
+            &device,
+        )
+        .select(
+            0,
+            Tensor::<B, 1, burn::tensor::Int>::from_data(
+                TensorData::new(selected_rows.to_vec(), [selected_rows.len()]),
+                &device,
+            ),
+        )
+        .dequantize()
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        let selected_reference = selected_rows
+            .into_iter()
+            .flat_map(|row| {
+                reconstructed[row as usize * input_width..(row as usize + 1) * input_width]
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), selected_reference.len());
+        assert!(
+            selected
+                .iter()
+                .zip(selected_reference)
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-6),
+            "packed-Q4 embedding row selection must widen only the selected rows"
+        );
+        let quantized_reference = (0..output_width)
+            .map(|output| {
+                reconstructed[output * input_width..(output + 1) * input_width]
+                    .iter()
+                    .zip(&input)
+                    .map(|(weight, input)| weight * input)
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        let snapshot = TensorSnapshot::from_data(
+            TensorData::new(raw, [output_width, input_width]).convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let mut linear = crate::QwenLinearConfig::new(input_width, output_width)
+            .with_bias(false)
+            .init::<B>(&device);
+        let applied = linear.apply(
+            vec![snapshot],
+            None,
+            Some(Box::new(FloatAdapter(
+                Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries,
+            ))),
+            false,
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        let actual = crate::linear::qwen_linear_forward(
+            &linear,
+            Tensor::<B, 2>::from_data(TensorData::new(input.clone(), [1, input_width]), &device),
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        let actual_rank3 = crate::linear::qwen_linear_forward(
+            &linear,
+            Tensor::<B, 3>::from_data(TensorData::new(input, [1, 1, input_width]), &device),
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        assert_eq!(actual_rank3.len(), actual.len());
+        assert!(
+            actual_rank3
+                .iter()
+                .zip(&actual)
+                .all(|(rank3, rank2)| (rank3 - rank2).abs() < 1.0e-5)
+        );
+        let error = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(actual - expected).powi(2))
+            .sum::<f64>();
+        let signal = reference
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>();
+        let dot = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(*actual) * f64::from(*expected))
+            .sum::<f64>();
+        let actual_norm = actual
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let relative_rmse = (error / signal).sqrt();
+        let cosine = dot / (actual_norm * signal.sqrt());
+        let kernel_relative_rmse = {
+            let error = actual
+                .iter()
+                .zip(&quantized_reference)
+                .map(|(actual, expected)| f64::from(actual - expected).powi(2))
+                .sum::<f64>();
+            let signal = quantized_reference
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>();
+            (error / signal).sqrt()
+        };
+        eprintln!(
+            "Qwen column-layout WGPU packed-Q4S: rel-RMSE={relative_rmse} cosine={cosine} kernel-rel-RMSE={kernel_relative_rmse}"
+        );
+        assert!(actual.iter().all(|value| value.is_finite()));
+        assert!(
+            kernel_relative_rmse < 1.0e-4,
+            "quantized kernel relative RMSE {kernel_relative_rmse}"
+        );
+        assert!(relative_rmse < 0.12, "relative RMSE {relative_rmse}");
+        assert!(cosine > 0.993, "cosine {cosine}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "requires BURN_QWEN3_VL_HF_SNAPSHOT and an explicitly selected native WGPU adapter"]
+    fn released_qwen_k_projection_packed_q4s_wgpu_module_reference() {
+        use std::{
+            fs::File,
+            io::{Read, Seek, SeekFrom},
+            path::PathBuf,
+        };
+
+        use burn::tensor::{DType, Tensor, TensorData};
+
+        const SOURCE_OFFSET: u64 = 1_546_680_424;
+        const OUTPUT_WIDTH: usize = 1_024;
+        const INPUT_WIDTH: usize = 4_096;
+        const SOURCE_BYTES: usize = OUTPUT_WIDTH * INPUT_WIDTH * 2;
+
+        type B = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+        let snapshot = PathBuf::from(
+            std::env::var_os("BURN_QWEN3_VL_HF_SNAPSHOT")
+                .expect("set BURN_QWEN3_VL_HF_SNAPSHOT to the pinned Turbo snapshot"),
+        );
+        let mut file = File::open(snapshot.join("mllm/model-00001-of-00004.safetensors"))
+            .expect("open pinned Qwen shard");
+        file.seek(SeekFrom::Start(SOURCE_OFFSET))
+            .expect("seek pinned Qwen tensor");
+        let mut bytes = vec![0_u8; SOURCE_BYTES];
+        file.read_exact(&mut bytes)
+            .expect("read pinned Qwen tensor");
+        let weights = bytes
+            .chunks_exact(2)
+            .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
+            .collect::<Vec<_>>();
+        assert!(weights.iter().all(|value| value.is_finite()));
+
+        let input = (0..INPUT_WIDTH)
+            .map(|index| ((index * 19 % 251) as f32 - 125.0) / 256.0)
+            .collect::<Vec<_>>();
+        let reference = weights
+            .chunks_exact(INPUT_WIDTH)
+            .map(|row| {
+                row.iter()
+                    .zip(&input)
+                    .map(|(weight, input)| weight * input)
+                    .sum::<f32>()
+            })
+            .collect::<Vec<_>>();
+        let tensor = TensorSnapshot::from_data(
+            TensorData::new(weights, [OUTPUT_WIDTH, INPUT_WIDTH]).convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let device = burn_wgpu::WgpuDevice::default();
+        let mut linear = crate::QwenLinearConfig::new(INPUT_WIDTH, OUTPUT_WIDTH)
+            .with_bias(false)
+            .init::<B>(&device);
+        let applied = linear.apply(
+            vec![tensor],
+            None,
+            Some(Box::new(FloatAdapter(
+                Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries,
+            ))),
+            false,
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        let actual = crate::linear::qwen_linear_forward(
+            &linear,
+            Tensor::<B, 2>::from_data(TensorData::new(input, [1, INPUT_WIDTH]), &device),
+        )
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        let squared_error = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(actual - expected).powi(2))
+            .sum::<f64>();
+        let signal = reference
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>();
+        let dot = actual
+            .iter()
+            .zip(&reference)
+            .map(|(actual, expected)| f64::from(*actual) * f64::from(*expected))
+            .sum::<f64>();
+        let actual_norm = actual
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let relative_rmse = (squared_error / signal).sqrt();
+        let cosine = dot / (actual_norm * signal.sqrt());
+        eprintln!(
+            "released Qwen block-00 k_proj packed-Q4S: rel-RMSE={relative_rmse} cosine={cosine}"
+        );
+        assert!(actual.iter().all(|value| value.is_finite()));
+        assert!(relative_rmse < 0.15, "relative RMSE {relative_rmse}");
+        assert!(cosine > 0.985, "cosine {cosine}");
     }
 
     #[test]

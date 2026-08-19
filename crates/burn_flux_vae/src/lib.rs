@@ -29,7 +29,7 @@ pub use blocks::{
     AttentionBlock, DecoderGroupNormPolicy, Downsample2d, MidBlock2d, ResnetBlock2d, Upsample2d,
 };
 pub use config::{AutoencoderKlConfig, AutoencoderKlConfigError, DiffusersAutoencoderKlConfig};
-pub use decoder::{Decoder, UpDecoderBlock2d};
+pub use decoder::{Decoder, StripedTailDecodeState, UpDecoderBlock2d};
 pub use distribution::DiagonalGaussian;
 pub use encoder::{DownEncoderBlock2d, Encoder};
 pub use inventory::{TensorInventory, TensorSpec};

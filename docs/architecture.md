@@ -195,8 +195,12 @@ demonstrated by the
 Turbo deliberately uses a different contract: compact F16 storage is widened only one semantic
 stage at a time for dense-F32 execution. High-VRAM browser `resident` keeps F16 matrix, embedding,
 and convolution buffers resident and uses integer-unpack/F32-accumulate CubeCL kernels, removing
-the full-stage widening copy without requiring `shader-f16`. Q4 remains disabled without image-
-quality and kernel-trace qualification of its own.
+the full-stage widening copy without requiring `shader-f16`. The opt-in Turbo-only `resident-q4`
+policy instead keeps Qwen matrices and embedding rows plus Boogu matrices in signed Q4S/F32-scale
+storage; VAE convolutions remain packed F16. It retains the complete request graph and uses
+activation-stage cleanup rather than model unloading. A 1024-square browser run peaked at
+15,360,589,824 bytes under a strict decimal 16 GB gate and produced a coherent output; this is
+output/memory evidence, not numerical parity.
 
 Native WGPU and browser WebGPU use the same Burn modules. Qwen attention currently expands grouped
 key/value heads with Burn tensor operations, then evaluates explicit F32 score matmuls and softmax

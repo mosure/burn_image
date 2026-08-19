@@ -73,15 +73,17 @@ fn new_quantized<R: CubeRuntime>(
     let mut shape_value: Shape = shape.clone();
 
     let rank = shape.rank();
-    let shape_last = shape[rank - 1];
     let num_quants = scheme.num_quants();
 
     let data_size = match scheme.store {
-        QuantStore::PackedU32(_) => {
-            if !shape_last.is_multiple_of(num_quants) {
+        QuantStore::PackedU32(packed_dim) => {
+            let packed_axis = rank
+                .checked_sub(packed_dim + 1)
+                .expect("PackedU32 dimension must be within the tensor rank");
+            if !shape[packed_axis].is_multiple_of(num_quants) {
                 panic!("Can't store in u32")
             }
-            shape_value[rank - 1] = shape_last.div_ceil(num_quants);
+            shape_value[packed_axis] = shape[packed_axis].div_ceil(num_quants);
             size_of::<u32>()
         }
         QuantStore::Native => match scheme.value {
@@ -263,11 +265,31 @@ where
     }
 
     fn q_select(
-        _tensor: QuantizedTensor<Self>,
-        _dim: usize,
-        _indices: IntTensor<Self>,
+        tensor: QuantizedTensor<Self>,
+        dim: usize,
+        indices: IntTensor<Self>,
     ) -> QuantizedTensor<Self> {
-        unimplemented!()
+        let DType::QFloat(scheme) = tensor.dtype else {
+            unreachable!("QTensorOps received a non-quantized tensor")
+        };
+        assert_eq!(tensor.rank(), 2, "quantized select requires a matrix");
+        assert_eq!(dim, 0, "quantized select only supports rows");
+        assert_eq!(
+            indices.rank(),
+            1,
+            "quantized select indices must be rank one"
+        );
+        assert!(
+            matches!(scheme.value, QuantValue::Q4S)
+                && matches!(scheme.level, QuantLevel::Block(_))
+                && matches!(scheme.param, QuantParam::F32)
+                && matches!(scheme.store, QuantStore::PackedU32(0)),
+            "quantized row selection currently requires packed Q4S last-axis blocks with F32 scales"
+        );
+        let mut shape = tensor.shape();
+        shape[0] = indices.shape()[0];
+        let output = empty_qtensor_optimized(shape, scheme, &tensor.device);
+        kernel::select_quantized_rows(tensor, indices, output)
     }
 
     fn q_slice(_tensor: QuantizedTensor<Self>, _slices: &[Slice]) -> QuantizedTensor<Self> {

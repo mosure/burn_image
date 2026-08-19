@@ -539,9 +539,9 @@ fn run_vae_encoder_only<B: Backend>(
 
     let execution_dtype = match float_policy {
         BooguFloatLoadPolicy::Preserve => burn::tensor::DType::F16,
-        BooguFloatLoadPolicy::AdaptToF32 | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
-            burn::tensor::DType::F32
-        }
+        BooguFloatLoadPolicy::AdaptToF32
+        | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+        | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => burn::tensor::DType::F32,
     };
     let input_view = tensors.tensor("vae.reference_input")?;
     let input = Tensor::<B, 4>::from_data(
@@ -696,9 +696,9 @@ fn run_vae<B: Backend>(
     let expected = decode_f32(&expected_view)?;
     let execution_dtype = match float_policy {
         BooguFloatLoadPolicy::Preserve => burn::tensor::DType::F16,
-        BooguFloatLoadPolicy::AdaptToF32 | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
-            burn::tensor::DType::F32
-        }
+        BooguFloatLoadPolicy::AdaptToF32
+        | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+        | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => burn::tensor::DType::F32,
     };
     let input = Tensor::<B, 4>::from_data(TensorData::new(input, input_shape), &device)
         .cast(execution_dtype);

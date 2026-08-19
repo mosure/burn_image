@@ -809,7 +809,10 @@ impl<B: Backend> ChunkedEmbeddingState<B> {
             ),
             &self.device,
         );
-        let selected = chunk.weight.clone().select(0, local_ids);
+        // Packed embedding tables select their few requested rows while still quantized, then
+        // widen only that compact result. Backends without a quantized dtype keep the ordinary
+        // select path because `dequantize` is an identity for floating tensors.
+        let selected = chunk.weight.clone().select(0, local_ids).dequantize();
         let selected_dtype = selected.dtype();
         let output = self.output.take().unwrap_or_else(|| {
             Tensor::<B, 2>::zeros([self.batch * self.sequence, self.hidden_size], &self.device)
