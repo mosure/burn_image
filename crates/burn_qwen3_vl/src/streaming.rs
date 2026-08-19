@@ -810,9 +810,10 @@ impl<B: Backend> ChunkedEmbeddingState<B> {
             &self.device,
         );
         let selected = chunk.weight.clone().select(0, local_ids);
+        let selected_dtype = selected.dtype();
         let output = self.output.take().unwrap_or_else(|| {
             Tensor::<B, 2>::zeros([self.batch * self.sequence, self.hidden_size], &self.device)
-                .cast(chunk.weight.dtype())
+                .cast(selected_dtype)
                 .reshape([self.batch, self.sequence, self.hidden_size])
         });
         self.output = Some(

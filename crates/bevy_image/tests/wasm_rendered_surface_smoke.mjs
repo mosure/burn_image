@@ -21,8 +21,8 @@
 // Set BURN_IMAGE_RENDERED_TURBO_1024_MULTI_REQUEST_QUALIFICATION=1 instead of the single-request
 // variable to run two sequential ordinary Generate/Save requests in the same page and engine.
 // It uses CDP keyboard/mouse input against the rendered Prompt, Seed, Run, and Save PNG controls,
-// validates the production 1024x1024 PNG download, and, without a residency override, verifies the
-// default Turbo preloaded packed-F16 storage / dense-F32-per-semantic-stage low-VRAM plan, its
+// validates the production 1024x1024 PNG download, and explicitly verifies the Turbo preloaded
+// packed-F16 storage / dense-F32-per-semantic-stage low-VRAM plan, its
 // separate denoiser-preload and request
 // traffic windows, and zero artifact access in the four-step DMD hot path. It also enforces an aggregate,
 // measured, decimal-32-GB-exclusive Chrome GPU-process framebuffer ceiling across all PIDs per
@@ -505,6 +505,9 @@ async function validateCommittedSources() {
     "preserve_packed_cache",
     "fail_closed_packed_f16_request_cleanup",
     "retained-Q8 dense-F32-per-stage Turbo policy is retired",
+    "const BROWSER_PRODUCTION_DENOISER_QUERY_CHUNK_SIZE: usize = 1_024;",
+    "denoiser_minimum_image_query_partitions:",
+    "burn_boogu::PORTABLE_ATTENTION_MINIMUM_IMAGE_QUERY_PARTITIONS",
   ]) {
     if (!browserBooguSource.includes(required)) {
       failures.push(`src/browser_boogu.rs omits ${required}`);
@@ -3665,6 +3668,9 @@ async function main() {
       query.set("qwen-block0-execution-mode", requestedQwenBlock0ExecutionMode);
       query.set("variant", "turbo");
       query.set("profile", "production");
+      // This harness is the strict low-VRAM release gate. Keep it independent from the app's
+      // evolving default residency policy and from the resident packed-F16 qualification.
+      query.set("residency", "low-vram");
       modelBaseUrl = `${baseUrl}/model/${TURBO_BUNDLE}`;
       modelBaseUrls = MODEL_BUNDLES.map((bundle) => `${baseUrl}/model/${bundle}`);
       query.set("artifacts", modelBaseUrl);

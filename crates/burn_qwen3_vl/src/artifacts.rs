@@ -143,6 +143,11 @@ pub enum Qwen3VlArtifactFloatPolicy {
     Preserve,
     /// Convert bounded F16 stages to F32 during application.
     AdaptToF32,
+    /// Retain rank-two F16 matrices for packed backend kernels while widening norms and biases.
+    ///
+    /// This policy is for F32-activation backends that can bind F16 bytes but do not expose a
+    /// typed F16 shader feature. It never changes the sealed artifact representation.
+    PackedF16WeightsF32Auxiliaries,
 }
 
 /// Failure while validating or applying a standalone Qwen component bundle.
@@ -1136,17 +1141,27 @@ fn validate_apply(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Float32Adapter;
+struct FloatAdapter(Qwen3VlArtifactFloatPolicy);
 
-impl ModuleAdapter for Float32Adapter {
+impl ModuleAdapter for FloatAdapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
         if snapshot.dtype != DType::F16 {
             return snapshot.clone();
         }
+        let output_dtype = match self.0 {
+            Qwen3VlArtifactFloatPolicy::Preserve => return snapshot.clone(),
+            Qwen3VlArtifactFloatPolicy::AdaptToF32 => DType::F32,
+            Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+                if snapshot.shape.len() == 2 =>
+            {
+                return snapshot.clone();
+            }
+            Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries => DType::F32,
+        };
         let data = snapshot.clone_data_fn();
         TensorSnapshot::from_closure(
-            Rc::new(move || Ok(data()?.convert_dtype(DType::F32))),
-            DType::F32,
+            Rc::new(move || Ok(data()?.convert_dtype(output_dtype))),
+            output_dtype,
             snapshot.shape.clone(),
             snapshot.path_stack.clone().unwrap_or_default(),
             snapshot.container_stack.clone().unwrap_or_default(),
@@ -1160,8 +1175,8 @@ impl ModuleAdapter for Float32Adapter {
 }
 
 fn load_adapter(policy: Qwen3VlArtifactFloatPolicy) -> Option<Box<dyn ModuleAdapter>> {
-    (policy == Qwen3VlArtifactFloatPolicy::AdaptToF32)
-        .then(|| Box::new(Float32Adapter) as Box<dyn ModuleAdapter>)
+    (policy != Qwen3VlArtifactFloatPolicy::Preserve)
+        .then(|| Box::new(FloatAdapter(policy)) as Box<dyn ModuleAdapter>)
 }
 
 #[cfg(test)]
@@ -1286,6 +1301,35 @@ mod tests {
         assert_eq!(adapted.dtype(), DType::F32);
         let adapted = adapted.into_data();
         assert_eq!(adapted.to_vec::<f32>().unwrap(), values);
+    }
+
+    #[test]
+    fn packed_f16_adapter_retains_matrices_and_widens_auxiliaries_correctness() {
+        let matrix = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 8], [2, 4]).convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let bias = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 4], [4]).convert_dtype(DType::F16),
+            vec!["bias".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let convolution = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 8], [2, 1, 1, 2, 2]).convert_dtype(DType::F16),
+            vec!["conv3d".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let adapter = FloatAdapter(Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries);
+
+        assert_eq!(adapter.adapt(&matrix).dtype, DType::F16);
+        assert_eq!(adapter.adapt(&bias).dtype, DType::F32);
+        // The Qwen patch Conv3d remains an F32 auxiliary until a mixed-input Conv3d kernel is
+        // admitted; keeping it explicit avoids silently routing an unsupported F16 activation.
+        assert_eq!(adapter.adapt(&convolution).dtype, DType::F32);
     }
 
     #[test]

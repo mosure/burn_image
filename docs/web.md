@@ -472,8 +472,12 @@ the ordinary UI because it requires a reference image. The browser model backend
 `CubeBackend` rather than Burn's fused alias. Floating stages are adapted to F32, and every
 asynchronous semantic source awaits the CubeCL `ComputeClient::sync()` future instead of blocking
 Wasm's event loop. Headless diagnostics still default to low-VRAM unless their route fixes another
-policy explicitly; `residency=resident` selects dense-F32 preload. The measurements below are
-specifically the historical 256-square streamed run.
+policy explicitly; `residency=resident` selects packed-F16 resident weights with integer-unpack,
+F32-accumulate linear/embedding/convolution kernels. Its portable denoiser attention requests q1024
+while adaptively retaining at least four query partitions for image-scale sequences. The optimized
+1024-square resident run completed in 37.676 s, including 32.302 s for all four DMD steps, with a
+byte-identical PNG, zero inference artifact traffic, and a 40,868 MiB Chrome GPU-process peak. The
+measurements below are specifically the historical 256-square streamed run.
 
 The validated launch was headful so Chrome used the real GPU rather than SwiftShader:
 

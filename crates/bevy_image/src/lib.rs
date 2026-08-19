@@ -122,6 +122,7 @@ enum BrowserHeadlessMode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum BrowserResidencySelector {
     Resident,
+    ResidentDenseF32,
     QualificationF32,
     #[default]
     LowVram,
@@ -149,9 +150,10 @@ fn parse_browser_residency(value: Option<&str>) -> Result<BrowserResidencySelect
             "the retained-Q8 dense-F32-per-stage browser policy is retired after real-browser non-finite output; use residency=low-vram"
                 .into(),
         ),
-        Some("resident") | Some("high-vram-resident-dense-f32") => {
+        Some("resident") | Some("high-vram-resident-packed-f16") => {
             Ok(BrowserResidencySelector::Resident)
         }
+        Some("high-vram-resident-dense-f32") => Ok(BrowserResidencySelector::ResidentDenseF32),
         Some("qualification-f32")
         | Some("qualification-per-request-f32-denoiser-retained") => {
             Ok(BrowserResidencySelector::QualificationF32)
@@ -160,7 +162,7 @@ fn parse_browser_residency(value: Option<&str>) -> Result<BrowserResidencySelect
             Ok(BrowserResidencySelector::LayerStreamedDiagnostic)
         }
         Some(_) => Err(
-            "unsupported browser residency; use residency=resident, residency=qualification-f32, residency=low-vram, residency=low-vram-runtime-q8-denoiser, residency=low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser, or the explicit residency=layer-streamed-diagnostic"
+            "unsupported browser residency; use residency=resident, residency=high-vram-resident-dense-f32, residency=qualification-f32, residency=low-vram, residency=low-vram-runtime-q8-denoiser, residency=low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser, or the explicit residency=layer-streamed-diagnostic"
                 .into(),
         ),
     }
@@ -367,7 +369,8 @@ fn report_browser_turbo_first_dmd_terminal_failure(window: &web_sys::Window, err
 /// authenticated 1.5K fixture. Exact F32 fixture replay uses
 /// `headless=parity&residency=qualification-f32`: Qwen/VAE are streamed per request and only the
 /// F32 denoiser is retained through the four DMD steps, so its evidence does not claim all-stage
-/// resident-dense execution. The
+/// packed-F16 resident execution. The explicit `residency=high-vram-resident-dense-f32` selector
+/// retains the prior diagnostic. The
 /// intentionally host-heavy `residency=layer-streamed-diagnostic` path requires an explicit
 /// `artifacts=` URL and is not a supported production mode.
 /// `headless=bootstrap` selects an opt-in no-surface F32 compute diagnostic;
@@ -639,6 +642,9 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
         wasm_bindgen_futures::spawn_local(async move {
             let policy = match residency {
                 BrowserResidencySelector::Resident => {
+                    BrowserBooguResidencyPolicy::HighVramResidentPackedF16
+                }
+                BrowserResidencySelector::ResidentDenseF32 => {
                     BrowserBooguResidencyPolicy::HighVramResidentDenseF32
                 }
                 BrowserResidencySelector::QualificationF32 => {
@@ -791,6 +797,7 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
                     .await
                 }
                 BrowserResidencySelector::Resident
+                | BrowserResidencySelector::ResidentDenseF32
                 | BrowserResidencySelector::PreloadedPackedF16
                 | BrowserResidencySelector::LayerStreamedDiagnostic => {
                     unreachable!("configuration accepts only qualification residencies for parity")
@@ -822,6 +829,10 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
     }
     let factory = match residency {
         BrowserResidencySelector::Resident => BrowserBooguFactory::with_residency(
+            variant,
+            BrowserBooguResidencyPolicy::HighVramResidentPackedF16,
+        ),
+        BrowserResidencySelector::ResidentDenseF32 => BrowserBooguFactory::with_residency(
             variant,
             BrowserBooguResidencyPolicy::HighVramResidentDenseF32,
         ),
@@ -959,6 +970,14 @@ mod web_shell_tests {
         assert_eq!(
             super::parse_browser_residency(Some("resident")).unwrap(),
             super::BrowserResidencySelector::Resident
+        );
+        assert_eq!(
+            super::parse_browser_residency(Some("high-vram-resident-packed-f16")).unwrap(),
+            super::BrowserResidencySelector::Resident
+        );
+        assert_eq!(
+            super::parse_browser_residency(Some("high-vram-resident-dense-f32")).unwrap(),
+            super::BrowserResidencySelector::ResidentDenseF32
         );
         assert_eq!(
             super::parse_browser_residency(Some("qualification-f32")).unwrap(),

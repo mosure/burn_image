@@ -651,6 +651,25 @@ pub struct BooguDenoiserRuntimeQ8Footprint {
     pub total_payload_bytes: u64,
 }
 
+/// Inventory-derived resident parameter payload for integer-unpacked F16 execution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BooguPackedF16ResidentFootprint {
+    /// Number of active rank-two linear/embedding and rank-four convolution tensors.
+    pub packed_f16_tensor_count: usize,
+    /// Number of active F16 values retained in two-byte storage.
+    pub packed_f16_elements: u64,
+    /// Exact two-byte payload of active packed-F16 parameters.
+    pub packed_f16_payload_bytes: u64,
+    /// Number of active normalization, bias, or natively-F32 parameter tensors.
+    pub f32_tensor_count: usize,
+    /// Number of active parameter values represented as F32.
+    pub f32_elements: u64,
+    /// Exact four-byte payload of active F32 parameters.
+    pub f32_payload_bytes: u64,
+    /// Complete active parameter payload, excluding allocator alignment and activations.
+    pub total_payload_bytes: u64,
+}
+
 fn qwen_specs(config: &Qwen3VlConfig) -> Vec<ArtifactTensorSpec> {
     QwenWeightInventory::for_config(config, true)
         .specs()
@@ -1367,6 +1386,114 @@ mod loading {
         Q8sBlock32F32QwenVisionF32,
     }
 
+    impl BooguArtifactInventory {
+        /// Derive the exact active parameter payload for packed-F16/F32 execution.
+        ///
+        /// Rank-two matrices and embedding tables plus rank-four convolution kernels retain the
+        /// released F16 payload. Rank-one norms/biases and every tensor stored as F32 remain F32.
+        /// Generate excludes the edit-only Qwen vision, VAE encoder, and reference-refiner stages.
+        pub fn packed_f16_resident_footprint(
+            &self,
+            variant: BooguVariant,
+            profile: BooguStorageProfile,
+        ) -> Result<super::BooguPackedF16ResidentFootprint, BooguError> {
+            if !matches!(
+                profile,
+                BooguStorageProfile::F16 | BooguStorageProfile::F16QwenVisionF32
+            ) {
+                return Err(BooguError::Artifact(format!(
+                    "packed-F16 resident execution requires an F16 storage profile, found {profile:?}"
+                )));
+            }
+
+            let mut footprint = super::BooguPackedF16ResidentFootprint::default();
+            for spec in self.tensors().iter().filter(|spec| {
+                // Boogu consumes hidden conditioning, not Qwen vocabulary logits. Released base
+                // component manifests therefore omit the untied lm_head entirely; counting it
+                // here would invent one 1,244,659,712-byte resident matrix that is neither
+                // downloaded nor allocated.
+                spec.target_name != "lm_head.weight"
+                    && (variant.is_edit()
+                        || (!spec.stage.starts_with("qwen-vision-")
+                            && spec.stage != "flux-vae-encoder"
+                            && !spec.stage.starts_with("boogu-reference-refiner-")))
+            }) {
+                let elements = spec
+                    .target_shape
+                    .iter()
+                    .try_fold(1_u64, |total, &dimension| {
+                        total.checked_mul(dimension as u64)
+                    })
+                    .ok_or_else(|| {
+                        BooguError::Artifact(format!(
+                            "packed-F16 resident element count overflowed for {}",
+                            spec.target_name
+                        ))
+                    })?;
+                let stored_f32 = profile == BooguStorageProfile::F16QwenVisionF32
+                    && spec.owner == TensorOwner::Qwen3Vl
+                    && spec.stage.starts_with("qwen-vision-");
+                if !stored_f32 && matches!(spec.target_shape.len(), 2 | 4) {
+                    if !elements.is_multiple_of(2) {
+                        return Err(BooguError::Artifact(format!(
+                            "packed-F16 resident tensor {} has an odd element count {elements}",
+                            spec.target_name
+                        )));
+                    }
+                    footprint.packed_f16_tensor_count = footprint
+                        .packed_f16_tensor_count
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            BooguError::Artifact(
+                                "packed-F16 resident tensor count overflowed".into(),
+                            )
+                        })?;
+                    footprint.packed_f16_elements = footprint
+                        .packed_f16_elements
+                        .checked_add(elements)
+                        .ok_or_else(|| {
+                            BooguError::Artifact(
+                                "packed-F16 resident element count overflowed".into(),
+                            )
+                        })?;
+                } else {
+                    footprint.f32_tensor_count =
+                        footprint.f32_tensor_count.checked_add(1).ok_or_else(|| {
+                            BooguError::Artifact("resident F32 tensor count overflowed".into())
+                        })?;
+                    footprint.f32_elements = footprint
+                        .f32_elements
+                        .checked_add(elements)
+                        .ok_or_else(|| {
+                            BooguError::Artifact("resident F32 element count overflowed".into())
+                        })?;
+                }
+            }
+            footprint.packed_f16_payload_bytes = footprint
+                .packed_f16_elements
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    BooguError::Artifact("packed-F16 resident byte count overflowed".into())
+                })?;
+            footprint.f32_payload_bytes = footprint
+                .f32_elements
+                .checked_mul(4)
+                .ok_or_else(|| BooguError::Artifact("resident F32 byte count overflowed".into()))?;
+            footprint.total_payload_bytes = footprint
+                .packed_f16_payload_bytes
+                .checked_add(footprint.f32_payload_bytes)
+                .ok_or_else(|| {
+                    BooguError::Artifact("packed-F16 resident total byte count overflowed".into())
+                })?;
+            if footprint.packed_f16_tensor_count == 0 || footprint.total_payload_bytes == 0 {
+                return Err(BooguError::Artifact(
+                    "packed-F16 resident footprint contains no packed weights".into(),
+                ));
+            }
+            Ok(footprint)
+        }
+    }
+
     /// Authenticated identity evidence for the opt-in 1.5K VAE encoder F32 A/B overlay.
     ///
     /// This does not make the overlay a published bundle or a production storage profile. The
@@ -1719,6 +1846,12 @@ mod loading {
         /// This explicit compatibility mode is useful for CPU backends without F16 support.
         /// Q8S tensors are never dequantized by this policy.
         AdaptToF32,
+        /// Retain F16 matrix/convolution weights as two-byte device buffers while widening
+        /// normalization parameters, biases, and other auxiliaries to F32.
+        ///
+        /// Execution remains F32. A backend selecting this policy must provide fused packed-F16
+        /// linear, row-selection, and convolution operations; it is not a typed-F16 claim.
+        PackedF16WeightsF32Auxiliaries,
     }
 
     /// Policy for verified quantized snapshots when applying a Burnpack stage.
@@ -2190,7 +2323,12 @@ mod loading {
 
             let read = AsyncStageShardRead::verify_sha256(&file, bytes.to_vec()).unwrap();
             let over_cap = read.into_verified_bytes(&file, (bytes.len() - 1) as u64);
-            assert!(over_cap.unwrap_err().to_string().contains("per-read cap"));
+            assert!(
+                over_cap
+                    .unwrap_err()
+                    .to_string()
+                    .contains("above the 19-byte cap")
+            );
         }
     }
 
@@ -7253,7 +7391,8 @@ mod loading {
         }
         let data = TensorData::new(dequantized, shape).convert_dtype(DType::F16);
         Ok(match float_policy {
-            BooguFloatLoadPolicy::Preserve => data,
+            BooguFloatLoadPolicy::Preserve
+            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => data,
             BooguFloatLoadPolicy::AdaptToF32 => data.convert_dtype(DType::F32),
         })
     }
@@ -7302,7 +7441,8 @@ mod loading {
                     return TensorSnapshot::from_closure(
                         Rc::new(move || dequantize_q8s_block32(data_fn()?, float_policy)),
                         match float_policy {
-                            BooguFloatLoadPolicy::Preserve => DType::F16,
+                            BooguFloatLoadPolicy::Preserve
+                            | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => DType::F16,
                             BooguFloatLoadPolicy::AdaptToF32 => DType::F32,
                         },
                         snapshot.shape.clone(),
@@ -7314,6 +7454,16 @@ mod loading {
                 (DType::F16 | DType::BF16 | DType::F64, _, BooguFloatLoadPolicy::AdaptToF32) => {
                     DType::F32
                 }
+                (DType::F16, _, BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries)
+                    if !matches!(snapshot.shape.len(), 2 | 4) =>
+                {
+                    DType::F32
+                }
+                (
+                    DType::BF16 | DType::F64,
+                    _,
+                    BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries,
+                ) => DType::F32,
                 _ => return snapshot.clone(),
             };
             let data_fn = snapshot.clone_data_fn();
@@ -8124,6 +8274,99 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn packed_f16_resident_footprint_is_variant_and_dtype_exact_correctness() {
+        let inventory = BooguArtifactInventory::new(
+            &tiny_qwen_config(),
+            &BooguConfig::default(),
+            &AutoencoderKlConfig::tiny(),
+        )
+        .unwrap();
+        let turbo = inventory
+            .packed_f16_resident_footprint(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+        let edit = inventory
+            .packed_f16_resident_footprint(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+        let mut tied_qwen_config = tiny_qwen_config();
+        tied_qwen_config.tie_word_embeddings = true;
+        let tied_inventory = BooguArtifactInventory::new(
+            &tied_qwen_config,
+            &BooguConfig::default(),
+            &AutoencoderKlConfig::tiny(),
+        )
+        .unwrap();
+        let tied_turbo = tied_inventory
+            .packed_f16_resident_footprint(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+        let tied_edit = tied_inventory
+            .packed_f16_resident_footprint(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+
+        assert!(turbo.packed_f16_tensor_count > 0);
+        assert!(turbo.f32_tensor_count > 0);
+        assert!(turbo.packed_f16_elements.is_multiple_of(2));
+        assert_eq!(
+            turbo.total_payload_bytes,
+            turbo.packed_f16_payload_bytes + turbo.f32_payload_bytes
+        );
+        assert!(edit.total_payload_bytes > turbo.total_payload_bytes);
+        assert!(edit.f32_payload_bytes > turbo.f32_payload_bytes);
+        assert_eq!(turbo, tied_turbo, "conditioning must not count lm_head");
+        assert_eq!(edit, tied_edit, "edit conditioning must not count lm_head");
+        assert!(
+            inventory
+                .packed_f16_resident_footprint(
+                    BooguVariant::Image01Turbo,
+                    BooguStorageProfile::Q8sBlock32F32,
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn packed_f16_load_adapter_retains_matrix_and_conv_weights_correctness() {
+        use burn::{
+            module::ParamId,
+            tensor::{DType, TensorData},
+        };
+        use burn_store::{ModuleAdapter, TensorSnapshot};
+
+        let adapter = loading::ArtifactLoadAdapter {
+            float_policy: BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries,
+            quantized_policy: BooguQuantizedLoadPolicy::Preserve,
+            runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
+            runtime_quantizable_paths: None,
+        };
+        let snapshot = |shape: Vec<usize>| {
+            let elements = shape.iter().product();
+            TensorSnapshot::from_data(
+                TensorData::new(vec![0.25_f32; elements], shape).convert_dtype(DType::F16),
+                vec!["weight".into()],
+                Vec::new(),
+                ParamId::new(),
+            )
+        };
+
+        assert_eq!(adapter.adapt(&snapshot(vec![2, 4])).dtype, DType::F16);
+        assert_eq!(adapter.adapt(&snapshot(vec![2, 2, 3, 3])).dtype, DType::F16);
+        assert_eq!(adapter.adapt(&snapshot(vec![4])).dtype, DType::F32);
     }
 
     #[cfg(feature = "burnpack")]
@@ -9036,7 +9279,11 @@ mod tests {
         )
         .unwrap();
         let error = block_on(source.load_vision_prelude()).unwrap_err();
-        assert!(error.to_string().contains("integrity verification failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("artifact integrity check failed")
+        );
 
         let (config, inventory, directory, mut manifest) = fixture();
         let cap = manifest.files.iter().map(|file| file.size).max().unwrap();
@@ -9060,7 +9307,8 @@ mod tests {
         )
         .err()
         .expect("oversized response must be rejected");
-        assert!(error.to_string().contains("exceeding the per-read cap"));
+        assert!(error.to_string().contains("above the"));
+        assert!(error.to_string().contains("-byte cap"));
 
         let (config, inventory, directory, manifest) = fixture();
         let mut reader = AsyncMemoryShardReader::from_directory(&directory, &manifest);
@@ -9078,7 +9326,11 @@ mod tests {
         )
         .err()
         .expect("size-mismatched response must be rejected");
-        assert!(error.to_string().contains("integrity verification failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("artifact integrity check failed")
+        );
 
         let (config, inventory, directory, mut manifest) = fixture();
         let wrong_dtype_file = manifest

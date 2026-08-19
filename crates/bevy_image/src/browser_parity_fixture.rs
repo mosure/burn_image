@@ -1520,10 +1520,12 @@ mod tests {
         let source = include_str!("../tests/wasm_browser_1k5_parity.mjs");
         for required in [
             "BURN_IMAGE_BROWSER_1K5_RESIDENCY",
-            "requires ${RESIDENCY_ENV}=qualification-f32 or ${RESIDENCY_ENV}=low-vram",
-            "residency: lowVramMode ? \"low-vram\" : \"qualification-f32\"",
+            "requires ${RESIDENCY_ENV}=qualification-f32, ${RESIDENCY_ENV}=low-vram, or ${RESIDENCY_ENV}=resident-packed-f16",
+            "const packedResidentMode = fullParityMode && residencySelector === \"resident-packed-f16\"",
+            "? \"resident\"",
             "browser-qualification-per-request-f32-denoiser-retained",
             "browser-low-vram-runtime-q8-denoiser",
+            "browser-high-vram-resident-packed-f16",
             "runtime-quantize-q8s-block32-f32",
             "low_vram_denoiser_dtype_audit.matches_inventory",
             "on_device_quantized_execution_claimed",

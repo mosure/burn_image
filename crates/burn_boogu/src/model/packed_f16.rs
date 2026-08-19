@@ -756,4 +756,272 @@ mod tests {
             expected
         );
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "opt-in WGPU packed-resident kernel correctness test"]
+    fn packed_f16_wgpu_linear_embedding_and_convolution_correctness() {
+        use burn::tensor::{DType, Int, Tensor, TensorData, TensorPrimitive, ops::ConvOptions};
+        use burn_cubecl::{
+            CubeBackend,
+            kernel::packed_f16::{
+                packed_f16_conv2d, packed_f16_rhs_matmul, packed_f16_select_rows,
+            },
+        };
+        use burn_wgpu::{WgpuDevice, WgpuRuntime};
+
+        type Backend = CubeBackend<WgpuRuntime, f32, i32, u32>;
+
+        fn float_primitive<const D: usize>(
+            tensor: Tensor<Backend, D>,
+        ) -> burn_cubecl::tensor::CubeTensor<WgpuRuntime> {
+            match tensor.into_primitive() {
+                TensorPrimitive::Float(tensor) => tensor,
+                TensorPrimitive::QFloat(_) => panic!("test tensor unexpectedly quantized"),
+            }
+        }
+
+        fn f16(values: &[f32]) -> Vec<half::f16> {
+            values.iter().copied().map(half::f16::from_f32).collect()
+        }
+
+        let device = WgpuDevice::DefaultDevice;
+
+        // Exercise the exact Qwen load shape: checkpoint [out, in] becomes a zero-copy
+        // non-contiguous [in, out] view before the fused matmul reads its F16 bytes.
+        let lhs = float_primitive(Tensor::<Backend, 2>::from_data(
+            TensorData::new(vec![1.0_f32, 2.0, 3.0, -1.0, 0.5, 2.0], [2, 3]),
+            &device,
+        ));
+        let rhs = float_primitive(
+            Tensor::<Backend, 2>::from_data(
+                TensorData::new(
+                    f16(&[
+                        1.0, 0.0, 2.0, // output 0
+                        0.0, 1.0, -1.0, // output 1
+                        2.0, -1.0, 0.5, // output 2
+                        -1.0, 2.0, 1.0, // output 3
+                    ]),
+                    [4, 3],
+                ),
+                (&device, DType::F16),
+            )
+            .transpose(),
+        );
+        let output = Tensor::<Backend, 2>::from_primitive(TensorPrimitive::Float(
+            packed_f16_rhs_matmul(lhs, rhs),
+        ));
+        let actual = futures::executor::block_on(output.into_data_async())
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(actual, vec![7.0, -1.0, 1.5, 6.0, 3.0, -1.5, -1.5, 4.0]);
+
+        let table = float_primitive(Tensor::<Backend, 2>::from_data(
+            TensorData::new(
+                f16(&[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, -2.0, -3.0, 7.0, 8.0, 9.0,
+                ]),
+                [4, 3],
+            ),
+            (&device, DType::F16),
+        ));
+        let indices =
+            Tensor::<Backend, 1, Int>::from_data(TensorData::new(vec![2_i32, 0_i32], [2]), &device)
+                .into_primitive();
+        let selected = Tensor::<Backend, 2>::from_primitive(TensorPrimitive::Float(
+            packed_f16_select_rows(table, 0, indices),
+        ));
+        let actual = futures::executor::block_on(selected.into_data_async())
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(actual, vec![-1.0, -2.0, -3.0, 1.0, 2.0, 3.0]);
+
+        let input = float_primitive(Tensor::<Backend, 4>::from_data(
+            TensorData::new(
+                vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                [1, 1, 3, 3],
+            ),
+            &device,
+        ));
+        let weight = float_primitive(Tensor::<Backend, 4>::from_data(
+            TensorData::new(
+                f16(&[1.0, 0.0, 0.0, -1.0, 0.5, 0.5, 0.5, 0.5]),
+                [2, 1, 2, 2],
+            ),
+            (&device, DType::F16),
+        ));
+        let bias = float_primitive(Tensor::<Backend, 1>::from_data(
+            TensorData::new(vec![0.5_f32, -1.0], [2]),
+            &device,
+        ));
+        let convolved =
+            Tensor::<Backend, 4>::from_primitive(TensorPrimitive::Float(packed_f16_conv2d(
+                input,
+                weight,
+                Some(bias),
+                ConvOptions::new([1, 1], [0, 0], [1, 1], 1),
+            )));
+        let actual = futures::executor::block_on(convolved.into_data_async())
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(actual, vec![-3.5, -3.5, -3.5, -3.5, 5.0, 7.0, 11.0, 13.0]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "opt-in representative WGPU packed-F16 matmul timing"]
+    fn packed_f16_wgpu_matmul_throughput_smoke() {
+        use std::time::Instant;
+
+        use burn::tensor::{DType, Tensor, TensorData, TensorPrimitive, backend::Backend as _};
+        use burn_cubecl::{
+            CubeBackend, kernel::packed_f16::packed_f16_rhs_matmul, tensor::CubeTensor,
+        };
+        use burn_wgpu::{WgpuDevice, WgpuRuntime};
+
+        type TestBackend = CubeBackend<WgpuRuntime, f32, i32, u32>;
+
+        fn primitive<const D: usize>(tensor: Tensor<TestBackend, D>) -> CubeTensor<WgpuRuntime> {
+            match tensor.into_primitive() {
+                TensorPrimitive::Float(tensor) => tensor,
+                TensorPrimitive::QFloat(_) => panic!("benchmark tensor unexpectedly quantized"),
+            }
+        }
+
+        const ROWS: usize = 4096;
+        const INNER: usize = 4096;
+        const COLS: usize = 4096;
+        const ATTEMPTS: usize = 3;
+        let device = WgpuDevice::DefaultDevice;
+        let lhs = primitive(Tensor::<TestBackend, 2>::ones([ROWS, INNER], &device));
+        let checkpoint = Tensor::<TestBackend, 2>::from_data(
+            TensorData::new(
+                vec![half::f16::from_f32(1.0 / INNER as f32); INNER * COLS],
+                [COLS, INNER],
+            ),
+            (&device, DType::F16),
+        );
+        let rhs = primitive(checkpoint.transpose());
+
+        let warm = packed_f16_rhs_matmul(lhs.clone(), rhs.clone());
+        TestBackend::sync(&device).unwrap();
+        drop(warm);
+
+        let mut fastest = std::time::Duration::MAX;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            let started = Instant::now();
+            let output = packed_f16_rhs_matmul(lhs.clone(), rhs.clone());
+            TestBackend::sync(&device).unwrap();
+            fastest = fastest.min(started.elapsed());
+            last = Some(output);
+        }
+        let operations = 2.0 * ROWS as f64 * INNER as f64 * COLS as f64;
+        let throughput_tflops = operations / fastest.as_secs_f64() / 1.0e12;
+        eprintln!(
+            "packed-F16 compatibility matmul {ROWS}x{INNER}x{COLS}: {:.3} ms, {:.3} TFLOP/s",
+            fastest.as_secs_f64() * 1_000.0,
+            throughput_tflops
+        );
+        assert!(throughput_tflops.is_finite() && throughput_tflops > 0.0);
+
+        let output = Tensor::<TestBackend, 2>::from_primitive(TensorPrimitive::Float(
+            last.expect("at least one timing attempt"),
+        ));
+        let sample = output
+            .slice([0..1, 0..1])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!((sample - 1.0).abs() <= 0.001, "unexpected sample {sample}");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "opt-in representative WGPU packed-F16 convolution timing"]
+    fn packed_f16_wgpu_conv2d_throughput_smoke() {
+        use std::time::Instant;
+
+        use burn::tensor::{
+            DType, Tensor, TensorData, TensorPrimitive, backend::Backend as _, ops::ConvOptions,
+        };
+        use burn_cubecl::{CubeBackend, kernel::packed_f16::packed_f16_conv2d, tensor::CubeTensor};
+        use burn_wgpu::{WgpuDevice, WgpuRuntime};
+
+        type TestBackend = CubeBackend<WgpuRuntime, f32, i32, u32>;
+
+        fn primitive<const D: usize>(tensor: Tensor<TestBackend, D>) -> CubeTensor<WgpuRuntime> {
+            match tensor.into_primitive() {
+                TensorPrimitive::Float(tensor) => tensor,
+                TensorPrimitive::QFloat(_) => panic!("benchmark tensor unexpectedly quantized"),
+            }
+        }
+
+        const BATCH: usize = 1;
+        const CHANNELS: usize = 512;
+        const SPATIAL: usize = 64;
+        const KERNEL: usize = 3;
+        const ATTEMPTS: usize = 3;
+        let device = WgpuDevice::DefaultDevice;
+        let input = primitive(Tensor::<TestBackend, 4>::ones(
+            [BATCH, CHANNELS, SPATIAL, SPATIAL],
+            &device,
+        ));
+        let weight_scale = 1.0 / (CHANNELS * KERNEL * KERNEL) as f32;
+        let weight = primitive(Tensor::<TestBackend, 4>::from_data(
+            TensorData::new(
+                vec![half::f16::from_f32(weight_scale); CHANNELS * CHANNELS * KERNEL * KERNEL],
+                [CHANNELS, CHANNELS, KERNEL, KERNEL],
+            ),
+            (&device, DType::F16),
+        ));
+        let options = ConvOptions::new([1, 1], [1, 1], [1, 1], 1);
+
+        let warm = packed_f16_conv2d(input.clone(), weight.clone(), None, options.clone());
+        TestBackend::sync(&device).unwrap();
+        drop(warm);
+
+        let mut fastest = std::time::Duration::MAX;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            let started = Instant::now();
+            let output = packed_f16_conv2d(input.clone(), weight.clone(), None, options.clone());
+            TestBackend::sync(&device).unwrap();
+            fastest = fastest.min(started.elapsed());
+            last = Some(output);
+        }
+        let operations = 2.0
+            * BATCH as f64
+            * CHANNELS as f64
+            * SPATIAL as f64
+            * SPATIAL as f64
+            * CHANNELS as f64
+            * KERNEL as f64
+            * KERNEL as f64;
+        let throughput_tflops = operations / fastest.as_secs_f64() / 1.0e12;
+        eprintln!(
+            "packed-F16 compatibility conv2d {CHANNELS}x{CHANNELS}x{KERNEL}x{KERNEL} at {SPATIAL}x{SPATIAL}: {:.3} ms, {:.3} TFLOP/s",
+            fastest.as_secs_f64() * 1_000.0,
+            throughput_tflops
+        );
+        assert!(throughput_tflops.is_finite() && throughput_tflops > 0.0);
+
+        let output = Tensor::<TestBackend, 4>::from_primitive(TensorPrimitive::Float(
+            last.expect("at least one timing attempt"),
+        ));
+        let sample = output
+            .slice([
+                0..1,
+                0..1,
+                SPATIAL / 2..SPATIAL / 2 + 1,
+                SPATIAL / 2..SPATIAL / 2 + 1,
+            ])
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!((sample - 1.0).abs() <= 0.002, "unexpected sample {sample}");
+    }
 }

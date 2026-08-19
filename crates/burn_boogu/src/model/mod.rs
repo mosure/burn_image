@@ -16,7 +16,9 @@ mod norm;
 pub mod packed_f16;
 mod streaming;
 
-pub use attention::{DoubleStreamAttention, GqaAttention};
+pub use attention::{
+    DoubleStreamAttention, GqaAttention, PORTABLE_ATTENTION_MINIMUM_IMAGE_QUERY_PARTITIONS,
+};
 pub use block::{DoubleStreamBlock, SingleStreamBlock};
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub(crate) use denoiser::BooguRoPeGeometry;

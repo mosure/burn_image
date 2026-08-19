@@ -1494,6 +1494,9 @@ fn load_native_runtime(
             burn_boogu::artifacts::BooguFloatLoadPolicy::AdaptToF32 => {
                 FluxVaeArtifactFloatPolicy::AdaptToF32
             }
+            burn_boogu::artifacts::BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
+                FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+            }
         };
         let vae = VerifiedBurnpackFluxVaeStageSource::<
             NativeBackend,

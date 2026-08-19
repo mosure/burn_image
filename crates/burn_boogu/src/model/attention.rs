@@ -26,6 +26,26 @@ use super::native_flash::{
 
 /// Bounds every fallback score tensor while retaining the complete key/value context.
 const DEFAULT_QUERY_CHUNK_SIZE: usize = 128;
+/// Minimum query partitions retained by portable attention for sequences longer than 128 rows.
+pub const PORTABLE_ATTENTION_MINIMUM_IMAGE_QUERY_PARTITIONS: usize = 4;
+
+/// Cap a requested portable-attention tile so an image-scale query never becomes dense.
+///
+/// The short instruction refiners are intentionally exempt: their released sequence is only 45
+/// rows, so splitting them adds submissions without providing a meaningful memory bound. Above
+/// the default 128-row tile, every query is divided into at least four partitions. This lets the
+/// browser amortize WebGPU dispatch overhead with a large requested tile while preserving the
+/// production ban on a full image-sequence-squared score tensor at smaller output sizes.
+fn effective_portable_query_chunk_size(query_len: usize, requested: usize) -> usize {
+    assert!(requested > 0, "attention query chunk must be non-zero");
+    assert!(query_len > 0, "attention query sequence must be non-empty");
+    if query_len <= DEFAULT_QUERY_CHUNK_SIZE {
+        return requested.min(query_len);
+    }
+
+    let image_scale_cap = query_len.div_ceil(PORTABLE_ATTENTION_MINIMUM_IMAGE_QUERY_PARTITIONS);
+    requested.min(image_scale_cap.max(DEFAULT_QUERY_CHUNK_SIZE))
+}
 
 pub(crate) trait AttentionKernel<B: Backend> {
     /// Whether dual-stream attention should apply its final shared token-wise projection to each
@@ -839,6 +859,7 @@ fn query_chunked_attention<B: Backend>(
     assert_eq!(key_head_dim, head_dim, "attention query/key width mismatch");
     assert_eq!(value_len, key_len, "attention key/value length mismatch");
 
+    let query_chunk_size = effective_portable_query_chunk_size(query_len, query_chunk_size);
     let mut outputs = Vec::with_capacity(query_len.div_ceil(query_chunk_size));
     for start in (0..query_len).step_by(query_chunk_size) {
         let end = start.saturating_add(query_chunk_size).min(query_len);
@@ -952,6 +973,17 @@ mod tests {
         assert_eq!(output.dims(), [1, 2, 5, 3]);
         assert_eq!(output.dtype(), DType::F32);
         assert!(output.is_finite().all().into_scalar());
+    }
+
+    #[test]
+    fn portable_query_chunk_keeps_image_attention_partitioned_correctness() {
+        assert_eq!(effective_portable_query_chunk_size(45, 1_024), 45);
+        assert_eq!(effective_portable_query_chunk_size(129, 1_024), 128);
+        assert_eq!(effective_portable_query_chunk_size(1_024, 1_024), 256);
+        assert_eq!(effective_portable_query_chunk_size(2_304, 1_024), 576);
+        assert_eq!(effective_portable_query_chunk_size(4_096, 1_024), 1_024);
+        assert_eq!(effective_portable_query_chunk_size(4_141, 1_024), 1_024);
+        assert_eq!(effective_portable_query_chunk_size(9_261, 1_024), 1_024);
     }
 
     #[test]

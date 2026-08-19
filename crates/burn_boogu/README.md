@@ -134,13 +134,22 @@ inner full-chain and memory gates but the stale host-key contract left the outer
 corrected source-bound canonical rerun now passes the exact no-surface numerical/memory gate; it did
 not capture a backend kernel trace, so no on-device quantized-execution claim is made.
 
-Ordinary browser Turbo does not runtime-quantize. Its
+Low-VRAM browser Turbo does not runtime-quantize. Its
 `VerifiedAsyncPackedF16DenoiserStageSource` authenticates the canonical F16 denoiser objects, pads
 them for aligned device views, and retains packed U32 arenas. Each semantic stage is widened on
 device to an exact dense-F32 module, executed with dense-F32 matmul, and released before the next
 stage. The request-scoped packed cache is cleared before VAE decode and rehydrated before the next
 request. The retired Turbo Q8 selectors remain fail-closed; their historical evidence does not
 qualify packed-F16 execution.
+
+The browser `resident` policy instead keeps Qwen, Boogu, and VAE matrix/embedding/convolution
+weights in packed F16 device buffers. CubeCL compatibility kernels unpack halves with integer
+operations at point of use and accumulate F32 without `shader-f16`; no full semantic stage is
+widened. The qualified Turbo footprint is 35,110,256,204 resident parameter bytes plus bounded
+activations, with zero artifact traffic during inference. Browser portable attention requests
+q1024 but caps every image-scale query to at least four partitions. The source-bound 1024 run
+reduced four-step DMD from 338.956 s to 32.302 s, kept the output PNG byte-identical, and completed
+the request in 37.676 s.
 
 ## Residency policies
 

@@ -7,7 +7,11 @@ members = [
   "crates/burn_boogu",
   "crates/bevy_image",
 ]
-exclude = ["patches/wgpu-29.0.4", "patches/cubecl-wgpu-0.10.0"]
+exclude = [
+  "patches/wgpu-29.0.4",
+  "patches/cubecl-wgpu-0.10.0",
+  "patches/burn-cubecl-0.21.0",
+]
 
 [workspace.package]
 version = "0.1.1"
@@ -64,6 +68,10 @@ web-sys = "0.3"
 wgpu = "=29.0.4"
 
 [patch.crates-io]
+# The browser backend keeps authenticated F16 model weights in their original two-byte storage
+# and widens values only inside fused F32-accumulating linear, embedding, and convolution kernels.
+# This avoids both the optional WebGPU `shader-f16` feature and whole-stage F32 materialization.
+burn-cubecl = { path = "patches/burn-cubecl-0.21.0" }
 # Chrome/Dawn may route large WebGPU writeBuffer calls through an unstable shared-memory transport.
 # The vendored WebGPU backend splits browser uploads into bounded JS calls.
 wgpu = { path = "patches/wgpu-29.0.4" }

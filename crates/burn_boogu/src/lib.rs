@@ -49,8 +49,9 @@ pub use model::{
     AsyncBooguDenoiserStageSource, AsyncRetainingDenoiserSynchronizationPolicy, BooguDenoiser,
     BooguDenoiserInput, BooguDenoiserPrelude, BooguDenoiserTail,
     BooguQuantizedLinearExecutionPolicy, BooguStreamState, DenoiserRmsNormPolicy,
-    DenoiserStageObserver, DoubleStreamBlock, RetainingAsyncBooguDenoiserStageSource,
-    SingleStreamBlock, StreamingBooguDenoiser, StreamingStageSource,
+    DenoiserStageObserver, DoubleStreamBlock, PORTABLE_ATTENTION_MINIMUM_IMAGE_QUERY_PARTITIONS,
+    RetainingAsyncBooguDenoiserStageSource, SingleStreamBlock, StreamingBooguDenoiser,
+    StreamingStageSource,
 };
 #[cfg(feature = "wgpu")]
 pub use model::{

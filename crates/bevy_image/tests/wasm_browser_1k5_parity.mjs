@@ -2,8 +2,8 @@
 // crates/bevy_image/www/out first, then run with BURN_IMAGE_BROWSER_1K5_PARITY=1.
 // The release gate requires BURN_IMAGE_BROWSER_1K5_RESIDENCY=low-vram. The optional non-blocking
 // F32 control diagnostic uses BURN_IMAGE_BROWSER_1K5_RESIDENCY=qualification-f32; it does not
-// replace the required low-VRAM numerical or memory gate. The former high-vram value remains an
-// input-only alias; F32-control reports serialize the truthful per-request denoiser-retained policy.
+// replace the required low-VRAM numerical or memory gate. The resident-packed-f16 selector
+// independently qualifies all-stage two-byte weight residency and fused F32 accumulation.
 // Set BURN_IMAGE_BROWSER_1K5_VAE_REFERENCE=1 instead for the diagnostic-only compact-fixture
 // three-repeat VAE encoder probe; the two workload selectors are mutually exclusive.
 // Set BURN_IMAGE_BROWSER_1K5_PARITY_VALIDATE_ONLY=1 to test only the mounted files,
@@ -47,6 +47,7 @@ import {
   BROWSER_1K5_CHROME_SHARED_MEMORY_MIN_HEADROOM_BYTES,
   BROWSER_1K5_F32_QUALIFICATION_DENOISER_RESIDENCY,
   BROWSER_1K5_LOW_VRAM_DENOISER_RESIDENCY,
+  BROWSER_1K5_PACKED_F16_DENOISER_RESIDENCY,
   BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES,
   attestBrowser1k5RuntimeAdapter,
   browser1k5ChromeLaunchEvidence,
@@ -95,20 +96,20 @@ if (vaeReferenceMode === fullParityMode) {
   throw new Error(`${ENABLE_ENV} and ${VAE_REFERENCE_ENV} are mutually exclusive`);
 }
 const requestedResidencySelector = process.env[RESIDENCY_ENV];
-const residencySelector =
-  requestedResidencySelector === "high-vram" ? "qualification-f32" : requestedResidencySelector;
+const residencySelector = requestedResidencySelector;
 if (vaeReferenceMode && requestedResidencySelector !== undefined) {
   throw new Error(`${RESIDENCY_ENV} is valid only with ${ENABLE_ENV}=1`);
 }
-if (fullParityMode && !["qualification-f32", "low-vram"].includes(residencySelector)) {
+if (
+  fullParityMode &&
+  !["qualification-f32", "low-vram", "resident-packed-f16"].includes(residencySelector)
+) {
   throw new Error(
-    `${ENABLE_ENV}=1 requires ${RESIDENCY_ENV}=qualification-f32 or ${RESIDENCY_ENV}=low-vram`,
+    `${ENABLE_ENV}=1 requires ${RESIDENCY_ENV}=qualification-f32, ${RESIDENCY_ENV}=low-vram, or ${RESIDENCY_ENV}=resident-packed-f16`,
   );
 }
-if (fullParityMode && requestedResidencySelector === "high-vram") {
-  console.warn(`${RESIDENCY_ENV}=high-vram is a legacy alias for qualification-f32`);
-}
 const lowVramMode = fullParityMode && residencySelector === "low-vram";
+const packedResidentMode = fullParityMode && residencySelector === "resident-packed-f16";
 const WORKLOAD_NAME = vaeReferenceMode ? "vae-reference" : "parity";
 const WORKLOAD_TEST = vaeReferenceMode
   ? "burn_image_browser_1k5_vae_reference"
@@ -144,11 +145,28 @@ const BROWSER_1K5_VAE_DECODE_POLICY = "exact-two-width-slabs-global-groupnorm";
 const BROWSER_1K5_DENOISER_QUERY_CHUNK_SIZE = 1_024;
 const BROWSER_F32_QUALIFICATION_RESIDENCY_POLICY =
   "browser-qualification-per-request-f32-denoiser-retained";
+const BROWSER_PACKED_F16_RESIDENCY_POLICY = "browser-high-vram-resident-packed-f16";
 const BROWSER_LOW_VRAM_RESIDENCY_POLICY = "browser-low-vram-runtime-q8-denoiser";
 const BROWSER_LOW_VRAM_WEIGHT_TRAFFIC_CONTRACT =
   "per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4";
 const BROWSER_F32_QUALIFICATION_WEIGHT_TRAFFIC_CONTRACT =
   "qualification-per-request/qwen+vae+denoiser-first-dmd-step/denoiser-cache-hits-steps-2-through-4";
+const BROWSER_PACKED_F16_WEIGHT_TRAFFIC_CONTRACT =
+  "eager-preload/qwen+vae+denoiser/resident-f16-weights/fused-f32-accumulate/zero-inference-artifact-transfers/zero-full-stage-widening";
+const BROWSER_PACKED_F16_LOAD_POLICY = "packed-f16-weights-f32-auxiliaries";
+const BROWSER_PACKED_F16_STORAGE_POLICY =
+  "verified-f16-matrix-convolution-buffers/f32-auxiliaries/no-full-stage-widening";
+const BROWSER_PACKED_F16_LINEAR_POLICY =
+  "resident-f16-storage/integer-unpack/fused-f32-accumulate-matmul";
+const BROWSER_1K5_PACKED_F16_RESOURCE_PLAN = Object.freeze({
+  weight_storage_policy: "packed-f16-weights-f32-auxiliaries",
+  stored_weight_bytes: 38_195_437_952,
+  packed_f16_weight_bytes: 34_640_380_224,
+  f32_auxiliary_weight_bytes: 2_314_599_372,
+  resident_weight_bytes: 36_954_979_596,
+  activation_reserve_bytes: 8_297_840_640,
+  conservative_planned_device_bytes: 45_252_820_236,
+});
 const BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT = 48;
 const BROWSER_1K5_QWEN_ALIGNED_STAGE_COUNT = 70;
 const BROWSER_1K5_DENOISER_BOUNDARY_COUNT = 236;
@@ -595,15 +613,25 @@ function createWorkloadTelemetry(denoiserResidencyPolicy) {
           failures.push(`parity milestone ${name} was not observed exactly once`);
         }
       }
+      const packedResident =
+        denoiserResidencyPolicy === BROWSER_1K5_PACKED_F16_DENOISER_RESIDENCY;
+      const preload = denoiserCounters("pre-parity");
       const step0 = denoiserCounters("dmd-step-0-start");
-      if (step0.successful_get_requests === 0 || step0.response_content_length_bytes === 0) {
+      if (packedResident) {
+        if (preload.successful_get_requests === 0 || preload.response_content_length_bytes === 0) {
+          failures.push("packed-F16 resident preload did not visibly fetch denoiser artifacts");
+        }
+      } else if (
+        step0.successful_get_requests === 0 ||
+        step0.response_content_length_bytes === 0
+      ) {
         failures.push("DMD step 0 did not visibly fetch the resident denoiser artifacts");
       }
-      for (const index of [1, 2, 3]) {
+      for (const index of packedResident ? [0, 1, 2, 3] : [1, 2, 3]) {
         const counters = denoiserCounters(`dmd-step-${index}-start`);
         if (counters.requests !== 0 || counters.response_content_length_bytes !== 0) {
           failures.push(
-            `DMD step ${index} issued ${counters.requests} Boogu denoiser requests totaling ${counters.response_content_length_bytes} response bytes after the first-pass residency boundary`,
+            `DMD step ${index} issued ${counters.requests} Boogu denoiser requests totaling ${counters.response_content_length_bytes} response bytes after the ${packedResident ? "eager-preload" : "first-pass"} residency boundary`,
           );
         }
         const allArtifacts = artifactCounters(`dmd-step-${index}-start`);
@@ -625,8 +653,8 @@ function createWorkloadTelemetry(denoiserResidencyPolicy) {
       }
       return {
         policy: denoiserResidencyPolicy,
-        first_pass: { ...step0 },
-        reused_steps: [1, 2, 3].map((index) => ({
+        first_pass: { ...(packedResident ? preload : step0) },
+        reused_steps: (packedResident ? [0, 1, 2, 3] : [1, 2, 3]).map((index) => ({
           step: index,
           ...denoiserCounters(`dmd-step-${index}-start`),
         })),
@@ -3365,14 +3393,21 @@ function validateCompleteParityReport(report, transportValidation) {
     report.residency_policy,
     lowVramMode
       ? BROWSER_LOW_VRAM_RESIDENCY_POLICY
-      : BROWSER_F32_QUALIFICATION_RESIDENCY_POLICY,
+      : packedResidentMode
+        ? BROWSER_PACKED_F16_RESIDENCY_POLICY
+        : BROWSER_F32_QUALIFICATION_RESIDENCY_POLICY,
   );
   for (const field of [
     "qwen_float_load_policy",
     "vae_float_load_policy",
     "denoiser_float_load_policy",
   ]) {
-    expectReportEqual(failures, field, report[field], "adapt-to-f32");
+    expectReportEqual(
+      failures,
+      field,
+      report[field],
+      packedResidentMode ? BROWSER_PACKED_F16_LOAD_POLICY : "adapt-to-f32",
+    );
   }
   for (const field of ["qwen_execution_dtype", "vae_execution_dtype", "denoiser_execution_dtype"]) {
     expectReportEqual(failures, field, report[field], "f32");
@@ -3389,8 +3424,52 @@ function validateCompleteParityReport(report, transportValidation) {
     report.weight_traffic_contract,
     lowVramMode
       ? BROWSER_LOW_VRAM_WEIGHT_TRAFFIC_CONTRACT
-      : BROWSER_F32_QUALIFICATION_WEIGHT_TRAFFIC_CONTRACT,
+      : packedResidentMode
+        ? BROWSER_PACKED_F16_WEIGHT_TRAFFIC_CONTRACT
+        : BROWSER_F32_QUALIFICATION_WEIGHT_TRAFFIC_CONTRACT,
   );
+  if (packedResidentMode) {
+    expectReportEqual(
+      failures,
+      "denoiser_storage_policy",
+      report.denoiser_storage_policy,
+      BROWSER_PACKED_F16_STORAGE_POLICY,
+    );
+    expectReportEqual(
+      failures,
+      "denoiser_linear_execution_policy",
+      report.denoiser_linear_execution_policy,
+      BROWSER_PACKED_F16_LINEAR_POLICY,
+    );
+    const plan = report.resident_resource_plan ?? {};
+    for (const [field, expected] of Object.entries(BROWSER_1K5_PACKED_F16_RESOURCE_PLAN)) {
+      expectReportEqual(failures, `resident_resource_plan.${field}`, plan[field], expected);
+    }
+    for (const field of Object.keys(plan)) {
+      if (!(field in BROWSER_1K5_PACKED_F16_RESOURCE_PLAN)) {
+        failures.push(`resident_resource_plan.${field} is unexpected`);
+      }
+    }
+    if (
+      plan.packed_f16_weight_bytes + plan.f32_auxiliary_weight_bytes !==
+      plan.resident_weight_bytes
+    ) {
+      failures.push("resident_resource_plan weight bytes do not sum exactly");
+    }
+    if (
+      plan.resident_weight_bytes + plan.activation_reserve_bytes !==
+      plan.conservative_planned_device_bytes
+    ) {
+      failures.push("resident_resource_plan conservative bytes do not sum exactly");
+    }
+  } else {
+    expectReportEqual(
+      failures,
+      "resident_resource_plan",
+      report.resident_resource_plan ?? null,
+      null,
+    );
+  }
   expectReportEqual(
     failures,
     "on_device_quantized_execution_claimed",
@@ -3480,6 +3559,8 @@ function validateCompleteParityReport(report, transportValidation) {
     report.denoiser_residency,
     lowVramMode
       ? BROWSER_1K5_LOW_VRAM_DENOISER_RESIDENCY
+      : packedResidentMode
+        ? BROWSER_1K5_PACKED_F16_DENOISER_RESIDENCY
       : BROWSER_1K5_F32_QUALIFICATION_DENOISER_RESIDENCY,
   );
   expectReportEqual(
@@ -4197,7 +4278,13 @@ async function main() {
       variant: "edit-turbo-1k5",
       profile: "production",
       ...(fullParityMode
-        ? { residency: lowVramMode ? "low-vram" : "qualification-f32" }
+        ? {
+            residency: lowVramMode
+              ? "low-vram"
+              : packedResidentMode
+                ? "resident"
+                : "qualification-f32",
+          }
         : {}),
       artifacts: `${baseUrl}/artifacts`,
       fixture: `${baseUrl}/fixture`,
@@ -4230,7 +4317,9 @@ async function main() {
         ? "real VAE encoder diagnostic"
         : lowVramMode
           ? "low-VRAM runtime-Q8 denoiser policy"
-          : "F32 qualification retained-denoiser policy",
+          : packedResidentMode
+            ? "all-stage packed-F16 resident policy"
+            : "F32 qualification retained-denoiser policy",
       lowVramMode ? BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES : null,
     );
     const navigation = await cdp.call("Page.navigate", { url: harnessUrl });

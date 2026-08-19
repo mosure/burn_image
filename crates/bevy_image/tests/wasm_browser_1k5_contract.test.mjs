@@ -60,6 +60,7 @@ const harnessScriptPath = join(testsDir, "wasm_browser_1k5_parity.mjs");
 const LOW_VRAM_POLICY = "request-scoped-runtime-q8-policy-retained-through-four-dmd-steps";
 const QUALIFICATION_F32_POLICY =
   "request-scoped-f32-policy-retained-through-four-dmd-steps";
+const PACKED_F16_POLICY = "all-stages-preloaded-packed-f16-fused-f32-accumulate";
 
 function admittedSharedMemoryMeasurement({
   availableBytes = BROWSER_1K5_CHROME_SHARED_MEMORY_MIN_HEADROOM_BYTES,
@@ -175,12 +176,20 @@ test("selects and exactly validates the denoiser residency policy for each mode"
     denoiserResidencyPolicyForMode("qualification-f32"),
     QUALIFICATION_F32_POLICY,
   );
+  assert.equal(
+    denoiserResidencyPolicyForMode("resident-packed-f16"),
+    PACKED_F16_POLICY,
+  );
   assert.deepEqual(
     validateDenoiserResidencyPolicy({ policy: LOW_VRAM_POLICY }, "low-vram"),
     [],
   );
   assert.deepEqual(
     validateDenoiserResidencyPolicy({ policy: QUALIFICATION_F32_POLICY }, "qualification-f32"),
+    [],
+  );
+  assert.deepEqual(
+    validateDenoiserResidencyPolicy({ policy: PACKED_F16_POLICY }, "resident-packed-f16"),
     [],
   );
   assert.notDeepEqual(

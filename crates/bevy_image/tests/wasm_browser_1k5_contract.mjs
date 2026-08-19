@@ -13,6 +13,8 @@ export const BROWSER_1K5_F32_QUALIFICATION_DENOISER_RESIDENCY =
   "request-scoped-f32-policy-retained-through-four-dmd-steps";
 export const BROWSER_1K5_LOW_VRAM_DENOISER_RESIDENCY =
   "request-scoped-runtime-q8-policy-retained-through-four-dmd-steps";
+export const BROWSER_1K5_PACKED_F16_DENOISER_RESIDENCY =
+  "all-stages-preloaded-packed-f16-fused-f32-accumulate";
 export const BROWSER_1K5_LOW_VRAM_STRICT_DEVICE_CAP_BYTES = 32_000_000_000;
 export const BROWSER_1K5_LOW_VRAM_RESOURCE_PLAN = Object.freeze({
   audited_retained_q8_denoiser_bytes: 12_590_785_792,
@@ -148,6 +150,9 @@ export function denoiserResidencyPolicyForMode(residencyMode) {
   }
   if (residencyMode === "qualification-f32") {
     return BROWSER_1K5_F32_QUALIFICATION_DENOISER_RESIDENCY;
+  }
+  if (residencyMode === "resident-packed-f16") {
+    return BROWSER_1K5_PACKED_F16_DENOISER_RESIDENCY;
   }
   throw new Error(`unsupported 1.5K browser residency mode ${JSON.stringify(residencyMode)}`);
 }

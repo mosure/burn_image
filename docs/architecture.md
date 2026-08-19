@@ -92,11 +92,14 @@ high-VRAM and browser paths do not inherit them. The output remained byte-identi
 allocator change. The separate native layer-streamed diagnostic accepts only an explicit local
 bundle and additionally rereads denoiser stages per step.
 
-The explicit browser high-VRAM policy follows the same ready-state boundary with dense-F32 WebGPU modules.
-Async preload fetches, verifies, and uploads one bounded semantic object at a time, releases its
-Wasm payload, and retains the initialized module. After every required Qwen, VAE, and denoiser stage
-is present and synchronized, inference has zero repeated model-weight transport or host-to-device
-upload. It is an advanced unqualified mode rather than the browser default.
+The explicit browser high-VRAM policy follows the same ready-state boundary with packed-F16 WebGPU
+weights and F32 accumulation. Async preload fetches, verifies, and uploads one bounded semantic
+object at a time, releases its Wasm payload, and retains the initialized module. Matrix, embedding,
+and convolution kernels unpack F16 values at point of use, so no full semantic stage is widened.
+After every required Qwen, VAE, and denoiser stage is present and synchronized, inference has zero
+repeated model-weight transport or host-to-device upload. Portable denoiser attention requests
+q1024 while an adaptive four-partition minimum prevents dense image-sequence-squared score tensors
+at smaller output sizes.
 
 The default browser `low-vram` policy leaves the canonical mixed-F16 artifact unchanged and is
 variant-aware. Edit streams Qwen and selected VAE objects and retains an inventory-qualified
@@ -188,10 +191,12 @@ encoding; it does not execute model layers.
 
 The historical Q8 work retained the useful packed-weight/direct-quantized-matmul design constraint
 demonstrated by the
-[Voxtral Mini realtime GGUF runtime](https://github.com/TrevorS/voxtral-mini-realtime-rs). Ordinary
-Turbo now deliberately uses a different contract: compact F16 storage is widened only one semantic
-stage at a time for dense-F32 execution. Q4 remains disabled without image-quality and kernel-trace
-qualification of its own.
+[Voxtral Mini realtime GGUF runtime](https://github.com/TrevorS/voxtral-mini-realtime-rs). Low-VRAM
+Turbo deliberately uses a different contract: compact F16 storage is widened only one semantic
+stage at a time for dense-F32 execution. High-VRAM browser `resident` keeps F16 matrix, embedding,
+and convolution buffers resident and uses integer-unpack/F32-accumulate CubeCL kernels, removing
+the full-stage widening copy without requiring `shader-f16`. Q4 remains disabled without image-
+quality and kernel-trace qualification of its own.
 
 Native WGPU and browser WebGPU use the same Burn modules. Qwen attention currently expands grouped
 key/value heads with Burn tensor operations, then evaluates explicit F32 score matmuls and softmax

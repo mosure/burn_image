@@ -14,6 +14,12 @@ const STORAGE: &str = include_str!("../patches/cubecl-wgpu-0.10.0/src/compute/st
 const STORAGE_RELEASE: &str =
     include_str!("../patches/cubecl-wgpu-0.10.0/src/compute/storage_release.rs");
 const SERVER: &str = include_str!("../patches/cubecl-wgpu-0.10.0/src/compute/server.rs");
+const BURN_CUBECL_PACKED_F16: &str =
+    include_str!("../patches/burn-cubecl-0.21.0/src/kernel/packed_f16.rs");
+const BURN_CUBECL_TENSOR_OPS: &str =
+    include_str!("../patches/burn-cubecl-0.21.0/src/ops/tensor.rs");
+const BURN_CUBECL_MODULE_OPS: &str =
+    include_str!("../patches/burn-cubecl-0.21.0/src/ops/module.rs");
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -374,4 +380,57 @@ fn pipeline_invalidation_precedes_cache_lookup_correctness() {
 
     assert!(invalidation < clear);
     assert!(clear < lookup);
+}
+
+#[test]
+fn packed_f16_compatibility_kernels_never_require_shader_f16_correctness() {
+    let compatibility = section(
+        BURN_CUBECL_PACKED_F16,
+        "pub fn requires_packed_f16_compatibility",
+        "#[cube]\nfn widen_f16_bits_to_f32",
+    );
+    assert!(compatibility.contains("tensor.dtype == DType::F16"));
+    assert!(compatibility.contains("!tensor"));
+    assert!(compatibility.contains("supports_type(ElemType::Float(FloatKind::F16))"));
+
+    assert!(BURN_CUBECL_PACKED_F16.contains("packed: &Tensor<u32>"));
+    assert!(BURN_CUBECL_PACKED_F16.contains("fn load_packed_f16"));
+    assert!(BURN_CUBECL_PACKED_F16.contains("fn widen_f16_bits_to_f32"));
+    assert!(BURN_CUBECL_PACKED_F16.contains("output: &mut Tensor<f32>"));
+    assert!(
+        BURN_CUBECL_PACKED_F16
+            .contains("sums[row_lane * OUTPUT_COLUMNS_PER_UNIT + column_lane] +=")
+    );
+    assert!(BURN_CUBECL_PACKED_F16.contains("sums[column_lane] +="));
+    assert!(!BURN_CUBECL_PACKED_F16.contains("FloatKind::F16) {"));
+    assert!(!BURN_CUBECL_PACKED_F16.contains("convert_dtype(DType::F32)"));
+}
+
+#[test]
+fn packed_f16_dispatch_covers_linear_embedding_and_convolution_correctness() {
+    let matmul = section(
+        BURN_CUBECL_TENSOR_OPS,
+        "    fn float_matmul(",
+        "    fn float_cross(",
+    );
+    assert!(matmul.contains("lhs.dtype == DType::F32"));
+    assert!(matmul.contains("requires_packed_f16_compatibility(&rhs)"));
+    assert!(matmul.contains("return packed_f16_rhs_matmul(lhs, rhs);"));
+
+    let select = section(
+        BURN_CUBECL_TENSOR_OPS,
+        "    fn float_select(",
+        "    fn float_select_add(",
+    );
+    assert!(select.contains("requires_packed_f16_compatibility(&tensor)"));
+    assert!(select.contains("return packed_f16_select_rows(tensor, dim, indices);"));
+
+    let conv2d = section(
+        BURN_CUBECL_MODULE_OPS,
+        "    fn conv2d(",
+        "    fn conv2d_x_backward(",
+    );
+    assert!(conv2d.contains("x.dtype == burn_backend::DType::F32"));
+    assert!(conv2d.contains("requires_packed_f16_compatibility(&weight)"));
+    assert!(conv2d.contains("return packed_f16_conv2d(x, weight, bias, options);"));
 }

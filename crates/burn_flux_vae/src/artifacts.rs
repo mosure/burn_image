@@ -90,6 +90,9 @@ pub enum FluxVaeArtifactFloatPolicy {
     /// Apply one bounded stage at a time as F32, matching FLUX `force_upcast` behavior.
     #[default]
     AdaptToF32,
+    /// Keep rank-two linear and rank-four convolution weights in F16 storage while widening
+    /// biases, normalization parameters, and every activation-facing auxiliary parameter.
+    PackedF16WeightsF32Auxiliaries,
 }
 
 #[derive(Debug, Error)]
@@ -832,17 +835,27 @@ fn validate_apply(
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Float32Adapter;
+struct FloatAdapter(FluxVaeArtifactFloatPolicy);
 
-impl ModuleAdapter for Float32Adapter {
+impl ModuleAdapter for FloatAdapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
         if snapshot.dtype != DType::F16 {
             return snapshot.clone();
         }
+        let output_dtype = match self.0 {
+            FluxVaeArtifactFloatPolicy::Preserve => return snapshot.clone(),
+            FluxVaeArtifactFloatPolicy::AdaptToF32 => DType::F32,
+            FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+                if matches!(snapshot.shape.len(), 2 | 4) =>
+            {
+                return snapshot.clone();
+            }
+            FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries => DType::F32,
+        };
         let data = snapshot.clone_data_fn();
         TensorSnapshot::from_closure(
-            Rc::new(move || Ok(data()?.convert_dtype(DType::F32))),
-            DType::F32,
+            Rc::new(move || Ok(data()?.convert_dtype(output_dtype))),
+            output_dtype,
             snapshot.shape.clone(),
             snapshot.path_stack.clone().unwrap_or_default(),
             snapshot.container_stack.clone().unwrap_or_default(),
@@ -856,16 +869,18 @@ impl ModuleAdapter for Float32Adapter {
 }
 
 fn load_adapter(policy: FluxVaeArtifactFloatPolicy) -> Option<Box<dyn ModuleAdapter>> {
-    (policy == FluxVaeArtifactFloatPolicy::AdaptToF32)
-        .then(|| Box::new(Float32Adapter) as Box<dyn ModuleAdapter>)
+    (policy != FluxVaeArtifactFloatPolicy::Preserve)
+        .then(|| Box::new(FloatAdapter(policy)) as Box<dyn ModuleAdapter>)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::{module::ParamId, tensor::TensorData};
     use burn_image::{
         ArtifactBundleId, ArtifactPath, ArtifactProfileId, ModelId, NumericFormat, Sha256Digest,
     };
+    use burn_store::TensorSnapshot;
 
     fn identity_manifest() -> ArtifactManifest {
         ArtifactManifest {
@@ -916,6 +931,24 @@ mod tests {
         let decoder = inventory.tensors.len() - encoder;
         assert_eq!(encoder, 106);
         assert_eq!(decoder, 138);
+    }
+
+    #[test]
+    fn packed_f16_adapter_retains_linear_and_conv_weights_correctness() {
+        let adapter = FloatAdapter(FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries);
+        let snapshot = |shape: Vec<usize>| {
+            let elements = shape.iter().product();
+            TensorSnapshot::from_data(
+                TensorData::new(vec![0.25_f32; elements], shape).convert_dtype(DType::F16),
+                vec!["weight".into()],
+                Vec::new(),
+                ParamId::new(),
+            )
+        };
+
+        assert_eq!(adapter.adapt(&snapshot(vec![2, 4])).dtype, DType::F16);
+        assert_eq!(adapter.adapt(&snapshot(vec![2, 2, 3, 3])).dtype, DType::F16);
+        assert_eq!(adapter.adapt(&snapshot(vec![4])).dtype, DType::F32);
     }
 
     #[test]

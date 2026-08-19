@@ -1006,6 +1006,9 @@ where
             "denoiser_float_load_policy": match denoiser_policy {
                 BooguFloatLoadPolicy::Preserve => "preserve",
                 BooguFloatLoadPolicy::AdaptToF32 => "adapt-to-f32",
+                BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
+                    "packed-f16-weights-f32-auxiliaries"
+                }
             },
             "denoiser_quantized_load_policy": "preserve",
             "denoiser_attention_policy": denoiser_attention_policy,

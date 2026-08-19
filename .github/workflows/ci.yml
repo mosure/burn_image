@@ -147,6 +147,7 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path patches/wgpu-29.0.4/Cargo.toml --all -- --check
           cargo fmt --manifest-path patches/cubecl-wgpu-0.10.0/Cargo.toml --all -- --check
+          cargo fmt --manifest-path patches/burn-cubecl-0.21.0/Cargo.toml --all -- --check
           rustfmt --edition=2024 --check .github/vendor_gpu_patch_contract.rs
           rustfmt --edition=2024 --check .github/release_workflow_contract.rs
       - name: Clippy
@@ -358,6 +359,7 @@ jobs:
 
           assert_local_patch wgpu 29.0.4 patches/wgpu-29.0.4
           assert_local_patch cubecl-wgpu 0.10.0 patches/cubecl-wgpu-0.10.0
+          assert_local_patch burn-cubecl 0.21.0 patches/burn-cubecl-0.21.0
       - name: Enforce browser Direct convolution feature contract
         shell: bash
         run: |

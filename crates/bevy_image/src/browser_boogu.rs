@@ -1,10 +1,13 @@
 //! Concrete browser-local Boogu runtime over verified bounded HTTP Range reads.
 //!
-//! The high-VRAM browser runtime eagerly verifies and materializes every Qwen, VAE, and denoiser
-//! stage once. Low-VRAM execution streams Qwen and VAE stages and retains an inventory-qualified
-//! runtime-Q8 denoiser for Edit releases. Turbo retains an authenticated packed-F16 denoiser and
-//! widens exactly one semantic stage to dense F32 for ordinary execution. No route falls back to
-//! CPU or manufactures placeholder output.
+//! The high-VRAM browser runtime eagerly verifies and retains every active Qwen, VAE, and denoiser
+//! stage once. Its production policy keeps rank-two/rank-four weights packed as F16 and executes
+//! them with compatibility kernels that accumulate in F32 without requiring `shader-f16`; an
+//! explicit diagnostic policy can still materialize dense F32 weights. Low-VRAM execution streams
+//! Qwen and VAE stages and retains an inventory-qualified runtime-Q8 denoiser for Edit releases.
+//! Turbo retains an authenticated packed-F16 denoiser and widens exactly one semantic stage to
+//! dense F32 for ordinary low-VRAM execution. No route falls back to CPU or manufactures
+//! placeholder output.
 
 use std::{
     collections::VecDeque,
@@ -27,11 +30,11 @@ use burn_boogu::{
     VerifiedAsyncPackedF16DenoiserStageSource,
     artifacts::{
         BooguArtifactInventory, BooguDenoiserRuntimeQuantizationPolicy, BooguFloatLoadPolicy,
-        BooguQuantizedLoadPolicy, BooguReleaseIdentity, BooguRuntimeQ8Scope, BooguStorageProfile,
-        TensorOwner, VerifiedAsyncBurnpackDenoiserStageSource,
-        VerifiedAsyncBurnpackQwenStageSource, VerifiedAsyncBurnpackVaeStageSource,
-        artifact_bundle_id_is_compatible, canonical_published_bundle,
-        validate_canonical_release_artifact_digest,
+        BooguPackedF16ResidentFootprint, BooguQuantizedLoadPolicy, BooguReleaseIdentity,
+        BooguRuntimeQ8Scope, BooguStorageProfile, TensorOwner,
+        VerifiedAsyncBurnpackDenoiserStageSource, VerifiedAsyncBurnpackQwenStageSource,
+        VerifiedAsyncBurnpackVaeStageSource, artifact_bundle_id_is_compatible,
+        canonical_published_bundle, validate_canonical_release_artifact_digest,
     },
     boogu_model_descriptor, boogu_processor_config, decode_input_image,
     decoder_output_data_to_host, dmd_prediction, dmd_renoise, encode_reference,
@@ -358,7 +361,10 @@ const MAX_RUNTIME_EVENTS: usize = 256;
 const MAX_EVENTS_PER_POLL: usize = 64;
 const BROWSER_PROGRESS_EVENT_NAME: &str = "burn-image-progress";
 const BROWSER_RUNTIME_EVENT_NAME: &str = "burn-image-runtime";
-const BROWSER_PRODUCTION_DENOISER_QUERY_CHUNK_SIZE: usize = 128;
+// The portable attention implementation caps image-scale sequences to at least four partitions,
+// so q1024 amortizes browser submission overhead without allowing a dense sequence-squared score
+// tensor at smaller output sizes. This matches the already-qualified 1.5K browser request bound.
+const BROWSER_PRODUCTION_DENOISER_QUERY_CHUNK_SIZE: usize = 1_024;
 const BROWSER_1K5_QWEN_QUERY_CHUNK_SIZE: usize = 128;
 const BROWSER_1K5_DENOISER_QUERY_CHUNK_SIZE: usize = 1_024;
 const BROWSER_1K5_VAE_QUERY_CHUNK_SIZE: usize = 4_096;
@@ -416,8 +422,10 @@ type BrowserBuildSlot = Arc<Mutex<Option<Result<BrowserBooguEngine, RuntimeError
 /// Browser model-weight residency contract.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrowserBooguResidencyPolicy {
-    /// Eagerly verify and materialize every model stage, then keep dense-F32 WebGPU handles resident.
+    /// Eagerly retain F16 matrix/convolution weights and execute fused F32-accumulate kernels.
     #[default]
+    HighVramResidentPackedF16,
+    /// Eagerly verify and materialize every model stage, then keep dense-F32 WebGPU handles resident.
     HighVramResidentDenseF32,
     /// Exact-fixture F32 qualification: stream Qwen/VAE per request and retain the denoiser only.
     QualificationPerRequestF32DenoiserRetained,
@@ -439,6 +447,7 @@ impl BrowserBooguResidencyPolicy {
     /// Stable provenance suffix for reports and output metadata.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::HighVramResidentPackedF16 => "browser-high-vram-resident-packed-f16",
             Self::HighVramResidentDenseF32 => "browser-high-vram-resident-dense-f32",
             Self::QualificationPerRequestF32DenoiserRetained => {
                 "browser-qualification-per-request-f32-denoiser-retained"
@@ -457,7 +466,8 @@ impl BrowserBooguResidencyPolicy {
     /// Parse the public browser query selector.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "resident" | "high-vram-resident-dense-f32" => Some(Self::HighVramResidentDenseF32),
+            "resident" | "high-vram-resident-packed-f16" => Some(Self::HighVramResidentPackedF16),
+            "high-vram-resident-dense-f32" => Some(Self::HighVramResidentDenseF32),
             "qualification-f32"
             | "qualification-per-request-f32-denoiser-retained"
             | "browser-qualification-per-request-f32-denoiser-retained" => {
@@ -482,6 +492,13 @@ impl BrowserBooguResidencyPolicy {
             Self::LowVramRuntimeQ8Denoiser
                 | Self::LowVramRetainedQ8DenseF32PerStageDenoiser
                 | Self::LowVramPreloadedPackedF16Denoiser
+        )
+    }
+
+    const fn is_high_vram_resident(self) -> bool {
+        matches!(
+            self,
+            Self::HighVramResidentPackedF16 | Self::HighVramResidentDenseF32
         )
     }
 }
@@ -518,8 +535,11 @@ enum BrowserRuntimeEvent {
         weight_bytes: u64,
     },
     ResidentResourcePlan {
+        weight_storage_policy: &'static str,
         stored_weight_bytes: u64,
-        conservative_f32_weight_bytes: u64,
+        packed_f16_weight_bytes: u64,
+        f32_auxiliary_weight_bytes: u64,
+        resident_weight_bytes: u64,
         activation_reserve_bytes: u64,
         conservative_planned_device_bytes: u64,
     },
@@ -711,12 +731,22 @@ impl From<BrowserArtifactTrafficSnapshot> for BrowserArtifactTrafficReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BrowserResidentResourcePlan {
-    stored_weight_bytes: u64,
-    conservative_f32_weight_bytes: u64,
-    activation_reserve_bytes: u64,
-    conservative_planned_device_bytes: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct BrowserResidentResourcePlan {
+    /// Exact storage policy admitted by the browser runtime.
+    pub weight_storage_policy: &'static str,
+    /// Exact active logical artifact weight bytes before dtype adaptation.
+    pub stored_weight_bytes: u64,
+    /// Exact active parameter bytes retained in packed F16 buffers.
+    pub packed_f16_weight_bytes: u64,
+    /// Exact active parameter bytes retained as F32 auxiliaries.
+    pub f32_auxiliary_weight_bytes: u64,
+    /// Sum of packed F16 weights and F32 auxiliaries resident on the device.
+    pub resident_weight_bytes: u64,
+    /// Conservative shape-aware activation/workspace reserve.
+    pub activation_reserve_bytes: u64,
+    /// Resident weights plus the conservative activation reserve.
+    pub conservative_planned_device_bytes: u64,
 }
 
 fn browser_low_vram_resource_plan_event(
@@ -2108,11 +2138,18 @@ fn max_inventory_stage_f32_bytes(
         .ok_or_else(|| execution_error(variant, "browser F32 stage plan is empty"))
 }
 
-const BROWSER_RESIDENT_MAX_SIMULTANEOUS_ACTIVATION_BUFFERS: u64 = 8;
+// The source-bound Turbo 1024 browser run peaked at 42,345,693,184 framebuffer bytes during
+// VAE/output transition while retaining 35,110,256,204 bytes of packed parameters. Twenty maximum
+// applied-buffer slots cover that measured non-weight residency with two slots of guard headroom;
+// eight slots did not, so the old plan was not conservative despite execution succeeding.
+const BROWSER_RESIDENT_MAX_SIMULTANEOUS_ACTIVATION_BUFFERS: u64 = 20;
 
 fn validate_browser_resident_resource_plan(
     variant: BooguVariant,
     manifest: &ArtifactManifest,
+    inventory: &BooguArtifactInventory,
+    profile: BooguStorageProfile,
+    float_policy: BooguFloatLoadPolicy,
 ) -> Result<BrowserResidentResourcePlan, RuntimeError> {
     let stored_weight_bytes = manifest
         .files
@@ -2132,34 +2169,81 @@ fn validate_browser_resident_resource_plan(
             "resident browser resource plan contains no model weights",
         ));
     }
-    // The production bundle mixes F16 and F32 storage. Doubling the complete logical Burnpack
-    // weight payload is a conservative bound for dense-F32 materialization, including headers and
-    // alignment. Activation residency is reported separately from the shape-aware single-buffer
-    // gate; eight simultaneous maximum model buffers remain a conservative fused-workset reserve.
-    let conservative_f32_weight_bytes = stored_weight_bytes.checked_mul(2).ok_or_else(|| {
-        execution_error(variant, "resident browser F32 weight-byte plan overflowed")
-    })?;
+    let (weight_storage_policy, footprint) = match float_policy {
+        BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => (
+            "packed-f16-weights-f32-auxiliaries",
+            inventory
+                .packed_f16_resident_footprint(variant, profile)
+                .map_err(|error| execution_error(variant, error))?,
+        ),
+        BooguFloatLoadPolicy::AdaptToF32 => {
+            // This legacy diagnostic keeps the complete logical payload in dense F32. Doubling
+            // Burnpack bytes is deliberately conservative and includes framing/alignment.
+            let resident_weight_bytes = stored_weight_bytes.checked_mul(2).ok_or_else(|| {
+                execution_error(variant, "resident browser F32 weight-byte plan overflowed")
+            })?;
+            (
+                "dense-f32",
+                BooguPackedF16ResidentFootprint {
+                    f32_payload_bytes: resident_weight_bytes,
+                    total_payload_bytes: resident_weight_bytes,
+                    ..BooguPackedF16ResidentFootprint::default()
+                },
+            )
+        }
+        BooguFloatLoadPolicy::Preserve => {
+            return Err(execution_error(
+                variant,
+                "resident browser plan cannot preserve typed F16 execution",
+            ));
+        }
+    };
+    if footprint.total_payload_bytes == 0 {
+        return Err(execution_error(
+            variant,
+            "resident browser parameter footprint is empty",
+        ));
+    }
+    if float_policy == BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+        && footprint.packed_f16_payload_bytes > stored_weight_bytes
+    {
+        return Err(execution_error(
+            variant,
+            format!(
+                "packed-F16 resident payload {} exceeds the active sealed weight bytes {stored_weight_bytes}",
+                footprint.packed_f16_payload_bytes,
+            ),
+        ));
+    }
     let activation_reserve_bytes = crate::boogu::BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES
         .checked_mul(BROWSER_RESIDENT_MAX_SIMULTANEOUS_ACTIVATION_BUFFERS)
         .ok_or_else(|| execution_error(variant, "resident browser activation plan overflowed"))?;
-    let conservative_planned_device_bytes = conservative_f32_weight_bytes
+    let conservative_planned_device_bytes = footprint
+        .total_payload_bytes
         .checked_add(activation_reserve_bytes)
         .ok_or_else(|| execution_error(variant, "resident browser device-byte plan overflowed"))?;
     let plan = BrowserResidentResourcePlan {
+        weight_storage_policy,
         stored_weight_bytes,
-        conservative_f32_weight_bytes,
+        packed_f16_weight_bytes: footprint.packed_f16_payload_bytes,
+        f32_auxiliary_weight_bytes: footprint.f32_payload_bytes,
+        resident_weight_bytes: footprint.total_payload_bytes,
         activation_reserve_bytes,
         conservative_planned_device_bytes,
     };
     set_browser_factory_progress(format!(
-        "Model setup: GPU residency plan accepted; preloading {:.1} GiB",
-        plan.conservative_f32_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        "Model setup: GPU residency plan accepted; preloading {:.1} GiB of {} weights",
+        plan.resident_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        plan.weight_storage_policy,
     ));
     dispatch_browser_event(
         BROWSER_RUNTIME_EVENT_NAME,
         &BrowserRuntimeEvent::ResidentResourcePlan {
+            weight_storage_policy: plan.weight_storage_policy,
             stored_weight_bytes: plan.stored_weight_bytes,
-            conservative_f32_weight_bytes: plan.conservative_f32_weight_bytes,
+            packed_f16_weight_bytes: plan.packed_f16_weight_bytes,
+            f32_auxiliary_weight_bytes: plan.f32_auxiliary_weight_bytes,
+            resident_weight_bytes: plan.resident_weight_bytes,
             activation_reserve_bytes: plan.activation_reserve_bytes,
             conservative_planned_device_bytes: plan.conservative_planned_device_bytes,
         },
@@ -3945,6 +4029,8 @@ pub struct BrowserBooguInferenceReport {
     pub qwen_visual_execution_dtype: String,
     pub vae_execution_dtype: String,
     pub denoiser_execution_dtype: String,
+    pub denoiser_requested_query_chunk_size: usize,
+    pub denoiser_minimum_image_query_partitions: usize,
     pub qwen_release_unused_memory_after_stage: bool,
     pub block0_execution_mode: String,
     pub qwen_embedding_execution_policy: String,
@@ -3953,6 +4039,7 @@ pub struct BrowserBooguInferenceReport {
     pub qwen_text_layer_submission_policy: String,
     pub packed_qwen_instruction_handoff_policy: String,
     pub packed_f16_dmd_vae_handoff_policy: String,
+    pub resident_resource_plan: Option<BrowserResidentResourcePlan>,
     pub low_vram_resource_plan: Option<BrowserLowVramResourcePlan>,
     pub packed_f16_resource_plan: Option<BrowserPackedF16ResourcePlan>,
     pub packed_f16_qwen_embedding_plan: Option<BrowserPackedF16QwenEmbeddingPlan>,
@@ -4342,6 +4429,7 @@ pub(crate) struct BrowserBooguParityReport {
     pub denoiser_expected_retained_stages: usize,
     pub denoiser_retained_stages_before_clear: usize,
     pub denoiser_cache_cleared_before_decode: bool,
+    pub resident_resource_plan: Option<BrowserResidentResourcePlan>,
     pub low_vram_resource_plan: Option<BrowserLowVramResourcePlan>,
     pub low_vram_denoiser_dtype_audit: Option<BrowserLowVramDenoiserDTypeAudit>,
     pub weight_traffic_contract: String,
@@ -4387,6 +4475,7 @@ struct BrowserNoSurfaceEngine {
 enum BrowserNoSurfacePolicy {
     CompatibleF32,
     PreserveQwenF16,
+    ResidentPackedF16,
     ResidentDenseF32,
     LowVramRuntimeQ8Denoiser,
     LowVramRetainedQ8DenseF32PerStageDenoiser,
@@ -4540,6 +4629,9 @@ impl BrowserBooguFactory {
                 BrowserNoSurfacePolicy::PreserveQwenF16 => {
                     "diagnostic-no-surface-preserved-qwen-f16"
                 }
+                BrowserNoSurfacePolicy::ResidentPackedF16 => {
+                    "no-surface-browser-high-vram-resident-packed-f16"
+                }
                 BrowserNoSurfacePolicy::ResidentDenseF32 => {
                     "no-surface-browser-high-vram-resident-dense-f32"
                 }
@@ -4640,6 +4732,9 @@ impl BrowserBooguFactory {
             variant,
             settings,
             match residency {
+                BrowserBooguResidencyPolicy::HighVramResidentPackedF16 => {
+                    BrowserNoSurfacePolicy::ResidentPackedF16
+                }
                 BrowserBooguResidencyPolicy::HighVramResidentDenseF32 => {
                     BrowserNoSurfacePolicy::ResidentDenseF32
                 }
@@ -4745,6 +4840,9 @@ impl BrowserBooguFactory {
                 qwen_visual_execution_dtype: engine.dtypes.qwen_visual.name().into(),
                 vae_execution_dtype: engine.dtypes.vae.name().into(),
                 denoiser_execution_dtype: engine.dtypes.denoiser.name().into(),
+                denoiser_requested_query_chunk_size: BROWSER_PRODUCTION_DENOISER_QUERY_CHUNK_SIZE,
+                denoiser_minimum_image_query_partitions:
+                    burn_boogu::PORTABLE_ATTENTION_MINIMUM_IMAGE_QUERY_PARTITIONS,
                 qwen_release_unused_memory_after_stage: engine
                     .qwen
                     .releases_unused_memory_after_stage(),
@@ -4773,6 +4871,7 @@ impl BrowserBooguFactory {
                     .policies
                     .packed_f16_dmd_vae_handoff_policy()
                     .into(),
+                resident_resource_plan: engine.resident_resource_plan,
                 low_vram_resource_plan: engine.low_vram_resource_plan,
                 packed_f16_resource_plan: engine.packed_f16_resource_plan,
                 packed_f16_qwen_embedding_plan: engine.packed_f16_qwen_embedding_plan,
@@ -5241,6 +5340,10 @@ async fn build_no_surface_engine(
         BrowserNoSurfacePolicy::PreserveQwenF16 => {
             BrowserExecutionPolicies::preserve_qwen_f16(&inputs.settings)
         }
+        BrowserNoSurfacePolicy::ResidentPackedF16 => {
+            BrowserExecutionPolicies::resident_packed_f16(&inputs.settings)
+                .map_err(|error| execution_error(variant, error))?
+        }
         BrowserNoSurfacePolicy::ResidentDenseF32 => {
             BrowserExecutionPolicies::resident_dense_f32(&inputs.settings)
                 .map_err(|error| execution_error(variant, error))?
@@ -5339,6 +5442,9 @@ async fn build_no_surface_parity_engine_with_residency(
         BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained => {
             Ok(BrowserExecutionPolicies::exact_1k5_parity(&settings))
         }
+        BrowserBooguResidencyPolicy::HighVramResidentPackedF16 => {
+            BrowserExecutionPolicies::resident_packed_f16(&settings)
+        }
         BrowserBooguResidencyPolicy::HighVramResidentDenseF32 => Err(
             "exact browser parity uses the qualification-per-request F32 denoiser-retained policy, not production all-stage residency",
         ),
@@ -5408,6 +5514,10 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
         let result_slot = slot.clone();
         spawn_local(async move {
             let policies = match residency {
+                BrowserBooguResidencyPolicy::HighVramResidentPackedF16 => {
+                    BrowserExecutionPolicies::resident_packed_f16(&inputs.settings)
+                        .map_err(|error| execution_error(inputs.identity.variant, error))
+                }
                 BrowserBooguResidencyPolicy::HighVramResidentDenseF32 => {
                     BrowserExecutionPolicies::resident_dense_f32(&inputs.settings)
                         .map_err(|error| execution_error(inputs.identity.variant, error))
@@ -5676,7 +5786,11 @@ impl BrowserExecutionPolicies {
     }
 
     fn weight_traffic_contract(self) -> &'static str {
-        if self.eager_preload {
+        if self.eager_preload
+            && self.denoiser_float == BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+        {
+            "eager-preload/qwen+vae+denoiser/resident-f16-weights/fused-f32-accumulate/zero-inference-artifact-transfers/zero-full-stage-widening"
+        } else if self.eager_preload {
             "eager-preload/qwen+vae+denoiser/zero-inference-artifact-transfers"
         } else if self.require_persistent_range_cache
             && self.denoiser_retaining_wrapper_adapter
@@ -5706,6 +5820,8 @@ impl BrowserExecutionPolicies {
     fn denoiser_linear_execution_policy(self) -> &'static str {
         if self.uses_packed_f16_denoiser_source() {
             "packed-f16-storage/device-widen-f32-per-semantic-stage/dense-f32-matmul"
+        } else if self.denoiser_float == BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries {
+            "resident-f16-storage/integer-unpack/fused-f32-accumulate-matmul"
         } else {
             quantized_linear_execution_policy_name(self.denoiser_retaining_wrapper_adapter)
         }
@@ -5714,6 +5830,8 @@ impl BrowserExecutionPolicies {
     fn denoiser_storage_policy(self) -> &'static str {
         if self.uses_packed_f16_denoiser_source() {
             "authenticated-compact-f16/padded-u32-retained/dense-f32-per-semantic-stage"
+        } else if self.denoiser_float == BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries {
+            "verified-f16-matrix-convolution-buffers/f32-auxiliaries/no-full-stage-widening"
         } else {
             "standard-verified-burn-module-snapshots"
         }
@@ -5781,6 +5899,27 @@ impl BrowserExecutionPolicies {
         }
         let mut policies = Self::layer_streamed_diagnostic(settings);
         policies.residency = BrowserBooguResidencyPolicy::HighVramResidentDenseF32;
+        policies.retain_qwen_stages = true;
+        policies.retain_vae_stages = true;
+        policies.retain_denoiser_stages = true;
+        policies.eager_preload = true;
+        policies.preload_denoiser_before_request = true;
+        policies.defer_retained_qwen_synchronization = true;
+        policies.defer_retained_denoiser_synchronization = true;
+        Ok(policies)
+    }
+
+    fn resident_packed_f16(settings: &crate::BooguAdapterSettings) -> Result<Self, &'static str> {
+        if settings.storage_profile != BooguStorageProfile::F16QwenVisionF32 {
+            return Err(
+                "browser resident packed-F16 production requires profile=production; quantized and all-F16 profiles remain explicit diagnostics",
+            );
+        }
+        let mut policies = Self::layer_streamed_diagnostic(settings);
+        policies.qwen_float = BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries;
+        policies.vae_float = BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries;
+        policies.denoiser_float = BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries;
+        policies.residency = BrowserBooguResidencyPolicy::HighVramResidentPackedF16;
         policies.retain_qwen_stages = true;
         policies.retain_vae_stages = true;
         policies.retain_denoiser_stages = true;
@@ -5964,7 +6103,7 @@ impl BrowserExecutionPolicies {
             self.vae_float,
             self.denoiser_float,
         );
-        if self.qwen_float == BooguFloatLoadPolicy::AdaptToF32 {
+        if self.qwen_float != BooguFloatLoadPolicy::Preserve {
             dtypes.qwen_visual = DType::F32;
         }
         dtypes
@@ -6147,6 +6286,7 @@ struct BrowserBooguEngine {
     dtypes: BooguRuntimeDTypes,
     device: burn_wgpu::WgpuDevice,
     applied_buffer_limits: BrowserAppliedBufferLimits,
+    resident_resource_plan: Option<BrowserResidentResourcePlan>,
     low_vram_resource_plan: Option<BrowserLowVramResourcePlan>,
     packed_f16_resource_plan: Option<BrowserPackedF16ResourcePlan>,
     packed_f16_qwen_embedding_plan: Option<BrowserPackedF16QwenEmbeddingPlan>,
@@ -6237,7 +6377,7 @@ impl BrowserBooguEngine {
             .flat_map(|manifest| active_manifest_weight_artifacts(manifest, true, variant))
             .collect()
         };
-        let resident_resource_plan = if policies.eager_preload {
+        let resident_resource_manifest = if policies.eager_preload {
             let mut resource_manifest = composition.pipeline_manifest.clone();
             if !composition.legacy_monolith {
                 resource_manifest
@@ -6247,10 +6387,7 @@ impl BrowserBooguEngine {
                     .files
                     .extend(composition.vae_manifest.files.iter().cloned());
             }
-            Some(validate_browser_resident_resource_plan(
-                variant,
-                &resource_manifest,
-            )?)
+            Some(resource_manifest)
         } else {
             None
         };
@@ -6476,6 +6613,18 @@ impl BrowserBooguEngine {
         let profile = settings.storage_profile;
         let dtypes = policies.execution_dtypes(profile);
         let synchronizer = BrowserAsyncSynchronizer::new(&device);
+        let resident_resource_plan = resident_resource_manifest
+            .as_ref()
+            .map(|manifest| {
+                validate_browser_resident_resource_plan(
+                    variant,
+                    manifest,
+                    &inventory,
+                    profile,
+                    policies.denoiser_float,
+                )
+            })
+            .transpose()?;
 
         let (verified_qwen_source, qwen_plan) = if composition.legacy_monolith {
             let source = VerifiedAsyncBurnpackQwenStageSource::new_auto(
@@ -6503,6 +6652,9 @@ impl BrowserBooguEngine {
             let float_policy = match policies.qwen_float {
                 BooguFloatLoadPolicy::Preserve => Qwen3VlArtifactFloatPolicy::Preserve,
                 BooguFloatLoadPolicy::AdaptToF32 => Qwen3VlArtifactFloatPolicy::AdaptToF32,
+                BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
+                    Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+                }
             };
             let source =
                 VerifiedAsyncBurnpackQwen3VlStageSource::new(contract, device.clone(), qwen_reader)
@@ -6537,7 +6689,12 @@ impl BrowserBooguEngine {
             ));
         }
         let vram_preflight = resident_resource_plan
-            .map(|plan| ("resident-dense-f32", plan.conservative_planned_device_bytes))
+            .map(|plan| {
+                (
+                    plan.weight_storage_policy,
+                    plan.conservative_planned_device_bytes,
+                )
+            })
             .or_else(|| {
                 low_vram_resource_plan.map(|plan| {
                     (
@@ -6640,6 +6797,9 @@ impl BrowserBooguEngine {
             let float_policy = match policies.vae_float {
                 BooguFloatLoadPolicy::Preserve => FluxVaeArtifactFloatPolicy::Preserve,
                 BooguFloatLoadPolicy::AdaptToF32 => FluxVaeArtifactFloatPolicy::AdaptToF32,
+                BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
+                    FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+                }
             };
             let source =
                 VerifiedAsyncBurnpackFluxVaeStageSource::new(contract, device.clone(), vae_reader)
@@ -6687,10 +6847,9 @@ impl BrowserBooguEngine {
         };
         let mut denoiser_source =
             BrowserAsyncStageSource::new(verified_denoiser_source, synchronizer);
-        // The 1.5K fixture-qualified path uses q1024 while remaining far below its full joint
-        // sequence. The 1K releases keep the model's q128 default: at small shapes q1024 could
-        // cover the entire sequence and accidentally materialize a dense seq^2 score tensor. GPU
-        // residency and output resolution never relax the bounded-attention contract.
+        // Both release sizes request q1024. Portable attention independently caps image-scale
+        // queries to at least four partitions, so smaller output sizes cannot accidentally
+        // materialize a dense seq^2 score tensor. GPU residency never relaxes that bound.
         denoiser_source.set_denoiser_query_chunk_size(
             if variant == BooguVariant::Image01EditTurbo1k5 {
                 BROWSER_1K5_DENOISER_QUERY_CHUNK_SIZE
@@ -6744,6 +6903,7 @@ impl BrowserBooguEngine {
             dtypes,
             device,
             applied_buffer_limits,
+            resident_resource_plan,
             low_vram_resource_plan,
             packed_f16_resource_plan,
             packed_f16_qwen_embedding_plan,
@@ -6764,7 +6924,7 @@ impl BrowserBooguEngine {
                 execution_error(
                     variant,
                     format!(
-                        "browser resident-dense preload failed without fallback: {error}; use residency=low-vram for the bounded-memory production path"
+                        "browser resident preload failed without fallback: {error}; use residency=low-vram for the bounded-memory production path"
                     ),
                 )
             })?;
@@ -6889,7 +7049,7 @@ impl BrowserBooguEngine {
 
     async fn preload_resident_weights(&mut self) -> Result<(), RuntimeError> {
         let variant = self.identity.variant;
-        if self.policies.residency != BrowserBooguResidencyPolicy::HighVramResidentDenseF32
+        if !self.policies.residency.is_high_vram_resident()
             || !self.qwen.source.retention_enabled()
             || !self.vae.retention_enabled()
             || !self.denoiser.source().retention_enabled()
@@ -6900,7 +7060,11 @@ impl BrowserBooguEngine {
             ));
         }
         report_browser_runtime_preparing(
-            "Verifying and materializing dense-F32 Qwen, VAE, and denoiser weights on WebGPU",
+            if self.policies.residency == BrowserBooguResidencyPolicy::HighVramResidentPackedF16 {
+                "Verifying and retaining packed-F16 Qwen, VAE, and denoiser weights on WebGPU"
+            } else {
+                "Verifying and materializing dense-F32 Qwen, VAE, and denoiser weights on WebGPU"
+            },
         );
 
         for spec in self.qwen.plan.embedding_rows.chunks.clone() {
@@ -7770,7 +7934,7 @@ impl BrowserBooguEngine {
     }
 
     fn validate_resident_caches(&self) -> Result<(), RuntimeError> {
-        if self.policies.residency != BrowserBooguResidencyPolicy::HighVramResidentDenseF32 {
+        if !self.policies.residency.is_high_vram_resident() {
             return Ok(());
         }
         let expected_qwen = self.expected_qwen_resident_stage_count();
@@ -9261,6 +9425,9 @@ impl BrowserBooguEngine {
                 BrowserBooguResidencyPolicy::QualificationPerRequestF32DenoiserRetained => {
                     "request-scoped-f32-policy-retained-through-four-dmd-steps"
                 }
+                BrowserBooguResidencyPolicy::HighVramResidentPackedF16 => {
+                    "all-stages-preloaded-packed-f16-fused-f32-accumulate"
+                }
                 BrowserBooguResidencyPolicy::HighVramResidentDenseF32 => {
                     "all-stages-preloaded-dense-f32"
                 }
@@ -9272,6 +9439,7 @@ impl BrowserBooguEngine {
             denoiser_expected_retained_stages: BROWSER_1K5_DENOISER_RETAINED_STAGE_COUNT,
             denoiser_retained_stages_before_clear,
             denoiser_cache_cleared_before_decode,
+            resident_resource_plan: self.resident_resource_plan,
             low_vram_resource_plan: self.low_vram_resource_plan,
             low_vram_denoiser_dtype_audit,
             weight_traffic_contract: self.policies.weight_traffic_contract().into(),
@@ -11755,6 +11923,9 @@ const fn float_policy_name(policy: BooguFloatLoadPolicy) -> &'static str {
     match policy {
         BooguFloatLoadPolicy::Preserve => "preserve",
         BooguFloatLoadPolicy::AdaptToF32 => "adapt-to-f32",
+        BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
+            "packed-f16-weights-f32-auxiliaries"
+        }
     }
 }
 
@@ -11946,10 +12117,18 @@ mod browser_source_tests {
     fn browser_residency_selector_is_fail_closed_and_stably_labeled_correctness() {
         assert_eq!(
             BrowserBooguResidencyPolicy::default(),
-            BrowserBooguResidencyPolicy::HighVramResidentDenseF32
+            BrowserBooguResidencyPolicy::HighVramResidentPackedF16
         );
         assert_eq!(
             BrowserBooguResidencyPolicy::parse("resident"),
+            Some(BrowserBooguResidencyPolicy::HighVramResidentPackedF16)
+        );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::parse("high-vram-resident-packed-f16"),
+            Some(BrowserBooguResidencyPolicy::HighVramResidentPackedF16)
+        );
+        assert_eq!(
+            BrowserBooguResidencyPolicy::parse("high-vram-resident-dense-f32"),
             Some(BrowserBooguResidencyPolicy::HighVramResidentDenseF32)
         );
         assert_eq!(
@@ -11993,6 +12172,10 @@ mod browser_source_tests {
         ] {
             assert_eq!(BrowserBooguResidencyPolicy::parse(retired), None);
         }
+        assert_eq!(
+            BrowserBooguResidencyPolicy::HighVramResidentPackedF16.label(),
+            "browser-high-vram-resident-packed-f16"
+        );
         assert_eq!(
             BrowserBooguResidencyPolicy::HighVramResidentDenseF32.label(),
             "browser-high-vram-resident-dense-f32"
@@ -12151,6 +12334,34 @@ mod browser_source_tests {
 
     #[test]
     fn browser_resident_policy_keeps_selected_pipeline_warm_between_requests_correctness() {
+        let packed = BrowserExecutionPolicies::resident_packed_f16(&production_settings())
+            .unwrap()
+            .for_ordinary_browser_factory(false);
+        assert_eq!(
+            packed.residency,
+            BrowserBooguResidencyPolicy::HighVramResidentPackedF16
+        );
+        assert_eq!(
+            packed.qwen_float,
+            BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+        );
+        assert_eq!(
+            packed.vae_float,
+            BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+        );
+        assert_eq!(
+            packed.denoiser_float,
+            BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+        );
+        assert!(packed.eager_preload);
+        assert!(packed.retain_qwen_stages);
+        assert!(packed.retain_vae_stages);
+        assert!(packed.retain_denoiser_stages);
+        assert_eq!(
+            packed.weight_traffic_contract(),
+            "eager-preload/qwen+vae+denoiser/resident-f16-weights/fused-f32-accumulate/zero-inference-artifact-transfers/zero-full-stage-widening"
+        );
+
         let policy = BrowserExecutionPolicies::resident_dense_f32(&production_settings())
             .unwrap()
             .for_ordinary_browser_factory(false);
@@ -13357,6 +13568,38 @@ mod browser_source_tests {
         assert!(
             error.contains("unchanged canonical profile=production"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn browser_turbo_packed_f16_resident_weight_plan_is_exact_correctness() {
+        let inventory = BooguArtifactInventory::new(
+            &released_qwen_config(),
+            &BooguConfig::default(),
+            &released_flux_vae_config(),
+        )
+        .unwrap();
+        let footprint = inventory
+            .packed_f16_resident_footprint(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+
+        assert_eq!(footprint.packed_f16_tensor_count, 778);
+        assert_eq!(footprint.f32_tensor_count, 670);
+        assert_eq!(footprint.packed_f16_payload_bytes, 35_101_539_904);
+        assert_eq!(footprint.f32_payload_bytes, 8_716_300);
+        assert_eq!(footprint.total_payload_bytes, 35_110_256_204);
+        assert_eq!(
+            footprint.total_payload_bytes,
+            footprint.packed_f16_payload_bytes + footprint.f32_payload_bytes
+        );
+        assert_eq!(
+            footprint.total_payload_bytes
+                + crate::boogu::BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES
+                    * BROWSER_RESIDENT_MAX_SIMULTANEOUS_ACTIVATION_BUFFERS,
+            43_408_096_844
         );
     }
 

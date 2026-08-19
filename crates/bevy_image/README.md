@@ -230,13 +230,25 @@ The `BooguRuntimeFactory`/`BooguRuntime` injection boundary remains public for e
 `BrowserBooguFactory` is the concrete Wasm implementation: it uses bounded HTTP ranges plus
 digest-verified async Qwen/VAE/denoiser sources. The interactive browser defaults to
 `residency=resident`, selecting the high-throughput
-`browser-high-vram-resident-dense-f32` policy: before **Ready**, it sequentially verifies and
-uploads one bounded semantic object at a time, releases each host payload, and retains every
-initialized dense-F32 WebGPU stage. Forward execution therefore performs no repeated model-weight
-download, hash/decode, or host-to-device transfer. This needs workstation-class WebGPU memory and
-fails before **Ready** if its resource plan, allocation, or device synchronization fails; it never
-falls back to CPU. The source-default change requires refreshed browser hardware qualification;
-the evidence below remains scoped to the explicitly selected low-VRAM policy.
+`browser-high-vram-resident-packed-f16` policy. Matrix, embedding, and convolution weights remain
+F16 in WebGPU storage; compatibility kernels unpack half values with integer operations and
+accumulate F32, so this path does not require `shader-f16`. Rank-one and unsupported auxiliary
+weights remain F32. Before **Ready**, the loader verifies and uploads one bounded logical object at
+a time and releases its host payload. Forward execution performs no model-weight download,
+verification, widening, or upload and never falls back to CPU.
+
+The optimized source-bound Turbo 1024 browser qualification retained 35,110,256,204 parameter
+bytes and used a 43,408,096,844-byte weights-plus-activation preflight plan. Portable denoiser
+attention now requests q1024 and adaptively retains at least four query partitions for every
+image-scale sequence. That reduced four-step DMD from 338.956 s to 32.302 s and the complete request
+from 343.634 s to 37.676 s; Qwen took 0.664 s and VAE decode 4.614 s. The PNG is byte-identical to
+the earlier packed-resident output. Chrome peaked at 40,868 MiB / 42,853,203,968 bytes, leaving
+554,892,876 bytes below the preflight plan, and Wasm linear memory peaked at 2,005,401,600 bytes.
+The raw report SHA-256 is `aa602e7ac2c1d674574c7571b4c605e9909d56071717d6ab5c85e7138e01e7b3`;
+the PID-scoped monitor SHA-256 is
+`6f8642ae076acad1010f51fd336186975c680f1348c0e4e3674c5f9502567bbc`. This is exact output
+equivalence and a complete browser request, not exhaustive tensor-boundary parity. It is a 10.5x
+DMD improvement, but the 37.676-second request still does not meet the 30-second interactive goal.
 
 Repository and Pages builds inherit both browser patches from the workspace root. Patched `wgpu`
 29.0.4 bounds `writeBuffer`/`writeTexture` calls to 2 MiB and exposes rejected queue-completion

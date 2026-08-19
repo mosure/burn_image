@@ -319,8 +319,19 @@ across all four DMD steps;
 `diagnostic-layer-streamed` additionally reloads the denoiser per step and remains an explicit
 local-only diagnostic.
 
-Explicit browser `resident` follows the high-VRAM ready-state boundary with dense-F32 WebGPU
-modules and remains an advanced unqualified mode. Default browser `low-vram` is variant-aware:
+Explicit browser `resident` follows the high-VRAM ready-state boundary with packed-F16 WebGPU
+weights and F32 accumulation. It retains 35,110,256,204 parameter bytes for Turbo and uses a
+43,408,096,844-byte preflight plan including activation reserve. Portable denoiser attention
+requests 1,024 query rows and is adaptively capped to at least four partitions for any sequence over
+128 rows. On the source-bound Turbo 1024 run this cut four-step DMD from 338.956 s to 32.302 s
+(10.5x) and the full request from 343.634 s to 37.676 s. Qwen took 0.664 s and VAE decode 4.614 s.
+The run completed without `shader-f16`, with zero inference artifact traffic, 2,005,401,600 peak
+Wasm bytes, and a 40,868 MiB / 42,853,203,968-byte Chrome GPU-process peak. Its PNG is byte-for-byte
+identical to the earlier packed-resident output. A representative packed 4096-cubed matmul reached
+18.258 TFLOP/s and the representative packed convolution reached 8.185 TFLOP/s. The result is close
+to, but still above, the 30-second interactive request target.
+
+Browser `low-vram` remains variant-aware:
 Edit retains an inventory-qualified runtime-Q8/F32 denoiser for one request. Ordinary Turbo
 authenticates 46 stages / 106 objects / 912 F16 tensors into a 19,870,010,624-byte packed cache,
 widens one semantic stage at a time on device, and executes dense-F32 matmul. Across four DMD steps
@@ -330,9 +341,9 @@ proven empty before VAE decode; a later request must rehydrate it from persisten
 browser VAE source initializes the complete 335,278,732-byte F32 autoencoder before applying
 selected encoder or decoder objects, so planning accounts for that full module even though
 artifact transport remains stage-bounded.
-`layer-streamed-diagnostic` additionally reloads denoiser weights every step.
-Historical streamed-browser numbers do not qualify either production policy; the current modular
-low-VRAM result below is the relevant 1536x1536 qualification.
+`layer-streamed-diagnostic` additionally reloads denoiser weights every step. Historical streamed-
+browser numbers do not qualify either production policy; the current modular low-VRAM result below
+is the relevant 1536x1536 qualification.
 
 ### Low-VRAM memory qualification
 
@@ -418,9 +429,9 @@ generation or parity measurement.
 Native 1K Edit and browser 1K Edit low-VRAM qualification remain pending. Native Turbo has
 the artifact/output/memory candidate recorded above but still lacks an exact-noise full-chain
 cross-runtime parity result. Ordinary rendered packed-F16 Turbo 1024 now has the output/memory
-result above, and the same-engine two-request ordinary smoke also passes. Exact-noise parity, the
-other browser shapes, the explicit dense-F32 resident policy, synchronized browser performance,
-and cross-stack portability remain pending.
+result above, the same-engine two-request ordinary smoke passes, and the explicit packed-F16
+resident policy has the source-bound 1024 request measurement above. Exact-noise parity, the other
+browser shapes, synchronized warm performance, and cross-stack portability remain pending.
 Their real-checkpoint runs must capture the complete workload window, prove positive GPU activity
 and process-scoped framebuffer samples, satisfy the applicable numerical and memory gates, and
 report host RSS/Wasm memory beside device memory.
