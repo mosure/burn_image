@@ -73,8 +73,8 @@ is disabled while pointer focus belongs to UI controls.
 
 Storage profile, load policy, and execution policy are separate and are all recorded:
 
-- Turbo ordinary execution uses packed signed-Q4 matrix weights with F32 auxiliaries.
-- Edit ordinary execution uses its sealed mixed-F16 profile.
+- Ordinary execution for every public variant uses packed signed-Q4 matrix weights with F32
+  auxiliaries.
 - Packed kernels accumulate in F32 and do not require WebGPU `shader-f16`.
 - Any stage conversion is bounded and named; storage compression alone is not called quantized
   execution.

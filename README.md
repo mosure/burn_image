@@ -13,7 +13,7 @@ CPU inference fallback.
 
 - Generate 1024 px images or edit references at 1024 px and 1536 px.
 - Share one WGPU adapter, device, and queue between Bevy rendering and Burn inference.
-- Keep Turbo's packed-Q4 weights resident for warm-session inference.
+- Keep the selected model's packed-Q4 weights resident for warm-session inference.
 - Share one Q4 Qwen component and one VAE component across all three Q4 model variants.
 - Load only the selected model and cache verified native artifacts under `~/.burn_image`.
 - Stream browser artifacts as immutable transport parts no larger than 25,000,000 bytes.
@@ -59,10 +59,10 @@ Edit requests use `--variant edit-turbo` or `--variant edit-turbo-1k5` and requi
 
 ## Model profiles
 
-Turbo uses the sealed `q4s-block-up-to128-f32` profile by default. It preserves signed Q4 matrix
-weights for measured GPU kernels and keeps F32 auxiliaries explicit. Edit Turbo and Edit Turbo
-1.5K currently use `f16-qwen-vision-f32` as their ordinary profile. Profile identity is part of the
-manifest and runtime provenance; a runtime never silently substitutes another profile.
+All three public variants use the sealed `q4s-block-up-to128-f32` profile by default. It preserves
+signed Q4 matrix weights for measured GPU kernels and keeps F32 auxiliaries explicit. The larger
+`f16-qwen-vision-f32` releases remain explicit validation profiles; a runtime never silently
+substitutes a different profile because profile identity is part of the manifest and provenance.
 
 ## Browser build
 

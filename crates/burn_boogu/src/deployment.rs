@@ -470,15 +470,13 @@ pub const fn default_browser_low_vram_residency(
 
 /// Resolve the public bounded-memory selector for one concrete released profile.
 ///
-/// Direct Q4S is already the smaller resident Turbo representation, so routing it through the
-/// mixed-F16 request-scoped widening path would add work and misstate provenance.
+/// Direct Q4S is the canonical resident representation for every public variant, so routing it
+/// through the mixed-F16 request-scoped widening path would add work and misstate provenance.
 pub const fn browser_bounded_residency_policy(
     variant: BooguVariant,
     profile: BooguStorageProfile,
 ) -> BrowserBooguResidencyPolicy {
-    if matches!(variant, BooguVariant::Image01Turbo)
-        && matches!(profile, BooguStorageProfile::Q4sBlockUpTo128F32)
-    {
+    if matches!(profile, BooguStorageProfile::Q4sBlockUpTo128F32) {
         BrowserBooguResidencyPolicy::ResidentPackedQ4s
     } else {
         default_browser_low_vram_residency(variant)
@@ -493,8 +491,7 @@ pub const fn default_browser_residency(variant: BooguVariant) -> BrowserBooguRes
 impl BooguDeploymentSettings {
     /// Construct the canonical production policy for one released variant.
     ///
-    /// Turbo selects the sealed direct-Q4S transit and execution format. Edit releases retain
-    /// mixed F16 until their Q4 execution policy has independent qualification.
+    /// Every public variant selects its sealed direct-Q4S transit and execution format.
     pub fn production(variant: BooguVariant, artifact_source: ArtifactSource) -> Self {
         Self {
             artifact_source,
@@ -600,13 +597,8 @@ impl BooguDeploymentSettings {
 }
 
 /// Preferred immutable storage profile for ordinary native and browser execution.
-pub const fn default_storage_profile(variant: BooguVariant) -> BooguStorageProfile {
-    match variant {
-        BooguVariant::Image01Turbo => BooguStorageProfile::Q4sBlockUpTo128F32,
-        BooguVariant::Image01EditTurbo | BooguVariant::Image01EditTurbo1k5 => {
-            BooguStorageProfile::F16QwenVisionF32
-        }
-    }
+pub const fn default_storage_profile(_variant: BooguVariant) -> BooguStorageProfile {
+    BooguStorageProfile::Q4sBlockUpTo128F32
 }
 
 /// Stable model id for one Boogu release.
@@ -716,38 +708,31 @@ mod tests {
     }
 
     #[test]
-    fn production_defaults_prioritize_published_q4_without_overclaiming_edit_correctness() {
-        assert_eq!(
-            default_storage_profile(BooguVariant::Image01Turbo),
-            BooguStorageProfile::Q4sBlockUpTo128F32
-        );
+    fn production_defaults_every_public_variant_to_published_q4_correctness() {
         for variant in [
+            BooguVariant::Image01Turbo,
             BooguVariant::Image01EditTurbo,
             BooguVariant::Image01EditTurbo1k5,
         ] {
             assert_eq!(
                 default_storage_profile(variant),
-                BooguStorageProfile::F16QwenVisionF32
+                BooguStorageProfile::Q4sBlockUpTo128F32
+            );
+            assert_eq!(
+                BooguDeploymentSettings::production(variant, remote()).storage_profile,
+                BooguStorageProfile::Q4sBlockUpTo128F32
+            );
+            assert_eq!(
+                browser_bounded_residency_policy(variant, BooguStorageProfile::Q4sBlockUpTo128F32,),
+                BrowserBooguResidencyPolicy::ResidentPackedQ4s
+            );
+            assert_eq!(
+                default_browser_residency(variant),
+                BrowserBooguResidencyPolicy::ResidentPackedQ4s
             );
         }
         assert_eq!(
-            BooguDeploymentSettings::production(BooguVariant::Image01Turbo, remote())
-                .storage_profile,
-            BooguStorageProfile::Q4sBlockUpTo128F32
-        );
-        assert_eq!(
             BrowserBooguResidencyPolicy::default(),
-            BrowserBooguResidencyPolicy::ResidentPackedQ4s
-        );
-        assert_eq!(
-            browser_bounded_residency_policy(
-                BooguVariant::Image01Turbo,
-                BooguStorageProfile::Q4sBlockUpTo128F32,
-            ),
-            BrowserBooguResidencyPolicy::ResidentPackedQ4s
-        );
-        assert_eq!(
-            default_browser_residency(BooguVariant::Image01Turbo),
             BrowserBooguResidencyPolicy::ResidentPackedQ4s
         );
     }

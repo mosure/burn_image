@@ -83,7 +83,7 @@ pub const BOOGU_PRODUCTION_PROFILE_SELECTOR: &str = "production";
 /// Resolve a user-facing profile selector without changing the sealed manifest profile identity.
 ///
 /// This parser handles exact storage identities. Browser/native entry points resolve `production`
-/// through [`default_boogu_storage_profile`] so Turbo can prefer Q4 while Edit stays mixed F16.
+/// through [`default_boogu_storage_profile`] so every public variant uses its shared Q4 release.
 #[cfg(feature = "boogu")]
 pub fn parse_boogu_storage_profile(
     value: &str,
@@ -338,8 +338,9 @@ fn report_browser_q4_matmul_terminal_failure(window: &web_sys::Window, error: &s
 /// base URL.
 /// When `artifacts` is omitted, the app uses the exact manifest bundle id beneath
 /// `https://aberration.technology/model/`. The default is Turbo with
-/// `profile=production` and warm `residency=resident`; `f16-qwen-vision-f32` selects the larger
-/// mixed-F16 release. The interactive default authenticates,
+/// `profile=production` and warm `residency=resident`; production selects the released packed-Q4
+/// profile for every public variant, while `f16-qwen-vision-f32` explicitly selects the larger
+/// mixed-F16 validation release. The interactive default authenticates,
 /// materializes, and retains the selected request graph before reporting ready, so later requests
 /// reuse the device-resident pipeline. Its mandatory shared-device VRAM preflight fails before
 /// weight download when the conservative plan cannot be committed. Explicit `residency=low-vram`
@@ -350,8 +351,10 @@ fn report_browser_q4_matmul_terminal_failure(window: &web_sys::Window, error: &s
 /// direct quantized matmul. Both policies have conservative sub-32-GB
 /// resource plans and exact per-request cache/network traffic reports. Ordinary Turbo UI loading
 /// and both Edit variants require the integrity-checked persistent object cache. Startup compares
-/// the selected executable closure with exact existing Cache Storage keys and fails before model
-/// transfer when origin quota cannot hold the missing bytes plus safety reserve.
+/// the selected executable closure with exact existing Cache Storage keys. Under quota pressure it
+/// first removes only unselected entries from burn_image's dedicated cache, preserving all keys
+/// shared with the selected release; it fails before transfer only when the selected closure and
+/// safety reserve still cannot fit.
 /// `headless=parity&residency=low-vram` replays the low-VRAM policy against the exact
 /// authenticated 1.5K fixture. Exact F32 fixture replay uses
 /// `headless=parity&residency=qualification-f32`: Qwen/VAE are streamed per request and only the
@@ -411,13 +414,6 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
                 "ordinary Turbo rejects residency=low-vram-runtime-q8-denoiser because its direct-Q8 path is not numerically qualified; use residency=low-vram",
             ));
         }
-        if variant != burn_boogu::BooguVariant::Image01Turbo
-            && residency == BrowserResidencySelector::ResidentQ4
-        {
-            return Err(JsValue::from_str(
-                "residency=resident-q4 is currently restricted to Turbo generation",
-            ));
-        }
         let profile_selector = params
             .get("profile")
             .unwrap_or_else(|| BOOGU_PRODUCTION_PROFILE_SELECTOR.to_owned());
@@ -427,8 +423,8 @@ pub fn start_boogu_web() -> Result<(), wasm_bindgen::JsValue> {
                 Some(BrowserHeadlessMode::Parity | BrowserHeadlessMode::VaeReference)
             ) {
                 // Existing numerical fixtures are sealed against the mixed-F16 release. Keep
-                // qualification routes explicit and unchanged while ordinary Turbo defaults to
-                // the smaller Q4S release.
+                // qualification routes explicit and unchanged while ordinary execution defaults
+                // every public variant to the smaller Q4S release.
                 burn_boogu::artifacts::BooguStorageProfile::F16QwenVisionF32
             } else {
                 crate::boogu::default_boogu_storage_profile(variant)
@@ -883,21 +879,23 @@ mod web_shell_tests {
 
     #[cfg(feature = "boogu")]
     #[test]
-    fn production_profile_selector_is_variant_aware_and_keeps_exact_alias_correctness() {
+    fn production_profile_selector_defaults_every_public_variant_to_q4_correctness() {
         use burn_boogu::artifacts::BooguStorageProfile;
 
         assert_eq!(
             super::parse_boogu_storage_profile(super::BOOGU_PRODUCTION_PROFILE_SELECTOR),
             None
         );
-        assert_eq!(
-            crate::boogu::default_boogu_storage_profile(burn_boogu::BooguVariant::Image01Turbo),
-            BooguStorageProfile::Q4sBlockUpTo128F32
-        );
-        assert_eq!(
-            crate::boogu::default_boogu_storage_profile(burn_boogu::BooguVariant::Image01EditTurbo),
-            BooguStorageProfile::F16QwenVisionF32
-        );
+        for variant in [
+            burn_boogu::BooguVariant::Image01Turbo,
+            burn_boogu::BooguVariant::Image01EditTurbo,
+            burn_boogu::BooguVariant::Image01EditTurbo1k5,
+        ] {
+            assert_eq!(
+                crate::boogu::default_boogu_storage_profile(variant),
+                BooguStorageProfile::Q4sBlockUpTo128F32
+            );
+        }
         assert_eq!(
             super::parse_boogu_storage_profile("f16-qwen-vision-f32"),
             Some(BooguStorageProfile::F16QwenVisionF32)
@@ -1139,6 +1137,9 @@ mod web_shell_tests {
             ".persisted()",
             ".persist()",
             "BrowserStorageQuotaInsufficient",
+            "unselected_keys",
+            "evicted_unselected_entries",
+            "buffer_unordered(BROWSER_CACHE_EVICTION_CONCURRENCY)",
             "selected model cache plan {cache_shape:?} differs from transfer plan {transfer_shape:?}",
             "Loading selected model from persistent cache",
             "Downloading selected model into persistent cache",

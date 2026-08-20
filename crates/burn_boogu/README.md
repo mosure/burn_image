@@ -7,8 +7,8 @@ Boogu Image generation and editing pipelines implemented in Burn.
 | variant | task | ordinary resolution | ordinary profile |
 |---|---|---:|---|
 | `Image01Turbo` | text-to-image | 1024 × 1024 | `q4s-block-up-to128-f32` |
-| `Image01EditTurbo` | image editing | 1024 × 1024 | `f16-qwen-vision-f32` |
-| `Image01EditTurbo1k5` | image editing | 1536 × 1536 | `f16-qwen-vision-f32` |
+| `Image01EditTurbo` | image editing | 1024 × 1024 | `q4s-block-up-to128-f32` |
+| `Image01EditTurbo1k5` | image editing | 1536 × 1536 | `q4s-block-up-to128-f32` |
 
 The selected profile is immutable release identity. Packed-Q4 execution keeps signed Q4 matrix
 weights packed for measured GPU kernels and retains explicitly declared auxiliaries in F32.

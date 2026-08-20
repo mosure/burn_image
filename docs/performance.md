@@ -6,7 +6,7 @@ numeric, or GPU correctness.
 ## Goals
 
 - Keep ordinary 1024 px requests near or below 30 seconds on capable desktop GPUs.
-- Keep the Turbo resident-Q4 plan within a 16 GB device budget.
+- Keep every public variant's resident-Q4 plan within a 16 GB device budget.
 - Keep selected weights resident for fast subsequent requests.
 - Avoid blocking the Bevy update loop during artifact I/O or inference.
 - Avoid full-bundle Wasm allocations and repeated network transfers.
@@ -16,13 +16,12 @@ browser/driver, resolution, profile, cache state, and whether kernel tuning occu
 
 ## Runtime policy
 
-Turbo ordinary execution prioritizes resident packed-Q4 weights. Packed linear, embedding, and
-convolution kernels accumulate in F32 without widening whole model stages. This reduces both VRAM
-residency and upload traffic compared with dense F32 materialization.
-
-Edit variants use their qualified mixed-F16 profile. The runtime unloads modules that are not used
-by a newly selected variant before loading replacement weights. It does not cycle model weights out
-after each successful request merely to minimize a peak number.
+Ordinary execution prioritizes resident packed-Q4 weights for Turbo, Edit Turbo, and Edit Turbo
+1.5K. Packed linear, embedding, and convolution kernels accumulate in F32 without widening whole
+model stages. This reduces both VRAM residency and upload traffic compared with dense F32
+materialization. The runtime unloads modules that are not used by a newly selected variant before
+loading replacement weights. It does not cycle model weights out after each successful request
+merely to minimize a peak number.
 
 Autotuning is opt-in. Interactive defaults use static kernels so the first request does not absorb a
 large tuning pause.

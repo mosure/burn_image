@@ -1415,7 +1415,7 @@ pub(crate) fn boogu_browser_1k5_parity_descriptor(
     if profile != BooguStorageProfile::F16QwenVisionF32 {
         return Err(model_execution(
             &boogu_model_id(variant),
-            "1.5K browser parity requires the production mixed-F16 artifact profile",
+            "1.5K browser parity requires its fixture-qualified mixed-F16 artifact profile",
         ));
     }
 
@@ -1765,6 +1765,26 @@ mod tests {
             ),
             Some(
                 "https://aberration.technology/model/boogu-image-0.1-turbo-q4s-block-up-to128-f32"
+                    .into()
+            )
+        );
+        assert_eq!(
+            boogu_cdn_base_url(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            Some(
+                "https://aberration.technology/model/boogu-image-0.1-edit-turbo-q4s-block-up-to128-f32"
+                    .into()
+            )
+        );
+        assert_eq!(
+            boogu_cdn_base_url(
+                BooguVariant::Image01EditTurbo1k5,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            Some(
+                "https://aberration.technology/model/boogu-image-0.1-edit-turbo-1k5-q4s-block-up-to128-f32"
                     .into()
             )
         );

@@ -38,22 +38,22 @@ pub fn validate_supported_bundle_converter_version(actual: &str) -> Result<(), B
         )))
     }
 }
-/// Exact sealed mixed-F16 Turbo bundle qualified for the canonical production release.
+/// Exact sealed mixed-F16 Turbo bundle retained for explicit validation.
 pub const TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a";
 /// Exact sealed direct-Q4S Turbo bundle used by ordinary native and browser execution.
 pub const TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
     "012237fb5e14c52188632ea220c043e5a9d59eaa243970100e7db35048942081";
-/// Exact sealed mixed-F16 Edit-Turbo 1K bundle qualified for the canonical production release.
+/// Exact sealed mixed-F16 Edit-Turbo 1K bundle retained for explicit validation.
 pub const EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "6f2f56a1c13418aea6985dfd1922f2e724577a1067123535fba90f88886f5335";
-/// Exact sealed direct-Q4S Edit-Turbo 1K bundle published for explicit Q4 execution.
+/// Exact sealed direct-Q4S Edit-Turbo 1K bundle used by ordinary native and browser execution.
 pub const EDIT_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
     "663d6a50c0ecd0181c195b6dcfc628998163c84fb0bf7f95e71d553268e88689";
-/// Exact sealed mixed-F16 Edit-Turbo 1.5K bundle qualified for the canonical production release.
+/// Exact sealed mixed-F16 Edit-Turbo 1.5K bundle retained for explicit validation.
 pub const EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "7d81dacfedc71c50639d303c52f035813a6f4cc0125166bd7c8879c8314dd620";
-/// Exact sealed direct-Q4S Edit-Turbo 1.5K bundle published for explicit Q4 execution.
+/// Exact sealed direct-Q4S Edit-Turbo 1.5K bundle used by ordinary native and browser execution.
 pub const EDIT_TURBO_1K5_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
     "9c217773abc54358bf45ce62c77b6b83361cd8bb49bd8357218fa40e80056aaa";
 /// Exact dependency-free mixed-F16 Turbo source digest accepted by the release builder.
@@ -8003,6 +8003,31 @@ mod tests {
     }
 
     #[cfg(feature = "burnpack")]
+    fn released_qwen_config() -> Qwen3VlConfig {
+        Qwen3VlConfig::from_json(
+            r#"{
+              "text_config": {
+                "vocab_size":151936,"hidden_size":4096,"intermediate_size":12288,
+                "num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,
+                "head_dim":128,"hidden_act":"silu","rms_norm_eps":1e-6,
+                "max_position_embeddings":262144,"rope_theta":5000000,
+                "rope_scaling":{"mrope_section":[24,20,20],"mrope_interleaved":true,"rope_type":"default"}
+              },
+              "vision_config": {
+                "depth":27,"hidden_size":1152,"intermediate_size":4304,"num_heads":16,
+                "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+                "out_hidden_size":4096,"in_channels":3,"num_position_embeddings":2304,
+                "deepstack_visual_indexes":[8,16,24],"hidden_act":"gelu_pytorch_tanh",
+                "layer_norm_eps":1e-6
+              },
+              "tie_word_embeddings":false,"image_token_id":151655,"video_token_id":151656,
+              "vision_start_token_id":151652,"vision_end_token_id":151653
+            }"#,
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "burnpack")]
     #[test]
     fn packed_f16_resident_footprint_is_variant_and_dtype_exact_correctness() {
         let inventory = BooguArtifactInventory::new(
@@ -8108,6 +8133,26 @@ mod tests {
         );
         assert!(q4.total_payload_bytes < f16.total_payload_bytes);
         assert!(edit_q4.total_payload_bytes > q4.total_payload_bytes);
+
+        let released = BooguArtifactInventory::new(
+            &released_qwen_config(),
+            &BooguConfig::default(),
+            &AutoencoderKlConfig::flux1(),
+        )
+        .unwrap();
+        for variant in [
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            let edit = released
+                .packed_q4_resident_footprint(variant, BooguStorageProfile::Q4sBlockUpTo128F32)
+                .unwrap();
+            assert_eq!(edit.packed_q4_value_bytes, 9_149_517_312);
+            assert_eq!(edit.scale_bytes, 1_205_980_992);
+            assert_eq!(edit.packed_f16_payload_bytes, 167_507_456);
+            assert_eq!(edit.f32_auxiliary_payload_bytes, 553_525_836);
+            assert_eq!(edit.total_payload_bytes, 11_076_531_596);
+        }
     }
 
     #[cfg(feature = "burnpack")]
@@ -8143,6 +8188,12 @@ mod tests {
                 BooguStorageProfile::Q4sBlockUpTo128F32,
             )
             .unwrap();
+        let edit_1k5_footprint = inventory
+            .packed_q4_resident_footprint(
+                BooguVariant::Image01EditTurbo1k5,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            )
+            .unwrap();
         eprintln!("released Turbo packed-Q4 footprint: {footprint:?}");
         eprintln!("released Edit packed-Q4 footprint: {edit_footprint:?}");
         assert_eq!(footprint.packed_q4_tensor_count, 738);
@@ -8155,6 +8206,18 @@ mod tests {
         assert_eq!(footprint.f32_auxiliary_elements, 2_195_875);
         assert_eq!(footprint.f32_auxiliary_payload_bytes, 8_783_500);
         assert_eq!(footprint.total_payload_bytes, 10_017_084_044);
+        for edit in [edit_footprint, edit_1k5_footprint] {
+            assert_eq!(edit.packed_q4_tensor_count, 849);
+            assert_eq!(edit.packed_q4_elements, 18_299_034_624);
+            assert_eq!(edit.packed_q4_value_bytes, 9_149_517_312);
+            assert_eq!(edit.scale_count, 301_495_248);
+            assert_eq!(edit.scale_bytes, 1_205_980_992);
+            assert_eq!(edit.packed_f16_elements, 83_753_728);
+            assert_eq!(edit.packed_f16_payload_bytes, 167_507_456);
+            assert_eq!(edit.f32_auxiliary_elements, 138_381_459);
+            assert_eq!(edit.f32_auxiliary_payload_bytes, 553_525_836);
+            assert_eq!(edit.total_payload_bytes, 11_076_531_596);
+        }
     }
 
     #[cfg(feature = "burnpack")]

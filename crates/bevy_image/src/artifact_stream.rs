@@ -51,6 +51,8 @@ pub const BROWSER_ARTIFACT_PART_CACHE_NAME: &str = "burn-image-artifact-parts-v2
 pub const BROWSER_PERSISTENT_CACHE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
 const BROWSER_PERSISTENT_CACHE_OVERHEAD_DIVISOR: u64 = 100;
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+const BROWSER_CACHE_EVICTION_CONCURRENCY: usize = 16;
 /// Hard ceiling for one semantic Burnpack object retained in Wasm linear memory.
 pub const MAX_BROWSER_STAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Bootstrap metadata must remain small enough to fetch before the sealed manifest is known.
@@ -257,7 +259,7 @@ pub enum ArtifactStreamError {
         actual: Option<String>,
     },
     #[error(
-        "browser origin has {available_bytes} available storage bytes, but the selected model still needs {missing_bytes} cache bytes plus {reserve_bytes} bytes of safety reserve ({cached_entries}/{total_entries} exact cache entries already present); free origin storage or clear unrelated site data before retrying"
+        "browser origin has {available_bytes} available storage bytes after evicting {evicted_entries} unselected burn_image cache entries, but the selected model still needs {missing_bytes} cache bytes plus {reserve_bytes} bytes of safety reserve ({cached_entries}/{total_entries} exact cache entries already present); free origin storage or clear unrelated site data before retrying"
     )]
     BrowserStorageQuotaInsufficient {
         available_bytes: u64,
@@ -265,6 +267,7 @@ pub enum ArtifactStreamError {
         reserve_bytes: u64,
         cached_entries: u64,
         total_entries: u64,
+        evicted_entries: u64,
     },
     #[error("browser persistent-cache plan is invalid: {0}")]
     BrowserPersistentCachePlan(String),
@@ -498,6 +501,15 @@ impl BrowserPersistentCachePlan {
             .copied()
             .sum()
     }
+
+    fn unselected_keys(&self, cache: &'static str, present: &BTreeSet<String>) -> Vec<String> {
+        let expected = self.entries.get(cache);
+        present
+            .iter()
+            .filter(|key| expected.is_none_or(|entries| !entries.contains_key(*key)))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Result of checking exact selected-model keys against origin Cache Storage and quota.
@@ -510,6 +522,8 @@ pub(crate) struct BrowserPersistentCachePreflight {
     pub(crate) missing_bytes: u64,
     pub(crate) storage_available_bytes: u64,
     pub(crate) persistent_storage_granted: bool,
+    pub(crate) evicted_unselected_entries: u64,
+    pub(crate) reclaimed_storage_bytes: u64,
 }
 
 #[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
@@ -695,6 +709,27 @@ fn browser_storage_estimate_field(
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+async fn browser_storage_estimate(
+    storage: &web_sys::StorageManager,
+) -> Result<(u64, u64, u64), ArtifactStreamError> {
+    use wasm_bindgen_futures::JsFuture;
+
+    let estimate_value = JsFuture::from(
+        storage
+            .estimate()
+            .map_err(|value| browser_storage_operation_error("estimate quota", value))?,
+    )
+    .await
+    .map_err(|value| browser_storage_operation_error("estimate quota", value))?;
+    // `StorageEstimate` is a WebIDL dictionary returned as a plain JavaScript object, not a
+    // constructible browser class. Read its numeric fields directly and validate them before
+    // converting to byte counts.
+    let usage = browser_storage_estimate_field(&estimate_value, "usage")?;
+    let quota = browser_storage_estimate_field(&estimate_value, "quota")?;
+    Ok((usage, quota, quota.saturating_sub(usage)))
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
 async fn request_browser_persistent_storage(
     storage: &web_sys::StorageManager,
 ) -> Result<bool, ArtifactStreamError> {
@@ -735,8 +770,6 @@ async fn request_browser_persistent_storage(
 pub(crate) async fn preflight_browser_persistent_cache(
     plan: &BrowserPersistentCachePlan,
 ) -> Result<BrowserPersistentCachePreflight, ArtifactStreamError> {
-    use wasm_bindgen_futures::JsFuture;
-
     let total_entries = plan.entry_count();
     let total_bytes = plan.total_bytes();
     if total_entries == 0 || total_bytes == 0 {
@@ -747,6 +780,7 @@ pub(crate) async fn preflight_browser_persistent_cache(
 
     let mut cached_entries = 0_u64;
     let mut cached_bytes = 0_u64;
+    let mut unselected_keys = BTreeMap::new();
     for (cache_name, expected) in &plan.entries {
         let cache = open_browser_artifact_cache(cache_name).await?;
         let present = browser_cache_keys(&cache, cache_name).await?;
@@ -756,6 +790,7 @@ pub(crate) async fn preflight_browser_persistent_cache(
                 cached_bytes = cached_bytes.saturating_add(*size);
             }
         }
+        unselected_keys.insert(*cache_name, plan.unselected_keys(cache_name, &present));
     }
     let missing_entries = total_entries.saturating_sub(cached_entries);
     let missing_bytes = total_bytes.saturating_sub(cached_bytes);
@@ -768,20 +803,36 @@ pub(crate) async fn preflight_browser_persistent_cache(
 
     let window = web_sys::window().ok_or(ArtifactStreamError::BrowserWindowUnavailable)?;
     let storage = window.navigator().storage();
-    let estimate_value = JsFuture::from(
-        storage
-            .estimate()
-            .map_err(|value| browser_storage_operation_error("estimate quota", value))?,
-    )
-    .await
-    .map_err(|value| browser_storage_operation_error("estimate quota", value))?;
-    // `StorageEstimate` is a WebIDL dictionary returned as a plain JavaScript object, not a
-    // constructible browser class. A checked `JsCast::dyn_into` therefore rejects valid Chrome
-    // results. Read its numeric dictionary fields directly and retain the finite/safe-integer
-    // validation before converting them to Rust byte counts.
-    let storage_usage_bytes = browser_storage_estimate_field(&estimate_value, "usage")?;
-    let storage_quota_bytes = browser_storage_estimate_field(&estimate_value, "quota")?;
-    let storage_available_bytes = storage_quota_bytes.saturating_sub(storage_usage_bytes);
+    let (_, _, initial_storage_available_bytes) = browser_storage_estimate(&storage).await?;
+    let mut storage_available_bytes = initial_storage_available_bytes;
+    let mut evicted_unselected_entries = 0_u64;
+    if storage_available_bytes < required_available {
+        use futures::{StreamExt, TryStreamExt};
+
+        // This dedicated Cache Storage namespace contains only immutable burn_image transport
+        // parts. Under quota pressure, retain every exact key needed by the selected model and
+        // evict only unselected entries (typically an older release or the previous denoiser).
+        // Shared Qwen/VAE keys remain protected because they are present in the new plan. Bound
+        // deletion concurrency so replacing a large obsolete release does not add hundreds of
+        // serial browser round trips or flood Cache Storage with an unbounded Promise fan-out.
+        for (cache_name, keys) in unselected_keys {
+            let cache = open_browser_artifact_cache(cache_name).await?;
+            let removed = futures::stream::iter(keys)
+                .map(|key| {
+                    let cache = cache.clone();
+                    async move { browser_cache_delete(&cache, cache_name, &key).await }
+                })
+                .buffer_unordered(BROWSER_CACHE_EVICTION_CONCURRENCY)
+                .try_collect::<Vec<_>>()
+                .await?;
+            evicted_unselected_entries = evicted_unselected_entries
+                .saturating_add(removed.into_iter().filter(|removed| *removed).count() as u64);
+        }
+        let (_, _, refreshed_available_bytes) = browser_storage_estimate(&storage).await?;
+        storage_available_bytes = refreshed_available_bytes;
+    }
+    let reclaimed_storage_bytes =
+        storage_available_bytes.saturating_sub(initial_storage_available_bytes);
     if storage_available_bytes < required_available {
         return Err(ArtifactStreamError::BrowserStorageQuotaInsufficient {
             available_bytes: storage_available_bytes,
@@ -789,6 +840,7 @@ pub(crate) async fn preflight_browser_persistent_cache(
             reserve_bytes,
             cached_entries,
             total_entries,
+            evicted_entries: evicted_unselected_entries,
         });
     }
 
@@ -811,6 +863,8 @@ pub(crate) async fn preflight_browser_persistent_cache(
         missing_bytes,
         storage_available_bytes,
         persistent_storage_granted,
+        evicted_unselected_entries,
+        reclaimed_storage_bytes,
     })
 }
 
@@ -3278,6 +3332,15 @@ mod tests {
         .unwrap();
         assert_eq!(plan.entry_count(), 2);
         assert_eq!(plan.total_bytes(), 30);
+        let present = BTreeSet::from([
+            "https://burn-image.invalid/part/a".to_owned(),
+            "https://burn-image.invalid/part/b".to_owned(),
+            "https://burn-image.invalid/part/old-release".to_owned(),
+        ]);
+        assert_eq!(
+            plan.unselected_keys(BROWSER_ARTIFACT_PART_CACHE_NAME, &present),
+            ["https://burn-image.invalid/part/old-release".to_owned()]
+        );
         assert_eq!(browser_persistent_cache_reserve(0), 0);
         assert_eq!(
             browser_persistent_cache_reserve(1_000),

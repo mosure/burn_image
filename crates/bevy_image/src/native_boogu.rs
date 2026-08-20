@@ -2255,7 +2255,14 @@ mod tests {
         let edit = native_switch_context(&base, BooguVariant::Image01EditTurbo, true).unwrap();
         assert_eq!(
             edit.settings.storage_profile,
-            BooguStorageProfile::F16QwenVisionF32
+            BooguStorageProfile::Q4sBlockUpTo128F32
+        );
+        let ArtifactSource::Remote { base_url } = edit.settings.artifact_source else {
+            panic!("canonical switch must keep a remote source")
+        };
+        assert_eq!(
+            base_url.as_str(),
+            "https://aberration.technology/model/boogu-image-0.1-edit-turbo-q4s-block-up-to128-f32"
         );
         assert_eq!(
             native_qwen_query_chunk_size(

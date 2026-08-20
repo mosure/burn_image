@@ -6,7 +6,7 @@ fn main() {
 #[cfg(feature = "boogu-native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ProfileArg {
-    /// Variant-aware production default: packed Q4S for Turbo, mixed F16 for Edit releases.
+    /// Production default: packed Q4S for every public release.
     #[value(name = "production")]
     Production,
     #[value(name = "f16-qwen-vision-f32")]
@@ -101,7 +101,7 @@ struct Args {
     /// Generate, Edit 1K, or Edit 1.5K without restarting.
     #[arg(long, value_enum, default_value = "turbo")]
     variant: VariantArg,
-    /// Storage profile represented by the bundle. `production` uses packed Q4S for Turbo and mixed F16 for Edit.
+    /// Storage profile represented by the bundle. `production` uses packed Q4S for every variant.
     #[arg(long, value_enum, default_value = "production")]
     profile: ProfileArg,
     /// Native residency. `low-vram` streams Qwen/VAE per request while retaining the denoiser below a fail-closed 32-GB device plan.
@@ -398,7 +398,7 @@ mod tests {
         );
         assert_eq!(
             production.resolve(burn_boogu::BooguVariant::Image01EditTurbo),
-            BooguStorageProfile::F16QwenVisionF32
+            BooguStorageProfile::Q4sBlockUpTo128F32
         );
         assert_eq!(
             mixed_f16.resolve(burn_boogu::BooguVariant::Image01Turbo),

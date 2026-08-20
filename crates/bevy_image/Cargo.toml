@@ -69,8 +69,8 @@ native-autotune = [
   "burn-wgpu/autotune",
 ]
 # Concrete browser-local adapter over bounded HTTP Range readers and asynchronous semantic
-# Qwen/VAE/denoiser sources. Ordinary Turbo defaults to the resident direct-Q4 policy; Edit keeps
-# its qualified mixed-F16 policy. Bounded request streaming supports lower-memory devices.
+# Qwen/VAE/denoiser sources. Every ordinary public variant defaults to the resident direct-Q4
+# policy. Bounded request streaming supports lower-memory devices.
 boogu-web = [
   "web",
   "boogu",

@@ -191,13 +191,18 @@ fn browser_residency_selector_is_fail_closed_and_stably_labeled_correctness() {
 }
 
 #[test]
-fn browser_turbo_resident_q4_keeps_all_modules_warm_correctness() {
+fn browser_public_variants_resident_q4_keep_all_modules_warm_correctness() {
     let q4_settings = q4_settings();
-    let policy = BrowserExecutionPolicies::resident_packed_q4s(
+    for variant in [
         BooguVariant::Image01Turbo,
-        &q4_settings,
-    )
-    .unwrap();
+        BooguVariant::Image01EditTurbo,
+        BooguVariant::Image01EditTurbo1k5,
+    ] {
+        assert!(BrowserExecutionPolicies::resident_packed_q4s(variant, &q4_settings).is_ok());
+    }
+    let policy =
+        BrowserExecutionPolicies::resident_packed_q4s(BooguVariant::Image01Turbo, &q4_settings)
+            .unwrap();
     assert_eq!(
         policy.residency,
         BrowserBooguResidencyPolicy::ResidentPackedQ4s
@@ -265,13 +270,6 @@ fn browser_turbo_resident_q4_keeps_all_modules_warm_correctness() {
     assert!(source.contains("resident_weights_preserved"));
     assert!(production_source.contains("decoder.decoder_float_dtype()"));
     assert!(!production_source.contains("let loaded_dtype: DType = decoder.float_dtype()"));
-    assert!(
-        BrowserExecutionPolicies::resident_packed_q4s(
-            BooguVariant::Image01EditTurbo,
-            &q4_settings,
-        )
-        .is_err()
-    );
     assert!(
         BrowserExecutionPolicies::resident_packed_q4s(
             BooguVariant::Image01Turbo,

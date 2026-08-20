@@ -61,8 +61,10 @@ Only one reconstructed logical object needs to be live in Wasm memory at a time.
 remain resident after upload, so this bound does not force per-request model unloading.
 
 Persistent-storage quota values returned by browser APIs are converted without narrowing to 32-bit
-integers. Quota failure is reported with actionable context; ample host disk space alone does not
-guarantee that a browser profile grants enough origin quota.
+integers. Before failing a selected-model quota preflight, the runtime removes only entries that
+are not part of the selected closure from burn_image's dedicated cache. Shared Qwen/VAE entries are
+retained. Quota failure is then reported with actionable context; ample host disk space alone does
+not guarantee that a browser profile grants enough origin quota.
 
 ## CDN requirements
 

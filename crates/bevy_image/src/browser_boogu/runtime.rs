@@ -1,9 +1,9 @@
 //! Bevy-owned browser adapter over verified bounded HTTP Range reads.
 //!
 //! The high-VRAM browser runtime eagerly verifies and retains every active Qwen, VAE, and denoiser
-//! stage once. Turbo production keeps eligible weights in direct packed Q4S form and executes
-//! measured packed kernels without requiring `shader-f16`; Edit production retains the mixed-F16
-//! execution policy. Explicit diagnostics can still materialize dense F32 weights. Low-VRAM
+//! stage once. Production keeps eligible weights in direct packed Q4S form for every public
+//! variant and executes measured packed kernels without requiring `shader-f16`. Explicit
+//! diagnostics can still materialize dense F32 weights. Low-VRAM
 //! execution streams Qwen and VAE stages and retains an inventory-qualified runtime-Q8 denoiser
 //! for Edit releases. Explicit mixed-F16 Turbo retains an authenticated packed-F16 denoiser and
 //! widens exactly one semantic stage to dense F32. No route falls back to CPU or manufactures
@@ -4593,8 +4593,8 @@ pub struct BrowserBooguFactory {
 impl BrowserBooguFactory {
     /// Select the immutable production release expected below the configured remote base URL.
     ///
-    /// Turbo defaults to resident direct Q4S; Edit variants retain their bounded mixed-F16
-    /// residency. Use [`Self::with_residency`] for an explicit validation route.
+    /// Every public variant defaults to resident direct Q4S. Use [`Self::with_residency`] for an
+    /// explicit validation route.
     pub const fn new(variant: BooguVariant) -> Self {
         Self {
             variant,
@@ -6154,12 +6154,20 @@ impl BrowserBooguEngine {
             } else {
                 "best effort"
             };
+            let eviction = (cache.evicted_unselected_entries > 0).then(|| {
+                format!(
+                    "; evicted {} unselected entries and reclaimed {}",
+                    cache.evicted_unselected_entries,
+                    format_transfer_bytes(cache.reclaimed_storage_bytes),
+                )
+            });
             set_browser_factory_progress(format!(
-                "Selected-model cache: {}/{} exact keys present; {} to store; {} free ({persistence})",
+                "Selected-model cache: {}/{} exact keys present; {} to store; {} free ({persistence}){}",
                 cache.cached_entries,
                 cache.total_entries,
                 format_transfer_bytes(cache.missing_bytes),
                 format_transfer_bytes(cache.storage_available_bytes),
+                eviction.as_deref().unwrap_or_default(),
             ));
             bootstrap_control.set_transfer_phase(if cache.missing_entries == 0 {
                 "Loading selected model from persistent cache"

@@ -429,14 +429,11 @@ impl BrowserExecutionPolicy {
         Ok(policy)
     }
 
-    /// Build the canonical resident packed-Q4S Turbo policy.
+    /// Build the canonical resident packed-Q4S policy for a public variant.
     pub fn resident_packed_q4s(
-        variant: BooguVariant,
+        _variant: BooguVariant,
         settings: &BooguDeploymentSettings,
     ) -> Result<Self, &'static str> {
-        if !matches!(variant, BooguVariant::Image01Turbo) {
-            return Err("resident packed-Q4S is currently qualified only for Turbo generation");
-        }
         if !matches!(
             settings.storage_profile,
             BooguStorageProfile::Q4sBlockUpTo128F32
@@ -639,18 +636,22 @@ mod tests {
     }
 
     #[test]
-    fn turbo_production_selects_resident_q4_policy_correctness() {
+    fn public_variants_select_resident_q4_policy_correctness() {
         let settings = production();
-        let policy =
-            BrowserExecutionPolicy::resident_packed_q4s(BooguVariant::Image01Turbo, &settings)
-                .unwrap();
-        assert_eq!(
-            policy.residency,
-            BrowserBooguResidencyPolicy::ResidentPackedQ4s
-        );
-        assert!(policy.eager_preload);
-        assert!(policy.retain_qwen_stages && policy.retain_vae_stages);
-        assert!(policy.retain_denoiser_stages);
-        assert!(policy.weight_traffic_contract().contains("no-model-unload"));
+        for variant in [
+            BooguVariant::Image01Turbo,
+            BooguVariant::Image01EditTurbo,
+            BooguVariant::Image01EditTurbo1k5,
+        ] {
+            let policy = BrowserExecutionPolicy::resident_packed_q4s(variant, &settings).unwrap();
+            assert_eq!(
+                policy.residency,
+                BrowserBooguResidencyPolicy::ResidentPackedQ4s
+            );
+            assert!(policy.eager_preload);
+            assert!(policy.retain_qwen_stages && policy.retain_vae_stages);
+            assert!(policy.retain_denoiser_stages);
+            assert!(policy.weight_traffic_contract().contains("no-model-unload"));
+        }
     }
 }
