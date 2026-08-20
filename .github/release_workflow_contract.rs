@@ -67,8 +67,13 @@ fn required_release_gate_aggregation_remains_fail_closed_correctness() {
 }
 
 #[test]
-fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
+fn pages_uses_bounded_immutable_checks_and_retains_opt_in_full_audit_correctness() {
     assert!(DEPLOY_WORKFLOW.contains("timeout-minutes: 360"));
+    assert!(DEPLOY_WORKFLOW.contains("full_cdn_audit:"));
+    assert!(DEPLOY_WORKFLOW.contains("default: false"));
+    assert!(DEPLOY_WORKFLOW.contains(
+        "FULL_CDN_AUDIT: ${{ github.event_name == 'workflow_dispatch' && inputs.full_cdn_audit }}"
+    ));
     assert!(DEPLOY_WORKFLOW.contains("--bin boogu-verify-artifacts"));
     assert!(DEPLOY_WORKFLOW.contains("--manifest-only \"$output\""));
     assert!(DEPLOY_WORKFLOW.contains(".sealed_manifest_verified == true"));
@@ -123,13 +128,16 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
     let complete_object_contract = section(
         DEPLOY_WORKFLOW,
         "          require_single_exact_header() {",
-        "          verify_manifest_contract() {",
+        "          verify_range_object_contract() {",
     );
     for required in [
         "require_identity_content_encoding()",
         "verify_complete_object_contract()",
         "test \"$status\" = 200",
         "test \"$downloaded_bytes\" = \"$expected_size\"",
+        "test \"$(stat --format='%s' \"$complete_body\")\" = \"$expected_size\"",
+        "actual_sha256=\"$(sha256sum \"$complete_body\" | awk '{print $1}')\"",
+        "test \"$actual_sha256\" = \"$expected_sha256\"",
         "\"$complete_headers\" content-length \"$expected_size\"",
         "count == 0 || (count == 1 && value == \"identity\")",
         "! grep -Eqi '^content-range:' \"$complete_headers\"",
@@ -153,14 +161,69 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
     }
     assert!(!DEPLOY_WORKFLOW.contains("elif [[ \"$cache_policy\" == no-cache ]]"));
 
+    let range_contract = section(
+        DEPLOY_WORKFLOW,
+        "          verify_range_object_contract() {",
+        "          verify_manifest_contract() {",
+    );
+    for required in [
+        "--header 'Range: bytes=0-0'",
+        "test \"$status\" = 206",
+        "test \"$downloaded_bytes\" = 1",
+        "content-range \"bytes 0-0/$expected_size\"",
+        "if ! grep -Eqi '^access-control-expose-headers:.*(content-range|\\*)'",
+        "::warning title=CDN Range header exposure::",
+        "sealed part size and SHA-256 verification remain mandatory",
+        "grep -Eqi '^cache-control:.*immutable'",
+    ] {
+        assert!(
+            range_contract.contains(required),
+            "browser representative Range contract is missing: {required}"
+        );
+    }
+
+    let manifest_contract = section(
+        DEPLOY_WORKFLOW,
+        "          verify_manifest_contract() {",
+        "          validate_remote_payload_inventory_contracts() {",
+    );
+    for required in [
+        "verify_complete_object_contract \\",
+        "\"$base_url/$path\" immutable \"$expected_size\" \"$expected_sha256\"",
+        "first_transport_url=\"$base_url/$path\"",
+        "last_transport_url=\"$base_url/$path\"",
+        "verify_range_object_contract \"$first_transport_url\" \"$first_transport_size\"",
+        "verify_range_object_contract \"$last_transport_url\" \"$last_transport_size\"",
+        "range-probed representative immutable transport parts",
+    ] {
+        assert!(
+            manifest_contract.contains(required),
+            "bounded immutable CDN check is missing: {required}"
+        );
+    }
+
+    let inventory_validation = section(
+        DEPLOY_WORKFLOW,
+        "          validate_remote_payload_inventory_contracts() {",
+        "          authenticate_remote_payloads() {",
+    );
+    for required in [
+        "sort -u \"$payload_inventory\"",
+        "remote payload URL has conflicting size/SHA-256 contracts",
+        "validated $(wc -l < \"$unique_payload_inventory\") unique immutable payload contracts",
+    ] {
+        assert!(
+            inventory_validation.contains(required),
+            "immutable payload inventory gate is missing: {required}"
+        );
+    }
+
     let authentication = section(
         DEPLOY_WORKFLOW,
         "          authenticate_remote_payloads() {",
         "          verify_manifest_contract \"$manifest_file\" \"$MODEL_BASE_URL\"",
     );
     for required in [
-        "sort -u \"$payload_inventory\"",
-        "remote payload URL has conflicting size/SHA-256 contracts",
         "((expected_size <= max_transport_shard_bytes))",
         "curl --fail --silent --show-error",
         "--speed-time 120",
@@ -170,17 +233,27 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
     ] {
         assert!(
             authentication.contains(required),
-            "remote authentication contract is missing: {required}"
+            "opt-in full remote authentication contract is missing: {required}"
         );
     }
 
     let last_manifest = DEPLOY_WORKFLOW
         .rfind("verify_manifest_contract \"$edit_1k5_q4_manifest\"")
         .expect("all three Q4S manifest verifications must remain present");
+    let inventory = DEPLOY_WORKFLOW
+        .rfind("          validate_remote_payload_inventory_contracts")
+        .expect("immutable payload inventory validation must remain present");
+    let audit_gate = DEPLOY_WORKFLOW
+        .rfind("          if [[ \"$FULL_CDN_AUDIT\" == true ]]; then")
+        .expect("full remote payload authentication must remain explicitly opt-in");
     let authenticate = DEPLOY_WORKFLOW
-        .rfind("          authenticate_remote_payloads")
-        .expect("full remote payload authentication must remain present");
-    assert!(last_manifest < authenticate);
+        .rfind("            authenticate_remote_payloads")
+        .expect("opt-in full remote payload authentication call must remain present");
+    assert!(last_manifest < inventory);
+    assert!(inventory < audit_gate);
+    assert!(audit_gate < authenticate);
+    assert!(DEPLOY_WORKFLOW.contains("::notice title=Immutable CDN audit deferred::"));
+    assert!(DEPLOY_WORKFLOW.contains("full_cdn_audit=true"));
 }
 
 #[test]

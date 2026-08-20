@@ -70,10 +70,15 @@ Every manifest, compact payload, layout, and physical part must support exact co
 Range validation. For Range requests the CDN must return:
 
 - HTTP `206`;
-- exact `Content-Range` including the full object length;
+- exact server-side `Content-Range` including the full object length;
 - exact `Content-Length`;
 - absent or `identity` `Content-Encoding`;
-- CORS exposure for `Content-Range`, `Content-Length`, and `Content-Encoding` (or `*`).
+- CORS permission for the requesting Pages origin.
+
+The canonical loader fetches each bounded physical part as a complete immutable object and verifies
+its exact size and SHA-256 digest, so it does not depend on JavaScript-visible `Content-Range`.
+Exposing `Content-Range` remains required for consumers of the lower-level browser Range API and is
+therefore reported as a readiness warning when absent.
 
 Physical parts target 20,971,520 bytes and must not exceed 25,000,000 bytes. Payloads should use an
 immutable cache policy. Manifest cache policy is advisory because manifests are sealed and refer to
@@ -110,10 +115,12 @@ Pages deployment verifies:
 
 - the generated JS/Wasm/icon package;
 - manifest seals and component pins;
-- layout structure and direct-file limits;
-- every unique physical part's size and SHA-256 digest;
-- complete-object and Range/CORS headers;
+- layout structure and the complete immutable URL/size/SHA-256 inventory;
+- exact size and SHA-256 for compact direct files;
+- exact Range/CORS/cache headers for bounded first/last physical-part samples in every bundle;
 - source/workflow contracts.
 
 The page is deployed only after readiness succeeds. CDN artifacts are published independently and
-must already exist at their immutable URLs.
+must already exist at their immutable URLs. A manual dispatch with `full_cdn_audit=true` retains the
+expensive publication-time audit that downloads and hashes every unique payload; normal source
+deploys intentionally do not repeat that roughly 103 GB transfer.

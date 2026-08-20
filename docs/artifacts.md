@@ -100,8 +100,12 @@ That narrower command proves structure and sealed metadata, not payload bytes.
 
 Upload immutable payloads first, component manifests next, and composed manifests last. A manifest
 must never become visible before every object it names is readable with the required HTTP contract.
-Deployment rechecks size, SHA-256, CORS, Range behavior, dependency pins, and reconstructed logical
-digests.
+Normal Pages deployment authenticates every sealed manifest and layout, fully hashes compact direct
+files, validates the complete URL/size/SHA-256 inventory, and checks exact Range/CORS/cache behavior
+on a bounded first/last transport-part sample per bundle. It does not re-download the roughly
+103 GB immutable payload closure on every source push. After publishing a new artifact release, run
+the Pages workflow manually with `full_cdn_audit=true` to re-download and SHA-256-authenticate every
+unique payload before treating that CDN release as remotely audited.
 
 Payload URLs use long-lived immutable caching. A cached manifest remains safe because it is sealed
 and points only to immutable content-addressed payloads; deployment emits a warning, rather than a

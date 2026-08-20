@@ -5,6 +5,12 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      full_cdn_audit:
+        description: Re-download and SHA-256-authenticate every immutable CDN payload
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -37,9 +43,8 @@ jobs:
     needs: readiness
     if: github.event_name == 'workflow_dispatch' || vars.BURN_IMAGE_PAGES_READY == 'true'
     runs-on: ubuntu-latest
-    # The ten-entry mixed-F16 plus shared-component Q4S release contains roughly 103 GB of
-    # unique remote payload URLs.
-    # Publication authentication streams and hashes each one sequentially before deployment.
+    # Normal deploys authenticate the sealed metadata and probe a bounded sample of immutable
+    # transport parts. The opt-in publication audit streams roughly 103 GB of unique payloads.
     timeout-minutes: 360
     environment:
       name: github-pages
@@ -65,6 +70,7 @@ jobs:
       - name: verify canonical browser CDN contract
         shell: bash
         env:
+          FULL_CDN_AUDIT: ${{ github.event_name == 'workflow_dispatch' && inputs.full_cdn_audit }}
           MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-turbo
           MODEL_CONTENT_DIGEST: 32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a
           Q4_MODEL_BASE_URL: https://aberration.technology/model/boogu-image-0.1-turbo-q4s-block-up-to128-f32
@@ -85,6 +91,7 @@ jobs:
           model_root_url="${MODEL_BASE_URL%/*}"
           manifest_verifier="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/release/boogu-verify-artifacts"
           payload_inventory="$scratch/remote-payloads.tsv"
+          unique_payload_inventory="$scratch/remote-payloads.unique.tsv"
           readonly transport_part_target_bytes=$((20 * 1024 * 1024))
           readonly max_transport_shard_bytes=25000000
           readonly transport_layout_path='metadata/transport-layout.json'
@@ -190,14 +197,17 @@ jobs:
             local url="$1"
             local cache_policy="$2"
             local expected_size="$3"
+            local expected_sha256="${4:-}"
+            local actual_sha256
             local downloaded_bytes
             local response_metrics
             local status
+            local complete_body="$scratch/complete.body"
             local complete_headers="$scratch/complete.headers"
             [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
             response_metrics="$(
-              curl --silent --show-error \
-                --output /dev/null \
+              curl --fail --silent --show-error \
+                --output "$complete_body" \
                 --dump-header "$complete_headers" \
                 --write-out $'%{http_code}\t%{size_download}' \
                 --header 'Origin: https://mosure.github.io' \
@@ -207,6 +217,12 @@ jobs:
             IFS=$'\t' read -r status downloaded_bytes <<< "$response_metrics"
             test "$status" = 200
             test "$downloaded_bytes" = "$expected_size"
+            test "$(stat --format='%s' "$complete_body")" = "$expected_size"
+            if [[ -n "$expected_sha256" ]]; then
+              [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
+              actual_sha256="$(sha256sum "$complete_body" | awk '{print $1}')"
+              test "$actual_sha256" = "$expected_sha256"
+            fi
             tr -d '\r' < "$complete_headers" > "$complete_headers.normalized"
             mv "$complete_headers.normalized" "$complete_headers"
             grep -Eqi '^access-control-allow-origin: (https://mosure\.github\.io|\*)$' \
@@ -227,6 +243,43 @@ jobs:
             fi
           }
 
+          verify_range_object_contract() {
+            local url="$1"
+            local expected_size="$2"
+            local downloaded_bytes
+            local response_metrics
+            local status
+            local range_body="$scratch/range.body"
+            local range_headers="$scratch/range.headers"
+            [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
+            response_metrics="$(
+              curl --fail --silent --show-error \
+                --output "$range_body" \
+                --dump-header "$range_headers" \
+                --write-out $'%{http_code}\t%{size_download}' \
+                --header 'Origin: https://mosure.github.io' \
+                --header 'Accept-Encoding: identity' \
+                --header 'Range: bytes=0-0' \
+                "$url"
+            )"
+            IFS=$'\t' read -r status downloaded_bytes <<< "$response_metrics"
+            test "$status" = 206
+            test "$downloaded_bytes" = 1
+            test "$(stat --format='%s' "$range_body")" = 1
+            tr -d '\r' < "$range_headers" > "$range_headers.normalized"
+            mv "$range_headers.normalized" "$range_headers"
+            grep -Eqi '^access-control-allow-origin: (https://mosure\.github\.io|\*)$' \
+              "$range_headers"
+            if ! grep -Eqi '^access-control-expose-headers:.*(content-range|\*)' "$range_headers"; then
+              echo "::warning title=CDN Range header exposure::$url does not expose Content-Range to browser JavaScript; sealed part size and SHA-256 verification remain mandatory."
+            fi
+            require_single_exact_header "$range_headers" content-length 1
+            require_single_exact_header \
+              "$range_headers" content-range "bytes 0-0/$expected_size"
+            require_identity_content_encoding "$range_headers"
+            grep -Eqi '^cache-control:.*immutable' "$range_headers"
+          }
+
           verify_manifest_contract() {
             local manifest="$1"
             local base_url="$2"
@@ -240,6 +293,10 @@ jobs:
             local manifest_size
             local declared_files=0
             local declared_transport_parts=0
+            local first_transport_url=""
+            local first_transport_size=""
+            local last_transport_url=""
+            local last_transport_size=""
             local path
             local role
             local expected_size
@@ -316,7 +373,8 @@ jobs:
                 continue
               fi
               ((expected_size <= max_transport_shard_bytes))
-              verify_complete_object_contract "$base_url/$path" immutable "$expected_size"
+              verify_complete_object_contract \
+                "$base_url/$path" immutable "$expected_size" "$expected_sha256"
               printf '%s\t%s\t%s\n' \
                 "$base_url/$path" "$expected_size" "$expected_sha256" >> "$payload_inventory"
               declared_files=$((declared_files + 1))
@@ -332,7 +390,12 @@ jobs:
               ((expected_size <= max_transport_shard_bytes))
               [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
               test "${path#transport/}" = "$expected_sha256.part"
-              verify_complete_object_contract "$base_url/$path" immutable "$expected_size"
+              if [[ -z "$first_transport_url" ]]; then
+                first_transport_url="$base_url/$path"
+                first_transport_size="$expected_size"
+              fi
+              last_transport_url="$base_url/$path"
+              last_transport_size="$expected_size"
               printf '%s\t%s\t%s\n' \
                 "$base_url/$path" "$expected_size" "$expected_sha256" >> "$payload_inventory"
               declared_transport_parts=$((declared_transport_parts + 1))
@@ -340,10 +403,30 @@ jobs:
               jq -er '.objects[].parts[] | [.path, (.size | tostring), .sha256] | @tsv' "$layout_file"
             )
             test "$declared_transport_parts" -gt 0
+            verify_range_object_contract "$first_transport_url" "$first_transport_size"
+            if [[ "$last_transport_url" != "$first_transport_url" ]]; then
+              verify_range_object_contract "$last_transport_url" "$last_transport_size"
+            fi
+            echo "range-probed representative immutable transport parts for $bundle_name"
+          }
+
+          validate_remote_payload_inventory_contracts() {
+            LC_ALL=C sort -u "$payload_inventory" > "$unique_payload_inventory"
+            test -s "$unique_payload_inventory"
+            awk -F '\t' '
+              {
+                contract = $2 FS $3
+                if (($1 in contracts) && contracts[$1] != contract) {
+                  print "remote payload URL has conflicting size/SHA-256 contracts: " $1 > "/dev/stderr"
+                  exit 1
+                }
+                contracts[$1] = contract
+              }
+            ' "$unique_payload_inventory"
+            echo "validated $(wc -l < "$unique_payload_inventory") unique immutable payload contracts"
           }
 
           authenticate_remote_payloads() {
-            local unique_inventory="$scratch/remote-payloads.unique.tsv"
             local payload_file="$scratch/remote-payload.bin"
             local url
             local expected_size
@@ -354,18 +437,6 @@ jobs:
             local authenticated
             local authenticated_files=0
             local authenticated_bytes=0
-
-            LC_ALL=C sort -u "$payload_inventory" > "$unique_inventory"
-            awk -F '\t' '
-              {
-                contract = $2 FS $3
-                if (($1 in contracts) && contracts[$1] != contract) {
-                  print "remote payload URL has conflicting size/SHA-256 contracts: " $1 > "/dev/stderr"
-                  exit 1
-                }
-                contracts[$1] = contract
-              }
-            ' "$unique_inventory"
 
             while IFS=$'\t' read -r url expected_size expected_sha256; do
               [[ "$url" == https://* ]]
@@ -406,7 +477,7 @@ jobs:
               fi
               authenticated_files=$((authenticated_files + 1))
               authenticated_bytes=$((authenticated_bytes + expected_size))
-            done < "$unique_inventory"
+            done < "$unique_payload_inventory"
 
             echo "authenticated $authenticated_files unique remote payload URLs ($authenticated_bytes bytes)"
           }
@@ -607,7 +678,12 @@ jobs:
             "$edit_1k5_q4_manifest" >/dev/null
           verify_manifest_contract "$edit_1k5_q4_manifest" "$EDIT_1K5_Q4_MODEL_BASE_URL"
 
-          authenticate_remote_payloads
+          validate_remote_payload_inventory_contracts
+          if [[ "$FULL_CDN_AUDIT" == true ]]; then
+            authenticate_remote_payloads
+          else
+            echo "::notice title=Immutable CDN audit deferred::Sealed manifests, layouts, compact payloads, and representative Range contracts passed. Run this workflow manually with full_cdn_audit=true after publishing a new CDN release to re-download and SHA-256-authenticate every immutable payload."
+          fi
 
       - name: install Cargo.lock-matched wasm-bindgen
         run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
