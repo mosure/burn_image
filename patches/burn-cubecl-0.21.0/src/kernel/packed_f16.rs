@@ -447,7 +447,8 @@ fn packed_f16_conv2d_kernel(
                 let output_index =
                     ((batch * out_channels + out_channel) * out_h + out_y) * out_w + out_x;
                 let bias: ComptimeOption<f32> = bias.map(|values| values[out_channel]);
-                output[output_index] = sums[column_lane] + bias.unwrap_or_else(|| f32::new(0.0));
+                output[output_index] =
+                    sums[column_lane] + bias.unwrap_or_else(|| f32::new(0.0_f32));
             }
         }
     }

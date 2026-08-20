@@ -131,31 +131,31 @@ fn cubic_interp_1d<F: Float, N: Size>(
     x3: Vector<F, N>,
     t: Vector<F, N>,
 ) -> Vector<F, N> {
-    let a = float(-0.75);
+    let a = float(-0.75_f32);
 
-    let coeffs0 = cubic_convolution_2(t + float(1.0), a);
+    let coeffs0 = cubic_convolution_2(t + float(1.0_f32), a);
     let coeffs1 = cubic_convolution_1(t, a);
-    let coeffs2 = cubic_convolution_1(float(1.0) - t, a);
-    let coeffs3 = cubic_convolution_2(float(2.0) - t, a);
+    let coeffs2 = cubic_convolution_1(float(1.0_f32) - t, a);
+    let coeffs3 = cubic_convolution_2(float(2.0_f32) - t, a);
 
     x0 * coeffs0 + x1 * coeffs1 + x2 * coeffs2 + x3 * coeffs3
 }
 
 #[cube]
 fn cubic_convolution_1<F: Float, N: Size>(x: Vector<F, N>, a: Vector<F, N>) -> Vector<F, N> {
-    let conv = (a + float(2.0)) * x;
-    let tmp = a + float(3.0);
-    (conv - tmp) * x * x + float(1.0)
+    let conv = (a + float(2.0_f32)) * x;
+    let tmp = a + float(3.0_f32);
+    (conv - tmp) * x * x + float(1.0_f32)
 }
 
 #[cube]
 fn cubic_convolution_2<F: Float, N: Size>(x: Vector<F, N>, a: Vector<F, N>) -> Vector<F, N> {
     let conv = a * x;
-    let conv = (conv - float(5.0) * a) * x;
-    let tmp = float(8.0) * a;
+    let conv = (conv - float(5.0_f32) * a) * x;
+    let tmp = float(8.0_f32) * a;
     let conv = (conv + tmp) * x;
 
-    conv - float(4.0) * a
+    conv - float(4.0_f32) * a
 }
 
 #[cube]
