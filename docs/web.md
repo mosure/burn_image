@@ -104,10 +104,12 @@ emit structured reports and terminal markers and are not part of the interactive
 
 ## Rendering safety
 
-Inference work runs outside the Bevy update loop. On browser/driver combinations that cannot safely
-acquire a surface during heavy compute, the runtime temporarily suspends surface acquisition while
-keeping request state visible, then restores it before presenting output. Gate violations, device
-loss, uncaptured errors, and cleanup failures fail qualification.
+Inference work runs outside the Bevy update loop. The WebAssembly frontend temporarily suspends
+surface acquisition while heavy compute owns the shared WebGPU queue, then restores it before
+presenting output. A web-only DOM safety overlay covers the intentionally frozen canvas and shows
+the current stage, step, or verified-cache activity from the same structured runtime progress
+events; native windows are never suspended by this policy. Gate violations, device loss,
+uncaptured errors, and cleanup failures fail qualification.
 
 ## Deployment readiness
 

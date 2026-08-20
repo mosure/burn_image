@@ -2385,6 +2385,9 @@ thread_local! {
     static BROWSER_FACTORY_PROGRESS: std::cell::RefCell<Option<String>> = const {
         std::cell::RefCell::new(None)
     };
+    static BROWSER_SURFACE_OVERLAY_ACTIVE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 fn set_browser_factory_progress(message: String) {
@@ -2393,6 +2396,14 @@ fn set_browser_factory_progress(message: String) {
 
 fn take_browser_factory_progress() -> Option<String> {
     BROWSER_FACTORY_PROGRESS.with(|progress| progress.borrow_mut().take())
+}
+
+fn set_browser_surface_overlay_active(active: bool) {
+    BROWSER_SURFACE_OVERLAY_ACTIVE.with(|state| state.set(active));
+}
+
+fn browser_surface_overlay_active() -> bool {
+    BROWSER_SURFACE_OVERLAY_ACTIVE.with(std::cell::Cell::get)
 }
 
 fn report_browser_manifest_verified(manifest: &ArtifactManifest) {
@@ -2467,6 +2478,7 @@ pub(crate) fn report_browser_surface_inference_suspended(
     inactive_camera_count: usize,
     active_job_count: usize,
 ) {
+    set_browser_surface_overlay_active(true);
     dispatch_browser_event(
         BROWSER_RUNTIME_EVENT_NAME,
         &BrowserRuntimeEvent::SurfaceInferenceSuspended {
@@ -2512,6 +2524,7 @@ pub(crate) fn report_browser_surface_inference_resumed(
             all_primary_window_cameras_restored,
         },
     );
+    set_browser_surface_overlay_active(false);
 }
 
 pub(crate) fn report_browser_surface_inference_gate_failure(
@@ -2643,6 +2656,9 @@ fn format_transfer_duration(seconds: u64) -> String {
 }
 
 fn browser_dom_event_stream_requested() -> bool {
+    if browser_surface_overlay_active() {
+        return true;
+    }
     static REQUESTED: OnceLock<bool> = OnceLock::new();
     *REQUESTED.get_or_init(|| {
         web_sys::window()
@@ -2657,9 +2673,10 @@ fn browser_dom_event_stream_requested() -> bool {
 }
 
 fn dispatch_browser_event<T: serde::Serialize>(name: &str, value: &T) {
-    // Interactive progress goes directly to ImageRunnerEvent/Bevy. Avoid serializing and
-    // dispatching thousands of unused DOM events now that the browser-only overlay is gone.
-    // Headless and rendered qualification routes retain their exact automation event contracts.
+    // Interactive progress goes directly to ImageRunnerEvent/Bevy unless the shared canvas is
+    // deliberately suspended. During that interval, forward only the request's bounded event
+    // window to the web-only safety overlay. Headless and rendered qualification routes retain
+    // their complete automation event contracts.
     if !browser_dom_event_stream_requested() {
         return;
     }

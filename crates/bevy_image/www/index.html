@@ -41,11 +41,109 @@
       #burn-image-reference-input {
         display: none;
       }
+
+      #burn-image-surface-suspension {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        color: #edf4ff;
+        background:
+          radial-gradient(circle at 50% 42%, rgba(35, 70, 112, 0.28), transparent 48%),
+          rgba(7, 10, 15, 0.88);
+        backdrop-filter: blur(7px);
+        cursor: progress;
+        pointer-events: auto;
+      }
+
+      #burn-image-surface-suspension[hidden] {
+        display: none;
+      }
+
+      .surface-suspension-card {
+        width: min(460px, 100%);
+        padding: 24px;
+        border: 1px solid rgba(125, 177, 241, 0.34);
+        border-radius: 16px;
+        background: rgba(15, 21, 30, 0.96);
+        box-shadow: 0 22px 72px rgba(0, 0, 0, 0.42);
+      }
+
+      .surface-suspension-heading {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      .surface-suspension-pulse {
+        width: 11px;
+        height: 11px;
+        flex: 0 0 auto;
+        border-radius: 50%;
+        background: #68b6ff;
+        box-shadow: 0 0 0 0 rgba(104, 182, 255, 0.52);
+        animation: surface-suspension-pulse 1.7s ease-out infinite;
+      }
+
+      .surface-suspension-card.is-error .surface-suspension-pulse {
+        background: #ff7f87;
+        animation: none;
+      }
+
+      .surface-suspension-eyebrow {
+        margin: 0 0 4px;
+        color: #88bff6;
+        font: 600 11px/1.2 system-ui, sans-serif;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .surface-suspension-card h1 {
+        margin: 0;
+        font: 600 20px/1.3 system-ui, sans-serif;
+      }
+
+      #burn-image-surface-stage {
+        margin: 18px 0 10px;
+        color: #d8e8fa;
+        font: 500 14px/1.45 system-ui, sans-serif;
+      }
+
+      #burn-image-surface-progress {
+        width: 100%;
+        height: 7px;
+        accent-color: #68b6ff;
+      }
+
+      #burn-image-surface-detail {
+        min-height: 18px;
+        margin: 9px 0 0;
+        color: #9cadbf;
+        font: 400 12px/1.5 system-ui, sans-serif;
+      }
+
+      @keyframes surface-suspension-pulse {
+        70% {
+          box-shadow: 0 0 0 9px rgba(104, 182, 255, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(104, 182, 255, 0);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .surface-suspension-pulse {
+          animation: none;
+        }
+      }
     </style>
   </head>
   <body>
-    <!-- Headless qualification routes retain this machine-readable terminal without displaying a
-         second browser UI. The visible interface is exclusively Bevy on every platform. -->
+    <!-- Headless qualification routes retain this machine-readable terminal. Bevy remains the
+         primary interface; the web-only safety overlay appears only while its surface is
+         deliberately suspended during shared-device inference. -->
     <span id="status" aria-hidden="true">Loading WebAssembly</span>
     <input
       id="burn-image-reference-input"
@@ -54,6 +152,29 @@
       aria-label="Choose an edit reference image"
     />
     <canvas id="burn-image"></canvas>
+    <section
+      id="burn-image-surface-suspension"
+      role="status"
+      aria-live="polite"
+      aria-busy="true"
+      aria-atomic="false"
+      hidden
+    >
+      <div class="surface-suspension-card">
+        <div class="surface-suspension-heading">
+          <span class="surface-suspension-pulse" aria-hidden="true"></span>
+          <div>
+            <p class="surface-suspension-eyebrow">WebGPU inference</p>
+            <h1 id="burn-image-surface-title">Rendering paused while the GPU works</h1>
+          </div>
+        </div>
+        <p id="burn-image-surface-stage">Starting inference</p>
+        <progress id="burn-image-surface-progress" max="1"></progress>
+        <p id="burn-image-surface-detail">
+          The Bevy surface will resume automatically when this request finishes.
+        </p>
+      </div>
+    </section>
 
     <script type="module">
       import init, {
@@ -63,7 +184,164 @@
 
       const status = document.querySelector("#status");
       const referenceInput = document.querySelector("#burn-image-reference-input");
+      const surfaceOverlay = document.querySelector("#burn-image-surface-suspension");
+      const surfaceCard = surfaceOverlay.querySelector(".surface-suspension-card");
+      const surfaceTitle = document.querySelector("#burn-image-surface-title");
+      const surfaceStage = document.querySelector("#burn-image-surface-stage");
+      const surfaceProgress = document.querySelector("#burn-image-surface-progress");
+      const surfaceDetail = document.querySelector("#burn-image-surface-detail");
       const MAX_REFERENCE_BYTES = 64 * 1024 * 1024;
+      let suspendedRunId = null;
+
+      const humanizeStage = (stage) => {
+        const value = String(stage || "GPU inference").replace(/[-_]+/g, " ").trim();
+        return value ? value.charAt(0).toUpperCase() + value.slice(1) : "GPU inference";
+      };
+
+      const formatBytes = (bytes) => {
+        const value = Number(bytes);
+        if (!Number.isFinite(value) || value < 0) return null;
+        if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GiB`;
+        if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MiB`;
+        return `${Math.round(value / 1024)} KiB`;
+      };
+
+      const setSurfaceProgress = (value, total) => {
+        const numericValue = Number(value);
+        const numericTotal = Number(total);
+        if (
+          Number.isFinite(numericValue) &&
+          Number.isFinite(numericTotal) &&
+          numericTotal > 0
+        ) {
+          surfaceProgress.max = numericTotal;
+          surfaceProgress.value = Math.min(Math.max(numericValue, 0), numericTotal);
+        } else {
+          surfaceProgress.removeAttribute("value");
+        }
+      };
+
+      const showSurfaceSuspension = (detail) => {
+        suspendedRunId = String(detail.run_id);
+        surfaceCard.classList.remove("is-error");
+        surfaceTitle.textContent = "Rendering paused while the GPU works";
+        surfaceStage.textContent = "Starting inference";
+        surfaceDetail.textContent =
+          "The Bevy surface will resume automatically when this request finishes.";
+        setSurfaceProgress();
+        surfaceOverlay.hidden = false;
+        surfaceOverlay.setAttribute("aria-busy", "true");
+      };
+
+      const hideSurfaceSuspension = (detail) => {
+        if (suspendedRunId !== null && String(detail.run_id) !== suspendedRunId) return;
+        suspendedRunId = null;
+        surfaceOverlay.hidden = true;
+        surfaceOverlay.setAttribute("aria-busy", "false");
+      };
+
+      const showSurfaceFailure = (message) => {
+        if (surfaceOverlay.hidden) return;
+        surfaceCard.classList.add("is-error");
+        surfaceTitle.textContent = "GPU inference stopped";
+        surfaceStage.textContent = String(message || "The shared WebGPU device became unavailable.");
+        surfaceDetail.textContent = "Reload the page to create a fresh shared GPU device.";
+        setSurfaceProgress();
+        surfaceOverlay.setAttribute("aria-busy", "false");
+      };
+
+      const updateTransferProgress = (transfer, fallbackLoaded, fallbackTotal) => {
+        const activity = transfer?.request_activity;
+        if (activity) {
+          surfaceStage.textContent = humanizeStage(activity.phase || "Applying cached model stages");
+          const bytes = formatBytes(activity.processed_bytes);
+          surfaceDetail.textContent = [
+            `${Number(activity.logical_objects_completed || 0)} verified objects`,
+            bytes,
+            "browser cache",
+          ]
+            .filter(Boolean)
+            .join(" / ");
+          setSurfaceProgress();
+          return;
+        }
+        const loaded = transfer?.loaded_bytes ?? fallbackLoaded;
+        const total = transfer?.total_bytes ?? fallbackTotal;
+        surfaceStage.textContent = humanizeStage(transfer?.phase || "Loading verified model data");
+        const loadedText = formatBytes(loaded);
+        const totalText = formatBytes(total);
+        surfaceDetail.textContent =
+          loadedText && totalText ? `${loadedText} of ${totalText}` : "Verifying model data";
+        setSurfaceProgress(loaded, total);
+      };
+
+      window.addEventListener("burn-image-runtime", (event) => {
+        const detail = event.detail || {};
+        if (detail.event === "surface_inference_suspended") {
+          showSurfaceSuspension(detail);
+        } else if (detail.event === "surface_inference_resumed") {
+          hideSurfaceSuspension(detail);
+        } else if (detail.event === "surface_inference_gate_failed") {
+          showSurfaceFailure(detail.message || "The inference surface safety gate failed.");
+        } else if (detail.event === "failed") {
+          showSurfaceFailure(detail.message);
+        }
+      });
+
+      window.addEventListener("burn-image-progress", (event) => {
+        if (surfaceOverlay.hidden) return;
+        const detail = event.detail || {};
+        if (suspendedRunId !== null && String(detail.run_id) !== suspendedRunId) return;
+        switch (detail.event) {
+          case "run_started":
+            surfaceStage.textContent = `Starting ${humanizeStage(detail.task)}`;
+            surfaceDetail.textContent = "Preparing the resident GPU pipeline";
+            setSurfaceProgress();
+            break;
+          case "artifact_started":
+          case "artifact_progress":
+          case "artifact_verified":
+            updateTransferProgress(detail.transfer, detail.loaded_bytes, detail.total_bytes);
+            break;
+          case "stage_started":
+            surfaceStage.textContent = humanizeStage(detail.stage);
+            surfaceDetail.textContent = detail.total_steps
+              ? `Step 0 of ${detail.total_steps}`
+              : "GPU work is in progress";
+            setSurfaceProgress(0, detail.total_steps);
+            break;
+          case "step":
+            surfaceStage.textContent = humanizeStage(detail.stage);
+            surfaceDetail.textContent = `Step ${detail.step} of ${detail.total_steps}`;
+            setSurfaceProgress(detail.step, detail.total_steps);
+            break;
+          case "stage_completed":
+            surfaceStage.textContent = `${humanizeStage(detail.stage)} complete`;
+            surfaceDetail.textContent = "Preparing the next GPU stage";
+            setSurfaceProgress();
+            break;
+          case "warning":
+            surfaceDetail.textContent = `Warning: ${detail.message}`;
+            break;
+          case "run_completed":
+            surfaceStage.textContent = "Inference complete";
+            surfaceDetail.textContent = "Restoring the Bevy surface";
+            setSurfaceProgress(1, 1);
+            break;
+          case "run_failed":
+            showSurfaceFailure(detail.message);
+            break;
+          case "run_cancelled":
+            surfaceStage.textContent = "Inference cancelled";
+            surfaceDetail.textContent = "Restoring the Bevy surface";
+            setSurfaceProgress();
+            break;
+        }
+      });
+
+      window.addEventListener("burn-image-backend", (event) => {
+        if (event.detail?.event === "failed") showSurfaceFailure(event.detail.message);
+      });
 
       const supportedReferenceFile = (file) => {
         const type = String(file?.type || "").toLowerCase();

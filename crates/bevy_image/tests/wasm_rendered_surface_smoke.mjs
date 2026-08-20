@@ -377,10 +377,19 @@ async function validateCommittedSources() {
     'id="burn-image"',
     'id="status" aria-hidden="true"',
     'id="burn-image-reference-input"',
+    'id="burn-image-surface-suspension"',
+    'id="burn-image-surface-stage"',
+    'id="burn-image-surface-progress"',
     'provide_reference_image_error',
     'reportReferenceError',
     'rel="icon" type="image/png" sizes="512x512" href="./out/burn-image-icon.png"',
-    "The visible interface is exclusively Bevy on every platform",
+    "web-only safety overlay appears only while its surface is",
+    'window.addEventListener("burn-image-runtime"',
+    'window.addEventListener("burn-image-progress"',
+    'detail.event === "surface_inference_suspended"',
+    'detail.event === "surface_inference_resumed"',
+    "showSurfaceSuspension",
+    "updateTransferProgress",
     "await init()",
   ]) {
     if (!indexSource.includes(required)) failures.push(`www/index.html omits ${required}`);
@@ -389,10 +398,7 @@ async function validateCommittedSources() {
     'id="model-loader"',
     'id="artifact-progress"',
     "loader-panel",
-    "burn-image-runtime",
-    "burn-image-progress",
     "configureModelReleaseSelector",
-    "surface_inference_suspended",
   ]) {
     if (indexSource.includes(forbidden)) {
       failures.push(`www/index.html retains fragmented browser UI behavior ${forbidden}`);
@@ -483,6 +489,10 @@ async function validateCommittedSources() {
     "with_required_range_cache()",
     "BrowserRuntimeEvent::PackedF16DenoiserPreload",
     "BrowserRuntimeEvent::VramPreflight",
+    "BROWSER_SURFACE_OVERLAY_ACTIVE",
+    "set_browser_surface_overlay_active(true)",
+    "set_browser_surface_overlay_active(false)",
+    "if browser_surface_overlay_active()",
     "run_browser_vram_preflight(",
     "queue.on_submitted_work_done",
     "failed before model-weight download",

@@ -989,12 +989,15 @@ mod web_shell_tests {
     }
 
     #[test]
-    fn web_shell_uses_bevy_as_its_only_visible_interface_correctness() {
+    fn web_shell_uses_bevy_with_request_scoped_safety_overlay_correctness() {
         let html = include_str!("../www/index.html");
         for required in [
             "id=\"status\" aria-hidden=\"true\"",
             "id=\"burn-image-reference-input\"",
             "id=\"burn-image\"",
+            "id=\"burn-image-surface-suspension\"",
+            "id=\"burn-image-surface-stage\"",
+            "id=\"burn-image-surface-progress\"",
             ".JPG",
             "HEIC/HEIF decoding is not available in this build",
             "rel=\"icon\"",
@@ -1003,8 +1006,14 @@ mod web_shell_tests {
             "reportReferenceError",
             "loadReferenceFile",
             "MAX_REFERENCE_BYTES",
+            "burn-image-runtime",
+            "burn-image-progress",
+            "surface_inference_suspended",
+            "surface_inference_resumed",
+            "showSurfaceSuspension",
+            "updateTransferProgress",
             "await init()",
-            "The visible interface is exclusively Bevy on every platform",
+            "web-only safety overlay appears only while its surface is",
         ] {
             assert!(html.contains(required), "web shell omits {required}");
         }
@@ -1012,11 +1021,8 @@ mod web_shell_tests {
             "id=\"model-loader\"",
             "id=\"artifact-progress\"",
             "loader-panel",
-            "burn-image-runtime",
-            "burn-image-progress",
             "configureModelReleaseSelector",
             "./model_selector.mjs",
-            "surface_inference_suspended",
             "requestAnimationFrame",
         ] {
             assert!(
@@ -1027,6 +1033,12 @@ mod web_shell_tests {
         assert!(
             html.contains("#status,\n      #burn-image-reference-input"),
             "the headless status terminal and browser picker must remain nonvisual"
+        );
+        assert!(
+            html.contains("id=\"burn-image-surface-suspension\"")
+                && html.contains("aria-busy=\"true\"")
+                && html.contains("hidden\n    >"),
+            "the web-only surface overlay must start hidden and expose busy status"
         );
     }
 
