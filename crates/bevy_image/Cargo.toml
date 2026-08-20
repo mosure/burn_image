@@ -139,6 +139,7 @@ web-sys = { workspace = true, features = [
   "Document",
   "Element",
   "Headers",
+  "History",
   "HtmlAnchorElement",
   "HtmlElement",
   "HtmlInputElement",

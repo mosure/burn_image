@@ -78,6 +78,23 @@ pub struct ImageControlPanelState {
     pub notice: String,
     size_index: usize,
     seed_valid: bool,
+    model_switch_pending: bool,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+#[derive(Resource, Default)]
+struct BrowserModelSwitchState {
+    navigation: Option<crate::browser_boogu::BrowserModelSwitchTask>,
+    restore: BrowserEditContextRestoreState,
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+#[derive(Default)]
+enum BrowserEditContextRestoreState {
+    #[default]
+    Unchecked,
+    Loading(crate::browser_boogu::BrowserEditContextRestoreTask),
+    Complete,
 }
 
 #[derive(Resource, Default)]
@@ -103,6 +120,7 @@ impl Default for ImageControlPanelState {
             // The seed field starts at `0`; it is valid before the first
             // EditableText change event is observed.
             seed_valid: true,
+            model_switch_pending: false,
         }
     }
 }
@@ -320,6 +338,12 @@ impl Plugin for ImageControlPanelPlugin {
                 complete_browser_download,
                 dispatch_browser_ui_contract.after(update_action_availability),
             ),
+        );
+
+        #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+        app.init_resource::<BrowserModelSwitchState>().add_systems(
+            Update,
+            drive_browser_model_switch_handoff.before(update_action_availability),
         );
     }
 }
@@ -1248,6 +1272,42 @@ fn descriptor_mode(descriptor: &ModelDescriptor) -> Option<EditorMode> {
     }
 }
 
+fn host_image_as_input(image: &HostImage) -> InputImage {
+    match image {
+        HostImage::Pixels(pixels) => InputImage::Pixels(pixels.clone()),
+        HostImage::Encoded(encoded) => InputImage::Encoded(encoded.clone()),
+    }
+}
+
+/// Selects the image that should survive a transition into an Edit model.
+///
+/// A newly generated output takes precedence only for Generate -> Edit. Existing edit sessions
+/// keep their explicit reference when switching between Edit model variants.
+fn model_switch_edit_context(
+    editor: &ImageEditorState,
+    panel: &ImageControlPanelState,
+    target_mode: Option<EditorMode>,
+) -> Option<HostImage> {
+    if target_mode != Some(EditorMode::Edit) {
+        return None;
+    }
+    if editor.mode == EditorMode::Generate
+        && let Some((_, output)) = panel.latest_output.as_ref()
+    {
+        return Some(output.clone());
+    }
+    editor.source.as_ref().map(|source| match source {
+        InputImage::Pixels(pixels) => HostImage::Pixels(pixels.clone()),
+        InputImage::Encoded(encoded) => HostImage::Encoded(encoded.clone()),
+    })
+}
+
+fn replace_edit_reference(editor: &mut ImageEditorState, image: &HostImage) {
+    editor.source = Some(host_image_as_input(image));
+    // A mask is spatially bound to the previous reference and cannot safely follow a replacement.
+    editor.mask = None;
+}
+
 fn handle_size_button(
     interactions: Query<&Interaction, (Changed<Interaction>, With<SizeButton>)>,
     mut dropdown: ResMut<SizeDropdownState>,
@@ -1273,6 +1333,9 @@ fn handle_model_option(
     mut editor: ResMut<ImageEditorState>,
     mut panel: ResMut<ImageControlPanelState>,
     mut dropdown: ResMut<ModelDropdownState>,
+    #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))] mut browser_switch: ResMut<
+        BrowserModelSwitchState,
+    >,
 ) {
     let Some(option) = interactions
         .iter()
@@ -1288,32 +1351,77 @@ fn handle_model_option(
         dropdown.open = false;
         return;
     };
+    if panel.model_switch_pending {
+        dropdown.open = false;
+        return;
+    }
+    let target_mode = descriptor_mode(descriptor);
+    let edit_context = model_switch_edit_context(&editor, &panel, target_mode);
+
+    #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+    {
+        let edit_context_png = edit_context
+            .as_ref()
+            .map(|image| crate::encode_host_image(image, ImageEncoding::Png))
+            .transpose()
+            .map_err(|error| error.to_string());
+        let edit_context_png = match edit_context_png {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                panel.notice = format!(
+                    "Could not preserve the current output for the Edit model switch: {error}"
+                );
+                dropdown.open = false;
+                return;
+            }
+        };
+        match crate::browser_boogu::request_browser_model_release(&descriptor.id, edit_context_png)
+        {
+            Ok(Some(task)) => {
+                browser_switch.navigation = Some(task);
+                panel.model_switch_pending = true;
+                panel.notice = if edit_context.is_some() {
+                    format!(
+                        "Switching to {}; preserving the current image as its Edit reference while the previous model unloads",
+                        descriptor.display_name
+                    )
+                } else {
+                    format!(
+                        "Switching to {}; the previous browser model is unloading",
+                        descriptor.display_name
+                    )
+                };
+                dropdown.open = false;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                panel.notice = error;
+                dropdown.open = false;
+                return;
+            }
+        }
+    }
+
+    if let Some(image) = edit_context.as_ref() {
+        replace_edit_reference(&mut editor, image);
+    }
     editor.model = Some(descriptor.id.clone());
-    if let Some(mode) = descriptor_mode(descriptor) {
+    if let Some(mode) = target_mode {
         editor.mode = mode;
     }
     apply_descriptor_size(descriptor, &mut editor, &mut panel);
-    #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-    match crate::browser_boogu::request_browser_model_release(&descriptor.id) {
-        Ok(true) => {
-            panel.notice = format!(
-                "Switching to {}; the previous browser model is unloading",
-                descriptor.display_name
-            );
-            dropdown.open = false;
-            return;
-        }
-        Ok(false) => {}
-        Err(error) => {
-            panel.notice = error;
-            dropdown.open = false;
-            return;
-        }
-    }
-    panel.notice = format!(
-        "{} selected; it will load on the next Run",
-        descriptor.display_name
-    );
+    panel.notice = if edit_context.is_some() && target_mode == Some(EditorMode::Edit) {
+        format!(
+            "{} selected; the current image is its Edit reference and remains in view",
+            descriptor.display_name
+        )
+    } else {
+        format!(
+            "{} selected; it will load on the next Run",
+            descriptor.display_name
+        )
+    };
     dropdown.open = false;
 }
 
@@ -1332,6 +1440,58 @@ fn close_model_dropdown_on_outside_click(
         .any(|interaction| *interaction == Interaction::Pressed);
     if !clicked_selector {
         dropdown.open = false;
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
+fn drive_browser_model_switch_handoff(
+    mut state: ResMut<BrowserModelSwitchState>,
+    mut panel: ResMut<ImageControlPanelState>,
+    mut load: MessageWriter<LoadImageBytes>,
+) {
+    let navigation_failure = state
+        .navigation
+        .as_ref()
+        .and_then(crate::browser_boogu::BrowserModelSwitchTask::take_failure);
+    if let Some(error) = navigation_failure {
+        state.navigation = None;
+        panel.model_switch_pending = false;
+        panel.notice = error;
+    }
+
+    if matches!(state.restore, BrowserEditContextRestoreState::Unchecked) {
+        state.restore = match crate::browser_boogu::request_browser_edit_context_restore() {
+            Ok(Some(task)) => BrowserEditContextRestoreState::Loading(task),
+            Ok(None) => BrowserEditContextRestoreState::Complete,
+            Err(error) => {
+                panel.notice = error;
+                BrowserEditContextRestoreState::Complete
+            }
+        };
+    }
+
+    let restored = match &state.restore {
+        BrowserEditContextRestoreState::Loading(task) => task.try_take(),
+        BrowserEditContextRestoreState::Unchecked | BrowserEditContextRestoreState::Complete => {
+            None
+        }
+    };
+    let Some(restored) = restored else {
+        return;
+    };
+    state.restore = BrowserEditContextRestoreState::Complete;
+    match restored {
+        Ok(bytes) => {
+            load.write(LoadImageBytes {
+                id: REFERENCE_IMAGE_IO_ID,
+                bytes: bytes.into(),
+                encoding: Some(ImageEncoding::Png),
+            });
+            panel.notice = "Restoring the generated image as the Edit reference".into();
+        }
+        Err(error) => {
+            panel.notice = error;
+        }
     }
 }
 
@@ -1650,12 +1810,7 @@ fn handle_use_output_reference_button(
         panel.notice = "No completed output is available as a reference".into();
         return;
     };
-    editor.source = Some(match output {
-        HostImage::Pixels(pixels) => InputImage::Pixels(pixels.clone()),
-        HostImage::Encoded(encoded) => InputImage::Encoded(encoded.clone()),
-    });
-    // A mask is spatially bound to the prior reference and cannot safely follow a replacement.
-    editor.mask = None;
+    replace_edit_reference(&mut editor, output);
     panel.notice = "Current output is now the edit reference".into();
 }
 
@@ -1717,6 +1872,10 @@ fn handle_run_button(
     }
     if !panel.seed_valid {
         panel.notice = "Fix the seed before running".into();
+        return;
+    }
+    if panel.model_switch_pending {
+        panel.notice = "Wait for the selected browser model to finish switching".into();
         return;
     }
     if jobs.iter().any(|job| !job.phase.is_terminal()) || has_pending_submission(&panel, &jobs) {
@@ -1853,6 +2012,10 @@ fn accept_reference_images(
         );
         panel.notice = if edit_descriptor.is_some() {
             loaded_notice
+        } else if editor.mode == EditorMode::Edit
+            && !matches!(&runner.state, ImageRunnerState::Ready { .. })
+        {
+            format!("{loaded_notice}; the Edit model is still loading")
         } else {
             format!("{loaded_notice}; the loaded runtime does not support Edit mode")
         };
@@ -2679,7 +2842,8 @@ fn update_action_availability(
         return;
     }
     let running = jobs.iter().any(|job| !job.phase.is_terminal());
-    let can_run = !running
+    let busy = running || panel.model_switch_pending;
+    let can_run = !busy
         && !has_pending_submission(&panel, &jobs)
         && panel.seed_valid
         && matches!(runner.state, ImageRunnerState::Ready { .. })
@@ -2687,10 +2851,10 @@ fn update_action_availability(
         && editor.validate_request().is_ok();
     let can_save = panel.latest_output.is_some();
     let reference_relevant = reference_control_relevant(&editor, &runner.state);
-    let can_use_output = !running && reference_relevant && panel.latest_output.is_some();
-    let can_select_model = !running && can_cycle_models(&runner.state);
-    let can_select_size = !running && can_cycle_size(&runner.state, &editor, &panel);
-    let can_choose_reference = !running && reference_relevant;
+    let can_use_output = !busy && reference_relevant && panel.latest_output.is_some();
+    let can_select_model = !busy && can_cycle_models(&runner.state);
+    let can_select_size = !busy && can_cycle_size(&runner.state, &editor, &panel);
+    let can_choose_reference = !busy && reference_relevant;
 
     for (entity, disabled) in &model_buttons {
         set_button_disabled(&mut commands, entity, disabled, !can_select_model);
@@ -2705,7 +2869,7 @@ fn update_action_availability(
         set_button_disabled(&mut commands, entity, disabled, !can_use_output);
     }
     for (entity, disabled) in &random_seed_buttons {
-        set_button_disabled(&mut commands, entity, disabled, running);
+        set_button_disabled(&mut commands, entity, disabled, busy);
     }
     for (entity, disabled) in &run_buttons {
         set_button_disabled(&mut commands, entity, disabled, !can_run);
@@ -2725,6 +2889,7 @@ fn run_requirement_message(
     panel: &ImageControlPanelState,
 ) -> Option<String> {
     if jobs.iter().any(|job| !job.phase.is_terminal())
+        || panel.model_switch_pending
         || has_pending_submission(panel, jobs)
         || !matches!(runner, ImageRunnerState::Ready { .. })
         || editor.model.is_none()
@@ -3769,6 +3934,62 @@ mod tests {
             editor.model.as_ref().unwrap().as_str(),
             "Boogu/Boogu-Image-0.1-Edit-Turbo"
         );
+    }
+
+    #[test]
+    fn generate_to_edit_model_switch_reuses_the_visible_output_without_a_pixel_copy_correctness() {
+        let runner = runner_with_models(&[
+            ("test/generate", "Generate", &[ImageTaskKind::Generate]),
+            ("test/edit", "Edit", &[ImageTaskKind::Edit]),
+        ]);
+        let dimensions = burn_image::Dimensions::new(2, 1).unwrap();
+        let output = burn_image::PixelBuffer::new(
+            dimensions,
+            burn_image::PixelFormat::Rgba8,
+            burn_image::ColorSpace::Srgb,
+            vec![10, 20, 30, 255, 40, 50, 60, 255],
+        )
+        .unwrap();
+        let output_ptr = output.bytes().as_ptr();
+        let mask = burn_image::InputMask::new(
+            dimensions,
+            burn_image::MaskSemantics::WhiteEdits,
+            vec![255, 255],
+        )
+        .unwrap();
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                mode: crate::EditorMode::Generate,
+                model: Some(ModelId::new("test/generate").unwrap()),
+                mask: Some(mask),
+                ..Default::default()
+            })
+            .insert_resource(super::ImageControlPanelState {
+                latest_output: Some((crate::ImageJobId(7), burn_image::HostImage::Pixels(output))),
+                ..Default::default()
+            })
+            .init_resource::<super::ModelDropdownState>()
+            .add_systems(Update, super::handle_model_option);
+        app.world_mut().spawn((
+            Button,
+            super::ModelOption { index: 1 },
+            Interaction::Pressed,
+        ));
+
+        app.update();
+
+        let editor = app.world().resource::<crate::ImageEditorState>();
+        assert_eq!(editor.mode, crate::EditorMode::Edit);
+        assert_eq!(editor.model.as_ref().unwrap().as_str(), "test/edit");
+        let Some(burn_image::InputImage::Pixels(reference)) = editor.source.as_ref() else {
+            panic!("visible generated pixels must become the Edit reference");
+        };
+        assert_eq!(reference.bytes().as_ptr(), output_ptr);
+        assert!(editor.mask.is_none());
+        let panel = app.world().resource::<super::ImageControlPanelState>();
+        assert!(panel.latest_output.is_some());
+        assert!(panel.notice.contains("remains in view"), "{}", panel.notice);
     }
 
     #[test]

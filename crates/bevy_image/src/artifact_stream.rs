@@ -536,7 +536,7 @@ fn browser_persistent_cache_reserve(missing_bytes: u64) -> u64 {
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-async fn open_browser_artifact_cache(
+pub(crate) async fn open_browser_artifact_cache(
     cache_name: &'static str,
 ) -> Result<web_sys::Cache, ArtifactStreamError> {
     use wasm_bindgen::JsCast;
@@ -554,7 +554,7 @@ async fn open_browser_artifact_cache(
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-async fn browser_cache_match(
+pub(crate) async fn browser_cache_match(
     cache: &web_sys::Cache,
     cache_name: &'static str,
     key: &str,
@@ -597,7 +597,7 @@ async fn browser_cache_match(
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-async fn browser_cache_put(
+pub(crate) async fn browser_cache_put(
     cache: &web_sys::Cache,
     cache_name: &'static str,
     key: &str,
@@ -624,7 +624,7 @@ async fn browser_cache_put(
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-async fn browser_cache_delete(
+pub(crate) async fn browser_cache_delete(
     cache: &web_sys::Cache,
     cache_name: &'static str,
     key: &str,

@@ -1086,8 +1086,11 @@ mod web_shell_tests {
             "fn browser_release_switching_enabled()",
             "!params.has(\"artifacts\") && !params.has(\"headless\")",
             "pub(crate) fn request_browser_model_release(",
-            ".assign(&url.href())",
-            "the previous browser model is unloading",
+            ".assign(&target)",
+            "store_browser_edit_context(&bytes, digest).await?",
+            "request_browser_edit_context_restore",
+            "Sha256Digest::calculate(&bytes) != digest",
+            "the current image as its Edit reference",
         ] {
             assert!(
                 runtime.contains(required) || controls.contains(required),

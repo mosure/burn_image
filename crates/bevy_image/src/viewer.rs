@@ -10,9 +10,9 @@ use bevy_pancam::{DirectionKeys, PanCam, PanCamPlugin, PanCamSystems};
 use burn_image::{Dimensions, HostImage, InputImage};
 
 use crate::{
-    ImageBytesLoaded, ImageDisplayReady, ImageEditorState, ImageFrontendSet, ImageIoId,
-    ImageRunnerStatus, LatestGeneratedImageView,
-    controls::{ImageControlPanel, image_control_panel_layout, reference_control_relevant},
+    EditorMode, ImageBytesLoaded, ImageDisplayReady, ImageEditorState, ImageFrontendSet, ImageIoId,
+    LatestGeneratedImageView,
+    controls::{ImageControlPanel, image_control_panel_layout},
     host_image_to_bevy_image,
 };
 
@@ -223,14 +223,16 @@ fn replace_reference_preview_image(
 
 fn sync_reference_preview_visibility(
     editor: Res<ImageEditorState>,
-    runner: Res<ImageRunnerStatus>,
     preview: Res<ReferencePreviewImage>,
     mut sprites: Query<(&Sprite, &mut Visibility), With<LatestGeneratedImageView>>,
 ) {
     let Some(preview_handle) = preview.handle.as_ref() else {
         return;
     };
-    let visibility = if reference_control_relevant(&editor, &runner.state) {
+    // Keep an accepted Edit reference visible while its target runtime initializes. In the
+    // browser this covers the deliberate reload boundary that releases the Generate model before
+    // loading Edit weights.
+    let visibility = if editor.mode == EditorMode::Edit && editor.source.is_some() {
         Visibility::Visible
     } else {
         Visibility::Hidden
@@ -477,16 +479,25 @@ mod tests {
     }
 
     #[test]
-    fn reference_preview_is_visible_only_for_a_capable_edit_selection_correctness() {
+    fn reference_preview_remains_visible_while_the_edit_runtime_initializes_correctness() {
         let handle = Handle::<Image>::default();
+        let dimensions = burn_image::Dimensions::new(1, 1).unwrap();
+        let source = burn_image::InputImage::Pixels(
+            burn_image::PixelBuffer::new(
+                dimensions,
+                burn_image::PixelFormat::Rgba8,
+                burn_image::ColorSpace::Srgb,
+                vec![1, 2, 3, 255],
+            )
+            .unwrap(),
+        );
         let mut app = App::new();
-        app.insert_resource(crate::ImageRunnerStatus {
-            state: crate::ImageRunnerState::Ready {
-                capabilities: crate::runner::tests::test_capabilities("test/hybrid"),
-            },
-        })
+        app.insert_resource(crate::ImageRunnerStatus::initializing(
+            "loading Edit weights",
+        ))
         .insert_resource(crate::ImageEditorState {
             model: Some(burn_image::ModelId::new("test/hybrid").unwrap()),
+            source: Some(source),
             ..Default::default()
         })
         .insert_resource(ReferencePreviewImage {

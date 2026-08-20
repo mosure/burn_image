@@ -92,8 +92,9 @@ use crate::{
     artifact_stream::{
         ArtifactStreamConfig, BrowserArtifactControl, BrowserArtifactEvent,
         BrowserArtifactTrafficSnapshot, BrowserPersistentCachePlan, BrowserStageShardReader,
-        MAX_BROWSER_MANIFEST_BYTES, artifact_progress_position, fetch_browser_bounded_file,
-        preflight_browser_persistent_cache, sibling_bundle_base_url,
+        MAX_BROWSER_MANIFEST_BYTES, artifact_progress_position, browser_cache_delete,
+        browser_cache_match, browser_cache_put, fetch_browser_bounded_file,
+        open_browser_artifact_cache, preflight_browser_persistent_cache, sibling_bundle_base_url,
     },
     browser_parity_fixture::{
         BrowserParityFixture, BrowserParityFixtureIdentity, BrowserParityVerificationSnapshot,
@@ -10520,19 +10521,200 @@ fn browser_release_switching_enabled() -> bool {
         .is_some_and(|params| !params.has("artifacts") && !params.has("headless"))
 }
 
+const BROWSER_EDIT_CONTEXT_QUERY: &str = "edit-context-sha256";
+const BROWSER_EDIT_CONTEXT_BYTES_QUERY: &str = "edit-context-bytes";
+const BROWSER_EDIT_CONTEXT_CACHE: &str = "burn-image-edit-context-v1";
+const BROWSER_EDIT_CONTEXT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Pending browser navigation after a generated image has been committed to a one-shot handoff.
+///
+/// Success unloads the page, so only a failure can become observable to the originating Bevy app.
+pub(crate) struct BrowserModelSwitchTask {
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl BrowserModelSwitchTask {
+    pub(crate) fn take_failure(&self) -> Option<String> {
+        self.failure.lock().ok()?.take()
+    }
+}
+
+/// One-shot generated-image restoration owned by the destination Edit page.
+type BrowserEditContextRestoreSlot = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
+type BrowserEditContextRestoreRequest = Result<Option<BrowserEditContextRestoreTask>, String>;
+
+pub(crate) struct BrowserEditContextRestoreTask {
+    result: BrowserEditContextRestoreSlot,
+}
+
+impl BrowserEditContextRestoreTask {
+    pub(crate) fn try_take(&self) -> Option<Result<Vec<u8>, String>> {
+        self.result.lock().ok()?.take()
+    }
+}
+
+fn browser_edit_context_cache_key(digest: Sha256Digest) -> String {
+    format!(
+        "https://burn-image.invalid/.well-known/edit-context/v1/{}.png",
+        digest.to_hex()
+    )
+}
+
+fn browser_model_switch_js_error(operation: &str, value: wasm_bindgen::JsValue) -> String {
+    let detail = value.as_string().unwrap_or_else(|| format!("{value:?}"));
+    format!("browser model switch {operation} failed: {detail}")
+}
+
+async fn store_browser_edit_context(bytes: &[u8], digest: Sha256Digest) -> Result<(), String> {
+    let byte_count = u64::try_from(bytes.len())
+        .map_err(|_| "browser Edit context byte length does not fit u64".to_owned())?;
+    if byte_count == 0 || byte_count > BROWSER_EDIT_CONTEXT_MAX_BYTES {
+        return Err(format!(
+            "browser Edit context must contain 1..={BROWSER_EDIT_CONTEXT_MAX_BYTES} PNG bytes, found {byte_count}"
+        ));
+    }
+    let cache = open_browser_artifact_cache(BROWSER_EDIT_CONTEXT_CACHE)
+        .await
+        .map_err(|error| format!("browser model switch handoff cache open failed: {error}"))?;
+    browser_cache_put(
+        &cache,
+        BROWSER_EDIT_CONTEXT_CACHE,
+        &browser_edit_context_cache_key(digest),
+        bytes,
+    )
+    .await
+    .map_err(|error| format!("browser model switch handoff cache write failed: {error}"))
+}
+
+async fn read_browser_edit_context(
+    digest: Sha256Digest,
+    expected_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    if expected_bytes == 0 || expected_bytes > BROWSER_EDIT_CONTEXT_MAX_BYTES {
+        return Err(format!(
+            "browser Edit context length must be within 1..={BROWSER_EDIT_CONTEXT_MAX_BYTES}, found {expected_bytes}"
+        ));
+    }
+    let cache = open_browser_artifact_cache(BROWSER_EDIT_CONTEXT_CACHE)
+        .await
+        .map_err(|error| format!("browser model switch handoff cache open failed: {error}"))?;
+    let key = browser_edit_context_cache_key(digest);
+    let read = browser_cache_match(&cache, BROWSER_EDIT_CONTEXT_CACHE, &key, expected_bytes)
+        .await
+        .map_err(|error| format!("browser model switch handoff cache read failed: {error}"))?
+        .ok_or_else(|| {
+            "The generated image handoff is missing; select the Edit model again".to_owned()
+        })
+        .and_then(|bytes| {
+            if bytes.is_empty() {
+                return Err("browser Edit context has an invalid cached representation".into());
+            }
+            if Sha256Digest::calculate(&bytes) != digest {
+                return Err("browser Edit context failed its SHA-256 check".into());
+            }
+            Ok(bytes)
+        });
+
+    let deleted = browser_cache_delete(&cache, BROWSER_EDIT_CONTEXT_CACHE, &key)
+        .await
+        .map_err(|error| format!("browser model switch handoff cache cleanup failed: {error}"))?;
+    if !deleted && read.is_ok() {
+        return Err("browser Edit context could not be removed after its one-shot read".into());
+    }
+    read
+}
+
+fn remove_browser_edit_context_query(window: &web_sys::Window) -> Result<(), String> {
+    let href = window
+        .location()
+        .href()
+        .map_err(|error| browser_model_switch_js_error("handoff URL read", error))?;
+    let url = web_sys::Url::new(&href)
+        .map_err(|error| browser_model_switch_js_error("handoff URL parse", error))?;
+    url.search_params().delete(BROWSER_EDIT_CONTEXT_QUERY);
+    url.search_params().delete(BROWSER_EDIT_CONTEXT_BYTES_QUERY);
+    window
+        .history()
+        .map_err(|error| browser_model_switch_js_error("handoff history access", error))?
+        .replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url.href()))
+        .map_err(|error| browser_model_switch_js_error("handoff URL cleanup", error))
+}
+
+/// Begins a one-shot read of the generated image carried across a browser model-release reload.
+pub(crate) fn request_browser_edit_context_restore() -> BrowserEditContextRestoreRequest {
+    let window = web_sys::window().ok_or_else(|| "browser Window is unavailable".to_owned())?;
+    let search = window
+        .location()
+        .search()
+        .map_err(|error| browser_model_switch_js_error("handoff query read", error))?;
+    let params = web_sys::UrlSearchParams::new_with_str(&search)
+        .map_err(|error| browser_model_switch_js_error("handoff query parse", error))?;
+    let expected = match (
+        params.get(BROWSER_EDIT_CONTEXT_QUERY),
+        params.get(BROWSER_EDIT_CONTEXT_BYTES_QUERY),
+    ) {
+        (None, None) => return Ok(None),
+        (Some(digest), Some(bytes)) => (digest, bytes),
+        _ => return Err("browser Edit context query is incomplete".into()),
+    };
+    if !matches!(
+        params.get("variant").as_deref(),
+        Some("edit-turbo" | "edit-turbo-1k5")
+    ) {
+        return Err("browser Edit context is present on a non-Edit model release".into());
+    }
+    let digest = Sha256Digest::from_hex(&expected.0)
+        .map_err(|error| format!("browser Edit context digest is invalid: {error}"))?;
+    if digest.to_hex() != expected.0 {
+        return Err("browser Edit context digest must use canonical lowercase hexadecimal".into());
+    }
+    let expected_bytes = expected
+        .1
+        .parse::<u64>()
+        .map_err(|error| format!("browser Edit context byte length is invalid: {error}"))?;
+    if expected_bytes == 0 || expected_bytes > BROWSER_EDIT_CONTEXT_MAX_BYTES {
+        return Err(format!(
+            "browser Edit context length must be within 1..={BROWSER_EDIT_CONTEXT_MAX_BYTES}, found {expected_bytes}"
+        ));
+    }
+    let result = Arc::new(Mutex::new(None));
+    let task = BrowserEditContextRestoreTask {
+        result: Arc::clone(&result),
+    };
+    spawn_local(async move {
+        let read = read_browser_edit_context(digest, expected_bytes).await;
+        let query_cleanup = remove_browser_edit_context_query(&window);
+        let restored = match (read, query_cleanup) {
+            (Ok(bytes), Ok(())) => Ok(bytes),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => {
+                Err(format!("{error}; URL cleanup also failed: {cleanup}"))
+            }
+        };
+        if let Ok(mut slot) = result.lock() {
+            *slot = Some(restored);
+        }
+    });
+    Ok(Some(task))
+}
+
 /// Reload the canonical browser release selected by the Bevy model dropdown.
 ///
 /// A navigation is the browser's model-switch boundary: it drops the old runtime/device tensors
 /// before the target release begins its VRAM preflight and verified artifact load. Custom artifact
 /// mirrors and no-surface diagnostics remain pinned to their one exact release.
-pub(crate) fn request_browser_model_release(model: &burn_image::ModelId) -> Result<bool, String> {
+pub(crate) fn request_browser_model_release(
+    model: &burn_image::ModelId,
+    edit_context_png: Option<Vec<u8>>,
+) -> Result<Option<BrowserModelSwitchTask>, String> {
     let Some(variant) = crate::boogu::variant_for_model(model) else {
         return Err(format!(
             "browser model switch received unknown model {model}"
         ));
     };
     if !browser_release_switching_enabled() {
-        return Ok(false);
+        return Ok(None);
     }
     let window = web_sys::window().ok_or_else(|| "browser Window is unavailable".to_owned())?;
     let href = window
@@ -10543,7 +10725,7 @@ pub(crate) fn request_browser_model_release(model: &burn_image::ModelId) -> Resu
         .map_err(|error| format!("browser model switch could not parse the page URL: {error:?}"))?;
     let params = url.search_params();
     if params.get("variant").as_deref() == Some(variant_slug(variant)) {
-        return Ok(false);
+        return Ok(None);
     }
     params.set("variant", variant_slug(variant));
     if params
@@ -10552,11 +10734,41 @@ pub(crate) fn request_browser_model_release(model: &burn_image::ModelId) -> Resu
     {
         params.set("residency", "low-vram");
     }
-    window
-        .location()
-        .assign(&url.href())
-        .map_err(|error| format!("browser model switch navigation failed: {error:?}"))?;
-    Ok(true)
+    let context = edit_context_png.map(|bytes| {
+        let digest = Sha256Digest::calculate(&bytes);
+        let byte_count = bytes.len() as u64;
+        params.set(BROWSER_EDIT_CONTEXT_QUERY, &digest.to_hex());
+        params.set(BROWSER_EDIT_CONTEXT_BYTES_QUERY, &byte_count.to_string());
+        (bytes, digest)
+    });
+    if context.is_none() {
+        params.delete(BROWSER_EDIT_CONTEXT_QUERY);
+        params.delete(BROWSER_EDIT_CONTEXT_BYTES_QUERY);
+    }
+    let target = url.href();
+    let failure = Arc::new(Mutex::new(None));
+    let task = BrowserModelSwitchTask {
+        failure: Arc::clone(&failure),
+    };
+    spawn_local(async move {
+        let result = async {
+            if let Some((bytes, digest)) = context {
+                store_browser_edit_context(&bytes, digest).await?;
+            }
+            window
+                .location()
+                .assign(&target)
+                .map_err(|error| browser_model_switch_js_error("navigation", error))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        if let Err(error) = result
+            && let Ok(mut slot) = failure.lock()
+        {
+            *slot = Some(error);
+        }
+    });
+    Ok(Some(task))
 }
 
 impl BooguRuntime for BrowserBooguRuntime {

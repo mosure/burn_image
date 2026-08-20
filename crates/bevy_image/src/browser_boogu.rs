@@ -8,7 +8,8 @@ mod runtime;
 
 pub use runtime::*;
 pub(crate) use runtime::{
-    report_browser_runtime_failure, report_browser_runtime_preparing,
-    report_browser_surface_inference_gate_failure, report_browser_surface_inference_resumed,
-    report_browser_surface_inference_suspended, request_browser_model_release,
+    BrowserEditContextRestoreTask, BrowserModelSwitchTask, report_browser_runtime_failure,
+    report_browser_runtime_preparing, report_browser_surface_inference_gate_failure,
+    report_browser_surface_inference_resumed, report_browser_surface_inference_suspended,
+    request_browser_edit_context_restore, request_browser_model_release,
 };
