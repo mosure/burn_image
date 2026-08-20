@@ -857,7 +857,13 @@ impl<B: Backend, R: AsyncArtifactShardReader> AsyncQwen3VlStageSource<B>
                         "authenticated row object byte count does not fit u64",
                     )
                 })?;
-                let data = parse_row_object_data(&file, bytes, &target, &spec)?;
+                let data = parse_row_object_data(
+                    &file,
+                    bytes,
+                    &target,
+                    &spec,
+                    Qwen3VlArtifactFloatPolicy::Preserve,
+                )?;
                 if applied {
                     return Err(contract(
                         qwen_streaming_stage_name(&stage),
@@ -1012,7 +1018,14 @@ fn apply_module_object<B: Backend, M: ModuleSnapshot<B>>(
                 ),
             ));
         }
-        validate_dtype(&stage, name, snapshot.dtype, expected_dtype)?;
+        validate_artifact_dtype(
+            &stage,
+            name,
+            snapshot.dtype,
+            expected_dtype,
+            &snapshot.shape,
+            float_policy,
+        )?;
         let local_name = name
             .strip_prefix(prefix)
             .ok_or_else(|| contract(&stage, format!("tensor {name} lacks prefix {prefix:?}")))?;
@@ -1055,7 +1068,7 @@ fn parse_row_object<B: Backend>(
     float_policy: Qwen3VlArtifactFloatPolicy,
     device: &B::Device,
 ) -> Result<Tensor<B, 2>, Qwen3VlArtifactError> {
-    let mut data = parse_row_object_data(file, bytes, target, spec)?;
+    let mut data = parse_row_object_data(file, bytes, target, spec, float_policy)?;
     match float_policy {
         Qwen3VlArtifactFloatPolicy::AdaptToF32 => {
             data = data.convert_dtype(DType::F32);
@@ -1085,12 +1098,14 @@ fn parse_row_object<B: Backend>(
 }
 
 /// Parse and validate the complete released row object without allocating a backend tensor.
-/// Host-routed browser execution uses this boundary to select raw F16 rows before any upload.
+/// Host-routed browser execution passes [`Qwen3VlArtifactFloatPolicy::Preserve`] to require raw
+/// F16 rows, while resident Q4 execution admits only the exact packed block-128/F32 scheme.
 fn parse_row_object_data(
     file: &ArtifactFile,
     bytes: Vec<u8>,
     target: &str,
     spec: &RowChunkSpec,
+    float_policy: Qwen3VlArtifactFloatPolicy,
 ) -> Result<TensorData, Qwen3VlArtifactError> {
     let mut store = BurnpackStore::from_bytes(Some(Bytes::from_bytes_vec(bytes)));
     let snapshots = store
@@ -1124,16 +1139,18 @@ fn parse_row_object_data(
             ),
         ));
     }
-    validate_dtype(
+    validate_artifact_dtype(
         "qwen-embedding",
         name,
         snapshot.dtype,
         Qwen3VlStageDType::F16,
+        &snapshot.shape,
+        float_policy,
     )?;
     let data = snapshot
         .to_data()
         .map_err(|error| contract("qwen-embedding", format!("read {name}: {error}")))?;
-    let expected_bytes = spec.byte_len();
+    let expected_bytes = expected_row_payload_bytes(spec, data.dtype)?;
     if data.bytes.len() != expected_bytes {
         return Err(contract(
             "qwen-embedding",
@@ -1144,6 +1161,73 @@ fn parse_row_object_data(
         ));
     }
     Ok(data)
+}
+
+fn is_packed_q4s_block128_f32(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::QFloat(scheme)
+            if scheme.value == QuantValue::Q4S
+                && scheme.level == QuantLevel::block([128])
+                && scheme.param == QuantParam::F32
+                && scheme.store == QuantStore::PackedU32(0)
+    )
+}
+
+fn validate_artifact_dtype(
+    stage: &str,
+    name: &str,
+    actual: DType,
+    expected: Qwen3VlStageDType,
+    shape: &[usize],
+    float_policy: Qwen3VlArtifactFloatPolicy,
+) -> Result<(), Qwen3VlArtifactError> {
+    if float_policy == Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries
+        && shape.len() == 2
+        && shape.last().is_some_and(|inner| inner.is_multiple_of(128))
+        && is_packed_q4s_block128_f32(actual)
+    {
+        return Ok(());
+    }
+    validate_dtype(stage, name, actual, expected)
+}
+
+fn expected_row_payload_bytes(
+    spec: &RowChunkSpec,
+    dtype: DType,
+) -> Result<usize, Qwen3VlArtifactError> {
+    let elements = spec.rows().checked_mul(spec.hidden_size).ok_or_else(|| {
+        contract(
+            "qwen-embedding",
+            "row tensor element count overflowed usize",
+        )
+    })?;
+    match dtype {
+        DType::F16 => elements.checked_mul(2).ok_or_else(|| {
+            contract(
+                "qwen-embedding",
+                "row tensor F16 payload byte count overflowed usize",
+            )
+        }),
+        dtype if is_packed_q4s_block128_f32(dtype) && elements.is_multiple_of(128) => elements
+            .checked_div(2)
+            .and_then(|packed| {
+                elements
+                    .checked_div(128)
+                    .and_then(|blocks| blocks.checked_mul(4))
+                    .and_then(|scales| packed.checked_add(scales))
+            })
+            .ok_or_else(|| {
+                contract(
+                    "qwen-embedding",
+                    "row tensor Q4S payload byte count overflowed usize",
+                )
+            }),
+        other => Err(contract(
+            "qwen-embedding",
+            format!("row tensor has unsupported validated dtype {other:?}"),
+        )),
+    }
 }
 
 fn validate_dtype(
@@ -1461,6 +1545,103 @@ mod tests {
     }
 
     #[test]
+    fn packed_q4s_row_object_preserves_prequantized_release_storage_correctness() {
+        let spec = RowChunkSpec {
+            chunk_index: 0,
+            row_range: 0..2,
+            total_rows: 2,
+            hidden_size: 128,
+            element_bytes: 2,
+        };
+        let target = qwen_row_slice_target("model.language_model.embed_tokens.weight", &spec);
+        let source = TensorData::new(
+            (0..256)
+                .map(|index| (index as f32 - 127.5) / 256.0)
+                .collect::<Vec<_>>(),
+            [spec.rows(), spec.hidden_size],
+        )
+        .convert_dtype(DType::F16);
+        let packed = quantize_q4s_block128_f32(source).unwrap();
+        let packed_bytes = packed.bytes.clone();
+        let snapshot =
+            TensorSnapshot::from_data(packed, vec![target.clone()], Vec::new(), ParamId::new());
+        let bytes = BurnpackWriter::new(vec![snapshot])
+            .to_bytes()
+            .unwrap()
+            .to_vec();
+        let file = ArtifactFile {
+            path: ArtifactPath::new(format!("objects/{}.bpk", Sha256Digest::calculate(&bytes)))
+                .unwrap(),
+            size: bytes.len() as u64,
+            sha256: Sha256Digest::calculate(&bytes),
+            role: ArtifactFileRole::Weights,
+            component: Some(ArtifactComponentId::new("qwen-embedding-rows-00").unwrap()),
+            shard: None,
+        };
+
+        let parsed = parse_row_object_data(
+            &file,
+            bytes.clone(),
+            &target,
+            &spec,
+            Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries,
+        )
+        .unwrap();
+        assert!(is_packed_q4s_block128_f32(parsed.dtype));
+        assert_eq!(parsed.bytes, packed_bytes);
+        assert_eq!(
+            parsed.bytes.len(),
+            256 / 2 + (256 / 128) * core::mem::size_of::<f32>()
+        );
+        let tensor = parse_row_object::<Flex>(
+            &file,
+            bytes.clone(),
+            &target,
+            &spec,
+            Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            tensor.dtype(),
+            DType::QFloat(scheme)
+                if scheme.value == QuantValue::Q4S
+                    && scheme.level == QuantLevel::block([128])
+                    && scheme.param == QuantParam::F32
+                    && scheme.store == QuantStore::Native
+        ));
+
+        let error = parse_row_object_data(
+            &file,
+            bytes,
+            &target,
+            &spec,
+            Qwen3VlArtifactFloatPolicy::Preserve,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("dtype mismatch: expected F16"));
+
+        let wrong_scheme = DType::QFloat(
+            QuantScheme::default()
+                .with_value(QuantValue::Q4S)
+                .with_level(QuantLevel::block([64]))
+                .with_param(QuantParam::F32)
+                .with_store(QuantStore::PackedU32(0)),
+        );
+        assert!(
+            validate_artifact_dtype(
+                "qwen-embedding",
+                &target,
+                wrong_scheme,
+                Qwen3VlStageDType::F16,
+                &[2, 128],
+                Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn packed_f16_adapter_retains_matrices_and_widens_auxiliaries_correctness() {
         let matrix = TensorSnapshot::from_data(
             TensorData::new(vec![0.25_f32; 8], [2, 4]).convert_dtype(DType::F16),
@@ -1513,13 +1694,13 @@ mod tests {
         );
         let adapter =
             FloatAdapter(Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries);
-        let packed = adapter.adapt(&matrix);
-        let packed = (packed.clone_data_fn())().unwrap();
+        let packed_snapshot = adapter.adapt(&matrix);
+        let packed = (packed_snapshot.clone_data_fn())().unwrap();
         let DType::QFloat(scheme) = packed.dtype else {
             panic!("matrix must be QFloat");
         };
         let (values, qparams) = QuantizedBytes {
-            bytes: packed.bytes,
+            bytes: packed.bytes.clone(),
             scheme,
             num_elements: 256,
         }
@@ -1527,6 +1708,30 @@ mod tests {
         assert_eq!(values.len(), 256);
         assert_eq!(qparams.scales.len(), 2);
         assert_eq!(adapter.adapt(&bias).dtype, DType::F32);
+
+        let prepacked_snapshot =
+            TensorSnapshot::from_data(packed, vec!["weight".into()], Vec::new(), ParamId::new());
+        assert!(is_packed_q4s_block128_f32(
+            adapter.adapt(&prepacked_snapshot).dtype
+        ));
+        let device = Default::default();
+        let mut linear = crate::QwenLinearConfig::new(128, 2)
+            .with_bias(false)
+            .init::<Flex>(&device);
+        let applied = linear.apply(
+            vec![prepacked_snapshot],
+            None,
+            Some(Box::new(adapter)),
+            false,
+        );
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert!(matches!(
+            linear.weight.val().dtype(),
+            DType::QFloat(scheme)
+                if scheme.value == QuantValue::Q4S
+                    && scheme.level == QuantLevel::block([128])
+                    && scheme.param == QuantParam::F32
+        ));
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1868,7 +2073,14 @@ mod tests {
                 .unwrap();
             let object_bytes = bytes.len() as u64;
             let target = qwen_row_slice_target("model.language_model.embed_tokens.weight", spec);
-            let data = parse_row_object_data(file, bytes, &target, spec).unwrap();
+            let data = parse_row_object_data(
+                file,
+                bytes,
+                &target,
+                spec,
+                Qwen3VlArtifactFloatPolicy::Preserve,
+            )
+            .unwrap();
             state.apply_chunk_data(spec, &data, object_bytes).unwrap();
         }
         let (data, report) = state.finish().unwrap();
@@ -1884,6 +2096,39 @@ mod tests {
             "a6aa0501f1d6f5a622934ee10a64b526843f723937f6d5abd96058b29ea8b6fe"
         );
         assert!(report.all_finite && report.not_all_zero && report.coverage_complete);
+    }
+
+    #[test]
+    #[ignore = "requires BURN_QWEN3_VL_Q4_COMPONENT_ROOT pointing at the released Q4 component bundle"]
+    fn released_packed_q4s_embedding_and_text_stage_load_reference() {
+        let root = std::env::var("BURN_QWEN3_VL_Q4_COMPONENT_ROOT").expect(
+            "set BURN_QWEN3_VL_Q4_COMPONENT_ROOT to the released Q4 Qwen component directory",
+        );
+        let directory = VerifiedArtifactDirectory::open(root.clone()).unwrap();
+        let config_bytes =
+            std::fs::read(Path::new(&root).join("metadata/source/mllm/config.json")).unwrap();
+        let config = Qwen3VlConfig::from_json(std::str::from_utf8(&config_bytes).unwrap()).unwrap();
+        let contract =
+            Qwen3VlComponentContract::released_base(directory.manifest().clone(), config).unwrap();
+        let first_embedding = contract.plan.embedding_rows.chunks[0].clone();
+        let reader = directory.shard_reader().unwrap();
+        let device = Default::default();
+        let mut source =
+            VerifiedBurnpackQwen3VlStageSource::<Flex, _>::new(contract, device, reader)
+                .with_float_policy(
+                    Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries,
+                );
+
+        let embedding = source.load_embedding_rows(&first_embedding).unwrap();
+        assert!(matches!(
+            embedding.weight.dtype(),
+            DType::QFloat(scheme)
+                if scheme.value == QuantValue::Q4S
+                    && scheme.level == QuantLevel::block([128])
+                    && scheme.param == QuantParam::F32
+        ));
+        drop(embedding);
+        drop(source.load_text_block(0).unwrap());
     }
 
     #[test]
