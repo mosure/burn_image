@@ -88,10 +88,15 @@ const QWEN_METADATA_PATHS: [&str; 22] = [
 ///
 /// Text and embedding stages are F16, vision stages are F32, and the unused LM head is absent.
 pub const QWEN_BASE_CONDITIONING_PROFILE: &str = "f16-text-f32-vision-base";
+/// Canonical packed-Q4S storage profile for the reusable base-conditioning weights.
+pub const QWEN_Q4S_BASE_CONDITIONING_PROFILE: &str = "q4s-block-up-to128-f32";
 /// Dependency role used by composed image-model manifests.
 pub const QWEN_COMPONENT_ROLE: &str = "qwen";
 /// Canonical reusable component bundle id.
 pub const QWEN_COMPONENT_BUNDLE_ID: &str = "qwen3-vl-8b-base-boogu-image-0.1";
+/// Canonical reusable packed-Q4S component bundle id.
+pub const QWEN_Q4S_COMPONENT_BUNDLE_ID: &str =
+    "qwen3-vl-8b-base-boogu-image-0.1-q4s-block-up-to128-f32";
 /// Provenance model id for the exact Qwen source shared by the Boogu 0.1 releases.
 pub const QWEN_COMPONENT_MODEL_ID: &str = "BooguDerived/Qwen3-VL-8B-Base-0.1";
 /// SHA-256 of the canonical sorted declarations for the four shared upstream MLLM shards.
@@ -100,6 +105,9 @@ pub const QWEN_COMPONENT_MODEL_REVISION: &str =
 /// Exact sealed digest of the canonical reusable Qwen component manifest.
 pub const QWEN_COMPONENT_CONTENT_DIGEST: &str =
     "2bab9d7c378158137c117a43d7a3cc5d66dc94af5dd0856d12348d08b2b9e9da";
+/// Exact sealed digest of the canonical reusable packed-Q4S Qwen component manifest.
+pub const QWEN_Q4S_COMPONENT_CONTENT_DIGEST: &str =
+    "d3e332ebd710d87fa6a2ae97eef3302f5c9f5e7d3f4e27675f0c4c4f5a31c5de";
 
 /// Construct the complete immutable dependency pin for the released Qwen component.
 pub fn qwen_component_dependency() -> ArtifactDependency {
@@ -111,6 +119,21 @@ pub fn qwen_component_dependency() -> ArtifactDependency {
         model: ModelId::new(QWEN_COMPONENT_MODEL_ID).expect("static model id is valid"),
         model_revision: QWEN_COMPONENT_MODEL_REVISION.to_owned(),
         content_digest: Sha256Digest::from_hex(QWEN_COMPONENT_CONTENT_DIGEST)
+            .expect("static digest is valid"),
+    }
+}
+
+/// Construct the complete immutable dependency pin for the released packed-Q4S Qwen component.
+pub fn qwen_q4s_component_dependency() -> ArtifactDependency {
+    ArtifactDependency {
+        role: ArtifactComponentId::new(QWEN_COMPONENT_ROLE).expect("static role is valid"),
+        bundle: ArtifactBundleId::new(QWEN_Q4S_COMPONENT_BUNDLE_ID)
+            .expect("static bundle is valid"),
+        profile: ArtifactProfileId::new(QWEN_Q4S_BASE_CONDITIONING_PROFILE)
+            .expect("static profile is valid"),
+        model: ModelId::new(QWEN_COMPONENT_MODEL_ID).expect("static model id is valid"),
+        model_revision: QWEN_COMPONENT_MODEL_REVISION.to_owned(),
+        content_digest: Sha256Digest::from_hex(QWEN_Q4S_COMPONENT_CONTENT_DIGEST)
             .expect("static digest is valid"),
     }
 }
@@ -139,7 +162,7 @@ pub fn qwen_row_slice_target(logical_target: &str, chunk: &RowChunkSpec) -> Stri
     )
 }
 
-/// Explicit compatibility conversion after the sealed storage dtype has been checked.
+/// Explicit load conversion after the sealed storage dtype has been checked.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Qwen3VlArtifactFloatPolicy {
     /// Keep the F16/F32 release dtype on a backend that supports it.
@@ -391,14 +414,27 @@ fn validate_identity(manifest: &ArtifactManifest) -> Result<(), Qwen3VlArtifactE
             "a standalone Qwen component must not depend on another bundle".into(),
         ));
     }
-    if manifest.profile.as_str() != QWEN_BASE_CONDITIONING_PROFILE {
-        return Err(Qwen3VlArtifactError::Manifest(format!(
-            "profile {} is not the canonical {QWEN_BASE_CONDITIONING_PROFILE} profile",
-            manifest.profile
-        )));
-    }
+    let (expected_bundle, expected_profile, expected_content_digest) =
+        match manifest.profile.as_str() {
+            QWEN_BASE_CONDITIONING_PROFILE => (
+                QWEN_COMPONENT_BUNDLE_ID,
+                QWEN_BASE_CONDITIONING_PROFILE,
+                QWEN_COMPONENT_CONTENT_DIGEST,
+            ),
+            QWEN_Q4S_BASE_CONDITIONING_PROFILE => (
+                QWEN_Q4S_COMPONENT_BUNDLE_ID,
+                QWEN_Q4S_BASE_CONDITIONING_PROFILE,
+                QWEN_Q4S_COMPONENT_CONTENT_DIGEST,
+            ),
+            actual => {
+                return Err(Qwen3VlArtifactError::Manifest(format!(
+                    "profile {actual} is not a canonical released Qwen component profile"
+                )));
+            }
+        };
     for (field, actual, expected) in [
-        ("bundle", manifest.bundle.as_str(), QWEN_COMPONENT_BUNDLE_ID),
+        ("bundle", manifest.bundle.as_str(), expected_bundle),
+        ("profile", manifest.profile.as_str(), expected_profile),
         ("model", manifest.model.as_str(), QWEN_COMPONENT_MODEL_ID),
         (
             "model_revision",
@@ -412,8 +448,8 @@ fn validate_identity(manifest: &ArtifactManifest) -> Result<(), Qwen3VlArtifactE
             )));
         }
     }
-    let expected_digest = Sha256Digest::from_hex(QWEN_COMPONENT_CONTENT_DIGEST)
-        .expect("static component digest is valid");
+    let expected_digest =
+        Sha256Digest::from_hex(expected_content_digest).expect("static component digest is valid");
     if manifest.content_digest != Some(expected_digest) {
         return Err(Qwen3VlArtifactError::Manifest(format!(
             "content digest {:?} differs from canonical {expected_digest}",
@@ -469,9 +505,7 @@ fn declared_max_shard_bytes(manifest: &ArtifactManifest) -> Result<u64, Qwen3VlA
             "target_max_shard_bytes must be positive".into(),
         ));
     }
-    if manifest.numeric_format
-        != burn_image::NumericFormat::Other(QWEN_BASE_CONDITIONING_PROFILE.to_owned())
-    {
+    if manifest.numeric_format != burn_image::NumericFormat::Other(manifest.profile.to_string()) {
         return Err(Qwen3VlArtifactError::Manifest(format!(
             "numeric format {:?} is not the canonical mixed profile",
             manifest.numeric_format
@@ -1026,10 +1060,23 @@ fn parse_row_object<B: Backend>(
         Qwen3VlArtifactFloatPolicy::AdaptToF32 => {
             data = data.convert_dtype(DType::F32);
         }
-        Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries => {
-            data = quantize_q4s_block128_f32(data)
-                .map_err(|error| contract("qwen-embedding", error.to_string()))?;
-        }
+        Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries => match data.dtype {
+            DType::F16 | DType::F32 => {
+                data = quantize_q4s_block128_f32(data)
+                    .map_err(|error| contract("qwen-embedding", error.to_string()))?;
+            }
+            DType::QFloat(scheme)
+                if scheme.value == QuantValue::Q4S
+                    && scheme.level == QuantLevel::block([128])
+                    && scheme.param == QuantParam::F32
+                    && scheme.store == QuantStore::PackedU32(0) => {}
+            other => {
+                return Err(contract(
+                    "qwen-embedding",
+                    format!("packed Q4S row object has unsupported dtype {other:?}"),
+                ));
+            }
+        },
         Qwen3VlArtifactFloatPolicy::Preserve
         | Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries => {}
     }
@@ -1756,6 +1803,32 @@ mod tests {
         assert!(actual.iter().all(|value| value.is_finite()));
         assert!(relative_rmse < 0.15, "relative RMSE {relative_rmse}");
         assert!(cosine > 0.985, "cosine {cosine}");
+
+        const BENCHMARK_ROWS: usize = 128;
+        const BENCHMARK_REPEATS: usize = 3;
+        let benchmark_input = (0..BENCHMARK_ROWS * INPUT_WIDTH)
+            .map(|index| ((index * 19 % 251) as f32 - 125.0) / 256.0)
+            .collect::<Vec<_>>();
+        let benchmark_input = Tensor::<B, 2>::from_data(
+            TensorData::new(benchmark_input, [BENCHMARK_ROWS, INPUT_WIDTH]),
+            &device,
+        );
+        let warmup =
+            crate::linear::qwen_linear_forward(&linear, benchmark_input.clone()).into_data();
+        assert_eq!(warmup.dtype, DType::F32);
+        let started = std::time::Instant::now();
+        for _ in 0..BENCHMARK_REPEATS {
+            let output =
+                crate::linear::qwen_linear_forward(&linear, benchmark_input.clone()).into_data();
+            assert_eq!(output.shape, [BENCHMARK_ROWS, OUTPUT_WIDTH].into());
+            assert_eq!(output.dtype, DType::F32);
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "released Qwen block-00 k_proj packed-Q4S benchmark: rows={BENCHMARK_ROWS} repeats={BENCHMARK_REPEATS} total_ms={} mean_ms={:.3}",
+            elapsed.as_millis(),
+            elapsed.as_secs_f64() * 1_000.0 / BENCHMARK_REPEATS as f64,
+        );
     }
 
     #[test]
@@ -1817,6 +1890,14 @@ mod tests {
     fn component_identity_fails_closed_correctness() {
         let manifest = identity_manifest();
         validate_identity(&manifest).unwrap();
+
+        let mut packed_q4s = manifest.clone();
+        packed_q4s.bundle = ArtifactBundleId::new(QWEN_Q4S_COMPONENT_BUNDLE_ID).unwrap();
+        packed_q4s.profile = ArtifactProfileId::new(QWEN_Q4S_BASE_CONDITIONING_PROFILE).unwrap();
+        packed_q4s.numeric_format = NumericFormat::Other(QWEN_Q4S_BASE_CONDITIONING_PROFILE.into());
+        packed_q4s.content_digest =
+            Some(Sha256Digest::from_hex(QWEN_Q4S_COMPONENT_CONTENT_DIGEST).unwrap());
+        validate_identity(&packed_q4s).unwrap();
 
         let mut wrong_bundle = manifest.clone();
         wrong_bundle.bundle = ArtifactBundleId::new("qwen-unpinned").unwrap();

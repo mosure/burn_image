@@ -59,6 +59,7 @@ enum BackendChoice {
 enum ProfileChoice {
     F16,
     F16QwenVisionF32,
+    Q4sBlockUpTo128F32,
     Q8sBlock32F32,
     Q8sBlock32F32QwenVisionF32,
 }
@@ -83,6 +84,7 @@ impl From<ProfileChoice> for BooguStorageProfile {
         match value {
             ProfileChoice::F16 => Self::F16,
             ProfileChoice::F16QwenVisionF32 => Self::F16QwenVisionF32,
+            ProfileChoice::Q4sBlockUpTo128F32 => Self::Q4sBlockUpTo128F32,
             ProfileChoice::Q8sBlock32F32 => Self::Q8sBlock32F32,
             ProfileChoice::Q8sBlock32F32QwenVisionF32 => Self::Q8sBlock32F32QwenVisionF32,
         }
@@ -921,6 +923,7 @@ const fn profile_label(profile: BooguStorageProfile) -> &'static str {
     match profile {
         BooguStorageProfile::F16 => "f16",
         BooguStorageProfile::F16QwenVisionF32 => "f16-qwen-vision-f32",
+        BooguStorageProfile::Q4sBlockUpTo128F32 => "q4s-block-up-to128-f32",
         BooguStorageProfile::Q8sBlock32F32 => "q8s-block32-f32",
         BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => "q8s-block32-f32-qwen-vision-f32",
     }

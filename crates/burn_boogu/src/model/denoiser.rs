@@ -13,26 +13,14 @@ use super::{
     norm::DenoiserRmsNormPolicy,
 };
 
-#[cfg(all(
-    any(feature = "wgpu", feature = "cuda-experimental"),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::attention::NativeFlashUnitAttention;
-#[cfg(all(
-    any(feature = "wgpu", feature = "cuda-experimental"),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::attention::NativePaddedBlackboxAttention;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::attention::SplitDoubleStreamSharedProjection;
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-use super::native_flash::NativeCudaBackend;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::native_flash::NativeWgpuBackend;
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-use super::native_flash::{
-    assert_supported_blackbox_configuration, assert_supported_blackbox_partition_configuration,
-};
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::native_flash::{
     assert_supported_wgpu_blackbox_configuration,
@@ -695,67 +683,6 @@ impl BooguDenoiser<NativeWgpuBackend> {
                 geometry,
                 rms_norm_policy,
             )
-        }
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl BooguDenoiser<NativeCudaBackend> {
-    /// Execute the full denoiser with bounded-query, required CUDA Cubek `FlashUnit` attention.
-    ///
-    /// The path requires preserved-F16 activations, honors every attention module's configured
-    /// query chunk, and fails closed instead of invoking dense attention or attention autotuning.
-    pub fn forward_native_cuda_flash_unit(
-        &self,
-        input: BooguDenoiserInput<NativeCudaBackend>,
-    ) -> Result<Tensor<NativeCudaBackend, 4>, BooguError> {
-        self.forward_with_kernel::<NativeFlashUnitAttention>(input)
-    }
-
-    /// Execute the denoiser with experimental padded CUDA blackbox FlashAttention.
-    ///
-    /// Every 120-wide Q/K/V head is transformed to the scale-equivalent 128-wide representation
-    /// required by the forced 16-by-16-by-16 CMMA blueprint. `num_planes` must be 2 or 4. The path
-    /// accepts only F16 activations and fails closed instead of invoking attention autotuning or a
-    /// dense fallback.
-    pub fn forward_native_cuda_padded_blackbox(
-        &self,
-        input: BooguDenoiserInput<NativeCudaBackend>,
-        num_planes: u8,
-    ) -> Result<Tensor<NativeCudaBackend, 4>, BooguError> {
-        self.forward_native_cuda_padded_blackbox_tiled(input, num_planes, 1)
-    }
-
-    /// Execute experimental padded CUDA blackbox FlashAttention with an explicit key/value
-    /// partition width.
-    ///
-    /// `seq_kv_tiles` must be 1 or 2, with two tiles restricted to two planes. This is a structural
-    /// execution control only; CUDA numerical parity remains a separate prerequisite for support.
-    pub fn forward_native_cuda_padded_blackbox_tiled(
-        &self,
-        input: BooguDenoiserInput<NativeCudaBackend>,
-        num_planes: u8,
-        seq_kv_tiles: u8,
-    ) -> Result<Tensor<NativeCudaBackend, 4>, BooguError> {
-        assert_supported_blackbox_configuration(num_planes, seq_kv_tiles);
-        self.forward_native_cuda_padded_blackbox_partitioned(input, num_planes, seq_kv_tiles, 1)
-    }
-
-    /// Execute experimental padded CUDA blackbox FlashAttention with explicit query and K/V
-    /// partition widths. `seq_q_tiles` must be 1, and CUDA parity remains a prerequisite.
-    pub(crate) fn forward_native_cuda_padded_blackbox_partitioned(
-        &self,
-        input: BooguDenoiserInput<NativeCudaBackend>,
-        num_planes: u8,
-        seq_kv_tiles: u8,
-        seq_q_tiles: u8,
-    ) -> Result<Tensor<NativeCudaBackend, 4>, BooguError> {
-        assert_supported_blackbox_partition_configuration(num_planes, seq_kv_tiles, seq_q_tiles);
-        match (num_planes, seq_kv_tiles, seq_q_tiles) {
-            (2, 1, 1) => self.forward_with_kernel::<NativePaddedBlackboxAttention<2, 1, 1>>(input),
-            (2, 2, 1) => self.forward_with_kernel::<NativePaddedBlackboxAttention<2, 2, 1>>(input),
-            (4, 1, 1) => self.forward_with_kernel::<NativePaddedBlackboxAttention<4, 1, 1>>(input),
-            _ => unreachable!("validated padded blackbox blueprint"),
         }
     }
 }

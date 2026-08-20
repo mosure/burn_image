@@ -18,9 +18,7 @@ pub const TURBO_REVISION: &str = "53ad54522023f64d049f7f38e4d679359ef3fb92";
 pub const EDIT_TURBO_REVISION: &str = "132a0ab9051b42c1d9be4919a68873d1f132c0c8";
 /// Immutable Edit-Turbo 1.5K Hugging Face revision.
 pub const EDIT_TURBO_1K5_REVISION: &str = "60981c49e48cffadf2c169532a4ba3f6108afd5e";
-/// Converter version that produced the immutable payloads reused by the canonical bundles.
-///
-/// Artifact compatibility follows the sealed converter contract, not this runtime crate's version.
+/// Converter version that produced the immutable payloads used by the canonical release bundles.
 pub const PUBLISHED_BUNDLE_CONVERTER_VERSION: &str = "0.1.0";
 /// Converter version emitted by the current importer for explicit local or custom bundles.
 pub const CURRENT_BUNDLE_CONVERTER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,41 +41,39 @@ pub fn validate_supported_bundle_converter_version(actual: &str) -> Result<(), B
 /// Exact sealed mixed-F16 Turbo bundle qualified for the canonical production release.
 pub const TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a";
-/// Exact sealed hybrid-Q8 Turbo legacy bundle retained as evidence.
-pub const TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST: &str =
-    "8685559e73cf836e98e1ebdf80815e3d66765f7d620624408148d5f98c87c0dd";
+/// Exact sealed direct-Q4S Turbo bundle used by ordinary native and browser execution.
+pub const TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
+    "012237fb5e14c52188632ea220c043e5a9d59eaa243970100e7db35048942081";
 /// Exact sealed mixed-F16 Edit-Turbo 1K bundle qualified for the canonical production release.
 pub const EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "6f2f56a1c13418aea6985dfd1922f2e724577a1067123535fba90f88886f5335";
-/// Exact sealed hybrid-Q8 Edit-Turbo 1K legacy bundle retained as evidence.
-pub const EDIT_TURBO_Q8S_BLOCK32_F32_QWEN_VISION_F32_CONTENT_DIGEST: &str =
-    "ffde989bb66df3a541d44957422f996790633dab46ca3547a59dfdfb871f0b7a";
+/// Exact sealed direct-Q4S Edit-Turbo 1K bundle published for explicit Q4 execution.
+pub const EDIT_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
+    "663d6a50c0ecd0181c195b6dcfc628998163c84fb0bf7f95e71d553268e88689";
 /// Exact sealed mixed-F16 Edit-Turbo 1.5K bundle qualified for the canonical production release.
 pub const EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "7d81dacfedc71c50639d303c52f035813a6f4cc0125166bd7c8879c8314dd620";
-/// Storage-policy marker for the opt-in 1.5K VAE encoder F32 A/B artifact.
-///
-/// This is deliberately metadata rather than a production storage profile: callers must
-/// select the ordinary mixed-F16 profile and an explicit custom artifact URL, then separately
-/// authenticate this diagnostic overlay contract.
-pub const EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_PROFILE: &str =
-    "f16-qwen-vision-f32+vae-encoder-f32";
-/// Exact number of ordinary FLUX VAE encoder tensors replaced by the diagnostic F32 overlay.
-pub const EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_TENSORS: usize = 106;
-/// SHA-256 of the pinned upstream F32 FLUX VAE SafeTensors object used by the diagnostic.
-pub const EDIT_TURBO_1K5_VAE_SOURCE_SHA256: &str =
-    "8c717328c8ad41faab2ccfd52ae17332505c6833cf176aad56e7b58f2c4d4c94";
-/// Exact byte length of the pinned upstream F32 FLUX VAE SafeTensors object.
-pub const EDIT_TURBO_1K5_VAE_SOURCE_BYTES: u64 = 335_306_212;
-/// Legacy descriptive mixed-F16 Turbo digest accepted only for explicit/local migration.
-pub const LEGACY_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
+/// Exact sealed direct-Q4S Edit-Turbo 1.5K bundle published for explicit Q4 execution.
+pub const EDIT_TURBO_1K5_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
+    "9c217773abc54358bf45ce62c77b6b83361cd8bb49bd8357218fa40e80056aaa";
+/// Exact dependency-free mixed-F16 Turbo source digest accepted by the release builder.
+pub const SOURCE_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "4f94cf68c00af12d5de486db4d316ce889d6d21e78913a1c74edab4bd0119ce3";
-/// Legacy descriptive mixed-F16 Edit-Turbo 1K digest accepted only for explicit/local migration.
-pub const LEGACY_EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
+/// Exact dependency-free direct-Q4S Turbo source digest accepted by the release builder.
+pub const SOURCE_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
+    "d5109b6c6de13d3fc1420328511686b95067220ac1fc9cf15287740c94896992";
+/// Exact dependency-free mixed-F16 Edit-Turbo 1K source digest accepted by the release builder.
+pub const SOURCE_EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "14acbafd13dc9b79757e7d554b504396bee30ea7ed231f533919c6c82a6e6a32";
-/// Legacy descriptive mixed-F16 Edit-Turbo 1.5K digest accepted only for explicit/local migration.
-pub const LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
+/// Exact dependency-free direct-Q4S Edit-Turbo 1K source digest accepted by the release builder.
+pub const SOURCE_EDIT_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
+    "2c17fa372740e4bf543daa14b14fcece73df9a753bd12e299a7b93f00a48507d";
+/// Exact dependency-free mixed-F16 Edit-Turbo 1.5K source digest accepted by the release builder.
+pub const SOURCE_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST: &str =
     "4e8b12ac5ca95272f9009080a23baf1bc52d1b0e7aebf2e9e5f394a492369213";
+/// Exact dependency-free direct-Q4S Edit-Turbo 1.5K source digest accepted by the release builder.
+pub const SOURCE_EDIT_TURBO_1K5_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST: &str =
+    "678e7fdcabb8cf06d199affc6773fc7aa97f936e055343d85a1229c234118f6e";
 /// Largest logical Burnpack object accepted by the browser semantic loader.
 pub const BOOGU_RELEASE_MAX_SHARD_BYTES: u64 = 256 * 1024 * 1024;
 /// Largest compact config, tokenizer, template, or inventory object accepted in a release.
@@ -358,23 +354,6 @@ impl BooguArtifactInventory {
         &self,
         variant: BooguVariant,
     ) -> Result<BooguDenoiserRuntimeQ8Footprint, BooguError> {
-        self.denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-            variant,
-            BooguRuntimeQ8Scope::AllInventoryEligible,
-        )
-    }
-
-    /// Derive the exact denoiser parameter payload for one closed runtime-Q8 execution scope.
-    ///
-    /// The scope changes only the runtime adaptation of already-authenticated floating-point
-    /// tensors. It does not alter artifact eligibility, inventories, manifests, or content
-    /// digests.
-    pub fn denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-        &self,
-        variant: BooguVariant,
-        scope: BooguRuntimeQ8Scope,
-    ) -> Result<BooguDenoiserRuntimeQ8Footprint, BooguError> {
-        scope.validate_variant(variant)?;
         let mut footprint = BooguDenoiserRuntimeQ8Footprint::default();
         for spec in self
             .tensors
@@ -394,7 +373,7 @@ impl BooguArtifactInventory {
                         spec.target_name
                     ))
                 })?;
-            if spec.quantizable && scope.quantizes_target(&spec.target_name) {
+            if spec.quantizable {
                 if !elements.is_multiple_of(32) {
                     return Err(BooguError::Artifact(format!(
                         "runtime Q8 footprint is not block-32 aligned for {}",
@@ -459,175 +438,6 @@ impl BooguArtifactInventory {
         }
         Ok(footprint)
     }
-}
-
-/// Closed selection of inventory-eligible matrices adapted to Q8 at runtime.
-///
-/// Artifact eligibility remains immutable. A narrower scope keeps selected authenticated F16
-/// production weights in F32 only while applying a runtime execution policy.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BooguRuntimeQ8Scope {
-    /// Quantize every matrix marked eligible by the sealed artifact inventory.
-    #[default]
-    AllInventoryEligible,
-    /// Turbo-only runtime stability scope retaining caption and final projection linears in F32.
-    TurboCaptionAndTailF32,
-    /// Historical Turbo diagnostic scope quantizing attention and feed-forward matrices only.
-    ///
-    /// Prelude projections, timestep/caption conditioning, every adaptive modulation projection,
-    /// and the output tail remain F32. Those comparatively small, high-leverage matrices control
-    /// residual scales and gates across the full denoiser. This scope remains available for
-    /// reproducible artifact accounting, but is not the current Turbo browser policy.
-    TurboAttentionFfnCoreQ8,
-    /// Historical Turbo scope quantizing all feed-forward matrices while retaining attention in F32.
-    ///
-    /// Only the ordinary, image, and instruction feed-forward module families are selected. Every
-    /// attention, conditioning, adaptive-modulation, prelude, and output-tail matrix remains F32.
-    /// It remains available for reproducible accounting but is not the current browser policy.
-    TurboFfnCoreQ8,
-    /// Historical Turbo scope quantizing every feed-forward gate and up projection.
-    ///
-    /// Within the ordinary, image, and instruction feed-forward module families, only
-    /// `linear_1.weight` and `linear_3.weight` are selected. The `linear_2.weight` down projection,
-    /// attention, conditioning, adaptive modulation, prelude, and output tail remain F32. This
-    /// remains available for reproducible accounting but is not the current browser policy.
-    TurboFfnGateUpQ8,
-    /// Evidence-calibrated Turbo scope selecting the exact 96 main-core gate/up matrices.
-    ///
-    /// All single-stream gate/up matrices and all dual-stream image/instruction gate/up matrices
-    /// are selected. Every down projection plus every context/noise refiner matrix remains F32.
-    /// This cap-tight policy is pending a complete real-browser measurement and is not a
-    /// numerical-parity claim.
-    TurboMainCoreFfnGateUpQ8,
-}
-
-impl BooguRuntimeQ8Scope {
-    /// Stable provenance label for the runtime-only selection.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::AllInventoryEligible => "all-inventory-eligible",
-            Self::TurboCaptionAndTailF32 => "turbo-caption-tail-f32",
-            Self::TurboAttentionFfnCoreQ8 => "turbo-attention-ffn-core-q8",
-            Self::TurboFfnCoreQ8 => "turbo-ffn-core-q8",
-            Self::TurboFfnGateUpQ8 => "turbo-ffn-gate-up-q8",
-            Self::TurboMainCoreFfnGateUpQ8 => "turbo-main-core-ffn-gate-up-q8",
-        }
-    }
-
-    fn quantizes_target(self, target: &str) -> bool {
-        match self {
-            Self::AllInventoryEligible => true,
-            Self::TurboCaptionAndTailF32 => !matches!(
-                target,
-                "time_caption_embed.caption_linear.weight"
-                    | "norm_out.linear_1.weight"
-                    | "norm_out.linear_2.weight"
-            ),
-            Self::TurboAttentionFfnCoreQ8 => turbo_attention_ffn_core_q8_target(target),
-            Self::TurboFfnCoreQ8 => turbo_ffn_core_q8_target(target),
-            Self::TurboFfnGateUpQ8 => turbo_ffn_gate_up_q8_target(target),
-            Self::TurboMainCoreFfnGateUpQ8 => turbo_main_core_ffn_gate_up_q8_target(target),
-        }
-    }
-
-    fn validate_variant(self, variant: BooguVariant) -> Result<(), BooguError> {
-        if matches!(
-            self,
-            Self::TurboCaptionAndTailF32
-                | Self::TurboAttentionFfnCoreQ8
-                | Self::TurboFfnCoreQ8
-                | Self::TurboFfnGateUpQ8
-                | Self::TurboMainCoreFfnGateUpQ8
-        ) && variant != BooguVariant::Image01Turbo
-        {
-            return Err(BooguError::Artifact(format!(
-                "runtime Q8 scope {} is restricted to Image01Turbo, found {variant:?}",
-                self.label()
-            )));
-        }
-        Ok(())
-    }
-}
-
-fn turbo_attention_ffn_core_q8_target(target: &str) -> bool {
-    // Fail closed: only the exact attention and feed-forward module families are quantized. A
-    // newly added inventory-eligible projection therefore stays F32 until it is explicitly
-    // classified and numerically qualified.
-    target.ends_with(".weight")
-        && (target.contains(".attn.")
-            || target.contains(".joint_attn.")
-            || target.contains(".image_self_attn.")
-            || target.contains(".feed_forward.")
-            || target.contains(".image_ffn.")
-            || target.contains(".instruction_ffn."))
-}
-
-fn turbo_ffn_core_q8_target(target: &str) -> bool {
-    // Fail closed: attention and every newly introduced matrix family remain F32 until an exact
-    // classifier and real-checkpoint numerical evidence explicitly admit them.
-    target.ends_with(".weight")
-        && (target.contains(".feed_forward.")
-            || target.contains(".image_ffn.")
-            || target.contains(".instruction_ffn."))
-}
-
-fn turbo_ffn_gate_up_q8_target(target: &str) -> bool {
-    // Fail closed: admit only the two explicitly qualified gate/up projections. In particular,
-    // the feed-forward down projection (`linear_2`) stays F32 so accumulated quantization error is
-    // not injected directly into the residual stream.
-    (target.ends_with(".linear_1.weight") || target.ends_with(".linear_3.weight"))
-        && (target.contains(".feed_forward.")
-            || target.contains(".image_ffn.")
-            || target.contains(".instruction_ffn."))
-}
-
-fn canonical_indexed_ffn_projection_target(
-    target: &str,
-    prefix: &str,
-    layer_count: usize,
-    module_and_projection: &[&str],
-) -> bool {
-    let Some(index_and_path) = target.strip_prefix(prefix) else {
-        return false;
-    };
-    let Some((index, path)) = index_and_path.split_once('.') else {
-        return false;
-    };
-    if index.is_empty()
-        || (index.len() > 1 && index.starts_with('0'))
-        || !index.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return false;
-    }
-    let Ok(index) = index.parse::<usize>() else {
-        return false;
-    };
-    index < layer_count && module_and_projection.contains(&path)
-}
-
-fn turbo_main_core_ffn_gate_up_q8_target(target: &str) -> bool {
-    const SINGLE_STREAM_GATE_UP: &[&str] = &[
-        "feed_forward.linear_1.weight",
-        "feed_forward.linear_3.weight",
-    ];
-    const DOUBLE_STREAM_GATE_UP: &[&str] = &[
-        "image_ffn.linear_1.weight",
-        "image_ffn.linear_3.weight",
-        "instruction_ffn.linear_1.weight",
-        "instruction_ffn.linear_3.weight",
-    ];
-
-    canonical_indexed_ffn_projection_target(
-        target,
-        "single_stream_layers.",
-        32,
-        SINGLE_STREAM_GATE_UP,
-    ) || canonical_indexed_ffn_projection_target(
-        target,
-        "double_stream_layers.",
-        8,
-        DOUBLE_STREAM_GATE_UP,
-    )
 }
 
 /// Inventory-derived denoiser parameter payload for runtime Q8S block-32/F32 execution.
@@ -695,6 +505,36 @@ pub struct BooguPackedQ4ResidentFootprint {
     pub total_payload_bytes: u64,
 }
 
+/// Exact signed-Q4 storage block and packed axis for one model-owned matrix.
+///
+/// Qwen keeps its saved column layout and packs the contiguous last axis. Boogu linear weights
+/// use Burn's `[input, output]` row layout and therefore pack the input axis. FLUX VAE weights are
+/// intentionally excluded because the current convolution path does not accept quantized weights.
+pub fn q4s_storage_block_and_axis(owner: TensorOwner, shape: &[usize]) -> Option<(usize, usize)> {
+    let [first, second] = shape else {
+        return None;
+    };
+    match owner {
+        TensorOwner::Qwen3Vl => second.is_multiple_of(128).then_some((128, 0)),
+        TensorOwner::BooguDenoiser if second.is_multiple_of(8) => [128_usize, 64, 32, 16, 8]
+            .into_iter()
+            .find(|block| first.is_multiple_of(*block))
+            .map(|block| (block, 1)),
+        TensorOwner::BooguDenoiser | TensorOwner::FluxVae => None,
+    }
+}
+
+/// Stable tensor-inventory spelling for one exact Q4S/F32-scale storage contract.
+pub fn q4s_stored_dtype(owner: TensorOwner, shape: &[usize]) -> Option<String> {
+    q4s_storage_block_and_axis(owner, shape).map(|(block, axis)| {
+        if axis == 0 {
+            format!("q4s-block{block}-f32-packed-axis0")
+        } else {
+            format!("q4s-block{block}x1-f32-packed-axis1")
+        }
+    })
+}
+
 fn qwen_specs(config: &Qwen3VlConfig) -> Vec<ArtifactTensorSpec> {
     QwenWeightInventory::for_config(config, true)
         .specs()
@@ -748,7 +588,7 @@ fn qwen_stage(name: &str) -> String {
 }
 
 #[cfg(feature = "burnpack")]
-fn legacy_qwen_stage(name: &str) -> String {
+fn source_qwen_stage(name: &str) -> String {
     if name == "lm_head.weight" {
         "qwen-lm-head".into()
     } else if let Some(index) = indexed_segment(name, "model.visual.blocks.") {
@@ -1387,8 +1227,8 @@ mod loading {
 
     use super::{
         BOOGU_RELEASE_MAX_METADATA_BYTES, BOOGU_RELEASE_MAX_SHARD_BYTES, BooguArtifactInventory,
-        BooguConfig, BooguReleaseIdentity, BooguRuntimeQ8Scope, SourceDType, TensorOwner,
-        TensorTransform, legacy_qwen_stage, qwen_row_slice_target, qwen_streaming_stage_name,
+        BooguConfig, BooguReleaseIdentity, SourceDType, TensorOwner, TensorTransform,
+        qwen_row_slice_target, qwen_streaming_stage_name, source_qwen_stage,
         validate_supported_bundle_converter_version,
     };
     use crate::{
@@ -1409,6 +1249,9 @@ mod loading {
         Q8sBlock32F32,
         /// Qwen vision uses F32; eligible non-vision matrices use Q8S; all else uses F16.
         Q8sBlock32F32QwenVisionF32,
+        /// Eligible Qwen and Boogu matrices use signed Q4S with F32 block scales; convolution
+        /// kernels and remaining compact tensors use F16.
+        Q4sBlockUpTo128F32,
     }
 
     impl BooguArtifactInventory {
@@ -1518,7 +1361,7 @@ mod loading {
             Ok(footprint)
         }
 
-        /// Derive the exact Turbo parameter payload for resident Q4S execution.
+        /// Derive the exact variant-active parameter payload for resident Q4S execution.
         ///
         /// Qwen text matrices and vocabulary rows use 128-value input blocks. Boogu row-layout
         /// matrices use the largest exact input-axis block up to 128. The small VAE linear and
@@ -1528,20 +1371,18 @@ mod loading {
             variant: BooguVariant,
             profile: BooguStorageProfile,
         ) -> Result<super::BooguPackedQ4ResidentFootprint, BooguError> {
-            if variant != BooguVariant::Image01Turbo
-                || profile != BooguStorageProfile::F16QwenVisionF32
-            {
+            if !matches!(profile, BooguStorageProfile::Q4sBlockUpTo128F32) {
                 return Err(BooguError::Artifact(
-                    "resident Q4S is currently restricted to the canonical Turbo production profile"
-                        .into(),
+                    "resident Q4S requires the canonical Q4 artifact profile".into(),
                 ));
             }
             let mut footprint = super::BooguPackedQ4ResidentFootprint::default();
             for spec in self.tensors().iter().filter(|spec| {
                 spec.target_name != "lm_head.weight"
-                    && !spec.stage.starts_with("qwen-vision-")
-                    && spec.stage != "flux-vae-encoder"
-                    && !spec.stage.starts_with("boogu-reference-refiner-")
+                    && (variant.is_edit()
+                        || (!spec.stage.starts_with("qwen-vision-")
+                            && spec.stage != "flux-vae-encoder"
+                            && !spec.stage.starts_with("boogu-reference-refiner-")))
             }) {
                 let elements = spec
                     .target_shape
@@ -1555,25 +1396,8 @@ mod loading {
                             spec.target_name
                         ))
                     })?;
-                let q4_block = if spec.target_shape.len() == 2 {
-                    match spec.owner {
-                        TensorOwner::Qwen3Vl => spec
-                            .target_shape
-                            .last()
-                            .copied()
-                            .and_then(|inner| inner.is_multiple_of(128).then_some(128_u64)),
-                        TensorOwner::BooguDenoiser => {
-                            let input = spec.target_shape[0];
-                            [128_usize, 64, 32, 16, 8]
-                                .into_iter()
-                                .find(|block| input.is_multiple_of(*block))
-                                .map(|block| block as u64)
-                        }
-                        TensorOwner::FluxVae => None,
-                    }
-                } else {
-                    None
-                };
+                let q4_block = super::q4s_storage_block_and_axis(spec.owner, &spec.target_shape)
+                    .map(|(block, _)| block as u64);
                 if let Some(block) = q4_block {
                     footprint.packed_q4_tensor_count = footprint
                         .packed_q4_tensor_count
@@ -1644,180 +1468,6 @@ mod loading {
         }
     }
 
-    /// Authenticated identity evidence for the opt-in 1.5K VAE encoder F32 A/B overlay.
-    ///
-    /// This does not make the overlay a published bundle or a production storage profile. The
-    /// browser must receive it through an explicit custom URL and label its result diagnostic.
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct BooguVaeEncoderF32DiagnosticManifest {
-        /// Sealed content digest of the complete diagnostic overlay manifest.
-        pub content_digest: Sha256Digest,
-        /// Legacy flat mixed-F16 digest from which all non-encoder payloads are reused.
-        pub base_content_digest: Sha256Digest,
-        /// Number of tensors whose storage changes from F16 to F32.
-        pub replaced_tensors: usize,
-        /// Number of bounded Burnpack files holding the replacement encoder.
-        pub encoder_weight_files: usize,
-        /// Total bytes in the replacement encoder Burnpack files.
-        pub encoder_weight_bytes: u64,
-    }
-
-    const VAE_ENCODER_F32_DIAGNOSTIC_METADATA: [(&str, &str); 12] = [
-        ("diagnostic_manifest_schema", "1"),
-        ("diagnostic_kind", "vae-encoder-f32-overlay"),
-        (
-            "diagnostic_storage_profile",
-            super::EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_PROFILE,
-        ),
-        ("diagnostic_base_bundle", "boogu-image-0.1-edit-turbo-1k5"),
-        (
-            "diagnostic_base_content_digest",
-            super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
-        ),
-        ("diagnostic_replaced_stage", "flux-vae-encoder"),
-        ("diagnostic_replaced_tensor_count", "106"),
-        ("diagnostic_replaced_stored_dtype", "f32"),
-        (
-            "diagnostic_upstream_vae_repository",
-            "Boogu/Boogu-Image-0.1-Edit-Turbo",
-        ),
-        (
-            "diagnostic_upstream_vae_revision",
-            super::EDIT_TURBO_REVISION,
-        ),
-        (
-            "diagnostic_upstream_vae_sha256",
-            super::EDIT_TURBO_1K5_VAE_SOURCE_SHA256,
-        ),
-        ("diagnostic_intended_mode", "browser-vae-reference"),
-    ];
-
-    /// Stamp the exact diagnostic metadata used by the F32 VAE encoder A/B overlay.
-    ///
-    /// The caller is still responsible for replacing exactly the encoder object and inventory
-    /// entries before sealing. Existing diagnostic metadata is rejected rather than overwritten.
-    pub fn stamp_edit_turbo_1k5_vae_encoder_f32_diagnostic_metadata(
-        manifest: &mut ArtifactManifest,
-    ) -> Result<(), BooguError> {
-        if manifest
-            .metadata
-            .keys()
-            .any(|key| key.starts_with("diagnostic_"))
-        {
-            return Err(BooguError::Artifact(
-                "base manifest already contains diagnostic metadata".into(),
-            ));
-        }
-        for (key, value) in VAE_ENCODER_F32_DIAGNOSTIC_METADATA {
-            manifest.metadata.insert(key.into(), value.into());
-        }
-        manifest.metadata.insert(
-            "diagnostic_upstream_vae_bytes".into(),
-            super::EDIT_TURBO_1K5_VAE_SOURCE_BYTES.to_string(),
-        );
-        manifest
-            .metadata
-            .insert("production_qualified".into(), "false".into());
-        Ok(())
-    }
-
-    /// Authenticate the sealed manifest-level identity of an explicit 1.5K VAE encoder F32 A/B.
-    ///
-    /// Exact tensor ownership and the rule that only the 106 encoder tensors use F32 are checked
-    /// by the normal sealed tensor-inventory verifier. This helper is the narrow selection gate a
-    /// browser diagnostic can use instead of accepting an arbitrary non-canonical digest.
-    pub fn validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest(
-        manifest: &ArtifactManifest,
-    ) -> Result<BooguVaeEncoderF32DiagnosticManifest, BooguError> {
-        manifest
-            .validate_sealed()
-            .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        let expected_profile = "f16-qwen-vision-f32";
-        if manifest.bundle.as_str() != "boogu-image-0.1-edit-turbo-1k5-f16-qwen-vision-f32"
-            || manifest.profile.as_str() != expected_profile
-            || manifest.model.as_str() != "Boogu/Boogu-Image-0.1-Edit-Turbo-1K5"
-            || manifest.model_revision != super::EDIT_TURBO_1K5_REVISION
-            || manifest.numeric_format != NumericFormat::Other(expected_profile.into())
-            || manifest.metadata.get("profile").map(String::as_str) != Some(expected_profile)
-        {
-            return Err(BooguError::Artifact(
-                "VAE encoder F32 diagnostic manifest has the wrong bundle, release, or base profile"
-                    .into(),
-            ));
-        }
-        let expected_keys = VAE_ENCODER_F32_DIAGNOSTIC_METADATA
-            .iter()
-            .map(|(key, _)| *key)
-            .chain(["diagnostic_upstream_vae_bytes"])
-            .collect::<BTreeSet<_>>();
-        let actual_keys = manifest
-            .metadata
-            .keys()
-            .filter(|key| key.starts_with("diagnostic_"))
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        if actual_keys != expected_keys
-            || VAE_ENCODER_F32_DIAGNOSTIC_METADATA
-                .iter()
-                .any(|(key, value)| manifest.metadata.get(*key).map(String::as_str) != Some(*value))
-            || manifest
-                .metadata
-                .get("diagnostic_upstream_vae_bytes")
-                .map(String::as_str)
-                != Some("335306212")
-            || manifest
-                .metadata
-                .get("production_qualified")
-                .map(String::as_str)
-                != Some("false")
-        {
-            return Err(BooguError::Artifact(
-                "VAE encoder F32 diagnostic metadata is incomplete or not exact".into(),
-            ));
-        }
-        let encoder_files = manifest
-            .files
-            .iter()
-            .filter(|file| {
-                file.role == ArtifactFileRole::Weights
-                    && file.component.as_ref().map(|value| value.as_str())
-                        == Some("flux-vae-encoder")
-            })
-            .collect::<Vec<_>>();
-        if encoder_files.len() != 1 || encoder_files[0].shard.is_some() {
-            return Err(BooguError::Artifact(format!(
-                "VAE encoder F32 diagnostic requires one bounded unsharded encoder object, found {}",
-                encoder_files.len()
-            )));
-        }
-        let encoder_weight_bytes = encoder_files[0].size;
-        if encoder_weight_bytes == 0 || encoder_weight_bytes > super::BOOGU_RELEASE_MAX_SHARD_BYTES
-        {
-            return Err(BooguError::Artifact(format!(
-                "VAE encoder F32 diagnostic object is {encoder_weight_bytes} bytes; limit is {}",
-                super::BOOGU_RELEASE_MAX_SHARD_BYTES
-            )));
-        }
-        let content_digest = manifest
-            .content_digest
-            .ok_or_else(|| BooguError::Artifact("diagnostic manifest is not sealed".into()))?;
-        let base_content_digest =
-            Sha256Digest::from_hex(super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
-                .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        if content_digest == base_content_digest {
-            return Err(BooguError::Artifact(
-                "diagnostic overlay aliases the canonical production digest".into(),
-            ));
-        }
-        Ok(BooguVaeEncoderF32DiagnosticManifest {
-            content_digest,
-            base_content_digest,
-            replaced_tensors: super::EDIT_TURBO_1K5_VAE_ENCODER_F32_DIAGNOSTIC_TENSORS,
-            encoder_weight_files: encoder_files.len(),
-            encoder_weight_bytes,
-        })
-    }
-
     /// One immutable bundle published beneath the canonical CDN root.
     ///
     /// Absence from [`PUBLISHED_ARTIFACT_BUNDLES`] means callers must require an explicit local or
@@ -1836,13 +1486,13 @@ mod loading {
         pub converter_version: &'static str,
     }
 
-    /// The three immutable production parent bundles published beneath the canonical CDN root.
+    /// The immutable production parent bundles published beneath the canonical CDN root.
     ///
     /// The shared Qwen and VAE component bundles are also canonical published entries, but parent
     /// dependency pins select them instead of a variant/profile lookup. Hybrid-Q8 and all-F16
     /// bundles remain available as explicitly selected diagnostics and are intentionally absent
     /// from this canonical parent selection set.
-    pub const PUBLISHED_ARTIFACT_BUNDLES: [CanonicalBooguArtifactBundle; 3] = [
+    pub const PUBLISHED_ARTIFACT_BUNDLES: [CanonicalBooguArtifactBundle; 6] = [
         CanonicalBooguArtifactBundle {
             variant: BooguVariant::Image01Turbo,
             profile: BooguStorageProfile::F16QwenVisionF32,
@@ -1864,6 +1514,27 @@ mod loading {
             content_digest: super::EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
             converter_version: super::PUBLISHED_BUNDLE_CONVERTER_VERSION,
         },
+        CanonicalBooguArtifactBundle {
+            variant: BooguVariant::Image01Turbo,
+            profile: BooguStorageProfile::Q4sBlockUpTo128F32,
+            bundle_id: "boogu-image-0.1-turbo-q4s-block-up-to128-f32",
+            content_digest: super::TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST,
+            converter_version: super::CURRENT_BUNDLE_CONVERTER_VERSION,
+        },
+        CanonicalBooguArtifactBundle {
+            variant: BooguVariant::Image01EditTurbo,
+            profile: BooguStorageProfile::Q4sBlockUpTo128F32,
+            bundle_id: "boogu-image-0.1-edit-turbo-q4s-block-up-to128-f32",
+            content_digest: super::EDIT_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST,
+            converter_version: super::CURRENT_BUNDLE_CONVERTER_VERSION,
+        },
+        CanonicalBooguArtifactBundle {
+            variant: BooguVariant::Image01EditTurbo1k5,
+            profile: BooguStorageProfile::Q4sBlockUpTo128F32,
+            bundle_id: "boogu-image-0.1-edit-turbo-1k5-q4s-block-up-to128-f32",
+            content_digest: super::EDIT_TURBO_1K5_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST,
+            converter_version: super::CURRENT_BUNDLE_CONVERTER_VERSION,
+        },
     ];
 
     /// Return the pinned release contract for an actually published variant/profile tuple.
@@ -1877,11 +1548,11 @@ mod loading {
             .find(|bundle| bundle.variant == variant && bundle.profile == profile)
     }
 
-    /// Return the legacy descriptive bundle id for a variant and exact storage profile.
+    /// Return the dependency-free source bundle id for a variant and exact storage profile.
     ///
     /// These identities remain valid for explicit local/custom artifacts and as the source of a
     /// canonical promotion. They are never used to construct a canonical CDN URL.
-    pub fn legacy_artifact_bundle_id(
+    pub fn source_artifact_bundle_id(
         variant: BooguVariant,
         profile: BooguStorageProfile,
     ) -> String {
@@ -1892,20 +1563,29 @@ mod loading {
         )
     }
 
-    /// Return the exact legacy digest eligible for promotion to a canonical production bundle.
-    pub const fn promotable_legacy_artifact_digest(
+    /// Return the exact source digest eligible for promotion to a canonical release bundle.
+    pub const fn release_source_artifact_digest(
         variant: BooguVariant,
         profile: BooguStorageProfile,
     ) -> Option<&'static str> {
         match (variant, profile) {
             (BooguVariant::Image01Turbo, BooguStorageProfile::F16QwenVisionF32) => {
-                Some(super::LEGACY_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+                Some(super::SOURCE_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            }
+            (BooguVariant::Image01Turbo, BooguStorageProfile::Q4sBlockUpTo128F32) => {
+                Some(super::SOURCE_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST)
             }
             (BooguVariant::Image01EditTurbo, BooguStorageProfile::F16QwenVisionF32) => {
-                Some(super::LEGACY_EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+                Some(super::SOURCE_EDIT_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            }
+            (BooguVariant::Image01EditTurbo, BooguStorageProfile::Q4sBlockUpTo128F32) => {
+                Some(super::SOURCE_EDIT_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST)
             }
             (BooguVariant::Image01EditTurbo1k5, BooguStorageProfile::F16QwenVisionF32) => {
-                Some(super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+                Some(super::SOURCE_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            }
+            (BooguVariant::Image01EditTurbo1k5, BooguStorageProfile::Q4sBlockUpTo128F32) => {
+                Some(super::SOURCE_EDIT_TURBO_1K5_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST)
             }
             _ => None,
         }
@@ -1913,25 +1593,25 @@ mod loading {
 
     /// Select the preferred bundle id for a variant/profile tuple.
     ///
-    /// The three published mixed-F16 tuples use their clean canonical identities. Diagnostics
-    /// retain the explicit legacy-derived dtype suffix and require an explicit source. Importers
-    /// must use [`legacy_artifact_bundle_id`] until a candidate is promoted separately.
+    /// Published tuples use canonical identities. Conversion-only profiles retain the explicit
+    /// dtype suffix and require an explicit source. Importers use [`source_artifact_bundle_id`]
+    /// until the release builder emits the canonical layout.
     pub fn preferred_artifact_bundle_id(
         variant: BooguVariant,
         profile: BooguStorageProfile,
     ) -> String {
         canonical_published_bundle(variant, profile)
             .map(|bundle| bundle.bundle_id.to_owned())
-            .unwrap_or_else(|| legacy_artifact_bundle_id(variant, profile))
+            .unwrap_or_else(|| source_artifact_bundle_id(variant, profile))
     }
 
-    /// Whether an explicit/local manifest uses the canonical id or its compatible legacy id.
-    pub fn artifact_bundle_id_is_compatible(
+    /// Whether a manifest uses its canonical release id or exact conversion-source id.
+    pub fn artifact_bundle_id_matches_selection(
         variant: BooguVariant,
         profile: BooguStorageProfile,
         actual: &str,
     ) -> bool {
-        actual == legacy_artifact_bundle_id(variant, profile)
+        actual == source_artifact_bundle_id(variant, profile)
             || canonical_published_bundle(variant, profile)
                 .is_some_and(|bundle| actual == bundle.bundle_id)
     }
@@ -1963,8 +1643,8 @@ mod loading {
 
     /// Require an exact artifact manifest qualified by the native Edit-Turbo 1.5K release gates.
     ///
-    /// This accepts either the dependency-composed canonical CDN release or the exact legacy flat
-    /// monolith used by explicit/local compatibility and diagnostic tooling. Canonical CDN callers
+    /// This accepts either the dependency-composed CDN release or the exact dependency-free source
+    /// bundle used by explicit local tooling. CDN callers
     /// should use [`validate_canonical_release_artifact_digest`] to require canonical identity.
     pub fn validate_edit_turbo_1k5_release_artifact_digest(
         actual: Sha256Digest,
@@ -1973,14 +1653,14 @@ mod loading {
         if matches!(
             actual.as_str(),
             super::EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST
-                | super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST
+                | super::SOURCE_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST
         ) {
             Ok(())
         } else {
             Err(BooguError::Artifact(format!(
-                "Edit-Turbo 1.5K requires canonical composition digest {} or compatible legacy flat digest {}, found {actual}",
+                "Edit-Turbo 1.5K requires canonical composition digest {} or exact source digest {}, found {actual}",
                 super::EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
-                super::LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
+                super::SOURCE_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
             )))
         }
     }
@@ -1993,7 +1673,7 @@ mod loading {
         Preserve,
         /// Convert floating-point tensors to F32 during application.
         ///
-        /// This explicit compatibility mode is useful for CPU backends without F16 support.
+        /// This explicit conversion is useful for CPU backends without F16 support.
         /// Q8S tensors are never dequantized by this policy.
         AdaptToF32,
         /// Retain F16 matrix/convolution weights as two-byte device buffers while widening
@@ -2081,9 +1761,9 @@ mod loading {
 
     const fn qwen_quantized_policy(profile: BooguStorageProfile) -> BooguQuantizedLoadPolicy {
         match profile {
-            BooguStorageProfile::F16 | BooguStorageProfile::F16QwenVisionF32 => {
-                BooguQuantizedLoadPolicy::Preserve
-            }
+            BooguStorageProfile::F16
+            | BooguStorageProfile::F16QwenVisionF32
+            | BooguStorageProfile::Q4sBlockUpTo128F32 => BooguQuantizedLoadPolicy::Preserve,
             BooguStorageProfile::Q8sBlock32F32
             | BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => {
                 BooguQuantizedLoadPolicy::DequantizeF16
@@ -2334,7 +2014,7 @@ mod loading {
 
         /// Preserve model-neutral typed evidence from a transport that already authenticated the
         /// exact payload. Unverified model-neutral reads remain unverified and are hashed by
-        /// [`Self::into_verified_bytes`], so this conversion cannot bypass the source trust gate.
+        /// `into_verified_bytes`, so this conversion cannot bypass the source trust gate.
         pub fn from_verified_artifact_bytes(inner: VerifiedArtifactBytes) -> Self {
             Self { inner }
         }
@@ -2982,6 +2662,7 @@ mod loading {
             "q8s-block32-f32-qwen-vision-f32" => {
                 Ok(BooguStorageProfile::Q8sBlock32F32QwenVisionF32)
             }
+            "q4s-block-up-to128-f32" => Ok(BooguStorageProfile::Q4sBlockUpTo128F32),
             profile => Err(BooguArtifactLoadError::Identity(format!(
                 "unsupported Boogu storage profile {profile}"
             ))),
@@ -3002,6 +2683,7 @@ mod loading {
             BooguStorageProfile::F16QwenVisionF32 => "f16-qwen-vision-f32",
             BooguStorageProfile::Q8sBlock32F32 => "q8s-block32-f32",
             BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => "q8s-block32-f32-qwen-vision-f32",
+            BooguStorageProfile::Q4sBlockUpTo128F32 => "q4s-block-up-to128-f32",
         }
     }
 
@@ -3027,13 +2709,13 @@ mod loading {
         variant: BooguVariant,
         profile: BooguStorageProfile,
     ) -> Result<(), BooguArtifactLoadError> {
-        let legacy_bundle = legacy_artifact_bundle_id(variant, profile);
+        let source_bundle = source_artifact_bundle_id(variant, profile);
         let published_bundle =
             canonical_published_bundle(variant, profile).map(|bundle| bundle.bundle_id);
-        if !artifact_bundle_id_is_compatible(variant, profile, manifest.bundle.as_str()) {
+        if !artifact_bundle_id_matches_selection(variant, profile, manifest.bundle.as_str()) {
             let accepted = published_bundle
-                .map(|bundle| format!("{legacy_bundle} or {bundle}"))
-                .unwrap_or(legacy_bundle);
+                .map(|bundle| format!("{source_bundle} or {bundle}"))
+                .unwrap_or(source_bundle);
             return Err(BooguArtifactLoadError::Identity(format!(
                 "bundle {} is not an accepted explicit/canonical release identity; expected {accepted}",
                 manifest.bundle,
@@ -3834,7 +3516,6 @@ mod loading {
     pub struct VerifiedBurnpackStageSource<B: Backend, R> {
         config: BooguConfig,
         inventory: BooguArtifactInventory,
-        variant: BooguVariant,
         profile: BooguStorageProfile,
         device: B::Device,
         stages: BTreeMap<String, Vec<ArtifactFile>>,
@@ -3842,7 +3523,6 @@ mod loading {
         float_policy: BooguFloatLoadPolicy,
         quantized_policy: BooguQuantizedLoadPolicy,
         runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
-        runtime_q8_scope: BooguRuntimeQ8Scope,
     }
 
     impl<B: Backend, R: StageShardReader> VerifiedBurnpackStageSource<B, R> {
@@ -3904,7 +3584,6 @@ mod loading {
             Ok(Self {
                 config,
                 inventory,
-                variant: identity.variant,
                 profile,
                 device,
                 stages,
@@ -3912,7 +3591,6 @@ mod loading {
                 float_policy: BooguFloatLoadPolicy::Preserve,
                 quantized_policy: BooguQuantizedLoadPolicy::Preserve,
                 runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
-                runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
             })
         }
 
@@ -3939,7 +3617,7 @@ mod loading {
         ///
         /// The default is [`BooguDenoiserRuntimeQuantizationPolicy::Disabled`]. Enabling Q8S
         /// conversion does not alter artifact identity and remains constrained by the sealed
-        /// inventory plus [`Self::with_runtime_q8_scope`].
+        /// inventory.
         pub fn with_runtime_quantization_policy(
             mut self,
             policy: BooguDenoiserRuntimeQuantizationPolicy,
@@ -3948,13 +3626,7 @@ mod loading {
             self
         }
 
-        /// Select the closed subset of inventory-eligible matrices quantized at runtime.
-        pub fn with_runtime_q8_scope(mut self, scope: BooguRuntimeQ8Scope) -> Self {
-            self.runtime_q8_scope = scope;
-            self
-        }
-
-        /// Enable or disable the explicit F32 compatibility adapter.
+        /// Enable or disable the explicit F32 conversion adapter.
         ///
         /// Prefer [`Self::with_float_load_policy`] when propagating a typed runtime policy.
         pub fn with_float32_adapter(self, enabled: bool) -> Self {
@@ -3984,11 +3656,8 @@ mod loading {
         ) -> Result<M, BooguError> {
             validate_runtime_denoiser_quantization_policy(
                 self.profile,
-                self.float_policy,
                 self.quantized_policy,
                 self.runtime_quantization_policy,
-                self.runtime_q8_scope,
-                self.variant,
                 stage,
             )?;
             let files = self.stages.get(stage).cloned().ok_or_else(|| {
@@ -4062,8 +3731,7 @@ mod loading {
                             "stage {stage} tensor {name} does not start with {prefix:?}"
                         ))
                     })?;
-                    if spec.quantizable && self.runtime_q8_scope.quantizes_target(&spec.target_name)
-                    {
+                    if spec.quantizable {
                         runtime_quantizable_paths.insert(local_name.to_owned());
                     }
                     local.push(rename_snapshot(snapshot, local_name));
@@ -4227,7 +3895,7 @@ mod loading {
             })
         }
 
-        /// Explicit compatibility conversion for CPU backends without F16 support.
+        /// Explicit conversion for CPU backends without F16 support.
         pub fn with_float_load_policy(mut self, policy: BooguFloatLoadPolicy) -> Self {
             self.float_policy = policy;
             self
@@ -4423,18 +4091,40 @@ mod loading {
                             "Qwen row stage {stage} contains an unknown or duplicate tensor {name}"
                         )));
                     }
-                    if snapshot.dtype != DType::F16
-                        || snapshot.shape.as_slice() != [spec.rows(), spec.hidden_size]
-                    {
+                    if snapshot.shape.as_slice() != [spec.rows(), spec.hidden_size] {
                         return Err(BooguError::Artifact(format!(
-                            "Qwen row tensor {name} violates its F16 shape contract"
+                            "Qwen row tensor {name} violates its sealed shape contract"
                         )));
                     }
+                    validate_entry_dtype(entry, snapshot.dtype).map_err(|message| {
+                        BooguError::Artifact(format!(
+                            "Qwen row tensor {name} dtype mismatch: {message}"
+                        ))
+                    })?;
                     let mut data = snapshot.to_data().map_err(|error| {
                         BooguError::Artifact(format!("failed to read Qwen row {name}: {error}"))
                     })?;
-                    if self.float_policy == BooguFloatLoadPolicy::AdaptToF32 {
-                        data = data.convert_dtype(DType::F32);
+                    match self.float_policy {
+                        BooguFloatLoadPolicy::AdaptToF32 => {
+                            data = data.convert_dtype(DType::F32);
+                        }
+                        BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries
+                            if matches!(data.dtype, DType::F16 | DType::F32) =>
+                        {
+                            let shape = data.shape.to_vec();
+                            let values = data.convert_dtype(DType::F32).to_vec::<f32>().map_err(
+                                |error| {
+                                    BooguError::Artifact(format!(
+                                        "failed to materialize Qwen row {name}: {error}"
+                                    ))
+                                },
+                            )?;
+                            data = super::quantize_q4s_block128_f32(values, shape)
+                                .map_err(|error| BooguError::Artifact(error.to_string()))?;
+                        }
+                        BooguFloatLoadPolicy::Preserve
+                        | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+                        | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => {}
                     }
                     // `Tensor::from_data` uses the backend's default float element (F32 for the
                     // WGPU type used here), even when the sealed row payload is F16. Reapply the
@@ -4822,7 +4512,7 @@ mod loading {
             })
         }
 
-        /// Explicit compatibility conversion for CPU backends without F16 support.
+        /// Explicit conversion for CPU backends without F16 support.
         pub fn with_float_load_policy(mut self, policy: BooguFloatLoadPolicy) -> Self {
             self.float_policy = policy;
             self
@@ -5023,18 +4713,40 @@ mod loading {
                             file.path, entry.burnpack_object
                         )));
                     }
-                    if snapshot.dtype != DType::F16
-                        || snapshot.shape.as_slice() != [spec.rows(), spec.hidden_size]
-                    {
+                    if snapshot.shape.as_slice() != [spec.rows(), spec.hidden_size] {
                         return Err(BooguError::Artifact(format!(
-                            "Qwen row tensor {name} violates its F16 shape contract"
+                            "Qwen row tensor {name} violates its sealed shape contract"
                         )));
                     }
+                    validate_entry_dtype(&entry, snapshot.dtype).map_err(|message| {
+                        BooguError::Artifact(format!(
+                            "Qwen row tensor {name} dtype mismatch: {message}"
+                        ))
+                    })?;
                     let mut data = snapshot.to_data().map_err(|error| {
                         BooguError::Artifact(format!("failed to read Qwen row {name}: {error}"))
                     })?;
-                    if self.float_policy == BooguFloatLoadPolicy::AdaptToF32 {
-                        data = data.convert_dtype(DType::F32);
+                    match self.float_policy {
+                        BooguFloatLoadPolicy::AdaptToF32 => {
+                            data = data.convert_dtype(DType::F32);
+                        }
+                        BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries
+                            if matches!(data.dtype, DType::F16 | DType::F32) =>
+                        {
+                            let shape = data.shape.to_vec();
+                            let values = data.convert_dtype(DType::F32).to_vec::<f32>().map_err(
+                                |error| {
+                                    BooguError::Artifact(format!(
+                                        "failed to materialize Qwen row {name}: {error}"
+                                    ))
+                                },
+                            )?;
+                            data = super::quantize_q4s_block128_f32(values, shape)
+                                .map_err(|error| BooguError::Artifact(error.to_string()))?;
+                        }
+                        BooguFloatLoadPolicy::Preserve
+                        | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
+                        | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => {}
                     }
                     let dtype = data.dtype;
                     found = Some(Tensor::<B, 2>::from_data(data, (&self.device, dtype)));
@@ -5932,7 +5644,6 @@ mod loading {
     /// returned device module therefore contains exactly one semantic denoiser stage.
     pub struct VerifiedAsyncBurnpackDenoiserStageSource<B: Backend, R> {
         config: BooguConfig,
-        variant: BooguVariant,
         profile: BooguStorageProfile,
         device: B::Device,
         entries: Vec<SerializedTensorInventory>,
@@ -5943,7 +5654,6 @@ mod loading {
         float_policy: BooguFloatLoadPolicy,
         quantized_policy: BooguQuantizedLoadPolicy,
         runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
-        runtime_q8_scope: BooguRuntimeQ8Scope,
     }
 
     impl<B: Backend, R: AsyncStageShardReader> VerifiedAsyncBurnpackDenoiserStageSource<B, R> {
@@ -6031,7 +5741,6 @@ mod loading {
             }
             Ok(Self {
                 config,
-                variant: identity.variant,
                 profile,
                 device,
                 entries,
@@ -6042,11 +5751,10 @@ mod loading {
                 float_policy: BooguFloatLoadPolicy::Preserve,
                 quantized_policy: BooguQuantizedLoadPolicy::Preserve,
                 runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy::Disabled,
-                runtime_q8_scope: BooguRuntimeQ8Scope::AllInventoryEligible,
             })
         }
 
-        /// Explicit compatibility conversion for CPU backends without F16 support.
+        /// Explicit conversion for CPU backends without F16 support.
         pub fn with_float_load_policy(mut self, policy: BooguFloatLoadPolicy) -> Self {
             self.float_policy = policy;
             self
@@ -6065,18 +5773,12 @@ mod loading {
         ///
         /// The default is [`BooguDenoiserRuntimeQuantizationPolicy::Disabled`]. Enabling Q8S
         /// conversion does not alter artifact identity and remains constrained by the sealed
-        /// inventory plus [`Self::with_runtime_q8_scope`].
+        /// inventory.
         pub fn with_runtime_quantization_policy(
             mut self,
             policy: BooguDenoiserRuntimeQuantizationPolicy,
         ) -> Self {
             self.runtime_quantization_policy = policy;
-            self
-        }
-
-        /// Select the closed subset of inventory-eligible matrices quantized at runtime.
-        pub fn with_runtime_q8_scope(mut self, scope: BooguRuntimeQ8Scope) -> Self {
-            self.runtime_q8_scope = scope;
             self
         }
 
@@ -6103,11 +5805,8 @@ mod loading {
         ) -> Result<M, BooguError> {
             validate_runtime_denoiser_quantization_policy(
                 self.profile,
-                self.float_policy,
                 self.quantized_policy,
                 self.runtime_quantization_policy,
-                self.runtime_q8_scope,
-                self.variant,
                 stage,
             )?;
             let files = self.stages.get(stage).cloned().ok_or_else(|| {
@@ -6181,9 +5880,7 @@ mod loading {
                             "stage {stage} tensor {name} does not start with {prefix:?}"
                         ))
                     })?;
-                    if self.runtime_quantizable_targets.contains(name)
-                        && self.runtime_q8_scope.quantizes_target(name)
-                    {
+                    if self.runtime_quantizable_targets.contains(name) {
                         runtime_quantizable_paths.insert(local_name.to_owned());
                     }
                     local.push(rename_snapshot(snapshot, local_name));
@@ -6561,14 +6258,6 @@ mod loading {
                 stage: "tensor-inventory".into(),
                 message: format!("invalid exact tensor inventory JSON: {error}"),
             })?;
-        let vae_encoder_f32_diagnostic = manifest
-            .metadata
-            .keys()
-            .any(|key| key.starts_with("diagnostic_"));
-        if vae_encoder_f32_diagnostic {
-            validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest(manifest)
-                .map_err(|error| contract("tensor-inventory", error.to_string()))?;
-        }
         verify_source_file_contract(manifest, &entries, reader)?;
         let weight_files = manifest
             .files
@@ -6644,13 +6333,23 @@ mod loading {
                 let expected_bytes = u64::try_from(expected_shape.iter().product::<usize>())
                     .ok()
                     .and_then(|elements| elements.checked_mul(source_element_bytes));
+                let (expected_stored_dtype, expected_quantized) =
+                    if profile == BooguStorageProfile::Q4sBlockUpTo128F32 {
+                        (
+                            super::q4s_stored_dtype(TensorOwner::Qwen3Vl, &expected_shape)
+                                .expect("released Qwen rows have a Q4-compatible hidden width"),
+                            true,
+                        )
+                    } else {
+                        ("f16".to_owned(), false)
+                    };
                 if !entry.included
                     || !valid_row_source
                     || start >= end
                     || end > spec.source_shape[0]
                     || entry.stored_shape.as_ref() != Some(&expected_shape)
-                    || entry.stored_dtype.as_deref() != Some("f16")
-                    || entry.quantized
+                    || entry.stored_dtype.as_deref() != Some(expected_stored_dtype.as_str())
+                    || entry.quantized != expected_quantized
                     || Some(entry.source_bytes) != expected_bytes
                 {
                     return Err(contract(
@@ -6660,15 +6359,15 @@ mod loading {
                 }
             } else if entry.included {
                 let (expected_stored_dtype, expected_quantized) =
-                    expected_spec_storage(profile, spec, vae_encoder_f32_diagnostic);
+                    expected_spec_storage(profile, spec);
                 let expected_stage = if schema == 1 && spec.owner == TensorOwner::Qwen3Vl {
-                    legacy_qwen_stage(&spec.source_name)
+                    source_qwen_stage(&spec.source_name)
                 } else {
                     spec.stage.clone()
                 };
                 if entry.target_name != spec.target_name
                     || entry.stage != expected_stage
-                    || entry.stored_dtype.as_deref() != Some(expected_stored_dtype)
+                    || entry.stored_dtype.as_deref() != Some(expected_stored_dtype.as_str())
                     || entry.stored_shape.as_ref() != Some(&spec.target_shape)
                     || entry.quantized != expected_quantized
                     || entry.source_bytes != full_source_bytes
@@ -6864,7 +6563,7 @@ mod loading {
         } else if entries.len() != expected_specs.len() || omitted_count != 0 {
             return Err(contract(
                 "tensor-inventory",
-                "legacy schema must contain exactly one stored entry per source tensor",
+                "standalone schema must contain exactly one stored entry per source tensor",
             ));
         }
         Ok(entries)
@@ -7078,7 +6777,7 @@ mod loading {
 
     /// Schema-v2 Boogu composition manifests own only the variant-specific denoiser inventory;
     /// their sealed Qwen/VAE dependencies are validated and loaded by the reusable model crates.
-    /// Legacy schema-v1 monoliths continue to bind the complete three-model inventory.
+    /// Standalone schema-v1 sources bind the complete three-model inventory.
     fn manifest_inventory_specs<'a>(
         manifest: &ArtifactManifest,
         inventory: &'a BooguArtifactInventory,
@@ -7152,6 +6851,10 @@ mod loading {
             BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => (
                 "q8s-block32-f32-qwen-vision-f32",
                 NumericFormat::Other("q8s-block32-f32-qwen-vision-f32".into()),
+            ),
+            BooguStorageProfile::Q4sBlockUpTo128F32 => (
+                "q4s-block-up-to128-f32",
+                NumericFormat::Other("q4s-block-up-to128-f32".into()),
             ),
         };
         if manifest.profile.as_str() != profile_name
@@ -7249,14 +6952,7 @@ mod loading {
     fn expected_spec_storage(
         profile: BooguStorageProfile,
         spec: &super::ArtifactTensorSpec,
-        vae_encoder_f32_diagnostic: bool,
-    ) -> (&'static str, bool) {
-        if vae_encoder_f32_diagnostic
-            && spec.owner == TensorOwner::FluxVae
-            && spec.stage == "flux-vae-encoder"
-        {
-            return ("f32", false);
-        }
+    ) -> (String, bool) {
         let qwen_vision =
             spec.owner == TensorOwner::Qwen3Vl && spec.stage.starts_with("qwen-vision-");
         let mixed_vision = matches!(
@@ -7264,7 +6960,12 @@ mod loading {
             BooguStorageProfile::F16QwenVisionF32 | BooguStorageProfile::Q8sBlock32F32QwenVisionF32
         );
         if mixed_vision && qwen_vision {
-            return ("f32", false);
+            return ("f32".to_owned(), false);
+        }
+        if profile == BooguStorageProfile::Q4sBlockUpTo128F32
+            && let Some(dtype) = super::q4s_stored_dtype(spec.owner, &spec.target_shape)
+        {
+            return (dtype, true);
         }
         let quantized = spec.quantizable
             && matches!(
@@ -7273,9 +6974,9 @@ mod loading {
                     | BooguStorageProfile::Q8sBlock32F32QwenVisionF32
             );
         if quantized {
-            ("q8s-block32-f32", true)
+            ("q8s-block32-f32".to_owned(), true)
         } else {
-            ("f16", false)
+            ("f16".to_owned(), false)
         }
     }
 
@@ -7284,8 +6985,8 @@ mod loading {
         spec: &super::ArtifactTensorSpec,
         actual: DType,
     ) -> Result<(), String> {
-        let (stored_dtype, quantized) = expected_spec_storage(profile, spec, false);
-        validate_stored_dtype(stored_dtype, quantized, actual)
+        let (stored_dtype, quantized) = expected_spec_storage(profile, spec);
+        validate_stored_dtype(&stored_dtype, quantized, actual)
     }
 
     fn validate_entry_dtype(
@@ -7311,6 +7012,26 @@ mod loading {
                     && scheme.level == burn::tensor::quantization::QuantLevel::block([32])
                     && scheme.param == burn::tensor::quantization::QuantParam::F32
             }
+            (stored, true, DType::QFloat(scheme)) if stored.starts_with("q4s-block") => {
+                let actual = match (scheme.level, scheme.store) {
+                    (
+                        burn::tensor::quantization::QuantLevel::Block(block),
+                        burn::tensor::quantization::QuantStore::PackedU32(axis),
+                    ) if scheme.value == burn::tensor::quantization::QuantValue::Q4S
+                        && scheme.param == burn::tensor::quantization::QuantParam::F32 =>
+                    {
+                        if axis == 0 && block.len() == 1 {
+                            format!("q4s-block{}-f32-packed-axis0", block[0])
+                        } else if axis == 1 && block.len() == 2 && block[1] == 1 {
+                            format!("q4s-block{}x1-f32-packed-axis1", block[0])
+                        } else {
+                            String::new()
+                        }
+                    }
+                    _ => String::new(),
+                };
+                actual == stored
+            }
             _ => false,
         };
         if matches {
@@ -7331,11 +7052,8 @@ mod loading {
 
     pub(super) fn validate_runtime_denoiser_quantization_policy(
         profile: BooguStorageProfile,
-        float_policy: BooguFloatLoadPolicy,
         quantized_policy: BooguQuantizedLoadPolicy,
         runtime_quantization_policy: BooguDenoiserRuntimeQuantizationPolicy,
-        runtime_q8_scope: BooguRuntimeQ8Scope,
-        variant: BooguVariant,
         stage: &str,
     ) -> Result<(), BooguError> {
         if runtime_quantization_policy != BooguDenoiserRuntimeQuantizationPolicy::Disabled
@@ -7353,26 +7071,6 @@ mod loading {
         {
             return Err(BooguError::Artifact(format!(
                 "stage {stage} runtime quantization requires the stored-payload quantized load policy Preserve"
-            )));
-        }
-        if runtime_quantization_policy == BooguDenoiserRuntimeQuantizationPolicy::Q4sBlockUpTo128F32
-            && runtime_q8_scope != BooguRuntimeQ8Scope::AllInventoryEligible
-        {
-            return Err(BooguError::Artifact(format!(
-                "stage {stage} runtime Q4S quantization requires the complete inventory-eligible matrix scope"
-            )));
-        }
-        runtime_q8_scope.validate_variant(variant)?;
-        if runtime_q8_scope != BooguRuntimeQ8Scope::AllInventoryEligible
-            && (profile != BooguStorageProfile::F16QwenVisionF32
-                || float_policy != BooguFloatLoadPolicy::AdaptToF32
-                || quantized_policy != BooguQuantizedLoadPolicy::Preserve
-                || runtime_quantization_policy
-                    != BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
-        {
-            return Err(BooguError::Artifact(format!(
-                "stage {stage} runtime Q8 scope {} requires the production F16/Qwen-vision-F32 profile, AdaptToF32, and runtime Q8S quantization",
-                runtime_q8_scope.label()
             )));
         }
         Ok(())
@@ -7904,23 +7602,21 @@ pub use loading::{
     BooguComponentVerification, BooguDenoiserRuntimeQuantizationPolicy, BooguFloatLoadPolicy,
     BooguLoadReport, BooguModels, BooguModularReleaseVerification, BooguQuantizedLoadPolicy,
     BooguReleaseVerification, BooguResidentLoadMemoryPolicy, BooguStorageProfile,
-    BooguVaeEncoderF32DiagnosticManifest, CanonicalBooguArtifactBundle, DirectoryStageShardReader,
-    PUBLISHED_ARTIFACT_BUNDLES, StageShardReader, VerifiedArtifactDirectory,
-    VerifiedAsyncBurnpackDenoiserStageSource, VerifiedAsyncBurnpackQwenStageSource,
-    VerifiedAsyncBurnpackVaeStageSource, VerifiedBurnpackQwenStageSource,
-    VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource, artifact_bundle_id_is_compatible,
-    canonical_published_bundle, legacy_artifact_bundle_id, load_resident_denoiser_from_directory,
+    CanonicalBooguArtifactBundle, DirectoryStageShardReader, PUBLISHED_ARTIFACT_BUNDLES,
+    StageShardReader, VerifiedArtifactDirectory, VerifiedAsyncBurnpackDenoiserStageSource,
+    VerifiedAsyncBurnpackQwenStageSource, VerifiedAsyncBurnpackVaeStageSource,
+    VerifiedBurnpackQwenStageSource, VerifiedBurnpackStageSource, VerifiedDirectoryVaeStageSource,
+    artifact_bundle_id_matches_selection, canonical_published_bundle,
+    load_resident_denoiser_from_directory,
     load_resident_denoiser_from_directory_with_memory_policy,
     load_resident_denoiser_from_directory_with_policies, load_resident_qwen_base_from_directory,
     load_resident_vae_from_directory, load_vae_decoder, load_vae_decoder_from_directory,
     load_vae_encoder, load_vae_encoder_from_directory, preferred_artifact_bundle_id,
-    promotable_legacy_artifact_digest, quantize_q4s_block128_f32, quantize_q8s_block32_f32,
-    quantize_row_layout_q4s_block_up_to128_f32,
-    stamp_edit_turbo_1k5_vae_encoder_f32_diagnostic_metadata,
-    validate_canonical_release_artifact_digest, validate_edit_turbo_1k5_release_artifact_digest,
-    validate_edit_turbo_1k5_vae_encoder_f32_diagnostic_manifest,
-    verify_modular_release_artifact_directories, verify_published_release_artifact_directory,
-    verify_release_artifact_directory,
+    quantize_q4s_block128_f32, quantize_q8s_block32_f32,
+    quantize_row_layout_q4s_block_up_to128_f32, release_source_artifact_digest,
+    source_artifact_bundle_id, validate_canonical_release_artifact_digest,
+    validate_edit_turbo_1k5_release_artifact_digest, verify_modular_release_artifact_directories,
+    verify_published_release_artifact_directory, verify_release_artifact_directory,
 };
 
 #[cfg(all(feature = "burnpack", feature = "wgpu"))]
@@ -7941,236 +7637,6 @@ mod tests {
     use burn_image::{ArtifactFile, ArtifactManifest};
 
     #[test]
-    fn turbo_ffn_core_q8_scope_is_exact_and_fail_closed_correctness() {
-        let scope = BooguRuntimeQ8Scope::TurboFfnCoreQ8;
-        assert_eq!(scope.label(), "turbo-ffn-core-q8");
-        for target in [
-            "single_stream_layers.0.feed_forward.linear_1.weight",
-            "double_stream_layers.0.image_ffn.linear_2.weight",
-            "double_stream_layers.0.instruction_ffn.linear_3.weight",
-        ] {
-            assert!(scope.quantizes_target(target), "did not select {target}");
-        }
-        for target in [
-            "single_stream_layers.0.attn.to_q.weight",
-            "double_stream_layers.0.joint_attn.to_q.weight",
-            "double_stream_layers.0.image_self_attn.to_q.weight",
-            "single_stream_layers.0.feed_forward.linear_1.bias",
-            "time_caption_embed.caption_linear.weight",
-            "norm_out.linear_1.weight",
-            "feed_forward.weight",
-        ] {
-            assert!(
-                !scope.quantizes_target(target),
-                "unexpectedly selected {target}"
-            );
-        }
-
-        let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
-        let quantized = inventory
-            .tensors()
-            .iter()
-            .filter(|spec| {
-                spec.quantizable
-                    && !spec.stage.starts_with("boogu-reference-refiner-")
-                    && scope.quantizes_target(&spec.target_name)
-            })
-            .map(|spec| spec.target_name.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(quantized.len(), 156);
-        assert!(
-            quantized
-                .iter()
-                .all(|target| turbo_ffn_core_q8_target(target))
-        );
-
-        let footprint = inventory
-            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-                BooguVariant::Image01Turbo,
-                scope,
-            )
-            .unwrap();
-        assert_eq!(footprint.tensor_count, 912);
-        assert_eq!(footprint.quantized_tensor_count, 156);
-        assert_eq!(footprint.f32_tensor_count, 756);
-        assert_eq!(footprint.quantized_elements, 7_111_802_880);
-        assert_eq!(footprint.f32_elements, 2_823_195_168);
-        assert_eq!(footprint.quantized_payload_bytes, 8_000_778_240);
-        assert_eq!(footprint.f32_payload_bytes, 11_292_780_672);
-        assert_eq!(footprint.total_payload_bytes, 19_293_558_912);
-        for variant in [
-            BooguVariant::Image01EditTurbo,
-            BooguVariant::Image01EditTurbo1k5,
-        ] {
-            assert!(
-                inventory
-                    .denoiser_runtime_q8s_block32_f32_footprint_with_scope(variant, scope)
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn turbo_ffn_gate_up_q8_scope_is_exact_and_fail_closed_correctness() {
-        let scope = BooguRuntimeQ8Scope::TurboFfnGateUpQ8;
-        assert_eq!(scope.label(), "turbo-ffn-gate-up-q8");
-        for target in [
-            "single_stream_layers.0.feed_forward.linear_1.weight",
-            "single_stream_layers.0.feed_forward.linear_3.weight",
-            "double_stream_layers.0.image_ffn.linear_1.weight",
-            "double_stream_layers.0.image_ffn.linear_3.weight",
-            "double_stream_layers.0.instruction_ffn.linear_1.weight",
-            "double_stream_layers.0.instruction_ffn.linear_3.weight",
-        ] {
-            assert!(scope.quantizes_target(target), "did not select {target}");
-        }
-        for target in [
-            "single_stream_layers.0.feed_forward.linear_2.weight",
-            "double_stream_layers.0.image_ffn.linear_2.weight",
-            "double_stream_layers.0.instruction_ffn.linear_2.weight",
-            "single_stream_layers.0.attn.linear_1.weight",
-            "single_stream_layers.0.feed_forward.linear_1.bias",
-            "single_stream_layers.0.feed_forward.other_linear_1.weight",
-            "feed_forward.linear_1.weight",
-        ] {
-            assert!(
-                !scope.quantizes_target(target),
-                "unexpectedly selected {target}"
-            );
-        }
-
-        let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
-        let quantized = inventory
-            .tensors()
-            .iter()
-            .filter(|spec| {
-                spec.quantizable
-                    && !spec.stage.starts_with("boogu-reference-refiner-")
-                    && scope.quantizes_target(&spec.target_name)
-            })
-            .map(|spec| spec.target_name.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(quantized.len(), 104);
-        assert!(
-            quantized
-                .iter()
-                .all(|target| turbo_ffn_gate_up_q8_target(target))
-        );
-
-        let footprint = inventory
-            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-                BooguVariant::Image01Turbo,
-                scope,
-            )
-            .unwrap();
-        assert_eq!(footprint.tensor_count, 912);
-        assert_eq!(footprint.quantized_tensor_count, 104);
-        assert_eq!(footprint.f32_tensor_count, 808);
-        assert_eq!(footprint.quantized_elements, 4_741_201_920);
-        assert_eq!(footprint.f32_elements, 5_193_796_128);
-        assert_eq!(footprint.quantized_payload_bytes, 5_333_852_160);
-        assert_eq!(footprint.f32_payload_bytes, 20_775_184_512);
-        assert_eq!(footprint.total_payload_bytes, 26_109_036_672);
-        for variant in [
-            BooguVariant::Image01EditTurbo,
-            BooguVariant::Image01EditTurbo1k5,
-        ] {
-            assert!(
-                inventory
-                    .denoiser_runtime_q8s_block32_f32_footprint_with_scope(variant, scope)
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn turbo_main_core_ffn_gate_up_q8_scope_matches_exact_canonical_target_set_correctness() {
-        let scope = BooguRuntimeQ8Scope::TurboMainCoreFfnGateUpQ8;
-        assert_eq!(scope.label(), "turbo-main-core-ffn-gate-up-q8");
-
-        let mut expected = BTreeSet::<String>::new();
-        for layer in 0..32 {
-            for projection in [1, 3] {
-                expected.insert(format!(
-                    "single_stream_layers.{layer}.feed_forward.linear_{projection}.weight"
-                ));
-            }
-        }
-        for layer in 0..8 {
-            for module in ["image_ffn", "instruction_ffn"] {
-                for projection in [1, 3] {
-                    expected.insert(format!(
-                        "double_stream_layers.{layer}.{module}.linear_{projection}.weight"
-                    ));
-                }
-            }
-        }
-        assert_eq!(expected.len(), 96);
-        assert!(expected.iter().all(|target| scope.quantizes_target(target)));
-
-        for target in [
-            "single_stream_layers.0.feed_forward.linear_2.weight",
-            "single_stream_layers.32.feed_forward.linear_1.weight",
-            "single_stream_layers.00.feed_forward.linear_1.weight",
-            "single_stream_layers.+1.feed_forward.linear_1.weight",
-            "double_stream_layers.0.image_ffn.linear_2.weight",
-            "double_stream_layers.8.image_ffn.linear_1.weight",
-            "double_stream_layers.01.image_ffn.linear_1.weight",
-            "double_stream_layers.0.feed_forward.linear_1.weight",
-            "context_refiner.0.feed_forward.linear_1.weight",
-            "context_refiner.0.feed_forward.linear_3.weight",
-            "noise_refiner.0.feed_forward.linear_1.weight",
-            "noise_refiner.0.feed_forward.linear_3.weight",
-            "single_stream_layers.0.feed_forward.linear_1.bias",
-            "single_stream_layers.0.feed_forward.linear_1.weight.extra",
-            "prefix.single_stream_layers.0.feed_forward.linear_1.weight",
-        ] {
-            assert!(
-                !scope.quantizes_target(target),
-                "unexpectedly selected {target}"
-            );
-        }
-
-        let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
-        let selected = inventory
-            .tensors()
-            .iter()
-            .filter(|spec| {
-                spec.quantizable
-                    && !spec.stage.starts_with("boogu-reference-refiner-")
-                    && scope.quantizes_target(&spec.target_name)
-            })
-            .map(|spec| spec.target_name.clone())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(selected, expected);
-
-        let footprint = inventory
-            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-                BooguVariant::Image01Turbo,
-                scope,
-            )
-            .unwrap();
-        assert_eq!(footprint.tensor_count, 912);
-        assert_eq!(footprint.quantized_tensor_count, 96);
-        assert_eq!(footprint.f32_tensor_count, 816);
-        assert_eq!(footprint.quantized_elements, 4_376_494_080);
-        assert_eq!(footprint.f32_elements, 5_558_503_968);
-        assert_eq!(footprint.quantized_payload_bytes, 4_923_555_840);
-        assert_eq!(footprint.f32_payload_bytes, 22_234_015_872);
-        assert_eq!(footprint.total_payload_bytes, 27_157_571_712);
-        for variant in [
-            BooguVariant::Image01EditTurbo,
-            BooguVariant::Image01EditTurbo1k5,
-        ] {
-            assert!(
-                inventory
-                    .denoiser_runtime_q8s_block32_f32_footprint_with_scope(variant, scope)
-                    .is_err()
-            );
-        }
-    }
-
-    #[test]
     fn runtime_q8_denoiser_footprint_is_inventory_derived_and_variant_exact_correctness() {
         let inventory = BooguArtifactInventory::denoiser(&BooguConfig::default()).unwrap();
         assert!(
@@ -8188,156 +7654,6 @@ mod tests {
         let edit_1k5 = inventory
             .denoiser_runtime_q8s_block32_f32_footprint(BooguVariant::Image01EditTurbo1k5)
             .unwrap();
-        let turbo_caption_tail_f32 = inventory
-            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-                BooguVariant::Image01Turbo,
-                BooguRuntimeQ8Scope::TurboCaptionAndTailF32,
-            )
-            .unwrap();
-        let turbo_attention_ffn_core_q8 = inventory
-            .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-                BooguVariant::Image01Turbo,
-                BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8,
-            )
-            .unwrap();
-        let excluded = inventory
-            .tensors()
-            .iter()
-            .filter(|spec| {
-                spec.quantizable
-                    && !BooguRuntimeQ8Scope::TurboCaptionAndTailF32
-                        .quantizes_target(&spec.target_name)
-            })
-            .map(|spec| spec.target_name.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            excluded,
-            BTreeSet::from([
-                "norm_out.linear_1.weight",
-                "norm_out.linear_2.weight",
-                "time_caption_embed.caption_linear.weight",
-            ])
-        );
-        assert_eq!(turbo.total_payload_bytes, 12_155_919_232);
-        assert_eq!(edit.total_payload_bytes, 12_590_785_792);
-        assert_eq!(edit_1k5, edit);
-        assert_eq!(turbo_caption_tail_f32.tensor_count, 912);
-        assert_eq!(turbo_caption_tail_f32.quantized_tensor_count, 362);
-        assert_eq!(turbo_caption_tail_f32.f32_tensor_count, 550);
-        assert_eq!(turbo_caption_tail_f32.quantized_elements, 9_577_041_920);
-        assert_eq!(turbo_caption_tail_f32.f32_elements, 357_956_128);
-        assert_eq!(
-            turbo_caption_tail_f32.quantized_payload_bytes,
-            10_774_172_160
-        );
-        assert_eq!(turbo_caption_tail_f32.f32_payload_bytes, 1_431_824_512);
-        assert_eq!(turbo_caption_tail_f32.total_payload_bytes, 12_205_996_672);
-        assert_eq!(
-            turbo_caption_tail_f32.total_payload_bytes - turbo.total_payload_bytes,
-            50_077_440
-        );
-        let core_scope_excluded = inventory
-            .tensors()
-            .iter()
-            .filter(|spec| {
-                spec.quantizable
-                    && !spec.stage.starts_with("boogu-reference-refiner-")
-                    && !BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8
-                        .quantizes_target(&spec.target_name)
-            })
-            .map(|spec| spec.target_name.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(core_scope_excluded.len(), 81);
-        assert!(
-            core_scope_excluded
-                .iter()
-                .all(|target| { !turbo_attention_ffn_core_q8_target(target) })
-        );
-        let core_scope_quantized = inventory
-            .tensors()
-            .iter()
-            .filter(|spec| {
-                spec.quantizable
-                    && !spec.stage.starts_with("boogu-reference-refiner-")
-                    && BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8
-                        .quantizes_target(&spec.target_name)
-            })
-            .map(|spec| spec.target_name.as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(core_scope_quantized.len(), 284);
-        assert!(
-            core_scope_quantized
-                .iter()
-                .all(|target| turbo_attention_ffn_core_q8_target(target))
-        );
-        assert_eq!(
-            core_scope_quantized
-                .iter()
-                .filter(|target| {
-                    target.contains(".attn.")
-                        || target.contains(".joint_attn.")
-                        || target.contains(".image_self_attn.")
-                })
-                .count(),
-            128
-        );
-        assert_eq!(
-            core_scope_quantized
-                .iter()
-                .filter(|target| target.contains(".feed_forward."))
-                .chain(core_scope_quantized.iter().filter(|target| {
-                    target.contains(".image_ffn.") || target.contains(".instruction_ffn.")
-                }),)
-                .count(),
-            156
-        );
-        for required in [
-            "x_embedder.weight",
-            "time_caption_embed.caption_linear.weight",
-            "time_caption_embed.time_linear_1.weight",
-            "time_caption_embed.time_linear_2.weight",
-            "noise_refiner.0.norm1.linear.weight",
-            "double_stream_layers.0.image_norm1.linear.weight",
-            "double_stream_layers.7.instruction_norm2.linear.weight",
-            "single_stream_layers.31.norm1.linear.weight",
-            "norm_out.linear_1.weight",
-            "norm_out.linear_2.weight",
-        ] {
-            assert!(core_scope_excluded.contains(required), "missing {required}");
-        }
-        assert_eq!(turbo_attention_ffn_core_q8.tensor_count, 912);
-        assert_eq!(turbo_attention_ffn_core_q8.quantized_tensor_count, 284);
-        assert_eq!(turbo_attention_ffn_core_q8.f32_tensor_count, 628);
-        assert_eq!(
-            turbo_attention_ffn_core_q8.quantized_elements,
-            8_556_871_680
-        );
-        assert_eq!(turbo_attention_ffn_core_q8.f32_elements, 1_378_126_368);
-        assert_eq!(
-            turbo_attention_ffn_core_q8.quantized_payload_bytes,
-            9_626_480_640
-        );
-        assert_eq!(turbo_attention_ffn_core_q8.f32_payload_bytes, 5_512_505_472);
-        assert_eq!(
-            turbo_attention_ffn_core_q8.total_payload_bytes,
-            15_138_986_112
-        );
-        assert!(
-            inventory
-                .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-                    BooguVariant::Image01EditTurbo1k5,
-                    BooguRuntimeQ8Scope::TurboCaptionAndTailF32,
-                )
-                .is_err()
-        );
-        assert!(
-            inventory
-                .denoiser_runtime_q8s_block32_f32_footprint_with_scope(
-                    BooguVariant::Image01EditTurbo,
-                    BooguRuntimeQ8Scope::TurboAttentionFfnCoreQ8,
-                )
-                .is_err()
-        );
         assert_eq!(
             turbo.total_payload_bytes,
             turbo.quantized_payload_bytes + turbo.f32_payload_bytes
@@ -8346,6 +7662,7 @@ mod tests {
             edit.total_payload_bytes,
             edit.quantized_payload_bytes + edit.f32_payload_bytes
         );
+        assert_eq!(edit_1k5, edit);
 
         let reference_refiner_bytes = inventory
             .tensors()
@@ -8365,63 +7682,6 @@ mod tests {
             edit.total_payload_bytes - turbo.total_payload_bytes,
             reference_refiner_bytes
         );
-    }
-
-    #[cfg(feature = "burnpack")]
-    #[test]
-    fn turbo_caption_tail_f32_runtime_q8_scope_is_fail_closed_correctness() {
-        let scope = BooguRuntimeQ8Scope::TurboCaptionAndTailF32;
-        loading::validate_runtime_denoiser_quantization_policy(
-            BooguStorageProfile::F16QwenVisionF32,
-            BooguFloatLoadPolicy::AdaptToF32,
-            BooguQuantizedLoadPolicy::Preserve,
-            BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
-            scope,
-            BooguVariant::Image01Turbo,
-            "boogu-prelude",
-        )
-        .unwrap();
-
-        for result in [
-            loading::validate_runtime_denoiser_quantization_policy(
-                BooguStorageProfile::F16,
-                BooguFloatLoadPolicy::AdaptToF32,
-                BooguQuantizedLoadPolicy::Preserve,
-                BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
-                scope,
-                BooguVariant::Image01Turbo,
-                "boogu-prelude",
-            ),
-            loading::validate_runtime_denoiser_quantization_policy(
-                BooguStorageProfile::F16QwenVisionF32,
-                BooguFloatLoadPolicy::Preserve,
-                BooguQuantizedLoadPolicy::Preserve,
-                BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
-                scope,
-                BooguVariant::Image01Turbo,
-                "boogu-prelude",
-            ),
-            loading::validate_runtime_denoiser_quantization_policy(
-                BooguStorageProfile::F16QwenVisionF32,
-                BooguFloatLoadPolicy::AdaptToF32,
-                BooguQuantizedLoadPolicy::Preserve,
-                BooguDenoiserRuntimeQuantizationPolicy::Disabled,
-                scope,
-                BooguVariant::Image01Turbo,
-                "boogu-prelude",
-            ),
-            loading::validate_runtime_denoiser_quantization_policy(
-                BooguStorageProfile::F16QwenVisionF32,
-                BooguFloatLoadPolicy::AdaptToF32,
-                BooguQuantizedLoadPolicy::Preserve,
-                BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
-                scope,
-                BooguVariant::Image01EditTurbo1k5,
-                "boogu-prelude",
-            ),
-        ] {
-            assert!(result.is_err());
-        }
     }
 
     #[test]
@@ -8444,7 +7704,7 @@ mod tests {
             Sha256Digest::from_hex(EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST).unwrap();
         validate_edit_turbo_1k5_release_artifact_digest(expected).unwrap();
         validate_edit_turbo_1k5_release_artifact_digest(
-            Sha256Digest::from_hex(LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            Sha256Digest::from_hex(SOURCE_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
                 .unwrap(),
         )
         .unwrap();
@@ -8459,7 +7719,7 @@ mod tests {
     fn canonical_published_bundle_matrix_is_exact_correctness() {
         use std::collections::BTreeSet;
 
-        assert_eq!(PUBLISHED_ARTIFACT_BUNDLES.len(), 3);
+        assert_eq!(PUBLISHED_ARTIFACT_BUNDLES.len(), 6);
         let bundle_ids = PUBLISHED_ARTIFACT_BUNDLES
             .iter()
             .map(|bundle| bundle.bundle_id)
@@ -8474,13 +7734,21 @@ mod tests {
             bundle_ids,
             BTreeSet::from([
                 "boogu-image-0.1-turbo",
+                "boogu-image-0.1-turbo-q4s-block-up-to128-f32",
                 "boogu-image-0.1-edit-turbo",
                 "boogu-image-0.1-edit-turbo-1k5",
+                "boogu-image-0.1-edit-turbo-q4s-block-up-to128-f32",
+                "boogu-image-0.1-edit-turbo-1k5-q4s-block-up-to128-f32",
             ])
         );
 
         for bundle in PUBLISHED_ARTIFACT_BUNDLES {
-            assert_eq!(bundle.converter_version, PUBLISHED_BUNDLE_CONVERTER_VERSION);
+            let expected_converter = if bundle.profile == BooguStorageProfile::Q4sBlockUpTo128F32 {
+                CURRENT_BUNDLE_CONVERTER_VERSION
+            } else {
+                PUBLISHED_BUNDLE_CONVERTER_VERSION
+            };
+            assert_eq!(bundle.converter_version, expected_converter);
             let parsed = Sha256Digest::from_hex(bundle.content_digest).unwrap();
             assert_eq!(
                 canonical_published_bundle(bundle.variant, bundle.profile),
@@ -8519,40 +7787,82 @@ mod tests {
         assert_eq!(
             preferred_artifact_bundle_id(
                 BooguVariant::Image01Turbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            "boogu-image-0.1-turbo-q4s-block-up-to128-f32"
+        );
+        assert_eq!(
+            preferred_artifact_bundle_id(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            "boogu-image-0.1-edit-turbo-q4s-block-up-to128-f32"
+        );
+        assert_eq!(
+            preferred_artifact_bundle_id(
+                BooguVariant::Image01EditTurbo1k5,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            "boogu-image-0.1-edit-turbo-1k5-q4s-block-up-to128-f32"
+        );
+        assert_eq!(
+            preferred_artifact_bundle_id(
+                BooguVariant::Image01Turbo,
                 BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
             ),
             "boogu-image-0.1-turbo-q8s-block32-f32-qwen-vision-f32"
         );
         assert_eq!(
-            promotable_legacy_artifact_digest(
+            release_source_artifact_digest(
                 BooguVariant::Image01Turbo,
                 BooguStorageProfile::F16QwenVisionF32,
             ),
-            Some(LEGACY_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+            Some(SOURCE_TURBO_F16_QWEN_VISION_F32_CONTENT_DIGEST)
         );
         assert_eq!(
-            promotable_legacy_artifact_digest(
+            release_source_artifact_digest(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            Some(SOURCE_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST)
+        );
+        assert_eq!(
+            release_source_artifact_digest(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            Some(SOURCE_EDIT_TURBO_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST)
+        );
+        assert_eq!(
+            release_source_artifact_digest(
+                BooguVariant::Image01EditTurbo1k5,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            Some(SOURCE_EDIT_TURBO_1K5_Q4S_BLOCK_UP_TO128_F32_CONTENT_DIGEST)
+        );
+        assert_eq!(
+            release_source_artifact_digest(
                 BooguVariant::Image01Turbo,
                 BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
             ),
             None
         );
-        assert!(artifact_bundle_id_is_compatible(
+        assert!(artifact_bundle_id_matches_selection(
             BooguVariant::Image01Turbo,
             BooguStorageProfile::F16QwenVisionF32,
             "boogu-image-0.1-turbo",
         ));
-        assert!(artifact_bundle_id_is_compatible(
+        assert!(artifact_bundle_id_matches_selection(
             BooguVariant::Image01Turbo,
             BooguStorageProfile::F16QwenVisionF32,
             "boogu-image-0.1-turbo-f16-qwen-vision-f32",
         ));
-        assert!(!artifact_bundle_id_is_compatible(
+        assert!(!artifact_bundle_id_matches_selection(
             BooguVariant::Image01Turbo,
             BooguStorageProfile::F16QwenVisionF32,
             "boogu-image-0.1-turbo-arbitrary",
         ));
-        assert!(!artifact_bundle_id_is_compatible(
+        assert!(!artifact_bundle_id_matches_selection(
             BooguVariant::Image01Turbo,
             BooguStorageProfile::Q8sBlock32F32QwenVisionF32,
             "boogu-image-0.1-turbo",
@@ -8577,7 +7887,7 @@ mod tests {
 
     #[cfg(feature = "burnpack")]
     #[test]
-    fn release_converter_compatibility_is_explicit_correctness() {
+    fn release_converter_contract_is_explicit_correctness() {
         validate_supported_bundle_converter_version(PUBLISHED_BUNDLE_CONVERTER_VERSION).unwrap();
         validate_supported_bundle_converter_version(CURRENT_BUNDLE_CONVERTER_VERSION).unwrap();
         let error = validate_supported_bundle_converter_version("0.0.0-unknown").unwrap_err();
@@ -8767,13 +8077,19 @@ mod tests {
         let q4 = inventory
             .packed_q4_resident_footprint(
                 BooguVariant::Image01Turbo,
-                BooguStorageProfile::F16QwenVisionF32,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
             )
             .unwrap();
         let f16 = inventory
             .packed_f16_resident_footprint(
                 BooguVariant::Image01Turbo,
                 BooguStorageProfile::F16QwenVisionF32,
+            )
+            .unwrap();
+        let edit_q4 = inventory
+            .packed_q4_resident_footprint(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
             )
             .unwrap();
 
@@ -8791,14 +8107,7 @@ mod tests {
                 + q4.f32_auxiliary_payload_bytes
         );
         assert!(q4.total_payload_bytes < f16.total_payload_bytes);
-        assert!(
-            inventory
-                .packed_q4_resident_footprint(
-                    BooguVariant::Image01EditTurbo,
-                    BooguStorageProfile::F16QwenVisionF32,
-                )
-                .is_err()
-        );
+        assert!(edit_q4.total_payload_bytes > q4.total_payload_bytes);
     }
 
     #[cfg(feature = "burnpack")]
@@ -8825,10 +8134,17 @@ mod tests {
         let footprint = inventory
             .packed_q4_resident_footprint(
                 BooguVariant::Image01Turbo,
-                BooguStorageProfile::F16QwenVisionF32,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            )
+            .unwrap();
+        let edit_footprint = inventory
+            .packed_q4_resident_footprint(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
             )
             .unwrap();
         eprintln!("released Turbo packed-Q4 footprint: {footprint:?}");
+        eprintln!("released Edit packed-Q4 footprint: {edit_footprint:?}");
         assert_eq!(footprint.packed_q4_tensor_count, 738);
         assert_eq!(footprint.packed_q4_elements, 17_501_245_440);
         assert_eq!(footprint.packed_q4_value_bytes, 8_750_622_720);
@@ -9718,6 +9034,29 @@ mod tests {
 
     #[cfg(feature = "burnpack")]
     #[test]
+    fn async_qwen_row_loader_accepts_sealed_q4_without_requantization_correctness() {
+        let source = include_str!("artifacts.rs");
+        let async_source = source
+            .split("pub struct VerifiedAsyncBurnpackQwenStageSource")
+            .nth(1)
+            .expect("async Qwen source is present");
+        let row_loader = async_source
+            .split("async fn load_row_tensor")
+            .nth(1)
+            .and_then(|source| {
+                source
+                    .split("impl<B: Backend, R: AsyncStageShardReader>")
+                    .next()
+            })
+            .expect("async Qwen row loader is present");
+        assert!(row_loader.contains("validate_entry_dtype(&entry, snapshot.dtype)"));
+        assert!(row_loader.contains("BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries"));
+        assert!(row_loader.contains("matches!(data.dtype, DType::F16 | DType::F32)"));
+        assert!(!row_loader.contains("snapshot.dtype != DType::F16"));
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
     fn async_reader_rejects_digest_size_and_cap_violations_correctness() {
         use burn::backend::NdArray;
         use burn_qwen3_vl::{AsyncQwen3VlStageSource, Qwen3VlStreamingPlan, RowChunkPlan};
@@ -10303,41 +9642,28 @@ mod tests {
             )
             .unwrap()
             .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
-            .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
-            .with_runtime_q8_scope(BooguRuntimeQ8Scope::TurboCaptionAndTailF32);
+            .with_runtime_quantization_policy(
+                BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32,
+            );
         let sync_prelude = sync_source.load_prelude().unwrap();
         for snapshot in sync_prelude.collect(None, None, false) {
-            let expected_q8 = prelude_quantizable.contains(&snapshot.full_path())
-                && snapshot.full_path() != "time_caption_embed.caption_linear.weight";
+            let expected_q8 = prelude_quantizable.contains(&snapshot.full_path());
             assert_eq!(
                 matches!(snapshot.dtype, DType::QFloat(_)),
                 expected_q8,
-                "unexpected scoped sync runtime dtype for {}",
+                "unexpected sync runtime dtype for {}",
                 snapshot.full_path()
             );
-            if snapshot.full_path() == "time_caption_embed.caption_linear.weight" {
-                assert_eq!(snapshot.dtype, DType::F32);
-            }
         }
         let sync_tail = sync_source.load_tail().unwrap();
         for snapshot in sync_tail.collect(None, None, false) {
-            let expected_q8 = tail_quantizable.contains(&snapshot.full_path())
-                && !matches!(
-                    snapshot.full_path().as_str(),
-                    "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
-                );
+            let expected_q8 = tail_quantizable.contains(&snapshot.full_path());
             assert_eq!(
                 matches!(snapshot.dtype, DType::QFloat(_)),
                 expected_q8,
-                "unexpected scoped sync runtime dtype for {}",
+                "unexpected sync runtime dtype for {}",
                 snapshot.full_path()
             );
-            if matches!(
-                snapshot.full_path().as_str(),
-                "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
-            ) {
-                assert_eq!(snapshot.dtype, DType::F32);
-            }
         }
         let reader = AsyncMemoryShardReader::from_directory(&directory, &manifest);
         let mut source = block_on(
@@ -10353,23 +9679,18 @@ mod tests {
         )
         .unwrap()
         .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
-        .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
-        .with_runtime_q8_scope(BooguRuntimeQ8Scope::TurboCaptionAndTailF32);
+        .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32);
 
         source.reader_mut().requests.clear();
         let prelude = block_on(source.load_prelude()).unwrap();
         for snapshot in prelude.collect(None, None, false) {
-            let expected_q8 = prelude_quantizable.contains(&snapshot.full_path())
-                && snapshot.full_path() != "time_caption_embed.caption_linear.weight";
+            let expected_q8 = prelude_quantizable.contains(&snapshot.full_path());
             assert_eq!(
                 matches!(snapshot.dtype, DType::QFloat(_)),
                 expected_q8,
-                "unexpected scoped runtime dtype for {}",
+                "unexpected runtime dtype for {}",
                 snapshot.full_path()
             );
-            if snapshot.full_path() == "time_caption_embed.caption_linear.weight" {
-                assert_eq!(snapshot.dtype, DType::F32);
-            }
         }
         let prelude_files = manifest
             .files
@@ -10405,23 +9726,13 @@ mod tests {
 
         let tail = block_on(source.load_tail()).unwrap();
         for snapshot in tail.collect(None, None, false) {
-            let expected_q8 = tail_quantizable.contains(&snapshot.full_path())
-                && !matches!(
-                    snapshot.full_path().as_str(),
-                    "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
-                );
+            let expected_q8 = tail_quantizable.contains(&snapshot.full_path());
             assert_eq!(
                 matches!(snapshot.dtype, DType::QFloat(_)),
                 expected_q8,
-                "unexpected scoped runtime dtype for {}",
+                "unexpected runtime dtype for {}",
                 snapshot.full_path()
             );
-            if matches!(
-                snapshot.full_path().as_str(),
-                "norm_out.linear_1.weight" | "norm_out.linear_2.weight"
-            ) {
-                assert_eq!(snapshot.dtype, DType::F32);
-            }
         }
 
         block_on(async {

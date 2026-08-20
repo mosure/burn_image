@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v1_digest_and_legacy_json_remain_stable_correctness() {
+    fn manifest_v1_component_digest_and_json_are_canonical_correctness() {
         let mut manifest = manifest();
         manifest.schema_version = ARTIFACT_MANIFEST_SCHEMA_V1;
         let digest = manifest.seal().unwrap();

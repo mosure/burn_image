@@ -6,21 +6,29 @@ fn main() {
 #[cfg(feature = "boogu-native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ProfileArg {
-    F16,
-    #[value(name = "production", alias = "f16-qwen-vision-f32")]
+    /// Variant-aware production default: packed Q4S for Turbo, mixed F16 for Edit releases.
+    #[value(name = "production")]
     Production,
-    Q8sBlock32F32,
-    Q8sBlock32F32QwenVisionF32,
+    #[value(name = "f16-qwen-vision-f32")]
+    F16QwenVisionF32,
+    #[value(name = "q4s")]
+    Q4sBlockUpTo128F32,
 }
 
 #[cfg(feature = "boogu-native")]
-impl From<ProfileArg> for burn_boogu::artifacts::BooguStorageProfile {
-    fn from(value: ProfileArg) -> Self {
-        match value {
-            ProfileArg::F16 => Self::F16,
-            ProfileArg::Production => Self::F16QwenVisionF32,
-            ProfileArg::Q8sBlock32F32 => Self::Q8sBlock32F32,
-            ProfileArg::Q8sBlock32F32QwenVisionF32 => Self::Q8sBlock32F32QwenVisionF32,
+impl ProfileArg {
+    fn resolve(
+        self,
+        variant: burn_boogu::BooguVariant,
+    ) -> burn_boogu::artifacts::BooguStorageProfile {
+        match self {
+            ProfileArg::Production => bevy_burn_image::default_boogu_storage_profile(variant),
+            ProfileArg::F16QwenVisionF32 => {
+                burn_boogu::artifacts::BooguStorageProfile::F16QwenVisionF32
+            }
+            ProfileArg::Q4sBlockUpTo128F32 => {
+                burn_boogu::artifacts::BooguStorageProfile::Q4sBlockUpTo128F32
+            }
         }
     }
 }
@@ -30,7 +38,6 @@ impl From<ProfileArg> for burn_boogu::artifacts::BooguStorageProfile {
 enum ResidencyArg {
     NativeHighVram,
     LowVram,
-    DiagnosticLayerStreamed,
 }
 
 #[cfg(feature = "boogu-native")]
@@ -39,7 +46,6 @@ impl From<ResidencyArg> for bevy_burn_image::NativeBooguResidencyPolicy {
         match value {
             ResidencyArg::NativeHighVram => Self::HighVram,
             ResidencyArg::LowVram => Self::LowVram,
-            ResidencyArg::DiagnosticLayerStreamed => Self::LayerStreamed,
         }
     }
 }
@@ -95,7 +101,7 @@ struct Args {
     /// Generate, Edit 1K, or Edit 1.5K without restarting.
     #[arg(long, value_enum, default_value = "turbo")]
     variant: VariantArg,
-    /// Storage profile represented by the bundle. `production` uses mixed F16 with F32 Qwen vision.
+    /// Storage profile represented by the bundle. `production` uses packed Q4S for Turbo and mixed F16 for Edit.
     #[arg(long, value_enum, default_value = "production")]
     profile: ProfileArg,
     /// Native residency. `low-vram` streams Qwen/VAE per request while retaining the denoiser below a fail-closed 32-GB device plan.
@@ -182,8 +188,8 @@ fn main() -> bevy::app::AppExit {
     use bevy_burn_image::{
         BooguAdapterSettings, NativeAutomatedRun, NativeAutomatedRunPlugin, NativeBooguFactory,
         NativeOutputQualification, NativeOutputQualificationPlugin,
-        default_native_boogu_model_base_url, prepare_native_output_qualification_request,
-        prepare_native_output_request, verify_native_output_artifacts,
+        default_native_boogu_model_base_url, prepare_native_output_request,
+        verify_native_output_artifacts,
     };
     use burn_boogu::BooguVariant;
     use burn_image::ArtifactSource;
@@ -197,7 +203,7 @@ fn main() -> bevy::app::AppExit {
         && args.qualification_output_dir.is_none()
         && args.artifacts.is_none()
         && std::env::var_os("BURN_IMAGE_MODEL_BASE_URL").is_none()
-        && args.residency != ResidencyArg::DiagnosticLayerStreamed;
+        && args.profile == ProfileArg::Production;
     let autotune = args.autotune.map(Into::into).unwrap_or_else(|| {
         if args.qualification_output_dir.is_some() {
             burn_boogu::NativeAutotunePolicy::Full
@@ -304,7 +310,7 @@ fn main() -> bevy::app::AppExit {
         let seed = required!("seed", args.qualification_seed);
         let width = required!("width", args.qualification_width);
         let height = required!("height", args.qualification_height);
-        let (request, request_identity) = prepare_native_output_qualification_request(
+        let (request, request_identity) = prepare_native_output_request(
             variant,
             prompt,
             seed,
@@ -337,7 +343,12 @@ fn main() -> bevy::app::AppExit {
             artifacts,
         }
     });
-    let profile = args.profile.into();
+    let profile =
+        if args.qualification_output_dir.is_some() && args.profile == ProfileArg::Production {
+            burn_boogu::artifacts::BooguStorageProfile::F16QwenVisionF32
+        } else {
+            args.profile.resolve(variant)
+        };
     let residency = args.residency.into();
     #[cfg(feature = "native-autotune")]
     burn_boogu::configure_native_autotune(autotune);
@@ -349,7 +360,7 @@ fn main() -> bevy::app::AppExit {
             ),
         },
     };
-    let mut settings = BooguAdapterSettings::verified_default(artifact_source);
+    let mut settings = BooguAdapterSettings::production(variant, artifact_source);
     settings.storage_profile = profile;
     let factory = if interactive_canonical_model_switching {
         NativeBooguFactory::with_canonical_model_switching(variant, residency, autotune)
@@ -377,16 +388,20 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn native_profile_prefers_production_and_accepts_legacy_alias_correctness() {
+    fn native_profile_resolves_current_release_profiles_correctness() {
         let production = <ProfileArg as clap::ValueEnum>::from_str("production", false).unwrap();
-        let legacy =
+        let mixed_f16 =
             <ProfileArg as clap::ValueEnum>::from_str("f16-qwen-vision-f32", false).unwrap();
         assert_eq!(
-            BooguStorageProfile::from(production),
+            production.resolve(burn_boogu::BooguVariant::Image01Turbo),
+            BooguStorageProfile::Q4sBlockUpTo128F32
+        );
+        assert_eq!(
+            production.resolve(burn_boogu::BooguVariant::Image01EditTurbo),
             BooguStorageProfile::F16QwenVisionF32
         );
         assert_eq!(
-            BooguStorageProfile::from(legacy),
+            mixed_f16.resolve(burn_boogu::BooguVariant::Image01Turbo),
             BooguStorageProfile::F16QwenVisionF32
         );
     }

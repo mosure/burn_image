@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_burn_image"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "bevy",
  "bevy_burn",
@@ -2089,7 +2089,6 @@ dependencies = [
  "burn-cuda",
  "burn-dispatch",
  "burn-flex",
- "burn-ir",
  "burn-ndarray",
  "burn-nn",
  "burn-optim",
@@ -2191,7 +2190,6 @@ checksum = "681478c5438ab6c753a55b85f5b42e5bd4c1f69a8564f2afa2f698ac396ba556"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
@@ -2239,7 +2237,6 @@ checksum = "a6c66b49136fc11f59773054358f401fbec7fa0d69615f55ef22c29cf241c9b7"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
@@ -2405,7 +2402,6 @@ checksum = "66af82fdaaf2ad0fa4b0dae90119aa94f333105d76d520e0eb48917717c06fde"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
@@ -2501,7 +2497,6 @@ dependencies = [
  "bon",
  "burn-cubecl",
  "burn-flex",
- "burn-fusion",
  "burn-ir",
  "burn-tensor",
  "bytemuck",
@@ -2530,11 +2525,10 @@ dependencies = [
 
 [[package]]
 name = "burn_boogu"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "burn",
  "burn-cubecl",
- "burn-cuda",
  "burn-fusion",
  "burn-ir",
  "burn-ndarray",
@@ -2565,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "burn_flux_vae"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "burn",
  "burn-store",
@@ -2579,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "burn_image"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2590,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "burn_qwen3_vl"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "burn",
  "burn-ndarray",

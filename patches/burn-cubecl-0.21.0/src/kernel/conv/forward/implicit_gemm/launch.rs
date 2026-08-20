@@ -37,6 +37,7 @@ pub fn conv_gemm_simple_sync<R: CubeRuntime, const N: usize>(
     launch_convolution_forward::<R, N>(&strategy, input, weight, bias, options)
 }
 
+#[cfg(feature = "autotune")]
 pub fn conv_gemm_simple_async<R: CubeRuntime, const N: usize>(
     input: CubeTensor<R>,
     weight: CubeTensor<R>,
@@ -65,6 +66,7 @@ pub fn conv_gemm_simple_async<R: CubeRuntime, const N: usize>(
 /// * `weight` - The weights (filter) applied to each kernel
 /// * `bias` - The bias added to each channel
 /// * `options` - The options to use for the convolution
+#[cfg(feature = "autotune")]
 pub fn conv_gemm_simple_tma<R: CubeRuntime, const N: usize>(
     input: CubeTensor<R>,
     weight: CubeTensor<R>,

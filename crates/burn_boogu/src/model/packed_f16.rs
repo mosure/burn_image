@@ -922,7 +922,7 @@ mod tests {
         let operations = 2.0 * ROWS as f64 * INNER as f64 * COLS as f64;
         let throughput_tflops = operations / fastest.as_secs_f64() / 1.0e12;
         eprintln!(
-            "packed-F16 compatibility matmul {ROWS}x{INNER}x{COLS}: {:.3} ms, {:.3} TFLOP/s",
+            "packed-F16 matmul {ROWS}x{INNER}x{COLS}: {:.3} ms, {:.3} TFLOP/s",
             fastest.as_secs_f64() * 1_000.0,
             throughput_tflops
         );
@@ -1003,7 +1003,7 @@ mod tests {
             * KERNEL as f64;
         let throughput_tflops = operations / fastest.as_secs_f64() / 1.0e12;
         eprintln!(
-            "packed-F16 compatibility conv2d {CHANNELS}x{CHANNELS}x{KERNEL}x{KERNEL} at {SPATIAL}x{SPATIAL}: {:.3} ms, {:.3} TFLOP/s",
+            "packed-F16 conv2d {CHANNELS}x{CHANNELS}x{KERNEL}x{KERNEL} at {SPATIAL}x{SPATIAL}: {:.3} ms, {:.3} TFLOP/s",
             fastest.as_secs_f64() * 1_000.0,
             throughput_tflops
         );

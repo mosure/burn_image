@@ -28,7 +28,7 @@ pub const ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY: &str = "transport_parts_require
 pub const ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY: &str = "transport_part_target_bytes";
 pub const ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY: &str = "target_max_transport_shard_bytes";
 pub const ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY: &str = "semantic_object_max_bytes";
-pub const ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY: &str = "target_max_shard_bytes";
+pub const ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY: &str = "target_max_shard_bytes";
 
 /// One content-addressed physical part of a logical manifest weight object.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,9 +497,9 @@ fn semantic_object_max_bytes(
 ) -> Result<u64, ArtifactTransportLayoutError> {
     let semantic =
         parse_canonical_positive_u64_metadata(manifest, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY)?;
-    let legacy = parse_canonical_positive_u64_metadata(
+    let declared = parse_canonical_positive_u64_metadata(
         manifest,
-        ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY,
+        ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY,
     )?;
     if semantic != ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES {
         return Err(ArtifactTransportLayoutError::MetadataMismatch {
@@ -508,11 +508,11 @@ fn semantic_object_max_bytes(
             actual: Some(semantic.to_string()),
         });
     }
-    if legacy != ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES {
+    if declared != ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES {
         return Err(ArtifactTransportLayoutError::MetadataMismatch {
-            key: ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY,
+            key: ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY,
             expected: ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
-            actual: Some(legacy.to_string()),
+            actual: Some(declared.to_string()),
         });
     }
     Ok(semantic)
@@ -580,7 +580,7 @@ mod tests {
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
             (
-                ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+                ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY.into(),
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
         ])
@@ -735,7 +735,7 @@ mod tests {
             .metadata
             .insert(ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY.into(), "1".into());
         manifest.metadata.insert(
-            ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+            ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY.into(),
             "1".into(),
         );
         manifest.seal().unwrap();

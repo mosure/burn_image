@@ -301,6 +301,26 @@ where
     }
 
     fn q_matmul(lhs: TensorPrimitive<Self>, rhs: TensorPrimitive<Self>) -> TensorPrimitive<Self> {
+        let use_packed_q4_rhs = match (&lhs, &rhs) {
+            (TensorPrimitive::Float(lhs), TensorPrimitive::QFloat(rhs))
+                if lhs.dtype == DType::F32 =>
+            {
+                let scheme = *rhs.scheme();
+                let block_is_supported = match scheme.level {
+                    QuantLevel::Block(block) => match block.as_slice() {
+                        [block] | [block, 1] => matches!(*block, 8 | 16 | 32 | 64 | 128),
+                        _ => false,
+                    },
+                    QuantLevel::Tensor => false,
+                };
+                matches!(scheme.mode, QuantMode::Symmetric)
+                    && matches!(scheme.value, QuantValue::Q4S)
+                    && matches!(scheme.param, QuantParam::F32)
+                    && matches!(scheme.store, QuantStore::PackedU32(0 | 1))
+                    && block_is_supported
+            }
+            _ => false,
+        };
         let (propagation, scheme) = match (&lhs, &rhs) {
             (TensorPrimitive::QFloat(lhs), _) => (lhs.propagation(), *lhs.scheme()),
             (_, TensorPrimitive::QFloat(rhs)) => (rhs.propagation(), *rhs.scheme()),
@@ -318,13 +338,26 @@ where
             TensorPrimitive::Float(lhs) => (lhs.dtype, lhs),
             TensorPrimitive::QFloat(lhs) => (out_dtype, lhs),
         };
+        // The portable register kernel is intentionally inferred for a row-major left operand.
+        // Activation tensors are small compared with resident weights, so normalize an occasional
+        // transposed/view activation here instead of silently re-entering the under-occupied
+        // generic quantized path.
+        let lhs = if use_packed_q4_rhs {
+            kernel::into_contiguous(lhs)
+        } else {
+            lhs
+        };
         let (_rhs_dtype, rhs) = match rhs {
             TensorPrimitive::Float(rhs) => (rhs.dtype, rhs),
             TensorPrimitive::QFloat(rhs) => (out_dtype, rhs),
         };
 
-        let out =
-            kernel::matmul::matmul(lhs, rhs, None, MatmulStrategy::default(), out_dtype).unwrap();
+        let strategy = if use_packed_q4_rhs {
+            MatmulStrategy::QuantizedPortable
+        } else {
+            MatmulStrategy::default()
+        };
+        let out = kernel::matmul::matmul(lhs, rhs, None, strategy, out_dtype).unwrap();
 
         match propagation {
             QuantPropagation::Propagate => {

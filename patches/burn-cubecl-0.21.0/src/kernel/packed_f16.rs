@@ -36,8 +36,8 @@ struct PackedMatmulArgs {
     rhs_column_stride: u32,
 }
 
-/// Whether this tensor needs the integer-unpack F16 compatibility path on its current device.
-pub fn requires_packed_f16_compatibility<R: CubeRuntime>(tensor: &CubeTensor<R>) -> bool {
+/// Whether this tensor needs integer-unpack F16 execution on its current device.
+pub fn requires_packed_f16_unpack<R: CubeRuntime>(tensor: &CubeTensor<R>) -> bool {
     tensor.dtype == DType::F16
         && !tensor
             .client

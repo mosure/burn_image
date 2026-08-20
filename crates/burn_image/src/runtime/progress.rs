@@ -231,15 +231,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aggregate_transfer_telemetry_is_additive_to_legacy_progress_json_correctness() {
-        let legacy = serde_json::json!({
+    fn aggregate_transfer_telemetry_is_optional_for_native_progress_correctness() {
+        let native = serde_json::json!({
             "event": "artifact_progress",
             "run_id": 7,
             "path": "objects/current.bpk",
             "loaded_bytes": 4,
             "total_bytes": 8
         });
-        let decoded: ProgressEvent = serde_json::from_value(legacy).unwrap();
+        let decoded: ProgressEvent = serde_json::from_value(native).unwrap();
         assert!(matches!(
             decoded,
             ProgressEvent::ArtifactProgress { transfer: None, .. }

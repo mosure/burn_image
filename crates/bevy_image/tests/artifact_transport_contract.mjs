@@ -382,47 +382,12 @@ function logicalInventory(manifest) {
   );
 }
 
-async function validateLegacyDirectLayout(bundleRoot, manifest) {
-  const direct = { file_count: 0, bytes: 0, max_file_bytes: 0 };
-  for (const file of manifest.files) {
-    await directFileMetadata(bundleRoot, file.path, file.size, `legacy artifact ${file.path}`);
-    direct.file_count += 1;
-    direct.bytes += file.size;
-    direct.max_file_bytes = Math.max(direct.max_file_bytes, file.size);
-  }
-  return {
-    policy: "explicit-legacy-direct-layout-no-browser-cache-shard-claim",
-    part_only: false,
-    legacy_direct_layout: true,
-    sidecar: null,
-    logical: logicalInventory(manifest),
-    manifest_declared: inventoryForFiles(manifest.files),
-    direct,
-    transport: {
-      part_reference_count: 0,
-      unique_part_count: 0,
-      reconstructed_bytes: 0,
-      unique_part_bytes: 0,
-      max_part_bytes: 0,
-      target_part_bytes: null,
-      hard_max_part_bytes: null,
-    },
-    telemetry_entries: manifest.files
-      .filter((file) => file.role === "weights" && typeof file.component === "string")
-      .map((file) => ({ path: file.path, component: file.component, logical_path: file.path })),
-  };
-}
-
 /**
  * Validate one local CDN bundle without reading every model byte.
- *
- * Canonical callers fail closed on the part-only layout. `allowLegacyDirectLayout` exists solely
- * for old test fixtures and must be opted into explicitly; it makes no cache-friendly claim.
  */
 export async function validateArtifactBundleTransport({
   bundleRoot,
   manifest,
-  allowLegacyDirectLayout = false,
 }) {
   validateManifestFiles(manifest);
   validateManifestSeal(manifest);
@@ -437,14 +402,11 @@ export async function validateArtifactBundleTransport({
     const hasTransportMetadata = Object.keys(TRANSPORT_METADATA).some((key) =>
       Object.hasOwn(manifest.metadata ?? {}, key),
     );
-    if (hasTransportMetadata || !allowLegacyDirectLayout) {
-      throw new Error(
-        hasTransportMetadata
-          ? "artifact manifest has partial transport metadata without its sealed sidecar"
-          : `artifact manifest omits required ${ARTIFACT_TRANSPORT_LAYOUT_PATH}`,
-      );
-    }
-    return validateLegacyDirectLayout(canonicalRoot, manifest);
+    throw new Error(
+      hasTransportMetadata
+        ? "artifact manifest has partial transport metadata without its sealed sidecar"
+        : `artifact manifest omits required ${ARTIFACT_TRANSPORT_LAYOUT_PATH}`,
+    );
   }
 
   const sidecar = validateTransportDeclaration(manifest);
@@ -604,7 +566,6 @@ export async function validateArtifactBundleTransport({
   return {
     policy: "manifest-sealed-part-only-browser-cache-transport-v1",
     part_only: true,
-    legacy_direct_layout: false,
     sidecar: {
       path: sidecar.path,
       size: sidecar.size,

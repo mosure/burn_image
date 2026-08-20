@@ -44,6 +44,7 @@ pub fn linear_layout<R: CubeRuntime>(
     )
 }
 
+#[cfg(feature = "autotune")]
 pub fn split_dim<R: CubeRuntime>(
     mut tensor: CubeTensor<R>,
     dim: usize,

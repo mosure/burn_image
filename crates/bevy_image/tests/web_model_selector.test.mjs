@@ -106,7 +106,7 @@ test("explicit custom artifacts lock the release selector", () => {
 });
 
 test("headless diagnostics cannot be mutated into another release", () => {
-  const href = "https://example.test/?headless=turbo-first-dmd&variant=turbo";
+  const href = "https://example.test/?headless=parity&variant=edit-turbo-1k5";
   const state = modelReleaseSelectionState(href);
   assert.equal(state.enabled, false);
   assert.match(state.reason, /no-surface diagnostic/);

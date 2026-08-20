@@ -40,13 +40,6 @@ use burn_image::CancellationToken;
 /// limit according to Wasm memory and WebGPU upload measurements.
 pub const MAX_BROWSER_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_BROWSER_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
-/// Legacy range-cache entries are deliberately no larger than the default
-/// transport chunk. Canonical content-addressed parts use their separate
-/// bounded complete-object cache below.
-pub const MAX_BROWSER_CACHE_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
-/// Versioned, origin-scoped Cache Storage namespace for authenticated weight
-/// ranges. Changing the key or response representation requires a new name.
-pub const BROWSER_ARTIFACT_RANGE_CACHE_NAME: &str = "burn-image-artifact-ranges-v1";
 /// Versioned Cache Storage namespace for complete, independently authenticated
 /// CDN transport parts. Canonical parts are at most 20 MiB, so one browser-owned
 /// response and one bounded Wasm copy replace five serial 4 MiB range/cache
@@ -63,11 +56,9 @@ pub const MAX_BROWSER_STAGE_BYTES: u64 = 256 * 1024 * 1024;
 /// Bootstrap metadata must remain small enough to fetch before the sealed manifest is known.
 pub const MAX_BROWSER_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Browser artifact-cache contract. Disabled preserves isolated qualification readers such as
-/// exact 1.5K parity. Required mode is used by every ordinary interactive policy so immutable
-/// objects survive reloads and release switches without depending on the opportunistic HTTP
-/// cache; it also prevents repeated network transfer within one session. Canonical layouts cache
-/// complete transport parts, while legacy direct Burnpacks retain fixed-size range entries.
+/// Browser artifact-cache contract. Disabled preserves isolated qualification readers. Required
+/// mode is used by interactive policies so immutable transport parts survive reloads and release
+/// switches without depending on the opportunistic HTTP cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BrowserRangeCachePolicy {
@@ -444,20 +435,6 @@ async fn fetch_browser_range_with_total(
     })
 }
 
-/// A synthetic Cache Storage key never reaches the network. It binds the
-/// cache-format version, exact source URL, sealed object digest, and byte
-/// range. Hashing the complete URL avoids ambiguous escaping while retaining
-/// collision resistance equivalent to the object's SHA-256 identity.
-#[cfg(any(all(target_arch = "wasm32", feature = "boogu-web"), test))]
-fn browser_range_cache_key(request: &BrowserRangeRequest, object_digest: Sha256Digest) -> String {
-    let url_digest = Sha256Digest::calculate(request.url.as_bytes());
-    format!(
-        "https://burn-image.invalid/.well-known/range-cache/v1/{url_digest}/{object_digest}/{}-{}",
-        request.range.offset(),
-        request.range.end_exclusive()
-    )
-}
-
 /// Synthetic key for one complete content-addressed transport part.
 ///
 /// The key binds the cache representation, exact resolved source URL, sealed
@@ -472,8 +449,7 @@ fn browser_part_cache_key(url: &str, object_digest: Sha256Digest, object_size: u
 
 /// Exact Cache Storage objects required by one selected browser model closure.
 ///
-/// Cache names remain part of the identity because canonical complete transport parts and legacy
-/// fixed ranges use intentionally different response representations.
+/// Cache names remain part of the identity so representation changes create a new namespace.
 #[cfg(any(test, all(target_arch = "wasm32", feature = "boogu-web")))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BrowserPersistentCachePlan {
@@ -543,28 +519,6 @@ fn browser_persistent_cache_reserve(missing_bytes: u64) -> u64 {
     }
     BROWSER_PERSISTENT_CACHE_RESERVE_BYTES
         .saturating_add(missing_bytes / BROWSER_PERSISTENT_CACHE_OVERHEAD_DIVISOR)
-}
-
-#[cfg(any(all(target_arch = "wasm32", feature = "boogu-web"), test))]
-fn browser_complete_file_transport_required(
-    has_transport_layout: bool,
-    role: ArtifactFileRole,
-) -> bool {
-    has_transport_layout && !matches!(role, ArtifactFileRole::Weights)
-}
-
-#[cfg(any(all(target_arch = "wasm32", feature = "boogu-web"), test))]
-const fn browser_cache_chunk_length(remaining: u64, configured: u64) -> u64 {
-    let configured = if configured < MAX_BROWSER_CACHE_CHUNK_BYTES {
-        configured
-    } else {
-        MAX_BROWSER_CACHE_CHUNK_BYTES
-    };
-    if remaining < configured {
-        remaining
-    } else {
-        configured
-    }
 }
 
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
@@ -894,28 +848,32 @@ pub async fn fetch_browser_bounded_file(
     fetch_browser_complete_file(base_url, &path, None, maximum_bytes, true).await
 }
 
-/// Fetch and authenticate an optional manifest-declared transport layout.
+/// Fetch and authenticate the manifest-declared transport layout.
 ///
-/// Absence is the only legacy/direct-object case. A partial declaration, an
-/// unavailable sidecar, different HTTP object size, sidecar digest mismatch,
-/// malformed JSON, or invalid logical-to-physical mapping all fail before a
-/// browser stage reader is constructed.
+/// A missing declaration, unavailable sidecar, different HTTP object size, sidecar digest
+/// mismatch, malformed JSON, or invalid logical-to-physical mapping fails before a browser stage
+/// reader is constructed.
 #[cfg(target_arch = "wasm32")]
 pub async fn fetch_browser_transport_layout(
     base_url: &RemoteBaseUrl,
     manifest: &ArtifactManifest,
     config: ArtifactStreamConfig,
-) -> Result<Option<VerifiedArtifactTransportLayout>, ArtifactStreamError> {
+) -> Result<VerifiedArtifactTransportLayout, ArtifactStreamError> {
     let declared = ArtifactTransportLayout::declared_file(manifest)
-        .map_err(|error| ArtifactStreamError::BrowserTransportLayout(error.to_string()))?;
-    let Some(file) = declared else {
-        return Ok(None);
-    };
-    let bytes =
-        fetch_browser_declared_file(base_url, file, MAX_ARTIFACT_TRANSPORT_LAYOUT_BYTES, config)
-            .await?;
+        .map_err(|error| ArtifactStreamError::BrowserTransportLayout(error.to_string()))?
+        .ok_or_else(|| {
+            ArtifactStreamError::BrowserTransportLayout(
+                "browser manifest omits its sealed transport layout".into(),
+            )
+        })?;
+    let bytes = fetch_browser_declared_file(
+        base_url,
+        declared,
+        MAX_ARTIFACT_TRANSPORT_LAYOUT_BYTES,
+        config,
+    )
+    .await?;
     ArtifactTransportLayout::parse_and_validate(manifest, &bytes)
-        .map(Some)
         .map_err(|error| ArtifactStreamError::BrowserTransportLayout(error.to_string()))
 }
 
@@ -1374,8 +1332,7 @@ impl BrowserArtifactTransferTracker {
         &mut self,
         manifest: &ArtifactManifest,
         bundle: Option<&ArtifactBundleId>,
-        layout: Option<&VerifiedArtifactTransportLayout>,
-        chunk_bytes: u64,
+        layout: &VerifiedArtifactTransportLayout,
     ) -> Result<(), String> {
         for file in manifest
             .files
@@ -1384,36 +1341,18 @@ impl BrowserArtifactTransferTracker {
         {
             self.register_logical_object(qualified_transfer_path(bundle, &file.path), file.size)?;
         }
-        if let Some(layout) = layout {
-            for object in layout.objects() {
-                let logical_path = qualified_transfer_path(bundle, &object.path);
-                let mut logical_parts = BTreeSet::new();
-                for part in &object.parts {
-                    let part_path = qualified_transfer_path(bundle, &part.path);
-                    // Canonical transport parts are one bounded complete-object
-                    // fetch/cache operation. Legacy direct Burnpacks below keep
-                    // their fixed-size range count.
-                    self.register_physical_part(part_path.clone(), part.size, part.size)?;
-                    logical_parts.insert(part_path);
-                }
-                self.logical_parts
-                    .entry(logical_path)
-                    .or_default()
-                    .extend(logical_parts);
+        for object in layout.objects() {
+            let logical_path = qualified_transfer_path(bundle, &object.path);
+            let mut logical_parts = BTreeSet::new();
+            for part in &object.parts {
+                let part_path = qualified_transfer_path(bundle, &part.path);
+                self.register_physical_part(part_path.clone(), part.size, part.size)?;
+                logical_parts.insert(part_path);
             }
-        } else {
-            for file in manifest
-                .files
-                .iter()
-                .filter(|file| file.role == ArtifactFileRole::Weights)
-            {
-                let logical_path = qualified_transfer_path(bundle, &file.path);
-                self.register_physical_part(logical_path.clone(), file.size, chunk_bytes)?;
-                self.logical_parts
-                    .entry(logical_path.clone())
-                    .or_default()
-                    .insert(logical_path);
-            }
+            self.logical_parts
+                .entry(logical_path)
+                .or_default()
+                .extend(logical_parts);
         }
         Ok(())
     }
@@ -1784,8 +1723,7 @@ impl BrowserArtifactControl {
         &self,
         manifest: &ArtifactManifest,
         bundle: Option<&ArtifactBundleId>,
-        layout: Option<&VerifiedArtifactTransportLayout>,
-        chunk_bytes: u64,
+        layout: &VerifiedArtifactTransportLayout,
     ) -> Result<(), BooguError> {
         let mut state = self
             .inner
@@ -1793,7 +1731,7 @@ impl BrowserArtifactControl {
             .expect("browser artifact control mutex poisoned");
         state
             .transfer
-            .register_manifest_plan(manifest, bundle, layout, chunk_bytes)
+            .register_manifest_plan(manifest, bundle, layout)
             .map_err(BooguError::Artifact)
     }
 
@@ -2113,18 +2051,7 @@ fn verify_browser_transport_reconstruction(
     Ok(())
 }
 
-#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-#[derive(Clone, Copy)]
-struct BrowserPhysicalObjectRead<'a> {
-    path: &'a ArtifactPath,
-    size: u64,
-    digest: Sha256Digest,
-    progress_path: &'a ArtifactPath,
-    progress_offset: u64,
-    progress_total: u64,
-}
-
-/// HTTP Range reader for one sealed semantic Burnpack at a time.
+/// Browser reader for one sealed semantic Burnpack at a time.
 ///
 /// Each response is capped by [`ArtifactStreamConfig`]; the aggregate is capped by
 /// [`MAX_BROWSER_STAGE_BYTES`] and verified exactly once against the manifest file SHA-256. Typed
@@ -2139,7 +2066,6 @@ pub struct BrowserStageShardReader {
     progress_bundle: Option<ArtifactBundleId>,
     transport_layout: Option<Arc<VerifiedArtifactTransportLayout>>,
     cache_policy: BrowserRangeCachePolicy,
-    range_cache: Option<web_sys::Cache>,
     part_cache: Option<web_sys::Cache>,
 }
 
@@ -2153,7 +2079,6 @@ impl BrowserStageShardReader {
             progress_bundle: None,
             transport_layout: None,
             cache_policy: BrowserRangeCachePolicy::Disabled,
-            range_cache: None,
             part_cache: None,
         }
     }
@@ -2173,13 +2098,12 @@ impl BrowserStageShardReader {
             progress_bundle: Some(bundle),
             transport_layout: None,
             cache_policy: BrowserRangeCachePolicy::Disabled,
-            range_cache: None,
             part_cache: None,
         }
     }
 
-    /// Construct an unqualified legacy reader that shares progress and
-    /// cancellation routing with sibling reader wrappers.
+    /// Construct an unqualified standalone reader that shares progress and cancellation routing
+    /// with sibling reader wrappers.
     pub fn with_control(
         base_url: RemoteBaseUrl,
         config: ArtifactStreamConfig,
@@ -2192,7 +2116,6 @@ impl BrowserStageShardReader {
             progress_bundle: None,
             transport_layout: None,
             cache_policy: BrowserRangeCachePolicy::Disabled,
-            range_cache: None,
             part_cache: None,
         }
     }
@@ -2225,20 +2148,16 @@ impl BrowserStageShardReader {
         self.control.register_manifest_transfer_plan(
             manifest,
             self.progress_bundle.as_ref(),
-            Some(&layout),
-            self.config
-                .max_chunk_bytes()
-                .min(MAX_BROWSER_CACHE_CHUNK_BYTES),
+            &layout,
         )?;
         self.transport_layout = Some(Arc::new(layout));
         Ok(self)
     }
 
-    /// Bootstrap this reader from its sealed manifest. No declaration retains
-    /// the legacy direct-object path; every declared layout is fetched and
+    /// Bootstrap this reader from its sealed manifest. The declared layout is fetched and
     /// authenticated before this method returns.
     pub async fn with_manifest_transport_layout(
-        mut self,
+        self,
         manifest: &ArtifactManifest,
     ) -> Result<Self, BooguError> {
         let base_url = match &self.source {
@@ -2252,29 +2171,15 @@ impl BrowserStageShardReader {
         let layout = fetch_browser_transport_layout(&base_url, manifest, self.config)
             .await
             .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        if let Some(layout) = layout {
-            return self.with_verified_transport_layout(manifest, layout);
-        }
-        self.control.register_manifest_transfer_plan(
-            manifest,
-            self.progress_bundle.as_ref(),
-            None,
-            self.config
-                .max_chunk_bytes()
-                .min(MAX_BROWSER_CACHE_CHUNK_BYTES),
-        )?;
-        self.transport_layout = None;
-        Ok(self)
+        self.with_verified_transport_layout(manifest, layout)
     }
 
     pub fn control(&self) -> BrowserArtifactControl {
         self.control.clone()
     }
 
-    /// Require verified Cache Storage entries. Canonical transport layouts use
-    /// one <=20 MiB entry per physical part; legacy direct Burnpacks retain
-    /// <=4 MiB range entries. Any cache or quota failure aborts instead of
-    /// silently repeating network traffic.
+    /// Require verified Cache Storage entries, one <=20 MiB entry per physical transport part.
+    /// Any cache or quota failure aborts instead of silently repeating network traffic.
     pub fn with_required_range_cache(mut self) -> Self {
         self.cache_policy = BrowserRangeCachePolicy::Required;
         self
@@ -2334,6 +2239,9 @@ impl BrowserStageShardReader {
                 ));
             }
         };
+        let layout = self.transport_layout.as_ref().ok_or_else(|| {
+            BooguError::Artifact("browser reader has no verified transport layout".into())
+        })?;
         for file in manifest
             .files
             .iter()
@@ -2342,73 +2250,25 @@ impl BrowserStageShardReader {
             if !active.contains(&self.progress_path(&file.path)) {
                 continue;
             }
-            if let Some(layout) = &self.transport_layout {
-                let object = layout.object(&file.path).ok_or_else(|| {
-                    BooguError::Artifact(
-                        ArtifactStreamError::BrowserTransportObjectMissing {
-                            path: file.path.clone(),
-                        }
-                        .to_string(),
-                    )
-                })?;
-                for part in &object.parts {
-                    let url = base_url.resolve(&part.path);
-                    plan.register(
-                        BROWSER_ARTIFACT_PART_CACHE_NAME,
-                        browser_part_cache_key(&url, part.sha256, part.size),
-                        part.size,
-                    )
-                    .map_err(|error| BooguError::Artifact(error.to_string()))?;
-                }
-                continue;
-            }
-
-            let chunk_bytes = self
-                .config
-                .max_chunk_bytes()
-                .min(MAX_BROWSER_CACHE_CHUNK_BYTES);
-            let url = base_url.resolve(&file.path);
-            let mut offset = 0_u64;
-            while offset < file.size {
-                let length = browser_cache_chunk_length(file.size - offset, chunk_bytes);
-                let range = ByteRange::new(offset, length).map_err(|error| {
-                    BooguError::Artifact(format!(
-                        "invalid legacy cache range for {}: {error}",
-                        file.path
-                    ))
-                })?;
-                let request = BrowserRangeRequest {
-                    path: file.path.clone(),
-                    url: url.clone(),
-                    range,
-                    range_header: range.http_range_header(),
-                };
+            let object = layout.object(&file.path).ok_or_else(|| {
+                BooguError::Artifact(
+                    ArtifactStreamError::BrowserTransportObjectMissing {
+                        path: file.path.clone(),
+                    }
+                    .to_string(),
+                )
+            })?;
+            for part in &object.parts {
+                let url = base_url.resolve(&part.path);
                 plan.register(
-                    BROWSER_ARTIFACT_RANGE_CACHE_NAME,
-                    browser_range_cache_key(&request, file.sha256),
-                    length,
+                    BROWSER_ARTIFACT_PART_CACHE_NAME,
+                    browser_part_cache_key(&url, part.sha256, part.size),
+                    part.size,
                 )
                 .map_err(|error| BooguError::Artifact(error.to_string()))?;
-                offset = offset.checked_add(length).ok_or_else(|| {
-                    BooguError::Artifact(format!(
-                        "legacy cache plan offset overflowed for {}",
-                        file.path
-                    ))
-                })?;
             }
         }
         Ok(())
-    }
-
-    async fn range_cache(&mut self) -> Result<web_sys::Cache, BooguError> {
-        if let Some(cache) = &self.range_cache {
-            return Ok(cache.clone());
-        }
-        let cache = open_browser_artifact_cache(BROWSER_ARTIFACT_RANGE_CACHE_NAME)
-            .await
-            .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        self.range_cache = Some(cache.clone());
-        Ok(cache)
     }
 
     async fn part_cache(&mut self) -> Result<web_sys::Cache, BooguError> {
@@ -2420,114 +2280,6 @@ impl BrowserStageShardReader {
             .map_err(|error| BooguError::Artifact(error.to_string()))?;
         self.part_cache = Some(cache.clone());
         Ok(cache)
-    }
-
-    async fn fetch_range_cached(
-        &mut self,
-        request: &BrowserRangeRequest,
-        object_digest: Sha256Digest,
-        object_size: u64,
-        force_network: bool,
-    ) -> Result<ArtifactChunk, BooguError> {
-        if request.range.length() > MAX_BROWSER_CACHE_CHUNK_BYTES {
-            return Err(BooguError::Artifact(format!(
-                "browser cache range for {} is {} bytes, exceeding the fixed {}-byte cache-entry cap",
-                request.path,
-                request.range.length(),
-                MAX_BROWSER_CACHE_CHUNK_BYTES
-            )));
-        }
-        let cache = self.range_cache().await?;
-        let key = browser_range_cache_key(request, object_digest);
-        if !force_network {
-            let cached = browser_cache_match(
-                &cache,
-                BROWSER_ARTIFACT_RANGE_CACHE_NAME,
-                &key,
-                request.range.length(),
-            )
-            .await
-            .map_err(|error| BooguError::Artifact(error.to_string()))?;
-            match cached {
-                Some(bytes) if u64::try_from(bytes.len()).ok() == Some(request.range.length()) => {
-                    self.control
-                        .record_cache_lookup(Some(request.range.length()), false);
-                    self.control.record_logical_range(request.range.length());
-                    return Ok(ArtifactChunk {
-                        path: request.path.clone(),
-                        range: request.range,
-                        bytes,
-                    });
-                }
-                Some(_) => {
-                    // Cache entries are untrusted. A malformed response is a
-                    // miss after successful eviction, never accepted or used
-                    // to satisfy a logical range read.
-                    self.control.record_cache_lookup(None, true);
-                    let removed =
-                        browser_cache_delete(&cache, BROWSER_ARTIFACT_RANGE_CACHE_NAME, &key)
-                            .await
-                            .map_err(|error| BooguError::Artifact(error.to_string()))?;
-                    self.control.record_cache_eviction(removed);
-                }
-                None => {
-                    self.control.record_cache_lookup(None, false);
-                    if self.control.cache_key_was_populated(&key) {
-                        return Err(BooguError::Artifact(
-                            ArtifactStreamError::BrowserCacheSessionEntryLost {
-                                cache: BROWSER_ARTIFACT_RANGE_CACHE_NAME,
-                                path: request.path.clone(),
-                                offset: request.range.offset(),
-                                end_exclusive: request.range.end_exclusive(),
-                            }
-                            .to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        let chunk = fetch_browser_range_with_total(request, Some(object_size))
-            .await
-            .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        let bytes = u64::try_from(chunk.bytes.len()).map_err(|_| {
-            BooguError::Artifact("browser range response byte count overflowed u64".into())
-        })?;
-        self.control.record_network_fetch(bytes);
-        browser_cache_put(
-            &cache,
-            BROWSER_ARTIFACT_RANGE_CACHE_NAME,
-            &key,
-            &chunk.bytes,
-        )
-        .await
-        .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        self.control.record_cache_write(&key, bytes);
-        self.control.record_logical_range(bytes);
-        Ok(chunk)
-    }
-
-    async fn fetch_range(
-        &mut self,
-        request: &BrowserRangeRequest,
-        object_digest: Sha256Digest,
-        object_size: u64,
-        force_network: bool,
-    ) -> Result<ArtifactChunk, BooguError> {
-        if self.cache_policy == BrowserRangeCachePolicy::Required {
-            return self
-                .fetch_range_cached(request, object_digest, object_size, force_network)
-                .await;
-        }
-        let chunk = fetch_browser_range_with_total(request, Some(object_size))
-            .await
-            .map_err(|error| BooguError::Artifact(error.to_string()))?;
-        let bytes = u64::try_from(chunk.bytes.len()).map_err(|_| {
-            BooguError::Artifact("browser range response byte count overflowed u64".into())
-        })?;
-        self.control.record_network_fetch(bytes);
-        self.control.record_logical_range(bytes);
-        Ok(chunk)
     }
 
     fn complete_object_url(&self, path: &ArtifactPath) -> Result<String, BooguError> {
@@ -2685,99 +2437,6 @@ impl BrowserStageShardReader {
         Ok(())
     }
 
-    async fn evict_object_ranges(
-        &mut self,
-        path: &ArtifactPath,
-        size: u64,
-        digest: Sha256Digest,
-    ) -> Result<(), BooguError> {
-        let cache = self.range_cache().await?;
-        let mut offset = 0_u64;
-        while offset < size {
-            let length = browser_cache_chunk_length(size - offset, self.config.max_chunk_bytes());
-            let range = ByteRange::new(offset, length).map_err(|error| {
-                BooguError::Artifact(format!(
-                    "invalid browser cache eviction range for {}: {error}",
-                    path
-                ))
-            })?;
-            let request = ArtifactReadRequest::ranged(path.clone(), range);
-            let browser = BrowserRangeRequest::from_source(&self.source, &request)
-                .map_err(|error| BooguError::Artifact(error.to_string()))?;
-            let key = browser_range_cache_key(&browser, digest);
-            let removed = browser_cache_delete(&cache, BROWSER_ARTIFACT_RANGE_CACHE_NAME, &key)
-                .await
-                .map_err(|error| BooguError::Artifact(error.to_string()))?;
-            self.control.record_cache_eviction(removed);
-            offset = range.end_exclusive();
-        }
-        Ok(())
-    }
-
-    async fn fetch_physical_object_bytes_attempt(
-        &mut self,
-        read: BrowserPhysicalObjectRead<'_>,
-        force_network: bool,
-    ) -> Result<Vec<u8>, BooguError> {
-        let capacity = usize::try_from(read.size).map_err(|_| {
-            BooguError::Artifact(format!(
-                "browser artifact object {} does not fit Wasm address space",
-                read.path
-            ))
-        })?;
-        let mut bytes = Vec::with_capacity(capacity);
-        let mut offset = 0_u64;
-        while offset < read.size {
-            self.control.check_cancelled()?;
-            let length =
-                browser_cache_chunk_length(read.size - offset, self.config.max_chunk_bytes());
-            let range = ByteRange::new(offset, length).map_err(|error| {
-                BooguError::Artifact(format!("invalid browser range for {}: {error}", read.path))
-            })?;
-            let request = ArtifactReadRequest::ranged(read.path.clone(), range);
-            let browser = BrowserRangeRequest::from_source(&self.source, &request)
-                .map_err(|error| BooguError::Artifact(error.to_string()))?;
-            let chunk = self
-                .fetch_range(&browser, read.digest, read.size, force_network)
-                .await?;
-            bytes.extend_from_slice(&chunk.bytes);
-            self.control
-                .record_transport_range(self.progress_path(read.path), range);
-            offset = range.end_exclusive();
-            let loaded_bytes = read.progress_offset.checked_add(offset).ok_or_else(|| {
-                BooguError::Artifact(format!(
-                    "browser progress byte count overflowed while reading {}",
-                    read.path
-                ))
-            })?;
-            self.control.push(BrowserArtifactEvent::Progress {
-                path: self.progress_path(read.progress_path),
-                loaded_bytes,
-                total_bytes: read.progress_total,
-            });
-        }
-        Ok(bytes)
-    }
-
-    async fn fetch_direct_shard_bytes_attempt(
-        &mut self,
-        file: &ArtifactFile,
-        force_network: bool,
-    ) -> Result<Vec<u8>, BooguError> {
-        self.fetch_physical_object_bytes_attempt(
-            BrowserPhysicalObjectRead {
-                path: &file.path,
-                size: file.size,
-                digest: file.sha256,
-                progress_path: &file.path,
-                progress_offset: 0,
-                progress_total: file.size,
-            },
-            force_network,
-        )
-        .await
-    }
-
     async fn fetch_direct_complete_file_attempt(
         &mut self,
         file: &ArtifactFile,
@@ -2929,12 +2588,12 @@ impl BrowserStageShardReader {
         &self,
         file: &ArtifactFile,
     ) -> Result<Option<ArtifactTransportObject>, BooguError> {
-        let Some(layout) = &self.transport_layout else {
-            return Ok(None);
-        };
         if file.role != ArtifactFileRole::Weights {
             return Ok(None);
         }
+        let layout = self.transport_layout.as_ref().ok_or_else(|| {
+            BooguError::Artifact("browser reader has no verified transport layout".into())
+        })?;
         layout.object(&file.path).cloned().map(Some).ok_or_else(|| {
             BooguError::Artifact(
                 ArtifactStreamError::BrowserTransportObjectMissing {
@@ -3091,15 +2750,10 @@ impl BrowserStageShardReader {
         if let Some(object) = self.transport_object_for_file(file)? {
             return self.fetch_transport_shard_read(file, &object).await;
         }
-        let use_complete_file =
-            browser_complete_file_transport_required(self.transport_layout.is_some(), file.role);
         let complete_file_maximum = maximum.min(ARTIFACT_TRANSPORT_MAX_PART_BYTES);
-        let bytes = if use_complete_file {
-            self.fetch_direct_complete_file_attempt(file, complete_file_maximum, false)
-                .await?
-        } else {
-            self.fetch_direct_shard_bytes_attempt(file, false).await?
-        };
+        let bytes = self
+            .fetch_direct_complete_file_attempt(file, complete_file_maximum, false)
+            .await?;
         let (read, actual) = match VerifiedArtifactBytes::try_verify_sha256(file, bytes) {
             Ok(read) => (Some(read), None),
             Err((_error, bytes)) => (None, Some((Sha256Digest::calculate(&bytes), bytes))),
@@ -3107,11 +2761,7 @@ impl BrowserStageShardReader {
         if let Some(read) = read {
             self.control
                 .record_transport_part_verified(self.progress_path(&file.path));
-            if use_complete_file {
-                self.protect_verified_direct_complete_file(file)?;
-            } else {
-                self.protect_verified_object_ranges(&file.path, file.size, file.sha256)?;
-            }
+            self.protect_verified_direct_complete_file(file)?;
             return Ok(read);
         }
         let (actual, bytes) = actual.expect("failed verification retains rejected bytes");
@@ -3132,29 +2782,16 @@ impl BrowserStageShardReader {
         // fetch so peak Wasm memory remains one bounded object plus one chunk.
         drop(bytes);
         self.control.record_integrity_refetch();
-        if use_complete_file {
-            self.evict_direct_complete_file(file).await?;
-        } else {
-            self.evict_object_ranges(&file.path, file.size, file.sha256)
-                .await?;
-        }
-        let bytes = if use_complete_file {
-            self.fetch_direct_complete_file_attempt(file, complete_file_maximum, true)
-                .await?
-        } else {
-            self.fetch_direct_shard_bytes_attempt(file, true).await?
-        };
+        self.evict_direct_complete_file(file).await?;
+        let bytes = self
+            .fetch_direct_complete_file_attempt(file, complete_file_maximum, true)
+            .await?;
         let read = match VerifiedArtifactBytes::try_verify_sha256(file, bytes) {
             Ok(read) => read,
             Err((_error, bytes)) => {
                 let actual = Sha256Digest::calculate(&bytes);
                 drop(bytes);
-                if use_complete_file {
-                    self.evict_direct_complete_file(file).await?;
-                } else {
-                    self.evict_object_ranges(&file.path, file.size, file.sha256)
-                        .await?;
-                }
+                self.evict_direct_complete_file(file).await?;
                 return Err(BooguError::Artifact(
                     ArtifactStreamError::BrowserCacheIntegrityRetryFailed {
                         path: file.path.clone(),
@@ -3167,40 +2804,8 @@ impl BrowserStageShardReader {
         };
         self.control
             .record_transport_part_verified(self.progress_path(&file.path));
-        if use_complete_file {
-            self.protect_verified_direct_complete_file(file)?;
-        } else {
-            self.protect_verified_object_ranges(&file.path, file.size, file.sha256)?;
-        }
+        self.protect_verified_direct_complete_file(file)?;
         Ok(read)
-    }
-
-    fn protect_verified_object_ranges(
-        &self,
-        path: &ArtifactPath,
-        size: u64,
-        digest: Sha256Digest,
-    ) -> Result<(), BooguError> {
-        if self.cache_policy != BrowserRangeCachePolicy::Required {
-            return Ok(());
-        }
-        let mut offset = 0_u64;
-        while offset < size {
-            let length = browser_cache_chunk_length(size - offset, self.config.max_chunk_bytes());
-            let range = ByteRange::new(offset, length).map_err(|error| {
-                BooguError::Artifact(format!(
-                    "invalid verified browser cache range for {}: {error}",
-                    path
-                ))
-            })?;
-            let request = ArtifactReadRequest::ranged(path.clone(), range);
-            let browser = BrowserRangeRequest::from_source(&self.source, &request)
-                .map_err(|error| BooguError::Artifact(error.to_string()))?;
-            self.control
-                .protect_verified_cache_key(&browser_range_cache_key(&browser, digest));
-            offset = range.end_exclusive();
-        }
-        Ok(())
     }
 }
 
@@ -3229,8 +2834,8 @@ impl AsyncStageShardReader for BrowserStageShardReader {
     }
 }
 
-/// Model crates consume the model-neutral reader contract. Keep the legacy Boogu reader
-/// implementation above only for the variant-specific denoiser during the compatibility window.
+/// Model crates consume the model-neutral reader contract while Boogu's denoiser uses the same
+/// verified transport implementation through its stage-reader trait.
 #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
 impl AsyncArtifactShardReader for BrowserStageShardReader {
     async fn read_shard(
@@ -3425,12 +3030,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use burn_image::{
-        ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
-        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY, ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY,
-        ARTIFACT_TRANSPORT_LAYOUT_PATH, ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY,
-        ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
-        ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY, ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY,
-        ArtifactProfileId, ArtifactShard, ArtifactTransportLayoutError, ModelId, NumericFormat,
+        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY,
+        ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY,
+        ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY, ARTIFACT_TRANSPORT_LAYOUT_PATH,
+        ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY,
+        ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION, ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY,
+        ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY, ArtifactProfileId, ArtifactShard,
+        ArtifactTransportLayoutError, ModelId, NumericFormat,
     };
 
     use super::*;
@@ -3501,7 +3107,7 @@ mod tests {
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
             (
-                ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+                ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY.into(),
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
         ])
@@ -3650,37 +3256,6 @@ mod tests {
     }
 
     #[test]
-    fn browser_cache_key_binds_url_digest_and_exact_range_correctness() {
-        let source = ArtifactSource::Remote {
-            base_url: RemoteBaseUrl::new("https://cdn.example/models").unwrap(),
-        };
-        let request = ArtifactReadRequest::ranged(
-            ArtifactPath::new("weights/a.bpk").unwrap(),
-            ByteRange::new(8, 4).unwrap(),
-        );
-        let browser = BrowserRangeRequest::from_source(&source, &request).unwrap();
-        let digest = Sha256Digest::calculate(b"sealed object");
-        let key = browser_range_cache_key(&browser, digest);
-        assert!(key.starts_with("https://burn-image.invalid/.well-known/range-cache/v1/"));
-        assert!(key.ends_with("/8-12"));
-        assert_eq!(key, browser_range_cache_key(&browser, digest));
-
-        let other_range = BrowserRangeRequest {
-            range: ByteRange::new(9, 4).unwrap(),
-            range_header: "bytes=9-12".into(),
-            ..browser.clone()
-        };
-        assert_ne!(key, browser_range_cache_key(&other_range, digest));
-        let mut other_url = browser;
-        other_url.url.push_str("&mirror=1");
-        assert_ne!(key, browser_range_cache_key(&other_url, digest));
-        assert_ne!(
-            key,
-            browser_range_cache_key(&other_url, Sha256Digest::calculate(b"replacement object"))
-        );
-    }
-
-    #[test]
     fn persistent_cache_plan_deduplicates_and_reserves_headroom_correctness() {
         let mut plan = BrowserPersistentCachePlan::default();
         plan.register(
@@ -3783,45 +3358,6 @@ mod tests {
     }
 
     #[test]
-    fn declared_transport_uses_complete_objects_for_compact_files_correctness() {
-        for role in [
-            ArtifactFileRole::Config,
-            ArtifactFileRole::Tokenizer,
-            ArtifactFileRole::Metadata,
-            ArtifactFileRole::Other,
-        ] {
-            assert!(browser_complete_file_transport_required(true, role));
-            assert!(!browser_complete_file_transport_required(false, role));
-        }
-        assert!(!browser_complete_file_transport_required(
-            true,
-            ArtifactFileRole::Weights,
-        ));
-    }
-
-    #[test]
-    fn browser_cache_chunks_never_exceed_four_mib_correctness() {
-        assert_eq!(
-            browser_cache_chunk_length(16 * 1024 * 1024, MAX_BROWSER_CHUNK_BYTES),
-            MAX_BROWSER_CACHE_CHUNK_BYTES
-        );
-        assert_eq!(browser_cache_chunk_length(17, 8), 8);
-        assert_eq!(browser_cache_chunk_length(7, 8), 7);
-        assert_eq!(ARTIFACT_TRANSPORT_TARGET_PART_BYTES, 20_971_520);
-        assert_eq!(ARTIFACT_TRANSPORT_MAX_PART_BYTES, 25_000_000);
-
-        let mut remaining = ARTIFACT_TRANSPORT_TARGET_PART_BYTES;
-        let mut range_count = 0;
-        while remaining > 0 {
-            let length = browser_cache_chunk_length(remaining, MAX_BROWSER_CHUNK_BYTES);
-            assert_eq!(length, MAX_BROWSER_CACHE_CHUNK_BYTES);
-            remaining -= length;
-            range_count += 1;
-        }
-        assert_eq!(range_count, 5);
-    }
-
-    #[test]
     fn browser_transport_typestate_authenticates_sidecar_and_manifest_correctness() {
         let logical = b"authenticated logical Burnpack";
         let weight = transport_weight(logical.len() as u64, Sha256Digest::calculate(logical));
@@ -3846,28 +3382,28 @@ mod tests {
     }
 
     #[test]
-    fn browser_transport_declaration_is_optional_only_when_entirely_absent_correctness() {
-        let logical = b"legacy direct object";
+    fn browser_transport_declaration_rejects_partial_metadata_correctness() {
+        let logical = b"direct object";
         let weight = transport_weight(logical.len() as u64, Sha256Digest::calculate(logical));
         let layout = transport_layout(&weight, vec![transport_part(0, logical)]);
-        let (mut legacy, _) = seal_transport_fixture(weight, &layout);
-        legacy
+        let (mut manifest, _) = seal_transport_fixture(weight, &layout);
+        manifest
             .files
             .retain(|file| file.path.as_str() != ARTIFACT_TRANSPORT_LAYOUT_PATH);
-        legacy.metadata.clear();
-        legacy.seal().unwrap();
+        manifest.metadata.clear();
+        manifest.seal().unwrap();
         assert!(
-            ArtifactTransportLayout::declared_file(&legacy)
+            ArtifactTransportLayout::declared_file(&manifest)
                 .unwrap()
                 .is_none()
         );
 
-        legacy
+        manifest
             .metadata
             .insert(ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY.into(), "true".into());
-        legacy.seal().unwrap();
+        manifest.seal().unwrap();
         assert!(matches!(
-            ArtifactTransportLayout::declared_file(&legacy),
+            ArtifactTransportLayout::declared_file(&manifest),
             Err(ArtifactTransportLayoutError::InvalidDeclaration(_))
         ));
     }
@@ -3988,9 +3524,9 @@ mod tests {
     #[test]
     fn browser_lost_session_entry_error_names_no_repeat_network_contract_correctness() {
         let error = ArtifactStreamError::BrowserCacheSessionEntryLost {
-            cache: BROWSER_ARTIFACT_RANGE_CACHE_NAME,
-            path: ArtifactPath::new("weights/a.bpk").unwrap(),
-            offset: 8,
+            cache: BROWSER_ARTIFACT_PART_CACHE_NAME,
+            path: ArtifactPath::new("transport/a.part").unwrap(),
+            offset: 0,
             end_exclusive: 12,
         }
         .to_string();
@@ -4357,7 +3893,7 @@ mod tests {
             (&vae, &vae_layout),
         ] {
             tracker
-                .register_manifest_plan(manifest, Some(&manifest.bundle), Some(layout), 4)
+                .register_manifest_plan(manifest, Some(&manifest.bundle), layout)
                 .unwrap();
         }
         let first = tracker.snapshot().unwrap();
@@ -4374,7 +3910,7 @@ mod tests {
             (&vae, &vae_layout),
         ] {
             tracker
-                .register_manifest_plan(manifest, Some(&manifest.bundle), Some(layout), 4)
+                .register_manifest_plan(manifest, Some(&manifest.bundle), layout)
                 .unwrap();
         }
         assert_eq!(tracker.snapshot().unwrap(), first);

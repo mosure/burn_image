@@ -41,8 +41,6 @@ fn release_evidence_uploads_only_allowlisted_files_correctness() {
     );
     assert!(!uploads.contains("burn-image-rendered-surface-profile-"));
     assert!(uploads.contains("if-no-files-found: error"));
-    assert!(uploads.contains("always() && inputs.run_browser_f32_control_diagnostic"));
-    assert!(uploads.contains("if-no-files-found: warn"));
 }
 
 #[test]
@@ -55,7 +53,6 @@ fn required_release_gate_aggregation_remains_fail_closed_correctness() {
     for required in [
         "NATIVE_LOW_VRAM_OUTCOME",
         "LOW_VRAM_OUTCOME",
-        "TURBO_FIRST_DMD_OUTCOME",
         "RENDERED_TURBO_OUTCOME",
         "RENDERED_TURBO_MULTI_REQUEST_OUTCOME",
         "NATIVE_TURBO_OUTPUT_OUTCOME",
@@ -80,10 +77,13 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
         "for role in qwen vae; do",
         "\"$EDIT_MODEL_BASE_URL/manifest.json\"",
         "\"$EDIT_1K5_MODEL_BASE_URL/manifest.json\"",
+        "\"$Q4_MODEL_BASE_URL/manifest.json\"",
+        "\"$EDIT_Q4_MODEL_BASE_URL/manifest.json\"",
+        "\"$EDIT_1K5_Q4_MODEL_BASE_URL/manifest.json\"",
     ] {
         assert!(
             DEPLOY_WORKFLOW.contains(fetched_manifest),
-            "canonical five-manifest fetch closure is missing: {fetched_manifest}"
+            "canonical release manifest fetch closure is missing: {fetched_manifest}"
         );
     }
 
@@ -105,6 +105,20 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
         );
     }
     assert!(!DEPLOY_WORKFLOW.contains("readonly max_payload_bytes=$((256 * 1024 * 1024))"));
+    for shared_q4_contract in [
+        "qwen3-vl-8b-base-boogu-image-0.1-q4s-block-up-to128-f32",
+        "flux1-vae-boogu-image-0.1-f16-shared",
+        "(.dependencies | type == \"array\" and length == 2)",
+        "(.dependencies | sort_by(.role)) == ($turbo[0].dependencies | sort_by(.role))",
+        "all(.files[]; .role != \"weights\" or ((.component // \"\") | startswith(\"boogu-\")))",
+        "dependency_file=\"$scratch/q4-$role-dependency.json\"",
+    ] {
+        assert!(
+            DEPLOY_WORKFLOW.contains(shared_q4_contract),
+            "shared Q4 dependency gate is missing: {shared_q4_contract}"
+        );
+    }
+    assert!(!DEPLOY_WORKFLOW.contains("monolithic-q4s-burnpack-transport-v1"));
 
     let complete_object_contract = section(
         DEPLOY_WORKFLOW,
@@ -161,8 +175,8 @@ fn pages_authenticates_sealed_manifests_and_full_payloads_correctness() {
     }
 
     let last_manifest = DEPLOY_WORKFLOW
-        .rfind("verify_manifest_contract \"$edit_1k5_manifest\"")
-        .expect("1.5K manifest verification must remain present");
+        .rfind("verify_manifest_contract \"$edit_1k5_q4_manifest\"")
+        .expect("all three Q4S manifest verifications must remain present");
     let authenticate = DEPLOY_WORKFLOW
         .rfind("          authenticate_remote_payloads")
         .expect("full remote payload authentication must remain present");

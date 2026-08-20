@@ -174,9 +174,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Keep package feature graphs isolated. A workspace-wide all-feature
-          # invocation unifies burn_boogu's diagnostic CUDA backend into the
-          # Bevy cdylib and can exhaust the hosted runner's linker resources.
+          # Keep package feature graphs isolated so each supported crate surface is tested with
+          # its own dependency set and the hosted runner avoids an oversized workspace link.
           cargo test -p burn_image --all-features --locked
           cargo test -p burn_qwen3_vl --all-features --locked
           cargo test -p burn_flux_vae --all-features --locked
@@ -405,20 +404,16 @@ jobs:
           node --check crates/bevy_image/tests/wasm_rendered_surface_contract.mjs
           node --check crates/bevy_image/tests/wasm_rendered_surface_contract.test.mjs
           node --check crates/bevy_image/tests/wasm_rendered_surface_smoke.mjs
-          node --check crates/bevy_image/tests/wasm_turbo_first_dmd_contract.mjs
-          node --check crates/bevy_image/tests/wasm_turbo_first_dmd_contract.test.mjs
-          node --check crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs
+          node --check crates/bevy_image/tests/wasm_q4_matmul_probe.mjs
           node --check crates/bevy_image/www/model_selector.mjs
           node --check crates/bevy_image/tests/web_model_selector.test.mjs
           node --test crates/bevy_image/tests/artifact_transport_contract.test.mjs
           node --test crates/bevy_image/tests/wasm_browser_1k5_contract.test.mjs
           node --test crates/bevy_image/tests/wasm_browser_1k5_scope.test.mjs
           node --test crates/bevy_image/tests/wasm_rendered_surface_contract.test.mjs
-          node --test crates/bevy_image/tests/wasm_turbo_first_dmd_contract.test.mjs
           node --test crates/bevy_image/tests/web_model_selector.test.mjs
           BURN_IMAGE_RENDERED_SURFACE_VALIDATE_ONLY=1 \
             node crates/bevy_image/tests/wasm_rendered_surface_smoke.mjs
-          node crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs
       - name: Build and inspect browser package
         shell: bash
         run: |

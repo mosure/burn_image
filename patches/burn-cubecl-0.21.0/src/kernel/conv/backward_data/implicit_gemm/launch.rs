@@ -32,6 +32,7 @@ pub fn dgrad_gemm_simple_sync<R: CubeRuntime, const N: usize>(
     launch_backwards_data::<R, N>(&strategy, out_grad, weights, input_shape, options)
 }
 
+#[cfg(feature = "autotune")]
 pub fn dgrad_gemm_simple_async<R: CubeRuntime, const N: usize>(
     out_grad: CubeTensor<R>,
     weights: CubeTensor<R>,
@@ -53,6 +54,7 @@ pub fn dgrad_gemm_simple_async<R: CubeRuntime, const N: usize>(
     launch_backwards_data::<R, N>(&strategy, out_grad, weights, input_shape, options)
 }
 
+#[cfg(feature = "autotune")]
 pub fn dgrad_gemm_simple_tma<R: CubeRuntime, const N: usize>(
     out_grad: CubeTensor<R>,
     weights: CubeTensor<R>,

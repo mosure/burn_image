@@ -272,18 +272,6 @@ pub fn prepare_native_output_request(
     ))
 }
 
-/// Backward-compatible qualification entry point for one exact released native request.
-pub fn prepare_native_output_qualification_request(
-    variant: BooguVariant,
-    prompt: String,
-    seed: u64,
-    width: u32,
-    height: u32,
-    source_path: Option<PathBuf>,
-) -> Result<(ImageRequest, NativeOutputQualificationRequestIdentity), String> {
-    prepare_native_output_request(variant, prompt, seed, width, height, source_path)
-}
-
 fn read_bounded_qualification_source(path: &Path) -> Result<Vec<u8>, String> {
     let file = fs::File::open(path)
         .map_err(|error| format!("open native source image {}: {error}", path.display()))?;
@@ -1219,7 +1207,7 @@ mod tests {
     #[test]
     fn turbo_request_identity_is_exact_and_ascii_correctness() {
         let prompt = "A studio photograph of a blue ceramic bird on a plain white table.";
-        let (request, identity) = prepare_native_output_qualification_request(
+        let (request, identity) = prepare_native_output_request(
             BooguVariant::Image01Turbo,
             prompt.into(),
             0,
@@ -1243,7 +1231,7 @@ mod tests {
             BooguVariant::Image01EditTurbo,
             BooguVariant::Image01EditTurbo1k5,
         ] {
-            let error = prepare_native_output_qualification_request(
+            let error = prepare_native_output_request(
                 variant,
                 "edit instruction".into(),
                 7,
@@ -1263,7 +1251,7 @@ mod tests {
             assert!(error.contains("requires an explicit source"));
         }
         assert!(
-            prepare_native_output_qualification_request(
+            prepare_native_output_request(
                 BooguVariant::Image01Turbo,
                 "prompt".into(),
                 0,

@@ -244,9 +244,9 @@ impl DirectoryArtifactShardReader {
 
     /// Construct a reader bound to one sealed manifest and its optional sealed transport layout.
     ///
-    /// Legacy manifests without transport declarations continue reading logical files directly.
-    /// Once a layout is declared, every logical weight is reconstructed exclusively from its
-    /// verified content-addressed parts; a missing direct logical file is therefore expected.
+    /// Standalone conversion sources read logical files directly. Once a layout is declared,
+    /// every logical weight is reconstructed exclusively from its verified content-addressed
+    /// parts; a missing direct logical file is therefore expected.
     pub fn from_manifest(
         root: impl Into<PathBuf>,
         manifest: &ArtifactManifest,
@@ -592,8 +592,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::{
-        ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_MANIFEST_SCHEMA_V1,
-        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY,
+        ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
+        ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY, ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY,
         ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY, ARTIFACT_TRANSPORT_LAYOUT_PATH,
         ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY,
         ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION, ARTIFACT_TRANSPORT_MAX_PART_BYTES,
@@ -640,7 +640,7 @@ mod tests {
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
             (
-                ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+                ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY.into(),
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
         ])

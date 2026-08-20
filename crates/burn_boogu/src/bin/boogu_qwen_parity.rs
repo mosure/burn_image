@@ -496,7 +496,7 @@ fn stage_oracle(
         Qwen3VlStage::VisionPrelude => optional_aligned_oracle(
             fixture,
             "qwen.vision.prelude",
-            "streamed prelude is post learned-position addition; legacy qwen.vision.patch_embed is raw Conv3d output",
+            "streamed prelude is post learned-position addition; the source qwen.vision.patch_embed capture is raw Conv3d output",
         ),
         Qwen3VlStage::VisionBlock { index } => {
             OracleMapping::Compare(format!("qwen.vision.block.{index}"))
@@ -511,7 +511,7 @@ fn stage_oracle(
             optional_aligned_oracle(
                 fixture,
                 &format!("qwen.text.layer.{index}.post_deepstack"),
-                "streamed observer is post deepstack insertion; legacy layer hook is pre insertion",
+                "streamed observer is post deepstack insertion; the source layer hook is pre insertion",
             )
         }
         Qwen3VlStage::TextBlock { index } => {

@@ -19,11 +19,11 @@ on:
         required: true
         type: string
       turbo_artifacts:
-        description: Absolute path to the exact legacy schema-v1 flat Turbo bundle required by native parity binaries
+        description: Absolute path to the exact dependency-free Turbo conversion source required by parity binaries
         required: true
         type: string
       edit_artifacts:
-        description: Absolute path to the exact legacy schema-v1 flat Edit-Turbo bundle required by native parity binaries
+        description: Absolute path to the exact dependency-free Edit-Turbo conversion source required by parity binaries
         required: true
         type: string
       edit_1k5_snapshot:
@@ -31,15 +31,11 @@ on:
         required: true
         type: string
       edit_1k5_artifacts:
-        description: Absolute path to the exact qualified legacy schema-v1 flat Edit-Turbo 1.5K bundle required by native parity binaries
+        description: Absolute path to the exact dependency-free Edit-Turbo 1.5K conversion source required by parity binaries
         required: true
         type: string
       edit_1k5_fixture:
         description: Absolute path to the exhaustive Edit-Turbo 1.5K schema-2 fixture directory
-        required: true
-        type: string
-      turbo_1k_fixture:
-        description: Absolute path to the exhaustive Turbo 1024 BF16 schema-2 fixture directory
         required: true
         type: string
       modular_artifact_root:
@@ -55,11 +51,6 @@ on:
         required: true
         default: ":0"
         type: string
-      run_browser_f32_control_diagnostic:
-        description: Run the optional non-blocking browser Edit-Turbo 1.5K F32 control diagnostic
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -78,7 +69,6 @@ jobs:
       BURN_IMAGE_EDIT_1K5_SNAPSHOT: ${{ inputs.edit_1k5_snapshot }}
       BURN_IMAGE_EDIT_1K5_FLAT_PARITY_ARTIFACTS: ${{ inputs.edit_1k5_artifacts }}
       BURN_IMAGE_EDIT_1K5_FIXTURE: ${{ inputs.edit_1k5_fixture }}
-      BURN_IMAGE_TURBO_1K_FIXTURE: ${{ inputs.turbo_1k_fixture }}
       BURN_IMAGE_CANONICAL_MODULAR_ARTIFACT_ROOT: ${{ inputs.modular_artifact_root }}
       BURN_IMAGE_REFERENCE_FIXTURES: ${{ inputs.reference_fixtures }}
       DISPLAY: ${{ inputs.display }}
@@ -106,7 +96,6 @@ jobs:
             BURN_IMAGE_EDIT_1K5_SNAPSHOT \
             BURN_IMAGE_EDIT_1K5_FLAT_PARITY_ARTIFACTS \
             BURN_IMAGE_EDIT_1K5_FIXTURE \
-            BURN_IMAGE_TURBO_1K_FIXTURE \
             BURN_IMAGE_CANONICAL_MODULAR_ARTIFACT_ROOT \
             BURN_IMAGE_REFERENCE_FIXTURES \
             DISPLAY; do
@@ -124,7 +113,6 @@ jobs:
             "$BURN_IMAGE_EDIT_1K5_SNAPSHOT" \
             "$BURN_IMAGE_EDIT_1K5_FLAT_PARITY_ARTIFACTS" \
             "$BURN_IMAGE_EDIT_1K5_FIXTURE" \
-            "$BURN_IMAGE_TURBO_1K_FIXTURE" \
             "$BURN_IMAGE_CANONICAL_MODULAR_ARTIFACT_ROOT" \
             "$BURN_IMAGE_REFERENCE_FIXTURES"; do
             if [[ ! -d "$directory" ]]; then
@@ -215,19 +203,6 @@ jobs:
             8e88d6c3580593da723049ef4027a60c5d730b6006ef766d49971a23c6446a70 \
             "$BURN_IMAGE_EDIT_1K5_FIXTURE/output.png"
 
-          # The first-DMD browser diagnostic uses the exhaustive 1024x1024
-          # Turbo BF16 oracle. It is distinct from the compact 256 fixture
-          # above and does not by itself claim full numerical parity.
-          verify_exact_file \
-            a7cf73b0ea0183d58b25f5c41eb732c28ed7a0aef52465365387d84cf2af0758 \
-            "$BURN_IMAGE_TURBO_1K_FIXTURE/metadata.json"
-          verify_exact_file \
-            eb3a81e7285f25df69a4e20a9f7d71d318bf9ccc5f84f2819c38fc2c1311f40e \
-            "$BURN_IMAGE_TURBO_1K_FIXTURE/tensors.safetensors"
-          verify_exact_file \
-            4abd717984140ace64143617f1981025917c1f35ceb2271501880b350961d703 \
-            "$BURN_IMAGE_TURBO_1K_FIXTURE/output.png"
-
       - name: Verify canonical modular published artifact contracts
         shell: bash
         run: |
@@ -246,22 +221,22 @@ jobs:
             --require-published-release \
             --require-edit-turbo-1k5-release
 
-      - name: Verify exact legacy flat native parity artifact contracts
+      - name: Verify exact conversion-source parity artifact contracts
         shell: bash
         run: |
           set -euo pipefail
           cargo run -p burn_boogu --release --locked --features import \
             --bin boogu-verify-artifacts -- \
             --artifacts "$BURN_IMAGE_TURBO_FLAT_PARITY_ARTIFACTS" \
-            --require-legacy-flat-parity-release
+            --require-source-release
           cargo run -p burn_boogu --release --locked --features import \
             --bin boogu-verify-artifacts -- \
             --artifacts "$BURN_IMAGE_EDIT_FLAT_PARITY_ARTIFACTS" \
-            --require-legacy-flat-parity-release
+            --require-source-release
           cargo run -p burn_boogu --release --locked --features import \
             --bin boogu-verify-artifacts -- \
             --artifacts "$BURN_IMAGE_EDIT_1K5_FLAT_PARITY_ARTIFACTS" \
-            --require-legacy-flat-parity-release \
+            --require-source-release \
             --require-edit-turbo-1k5-release
 
       - name: Processor reference parity
@@ -506,44 +481,6 @@ jobs:
             "$www_out/bevy_burn_image_bg.wasm" \
             "$www_out/burn-image-icon.png"
 
-      - name: Browser Turbo 1024 first-DMD packed-F16 dense-F32-per-stage diagnostic
-        id: browser_turbo_first_dmd_1024
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          output_dir="$RUNNER_TEMP/burn-image-turbo-first-dmd-1024"
-          mkdir -p "$output_dir"
-          artifact_root="$(realpath -e "$BURN_IMAGE_CANONICAL_MODULAR_ARTIFACT_ROOT")"
-          fixture_dir="$(realpath -e "$BURN_IMAGE_TURBO_1K_FIXTURE")"
-          BURN_IMAGE_TURBO_FIRST_DMD=1 \
-          BURN_IMAGE_TURBO_FIRST_DMD_ARTIFACT_ROOT="$artifact_root" \
-          BURN_IMAGE_TURBO_FIRST_DMD_FIXTURE_DIR="$fixture_dir" \
-          BURN_IMAGE_TURBO_FIRST_DMD_FIXTURE_PROFILE=qualification-1024-bf16 \
-          BURN_IMAGE_TURBO_FIRST_DMD_WWW_OUT_DIR="$RUNNER_TEMP/burn-image-boogu-web" \
-          BURN_IMAGE_TURBO_FIRST_DMD_OUTPUT_DIR="$output_dir" \
-          BURN_IMAGE_TURBO_FIRST_DMD_TIMEOUT_MS=7200000 \
-            node crates/bevy_image/tests/wasm_turbo_first_dmd_probe.mjs \
-              2>&1 | tee "$output_dir/workflow-console.log"
-
-      - name: Optional browser Edit-Turbo 1.5K F32 control diagnostic
-        id: browser_f32_control_diagnostic
-        if: ${{ inputs.run_browser_f32_control_diagnostic }}
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          output_dir="$RUNNER_TEMP/burn-image-browser-f32-control-diagnostic"
-          mkdir -p "$output_dir"
-          BURN_IMAGE_BROWSER_1K5_PARITY=1 \
-          BURN_IMAGE_BROWSER_1K5_RESIDENCY=qualification-f32 \
-          BURN_IMAGE_BROWSER_1K5_PARITY_ARTIFACT_DIR="$BURN_IMAGE_CANONICAL_MODULAR_ARTIFACT_ROOT/boogu-image-0.1-edit-turbo-1k5" \
-          BURN_IMAGE_BROWSER_1K5_PARITY_FIXTURE_DIR="$BURN_IMAGE_EDIT_1K5_FIXTURE" \
-          BURN_IMAGE_BROWSER_1K5_PARITY_WWW_OUT_DIR="$RUNNER_TEMP/burn-image-boogu-web" \
-          BURN_IMAGE_BROWSER_1K5_PARITY_OUTPUT_DIR="$output_dir" \
-            node crates/bevy_image/tests/wasm_browser_1k5_parity.mjs \
-              2>&1 | tee "$output_dir/workflow-console.log"
-
       - name: Browser Edit-Turbo 1.5K low-VRAM parity
         id: browser_low_vram
         continue-on-error: true
@@ -662,9 +599,6 @@ jobs:
             ${{ runner.temp }}/burn-image-browser-low-vram/*.json
             ${{ runner.temp }}/burn-image-browser-low-vram/*.log
             ${{ runner.temp }}/burn-image-browser-low-vram/*.png
-            ${{ runner.temp }}/burn-image-turbo-first-dmd-1024/*.json
-            ${{ runner.temp }}/burn-image-turbo-first-dmd-1024/*.log
-            ${{ runner.temp }}/burn-image-turbo-first-dmd-1024/*.png
             ${{ runner.temp }}/burn-image-rendered-turbo-1024/*.json
             ${{ runner.temp }}/burn-image-rendered-turbo-1024/*.log
             ${{ runner.temp }}/burn-image-rendered-turbo-1024/*.png
@@ -682,25 +616,12 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload optional browser F32 control evidence
-        if: ${{ always() && inputs.run_browser_f32_control_diagnostic }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: optional-browser-f32-control-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/burn-image-browser-f32-control-diagnostic/*.json
-            ${{ runner.temp }}/burn-image-browser-f32-control-diagnostic/*.log
-            ${{ runner.temp }}/burn-image-browser-f32-control-diagnostic/*.png
-          if-no-files-found: warn
-          retention-days: 30
-
       - name: Require every release qualification gate
         if: always()
         shell: bash
         env:
           NATIVE_LOW_VRAM_OUTCOME: ${{ steps.native_low_vram_1k5.outcome }}
           LOW_VRAM_OUTCOME: ${{ steps.browser_low_vram.outcome }}
-          TURBO_FIRST_DMD_OUTCOME: ${{ steps.browser_turbo_first_dmd_1024.outcome }}
           RENDERED_TURBO_OUTCOME: ${{ steps.browser_rendered_turbo_1024.outcome }}
           RENDERED_TURBO_MULTI_REQUEST_OUTCOME: ${{ steps.browser_rendered_turbo_1024_multi_request.outcome }}
           NATIVE_TURBO_OUTPUT_OUTCOME: ${{ steps.native_turbo_1024_output.outcome }}
@@ -711,7 +632,6 @@ jobs:
           for gate in \
             NATIVE_LOW_VRAM_OUTCOME \
             LOW_VRAM_OUTCOME \
-            TURBO_FIRST_DMD_OUTCOME \
             RENDERED_TURBO_OUTCOME \
             RENDERED_TURBO_MULTI_REQUEST_OUTCOME \
             NATIVE_TURBO_OUTPUT_OUTCOME \

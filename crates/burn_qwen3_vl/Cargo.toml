@@ -23,7 +23,7 @@ artifacts = ["dep:burn-store", "dep:burn_image"]
 [dependencies]
 burn.workspace = true
 burn-store = { workspace = true, optional = true }
-burn_image = { version = "0.1.1", path = "../burn_image", optional = true }
+burn_image = { version = "0.1.2", path = "../burn_image", optional = true }
 half.workspace = true
 image.workspace = true
 safetensors = { workspace = true, optional = true }

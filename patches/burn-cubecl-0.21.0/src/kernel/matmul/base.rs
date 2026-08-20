@@ -6,8 +6,14 @@ use cubek::{
     matmul::{
         definition::{MatmulElems, MatmulGlobalElems, MatmulSetupError},
         launch::Strategy,
+        routines::BlueprintStrategy,
     },
     std::InputBinding,
+};
+
+use super::quantized::{
+    QuantizedCmmaAlgorithm, QuantizedCmmaSelectionArgs, QuantizedUnitAlgorithm,
+    QuantizedUnitSelectionArgs,
 };
 
 #[cfg(feature = "autotune")]
@@ -20,6 +26,15 @@ pub enum MatmulStrategy {
     Autotune,
     /// Cube implementation of matmul.
     Cube,
+    /// Bounded Cube implementation for packed quantized operands.
+    ///
+    /// The default cooperative-matrix selector can infer a 64-KiB shared stage for F32 x Q4S,
+    /// exceeding WebGPU adapters that expose only the portable 16-KiB workgroup-storage minimum.
+    /// The custom selector keeps Q4 values packed at rest and uses a bounded
+    /// F16-stage/F32-accumulation cooperative kernel when the adapter supports it. A
+    /// resource-checked register-tiled kernel is the portable fallback for WebGPU and adapters
+    /// without cooperative matrices.
+    QuantizedPortable,
 }
 
 impl Default for MatmulStrategy {
@@ -47,11 +62,17 @@ pub fn matmul<R: CubeRuntime>(
             launch_matmul(&Default::default(), lhs, rhs, out.clone())?;
             Ok(out)
         }
+        MatmulStrategy::QuantizedPortable => {
+            let out = out.unwrap_or_else(|| init_matmul_output(&lhs, &rhs, out_dtype));
+            launch_matmul_quantized(lhs, rhs, out.clone())?;
+            Ok(out)
+        }
         #[cfg(feature = "autotune")]
         MatmulStrategy::Autotune => Ok(matmul_autotune(lhs, rhs, out, out_dtype)),
     }
 }
 
+#[cfg(feature = "autotune")]
 pub(crate) fn launch_matmul_naive<R: CubeRuntime>(
     strategy: &Strategy,
     mut lhs: CubeTensor<R>,
@@ -80,6 +101,29 @@ pub(crate) fn launch_matmul_naive<R: CubeRuntime>(
 
 pub(crate) fn launch_matmul<R: CubeRuntime>(
     strategy: &Strategy,
+    lhs: CubeTensor<R>,
+    rhs: CubeTensor<R>,
+    out: CubeTensor<R>,
+) -> Result<(), MatmulSetupError> {
+    launch_matmul_with(MatmulLaunch::Standard(strategy), lhs, rhs, out)
+}
+
+fn launch_matmul_quantized<R: CubeRuntime>(
+    lhs: CubeTensor<R>,
+    rhs: CubeTensor<R>,
+    out: CubeTensor<R>,
+) -> Result<(), MatmulSetupError> {
+    launch_matmul_with(MatmulLaunch::QuantizedPortable, lhs, rhs, out)
+}
+
+#[derive(Clone, Copy)]
+enum MatmulLaunch<'a> {
+    Standard(&'a Strategy),
+    QuantizedPortable,
+}
+
+fn launch_matmul_with<R: CubeRuntime>(
+    strategy: MatmulLaunch<'_>,
     lhs: CubeTensor<R>,
     mut rhs: CubeTensor<R>,
     out: CubeTensor<R>,
@@ -124,7 +168,7 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
         ),
         Some((data, scale)) => {
             // Extremely hacky fix to ensure naive can run in every case
-            if matches!(strategy, Strategy::Naive)
+            if matches!(strategy, MatmulLaunch::Standard(Strategy::Naive))
                 && matches!(rhs.scheme().level, QuantLevel::Block(_))
             {
                 rhs = dequantize(rhs.clone(), lhs_dtype);
@@ -158,14 +202,39 @@ pub(crate) fn launch_matmul<R: CubeRuntime>(
         out: out_dtype.into(),
     });
 
-    cubek::matmul::launch::launch_ref(
-        strategy,
-        client,
-        lhs_handle,
-        rhs_handle,
-        out.clone().binding(),
-        &mut dtypes,
-    )?;
+    match strategy {
+        MatmulLaunch::Standard(strategy) => cubek::matmul::launch::launch_ref(
+            strategy,
+            client,
+            lhs_handle,
+            rhs_handle,
+            out.clone().binding(),
+            &mut dtypes,
+        )?,
+        MatmulLaunch::QuantizedPortable => {
+            let cooperative =
+                cubek::matmul::launch::launch_tiling::launch_ref::<R, QuantizedCmmaAlgorithm>(
+                    client,
+                    lhs_handle.clone(),
+                    rhs_handle.clone(),
+                    out.clone().binding(),
+                    &BlueprintStrategy::Inferred(QuantizedCmmaSelectionArgs),
+                    &mut dtypes,
+                );
+            if let Err(MatmulSetupError::Unavailable(_)) = cooperative {
+                cubek::matmul::launch::launch_tiling::launch_ref::<R, QuantizedUnitAlgorithm>(
+                    client,
+                    lhs_handle,
+                    rhs_handle,
+                    out.clone().binding(),
+                    &BlueprintStrategy::Inferred(QuantizedUnitSelectionArgs),
+                    &mut dtypes,
+                )?;
+            } else {
+                cooperative?;
+            }
+        }
+    }
 
     Ok(())
 }

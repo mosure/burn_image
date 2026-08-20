@@ -22,6 +22,10 @@ const BURN_CUBECL_MODULE_OPS: &str =
     include_str!("../patches/burn-cubecl-0.21.0/src/ops/module.rs");
 const BURN_CUBECL_QUANTIZED_OPS: &str =
     include_str!("../patches/burn-cubecl-0.21.0/src/ops/qtensor.rs");
+const BURN_CUBECL_MATMUL_BASE: &str =
+    include_str!("../patches/burn-cubecl-0.21.0/src/kernel/matmul/base.rs");
+const BURN_CUBECL_QUANTIZED_MATMUL: &str =
+    include_str!("../patches/burn-cubecl-0.21.0/src/kernel/matmul/quantized.rs");
 const BURN_CUBECL_BASE_OPS: &str = include_str!("../patches/burn-cubecl-0.21.0/src/ops/base.rs");
 const BURN_CUBECL_SELECT: &str =
     include_str!("../patches/burn-cubecl-0.21.0/src/kernel/index/select.rs");
@@ -73,6 +77,75 @@ fn packed_quantized_uploads_honor_the_declared_axis_correctness() {
 }
 
 #[test]
+fn packed_q4_matmul_uses_bounded_cooperative_path_with_portable_fallback_correctness() {
+    let route = section(BURN_CUBECL_QUANTIZED_OPS, "    fn q_matmul(", "\n    }\n}");
+    assert!(route.contains("MatmulStrategy::QuantizedPortable"));
+    assert!(route.contains("use_packed_q4_rhs"));
+    assert!(route.contains("TensorPrimitive::Float(lhs), TensorPrimitive::QFloat(rhs)"));
+    assert!(route.contains("lhs.dtype == DType::F32"));
+    assert!(route.contains("kernel::into_contiguous(lhs)"));
+    assert!(route.contains("QuantValue::Q4S"));
+    assert!(route.contains("QuantParam::F32"));
+    assert!(route.contains("QuantStore::PackedU32(0 | 1)"));
+    assert!(route.contains("MatmulStrategy::default()"));
+
+    let launch = section(
+        BURN_CUBECL_MATMUL_BASE,
+        "        MatmulLaunch::QuantizedPortable => {",
+        "\n        }\n    }\n\n    Ok(())",
+    );
+    let cooperative = launch
+        .find("QuantizedCmmaAlgorithm")
+        .expect("packed Q4 must try the bounded cooperative kernel");
+    let unavailable = launch
+        .find("if let Err(MatmulSetupError::Unavailable(_))")
+        .expect("only unavailable cooperative support may select the fallback");
+    let fallback = launch
+        .find("QuantizedUnitAlgorithm")
+        .expect("packed Q4 must retain the portable register fallback");
+    assert!(cooperative < unavailable);
+    assert!(unavailable < fallback);
+
+    let cooperative_blueprint = section(
+        BURN_CUBECL_QUANTIZED_MATMUL,
+        "impl<RC, LL, RL, AL> Routine<RC> for QuantizedCmmaAlgorithm<LL, RL, AL>",
+        "/// Resource-bounded register-tiled fallback for WebGPU and adapters without cooperative matrices.",
+    );
+    for marker in [
+        "dtypes.lhs_stage = f16;",
+        "dtypes.rhs_stage = f16;",
+        "dtypes.lhs_register = f16;",
+        "dtypes.rhs_register = f16;",
+        "partition_k: Some(1)",
+        "row_count: Some(quantized_cmma_row_count(",
+        "PartitionBuffering::Single",
+    ] {
+        assert!(
+            cooperative_blueprint.contains(marker),
+            "bounded packed-Q4 cooperative kernel lost marker: {marker}"
+        );
+    }
+
+    let fallback_blueprint = section(
+        BURN_CUBECL_QUANTIZED_MATMUL,
+        "impl<RC: RuntimeConfig> Routine<RC> for QuantizedUnitAlgorithm",
+        "\n}",
+    );
+    assert!(fallback_blueprint.contains("SimpleMatmulFamily"));
+    assert!(fallback_blueprint.contains("SyncFullCyclicLoading<ColMajorTilingOrder>"));
+    assert!(fallback_blueprint.contains("SyncFullCyclicLoading<RowMajorTilingOrder>"));
+    assert!(fallback_blueprint.contains("tile: TileSizeSelection::MinTileSize"));
+    assert!(fallback_blueprint.contains("stage: StageScaling::Enabled(2)"));
+    assert!(fallback_blueprint.contains("partition: PartitionScaling::Disabled"));
+    assert!(fallback_blueprint.contains("quantized_unit_shared_memory_bytes"));
+    assert!(fallback_blueprint.contains("max_shared_memory_size"));
+    assert!(fallback_blueprint.contains("plane_dim: QUANTIZED_PORTABLE_UNIT_PLANE_DIM"));
+    assert!(
+        BURN_CUBECL_QUANTIZED_MATMUL.contains("const QUANTIZED_PORTABLE_UNIT_PLANE_DIM: u32 = 32;")
+    );
+}
+
+#[test]
 fn result_bearing_queue_api_is_public_and_forwarded_correctness() {
     assert!(WGPU_API.contains("pub use queue::*;"));
 
@@ -112,13 +185,13 @@ fn dispatch_queue_result_default_preserves_existing_backends_correctness() {
         "pub trait QueueInterface: CommonTraits {",
         "pub trait ShaderModuleInterface: CommonTraits {",
     );
-    let legacy = queue_interface
+    let callback_api = queue_interface
         .find("fn on_submitted_work_done(&self, callback: BoxSubmittedWorkDoneCallback);")
         .expect("the existing callback API must remain the dispatch primitive");
     let result = queue_interface
         .find("fn on_submitted_work_done_result(&self, callback: BoxSubmittedWorkDoneResultCallback) {")
         .expect("dispatch must expose a result-bearing completion hook");
-    assert!(legacy < result);
+    assert!(callback_api < result);
     assert!(
         queue_interface[result..]
             .contains("self.on_submitted_work_done(Box::new(move || callback(Ok(()))));")
@@ -132,7 +205,7 @@ fn webgpu_queue_rejection_maps_to_public_error_correctness() {
         "impl dispatch::QueueInterface for WebQueue {",
         "impl Drop for WebQueue {",
     );
-    let legacy = queue
+    let callback_api = queue
         .find("fn on_submitted_work_done(&self, callback: dispatch::BoxSubmittedWorkDoneCallback)")
         .expect("WebGPU must retain the original completion callback");
     let result = queue
@@ -155,12 +228,12 @@ fn webgpu_queue_rejection_maps_to_public_error_correctness() {
         .map(|offset| success + offset)
         .expect("rejected WebGPU completion must map to the public error");
 
-    assert!(legacy < result);
+    assert!(callback_api < result);
     assert!(result < promise);
     assert!(promise < await_promise);
     assert!(await_promise < success);
     assert!(success < rejection);
-    assert!(queue[legacy..result].contains("self.on_submitted_work_done_result"));
+    assert!(queue[callback_api..result].contains("self.on_submitted_work_done_result"));
     assert!(queue[success..rejection].contains("dyn_ref::<js_sys::Error>()"));
     assert!(queue[success..rejection].contains(".or_else(|| error.as_string())"));
 }
@@ -424,15 +497,15 @@ fn pipeline_invalidation_precedes_cache_lookup_correctness() {
 }
 
 #[test]
-fn packed_f16_compatibility_kernels_never_require_shader_f16_correctness() {
-    let compatibility = section(
+fn packed_f16_unpack_kernels_never_require_shader_f16_correctness() {
+    let unpack_route = section(
         BURN_CUBECL_PACKED_F16,
-        "pub fn requires_packed_f16_compatibility",
+        "pub fn requires_packed_f16_unpack",
         "#[cube]\nfn widen_f16_bits_to_f32",
     );
-    assert!(compatibility.contains("tensor.dtype == DType::F16"));
-    assert!(compatibility.contains("!tensor"));
-    assert!(compatibility.contains("supports_type(ElemType::Float(FloatKind::F16))"));
+    assert!(unpack_route.contains("tensor.dtype == DType::F16"));
+    assert!(unpack_route.contains("!tensor"));
+    assert!(unpack_route.contains("supports_type(ElemType::Float(FloatKind::F16))"));
 
     assert!(BURN_CUBECL_PACKED_F16.contains("packed: &Tensor<u32>"));
     assert!(BURN_CUBECL_PACKED_F16.contains("fn load_packed_f16"));
@@ -455,7 +528,7 @@ fn packed_f16_dispatch_covers_linear_embedding_and_convolution_correctness() {
         "    fn float_cross(",
     );
     assert!(matmul.contains("lhs.dtype == DType::F32"));
-    assert!(matmul.contains("requires_packed_f16_compatibility(&rhs)"));
+    assert!(matmul.contains("requires_packed_f16_unpack(&rhs)"));
     assert!(matmul.contains("return packed_f16_rhs_matmul(lhs, rhs);"));
 
     let select = section(
@@ -463,7 +536,7 @@ fn packed_f16_dispatch_covers_linear_embedding_and_convolution_correctness() {
         "    fn float_select(",
         "    fn float_select_add(",
     );
-    assert!(select.contains("requires_packed_f16_compatibility(&tensor)"));
+    assert!(select.contains("requires_packed_f16_unpack(&tensor)"));
     assert!(select.contains("return packed_f16_select_rows(tensor, dim, indices);"));
 
     let conv2d = section(
@@ -472,6 +545,6 @@ fn packed_f16_dispatch_covers_linear_embedding_and_convolution_correctness() {
         "    fn conv2d_x_backward(",
     );
     assert!(conv2d.contains("x.dtype == burn_backend::DType::F32"));
-    assert!(conv2d.contains("requires_packed_f16_compatibility(&weight)"));
+    assert!(conv2d.contains("requires_packed_f16_unpack(&weight)"));
     assert!(conv2d.contains("return packed_f16_conv2d(x, weight, bias, options);"));
 }

@@ -4,13 +4,8 @@ use super::attention::{AttentionKernel, PortableChunkedAttention};
 use super::norm::{DenoiserRmsNormPolicy, rms_norm_with_policy, rms_normalized_with_policy};
 use super::{DoubleStreamAttention, GqaAttention, LuminaFeedForward, RmsNormZero};
 
-#[cfg(all(
-    any(feature = "wgpu", feature = "cuda-experimental"),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::attention::NativeFlashUnitAttention;
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-use super::native_flash::NativeCudaBackend;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::native_flash::NativeWgpuBackend;
 
@@ -380,40 +375,6 @@ impl DoubleStreamBlock<NativeWgpuBackend> {
         joint_rope: (Tensor<NativeWgpuBackend, 3>, Tensor<NativeWgpuBackend, 3>),
         conditioning: Tensor<NativeWgpuBackend, 2>,
     ) -> (Tensor<NativeWgpuBackend, 3>, Tensor<NativeWgpuBackend, 3>) {
-        self.forward_with_kernel::<NativeFlashUnitAttention>(
-            image,
-            instruction,
-            image_rope,
-            joint_rope,
-            conditioning,
-        )
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl SingleStreamBlock<NativeCudaBackend> {
-    /// Apply one block using bounded-query, required native CUDA Cubek `FlashUnit` attention.
-    pub fn forward_native_cuda_flash_unit(
-        &self,
-        tokens: Tensor<NativeCudaBackend, 3>,
-        rope: Option<(Tensor<NativeCudaBackend, 3>, Tensor<NativeCudaBackend, 3>)>,
-        conditioning: Option<Tensor<NativeCudaBackend, 2>>,
-    ) -> Tensor<NativeCudaBackend, 3> {
-        self.forward_with_kernel::<NativeFlashUnitAttention>(tokens, rope, conditioning)
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl DoubleStreamBlock<NativeCudaBackend> {
-    /// Apply the dual-stream block using bounded-query, required native CUDA FlashUnit attention.
-    pub fn forward_native_cuda_flash_unit(
-        &self,
-        image: Tensor<NativeCudaBackend, 3>,
-        instruction: Tensor<NativeCudaBackend, 3>,
-        image_rope: (Tensor<NativeCudaBackend, 3>, Tensor<NativeCudaBackend, 3>),
-        joint_rope: (Tensor<NativeCudaBackend, 3>, Tensor<NativeCudaBackend, 3>),
-        conditioning: Tensor<NativeCudaBackend, 2>,
-    ) -> (Tensor<NativeCudaBackend, 3>, Tensor<NativeCudaBackend, 3>) {
         self.forward_with_kernel::<NativeFlashUnitAttention>(
             image,
             instruction,

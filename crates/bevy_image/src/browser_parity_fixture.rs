@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn browser_webgpu_vae_f32_oracle_envelope_sources_stay_synchronized_correctness() {
-        let rust = include_str!("browser_boogu.rs");
+        let rust = include_str!("browser_boogu/runtime.rs");
         let javascript_source = include_str!("../tests/wasm_browser_1k5_parity.mjs");
         assert!(javascript_source.contains("const F32_EPSILON = 2 ** -23;"));
         assert!(
@@ -1508,7 +1508,7 @@ mod tests {
         assert_eq!(javascript.matches("maximum_abs: 0.013").count(), 2);
         assert!(rust.contains("artifact_profile: \"f16-qwen-vision-f32\""));
         assert!(javascript.contains("artifact_profile: CANONICAL_PROFILE"));
-        assert!(rust.contains("BROWSER_WEBGPU_VAE_F32_ORACLE_LEGACY_FLAT_CONTENT_DIGEST"));
+        assert!(rust.contains("BROWSER_WEBGPU_VAE_F32_ORACLE_SOURCE_CONTENT_DIGEST"));
         assert!(
             javascript_source
                 .contains("5d7e25b1d9be1fdf4a6372bfb9db28cf62ef90253082cef22af09653047e3a7b")

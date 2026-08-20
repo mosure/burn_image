@@ -20,7 +20,9 @@ use burn_boogu::{
     artifacts::{
         ArtifactTensorSpec, BooguArtifactInventory, EDIT_TURBO_1K5_REVISION, EDIT_TURBO_REVISION,
         TURBO_REVISION, TensorOwner, TensorTransform, UPSTREAM_SOURCE_REVISION,
-        quantize_q8s_block32_f32, qwen_row_slice_target, qwen_streaming_stage_name,
+        q4s_storage_block_and_axis, q4s_stored_dtype, quantize_q4s_block128_f32,
+        quantize_q8s_block32_f32, quantize_row_layout_q4s_block_up_to128_f32,
+        qwen_row_slice_target, qwen_streaming_stage_name,
     },
 };
 use burn_flux_vae::AutoencoderKlConfig;
@@ -78,7 +80,7 @@ struct Args {
 enum VariantArg {
     Image01Turbo,
     Image01EditTurbo,
-    #[value(name = "image01-edit-turbo-1k5", alias = "image01-edit-turbo1k5")]
+    #[value(name = "image01-edit-turbo-1k5")]
     Image01EditTurbo1k5,
 }
 
@@ -123,6 +125,7 @@ enum ProfileArg {
     F16QwenVisionF32,
     Q8sBlock32F32,
     Q8sBlock32F32QwenVisionF32,
+    Q4sBlockUpTo128F32,
 }
 
 impl ProfileArg {
@@ -132,15 +135,17 @@ impl ProfileArg {
             Self::F16QwenVisionF32 => "f16-qwen-vision-f32",
             Self::Q8sBlock32F32 => "q8s-block32-f32",
             Self::Q8sBlock32F32QwenVisionF32 => "q8s-block32-f32-qwen-vision-f32",
+            Self::Q4sBlockUpTo128F32 => "q4s-block-up-to128-f32",
         }
     }
 
     fn numeric_format(self) -> NumericFormat {
         match self {
             Self::F16 => NumericFormat::F16,
-            Self::F16QwenVisionF32 | Self::Q8sBlock32F32 | Self::Q8sBlock32F32QwenVisionF32 => {
-                NumericFormat::Other(self.slug().to_owned())
-            }
+            Self::F16QwenVisionF32
+            | Self::Q8sBlock32F32
+            | Self::Q8sBlock32F32QwenVisionF32
+            | Self::Q4sBlockUpTo128F32 => NumericFormat::Other(self.slug().to_owned()),
         }
     }
 }
@@ -503,11 +508,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .to_owned(),
     );
     let mut manifest = ArtifactManifest {
-        // Direct imports remain dependency-free legacy candidates. The release preparation tool
-        // extracts and seals schema-v1 components, then emits the schema-v2 composition lock.
+        // Direct imports are dependency-free conversion sources. The release builder extracts and
+        // seals schema-v1 components, then emits the schema-v2 composition lock.
         schema_version: ARTIFACT_MANIFEST_SCHEMA_V1,
-        // Conversion candidates keep a descriptive identity. Only the promotion tool assigns the
-        // clean canonical id after authenticating an exact legacy production bundle.
+        // Conversion sources keep a descriptive identity. The release builder assigns the clean
+        // canonical id after authenticating the exact source bundle.
         bundle: ArtifactBundleId::new(format!("{}-{}", args.variant.slug(), args.profile.slug()))?,
         profile: ArtifactProfileId::new(args.profile.slug())?,
         model: ModelId::new(args.variant.model_id())?,
@@ -1136,7 +1141,11 @@ fn validate_shard_plan(
 
 fn stored_size_estimate(tensor: &SourceTensor, profile: ProfileArg) -> u64 {
     let elements = tensor.target_shape.iter().product::<usize>() as u64;
-    if should_quantize(tensor, profile) {
+    if profile == ProfileArg::Q4sBlockUpTo128F32
+        && let Some((block, _)) = q4s_storage_block_and_axis(tensor.owner, &tensor.target_shape)
+    {
+        elements / 2 + elements / block as u64 * 4 + 1024
+    } else if should_quantize(tensor, profile) {
         elements + elements.div_ceil(32) * 4 + 1024
     } else if should_store_f32(tensor, profile) {
         elements * 4 + 1024
@@ -1146,6 +1155,9 @@ fn stored_size_estimate(tensor: &SourceTensor, profile: ProfileArg) -> u64 {
 }
 
 fn should_quantize(tensor: &SourceTensor, profile: ProfileArg) -> bool {
+    if profile == ProfileArg::Q4sBlockUpTo128F32 {
+        return q4s_storage_block_and_axis(tensor.owner, &tensor.target_shape).is_some();
+    }
     let q8 = matches!(
         profile,
         ProfileArg::Q8sBlock32F32 | ProfileArg::Q8sBlock32F32QwenVisionF32
@@ -1180,23 +1192,40 @@ fn write_shard(
     for tensor in &shard.tensors {
         let source_data = read_tensor_bytes(tensor)?;
         let quantized = should_quantize(tensor, profile);
-        let (data, stored_dtype, stored_shape) = if quantized {
-            let (values, shape) = decode_transposed_f32(tensor, &source_data)?;
-            let data = quantize_q8s_block32_f32(values, shape.clone())?;
-            (data, "q8s-block32-f32".to_owned(), shape)
-        } else if should_store_f32(tensor, profile) {
-            (
-                convert_f32(tensor, &source_data)?,
-                "f32".to_owned(),
-                tensor.target_shape.clone(),
-            )
-        } else {
-            (
-                convert_f16(tensor, &source_data)?,
-                "f16".to_owned(),
-                tensor.target_shape.clone(),
-            )
-        };
+        let (data, stored_dtype, stored_shape) =
+            if quantized && profile == ProfileArg::Q4sBlockUpTo128F32 {
+                let data = match tensor.owner {
+                    TensorOwner::Qwen3Vl => {
+                        let (values, shape) = decode_transposed_f32(tensor, &source_data)?;
+                        quantize_q4s_block128_f32(values, shape)?
+                    }
+                    TensorOwner::BooguDenoiser => quantize_row_layout_q4s_block_up_to128_f32(
+                        convert_f32(tensor, &source_data)?,
+                    )?,
+                    TensorOwner::FluxVae => {
+                        return Err("FLUX VAE tensors are not eligible for Q4 storage".into());
+                    }
+                };
+                let stored_dtype = q4s_stored_dtype(tensor.owner, &tensor.target_shape)
+                    .ok_or("Q4 tensor has no exact storage contract")?;
+                (data, stored_dtype, tensor.target_shape.clone())
+            } else if quantized {
+                let (values, shape) = decode_transposed_f32(tensor, &source_data)?;
+                let data = quantize_q8s_block32_f32(values, shape.clone())?;
+                (data, "q8s-block32-f32".to_owned(), shape)
+            } else if should_store_f32(tensor, profile) {
+                (
+                    convert_f32(tensor, &source_data)?,
+                    "f32".to_owned(),
+                    tensor.target_shape.clone(),
+                )
+            } else {
+                (
+                    convert_f16(tensor, &source_data)?,
+                    "f16".to_owned(),
+                    tensor.target_shape.clone(),
+                )
+            };
         let stored_sha256 = Sha256Digest::calculate(data.bytes.as_ref());
         let target_name = tensor.target_name.clone();
         let id = deterministic_param_id(&format!("{}:{}", tensor.component, target_name));
@@ -1313,6 +1342,31 @@ fn validate_written_burnpack(
                 if scheme.value == QuantValue::Q8S
                     && scheme.level == QuantLevel::block([32])
                     && scheme.param == QuantParam::F32),
+            stored if stored.starts_with("q4s-block") && *quantized => {
+                let expected = match snapshot.dtype {
+                    DType::QFloat(scheme)
+                        if scheme.value == QuantValue::Q4S && scheme.param == QuantParam::F32 =>
+                    {
+                        match (scheme.level, scheme.store) {
+                            (
+                                QuantLevel::Block(block),
+                                burn::tensor::quantization::QuantStore::PackedU32(0),
+                            ) if block.len() == 1 => {
+                                format!("q4s-block{}-f32-packed-axis0", block[0])
+                            }
+                            (
+                                QuantLevel::Block(block),
+                                burn::tensor::quantization::QuantStore::PackedU32(1),
+                            ) if block.len() == 2 && block[1] == 1 => {
+                                format!("q4s-block{}x1-f32-packed-axis1", block[0])
+                            }
+                            _ => String::new(),
+                        }
+                    }
+                    _ => String::new(),
+                };
+                expected == stored
+            }
             "f16" if !quantized => snapshot.dtype == DType::F16,
             "f32" if !quantized => snapshot.dtype == DType::F32,
             _ => false,
@@ -1627,6 +1681,35 @@ mod tests {
             if scheme.param == QuantParam::F32
                 && scheme.level == QuantLevel::block([32])));
         assert_eq!(data.shape.as_slice(), &[1, 32]);
+    }
+
+    #[test]
+    fn direct_q4_profile_matches_runtime_layout_and_size_contract_correctness() {
+        let mut qwen =
+            vocabulary_source("model.language_model.layers.0.self_attn.q_proj.weight", 0);
+        qwen.target_shape = vec![256, 128];
+        assert!(should_quantize(&qwen, ProfileArg::Q4sBlockUpTo128F32));
+        assert_eq!(
+            q4s_stored_dtype(qwen.owner, &qwen.target_shape).as_deref(),
+            Some("q4s-block128-f32-packed-axis0")
+        );
+        assert_eq!(
+            stored_size_estimate(&qwen, ProfileArg::Q4sBlockUpTo128F32),
+            256 * 128 / 2 + 256 * 4 + 1024
+        );
+
+        let mut denoiser = qwen.clone();
+        denoiser.owner = TensorOwner::BooguDenoiser;
+        denoiser.target_shape = vec![64, 3360];
+        assert_eq!(
+            q4s_stored_dtype(denoiser.owner, &denoiser.target_shape).as_deref(),
+            Some("q4s-block64x1-f32-packed-axis1")
+        );
+
+        let mut vae = qwen;
+        vae.owner = TensorOwner::FluxVae;
+        assert!(!should_quantize(&vae, ProfileArg::Q4sBlockUpTo128F32));
+        assert_eq!(q4s_stored_dtype(vae.owner, &vae.target_shape), None);
     }
 
     #[test]

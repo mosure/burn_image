@@ -131,7 +131,7 @@ const CANONICAL_ARTIFACT_CONTENT_DIGEST =
   "7d81dacfedc71c50639d303c52f035813a6f4cc0125166bd7c8879c8314dd620";
 // Provenance of the schema-v1 flat closure used for the calibrated VAE envelope. This is not the
 // canonical transport identity; a successful run of this harness requalifies the modular closure.
-const LEGACY_FLAT_QUALIFIED_ARTIFACT_CONTENT_DIGEST =
+const SOURCE_BUNDLE_QUALIFIED_ARTIFACT_CONTENT_DIGEST =
   "5d7e25b1d9be1fdf4a6372bfb9db28cf62ef90253082cef22af09653047e3a7b";
 const CANONICAL_ARTIFACT_FILE_COUNT = 253;
 const CANONICAL_ARTIFACT_WEIGHT_FILE_COUNT = 223;
@@ -174,7 +174,7 @@ const BROWSER_1K5_DMD_STEP_COUNT = 4;
 const BROWSER_1K5_VAE_REFERENCE_REPEAT_COUNT = 3;
 const BROWSER_WEBGPU_VAE_F32_ORACLE_ENVELOPE = Object.freeze({
   backend: "BrowserWebGpu/raw-cubecl-no-fusion",
-  artifact_content_digest: LEGACY_FLAT_QUALIFIED_ARTIFACT_CONTENT_DIGEST,
+  artifact_content_digest: SOURCE_BUNDLE_QUALIFIED_ARTIFACT_CONTENT_DIGEST,
   artifact_profile: CANONICAL_PROFILE,
   weight_storage_dtype: "f16",
   weight_load_policy: "adapt-to-f32",

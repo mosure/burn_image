@@ -116,15 +116,12 @@ pub struct NativeHighVramPolicy {
     pub blackbox_seq_q_tiles: u8,
 }
 
-/// Backwards-compatible name for the Edit-Turbo 1.5K native policy type.
-pub type EditTurbo1k5NativePolicy = NativeHighVramPolicy;
-
 /// Parity- and performance-qualified native Turbo and Edit-Turbo 1K execution controls.
 ///
 /// The kernel, dtype, and query-chunk controls are shared by the native high- and low-VRAM
 /// production routes. `provenance_label` and retained-Qwen synchronization describe high-VRAM
 /// residency specifically; low-VRAM provenance supplies its own streamed-per-stage label.
-/// Browser, diagnostic layer-streamed, Q8, and all-F16 execution retain independent policies.
+/// Browser, Q8, and all-F16 execution retain independent policies.
 pub const BOOGU_1K_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
     provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum",
     autotune: NativeAutotunePolicy::Full,
@@ -142,7 +139,7 @@ pub const BOOGU_1K_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
 };
 
 /// Parity- and performance-qualified native Edit-Turbo 1.5K execution controls.
-pub const EDIT_TURBO_1K5_NATIVE_POLICY: EditTurbo1k5NativePolicy = NativeHighVramPolicy {
+pub const EDIT_TURBO_1K5_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
     provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum",
     autotune: NativeAutotunePolicy::Full,
     denoiser_attention: NativeDenoiserAttentionPolicy::PaddedBlackbox,

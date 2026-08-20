@@ -15,7 +15,7 @@ use std::{
 };
 
 use burn_boogu::artifacts::{
-    artifact_bundle_id_is_compatible, canonical_published_bundle,
+    artifact_bundle_id_matches_selection, canonical_published_bundle,
     validate_canonical_release_artifact_digest,
 };
 use burn_boogu::{BooguVariant, artifacts::BooguStorageProfile, boogu_model_descriptor};
@@ -28,8 +28,8 @@ use burn_image::{
 use thiserror::Error;
 
 use crate::{
-    BOOGU_CDN_ROOT, MAX_BROWSER_MANIFEST_BYTES, boogu_bundle_id, boogu_legacy_bundle_id,
-    boogu_profile_slug, sibling_bundle_base_url,
+    BOOGU_CDN_ROOT, MAX_BROWSER_MANIFEST_BYTES, boogu_bundle_id, boogu_profile_slug,
+    boogu_source_bundle_id, sibling_bundle_base_url,
 };
 
 const QWEN_DEPENDENCY_ROLE: &str = "qwen";
@@ -63,9 +63,9 @@ impl NativeArtifactCacheError {
 
 /// Exact local roots used to assemble one Boogu runtime.
 ///
-/// Legacy monolithic schema-v1 bundles point all three roots at the same
-/// directory. Schema-v2 compositions keep independently sealed Qwen and VAE
-/// bundles in digest-isolated cache directories.
+/// Standalone schema-v1 bundles point all three roots at the same directory. Schema-v2
+/// compositions keep independently sealed Qwen and VAE bundles in digest-isolated cache
+/// directories.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedNativeBooguArtifactDirectories {
     pipeline_root: PathBuf,
@@ -86,11 +86,11 @@ impl ResolvedNativeBooguArtifactDirectories {
         &self.vae_root
     }
 
-    pub fn is_legacy_monolith(&self) -> bool {
+    pub fn is_standalone(&self) -> bool {
         self.pipeline_root == self.qwen_root && self.pipeline_root == self.vae_root
     }
 
-    fn legacy(root: PathBuf) -> Self {
+    fn standalone(root: PathBuf) -> Self {
         Self {
             pipeline_root: root.clone(),
             qwen_root: root.clone(),
@@ -132,7 +132,7 @@ fn canonical_native_boogu_model_base_url(
 ///
 /// `BURN_IMAGE_CACHE_DIR` replaces the broad `~/.burn_image` root;
 /// `BURN_IMAGE_MODEL_CACHE_DIR` replaces the final bundle directory.
-/// A custom remote source is isolated under the legacy tuple identity unless the exact-directory
+/// A custom remote source is isolated under the standalone source tuple unless the exact-directory
 /// override is set, so it cannot reuse or populate the canonical production cache by accident.
 pub fn default_native_boogu_model_cache_root(
     variant: BooguVariant,
@@ -176,7 +176,7 @@ fn native_boogu_model_cache_root_under(
     let cache_key = if canonical_source {
         boogu_bundle_id(variant, profile)
     } else {
-        boogu_legacy_bundle_id(variant, profile)
+        boogu_source_bundle_id(variant, profile)
     };
     broad_root
         .join(DEFAULT_BURN_IMAGE_MODEL_CACHE_SUBDIR)
@@ -402,10 +402,10 @@ where
     let (manifest, _) = read_expected_manifest(&manifest_path, variant, profile, false)?;
     let Some((qwen, vae)) = required_component_dependencies(&manifest)? else {
         progress(&format!(
-            "using legacy monolithic artifact directory {}",
+            "using standalone artifact directory {}",
             pipeline_root.display()
         ));
-        return Ok(ResolvedNativeBooguArtifactDirectories::legacy(
+        return Ok(ResolvedNativeBooguArtifactDirectories::standalone(
             pipeline_root,
         ));
     };
@@ -434,8 +434,8 @@ where
     F: Fn(&str),
 {
     let Some((qwen, vae)) = required_component_dependencies(manifest)? else {
-        progress("resolved legacy monolithic remote bundle");
-        return Ok(ResolvedNativeBooguArtifactDirectories::legacy(
+        progress("resolved standalone remote bundle");
+        return Ok(ResolvedNativeBooguArtifactDirectories::standalone(
             pipeline_cache_root.to_owned(),
         ));
     };
@@ -727,14 +727,14 @@ fn parse_expected_manifest(
     })?;
 
     let expected_bundle = boogu_bundle_id(variant, profile);
-    let legacy_bundle = boogu_legacy_bundle_id(variant, profile);
+    let source_bundle = boogu_source_bundle_id(variant, profile);
     let expected_profile = boogu_profile_slug(profile);
     let descriptor = boogu_model_descriptor(variant);
     let expected_numeric = numeric_format(profile);
     let bundle_matches = if require_canonical_digest {
         manifest.bundle.as_str() == expected_bundle
     } else {
-        artifact_bundle_id_is_compatible(variant, profile, manifest.bundle.as_str())
+        artifact_bundle_id_matches_selection(variant, profile, manifest.bundle.as_str())
     };
     if !bundle_matches
         || manifest.profile.as_str() != expected_profile
@@ -743,7 +743,7 @@ fn parse_expected_manifest(
         || manifest.numeric_format != expected_numeric
     {
         return Err(NativeArtifactCacheError::message(format!(
-            "model manifest identity mismatch: expected bundle={expected_bundle} (explicit sources may also use legacy {legacy_bundle}), profile={expected_profile}, model={}, revision={}, numeric={expected_numeric:?}; found bundle={}, profile={}, model={}, revision={}, numeric={:?}",
+            "model manifest identity mismatch: expected bundle={expected_bundle} (an explicit local conversion source may use {source_bundle}), profile={expected_profile}, model={}, revision={}, numeric={expected_numeric:?}; found bundle={}, profile={}, model={}, revision={}, numeric={:?}",
             descriptor.id,
             descriptor.revision,
             manifest.bundle,
@@ -1266,6 +1266,9 @@ fn numeric_format(profile: BooguStorageProfile) -> NumericFormat {
         BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => {
             NumericFormat::Other("q8s-block32-f32-qwen-vision-f32".into())
         }
+        BooguStorageProfile::Q4sBlockUpTo128F32 => {
+            NumericFormat::Other("q4s-block-up-to128-f32".into())
+        }
     }
 }
 
@@ -1386,13 +1389,14 @@ mod tests {
         payload: &[u8],
     ) -> ArtifactManifest {
         use burn_image::{
-            ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
-            ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY, ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY,
-            ARTIFACT_TRANSPORT_LAYOUT_PATH, ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY,
-            ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
-            ARTIFACT_TRANSPORT_MAX_PART_BYTES, ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY,
-            ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY, ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
-            ArtifactTransportLayout, ArtifactTransportObject, ArtifactTransportPart,
+            ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY,
+            ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY,
+            ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY, ARTIFACT_TRANSPORT_LAYOUT_PATH,
+            ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY,
+            ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION, ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+            ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY, ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY,
+            ARTIFACT_TRANSPORT_TARGET_PART_BYTES, ArtifactTransportLayout, ArtifactTransportObject,
+            ArtifactTransportPart,
         };
 
         let logical_path = ArtifactPath::new("objects/tiny.bpk").unwrap();
@@ -1446,7 +1450,7 @@ mod tests {
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
             (
-                ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+                ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY.into(),
                 ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
             ),
         ]);
@@ -1491,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_source_accepts_legacy_descriptive_bundle_identity_correctness() {
+    fn explicit_source_accepts_standalone_bundle_identity_correctness() {
         let temp = tempfile::tempdir().unwrap();
         let variant = BooguVariant::Image01Turbo;
         let profile = BooguStorageProfile::F16QwenVisionF32;
@@ -1499,7 +1503,7 @@ mod tests {
             temp.path(),
             variant,
             profile,
-            boogu_legacy_bundle_id(variant, profile),
+            boogu_source_bundle_id(variant, profile),
         );
         let bytes = fs::read(temp.path().join("manifest.json")).unwrap();
 
@@ -1516,7 +1520,9 @@ mod tests {
             "{error}"
         );
         assert!(
-            error.contains("expected bundle=boogu-image-0.1-turbo (explicit sources"),
+            error.contains(
+                "expected bundle=boogu-image-0.1-turbo (an explicit local conversion source may use"
+            ),
             "{error}"
         );
     }
@@ -1542,6 +1548,15 @@ mod tests {
         assert_eq!(
             base.as_str(),
             "https://aberration.technology/model/boogu-image-0.1-edit-turbo-1k5"
+        );
+        assert_eq!(
+            canonical_native_boogu_model_base_url(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            )
+            .unwrap()
+            .as_str(),
+            "https://aberration.technology/model/boogu-image-0.1-turbo-q4s-block-up-to128-f32"
         );
         assert!(
             canonical_native_boogu_model_base_url(
@@ -1696,7 +1711,7 @@ mod tests {
         assert_eq!(resolved.pipeline_root(), pipeline_root);
         assert_eq!(resolved.qwen_root(), parent.join("shared-qwen"));
         assert_eq!(resolved.vae_root(), parent.join("shared-vae"));
-        assert!(!resolved.is_legacy_monolith());
+        assert!(!resolved.is_standalone());
     }
 
     #[test]
@@ -1754,14 +1769,14 @@ mod tests {
     }
 
     #[test]
-    fn local_schema_v1_monolith_preserves_legacy_roots_correctness() {
+    fn local_standalone_schema_v1_uses_one_root_correctness() {
         let temp = tempfile::tempdir().unwrap();
         let variant = BooguVariant::Image01Turbo;
         let profile = BooguStorageProfile::F16QwenVisionF32;
         write_tiny_remote(temp.path(), variant, profile);
         let resolved =
             resolve_local_composition(variant, profile, temp.path().to_owned(), &|_| {}).unwrap();
-        assert!(resolved.is_legacy_monolith());
+        assert!(resolved.is_standalone());
         assert_eq!(resolved.pipeline_root(), temp.path());
         assert_eq!(resolved.qwen_root(), temp.path());
         assert_eq!(resolved.vae_root(), temp.path());

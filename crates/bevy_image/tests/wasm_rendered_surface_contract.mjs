@@ -17,6 +17,19 @@ export const BROWSER_WEBGPU_ENABLED_FEATURE_BASELINE = Object.freeze([
 export const TURBO_MODEL_ID = "Boogu/Boogu-Image-0.1-Turbo";
 export const TURBO_PRODUCTION_CONTENT_DIGEST =
   "32b2f0a972d7c00e4bc914f949dcf15195c10c428be456330a168a556576138a";
+export const TURBO_Q4_PRODUCTION_CONTENT_DIGEST =
+  "012237fb5e14c52188632ea220c043e5a9d59eaa243970100e7db35048942081";
+export const TURBO_Q4_QWEN_COMPONENT_CONTENT_DIGEST =
+  "d3e332ebd710d87fa6a2ae97eef3302f5c9f5e7d3f4e27675f0c4c4f5a31c5de";
+export const TURBO_Q4_VAE_COMPONENT_CONTENT_DIGEST =
+  "fcd840d188556b3f8aa3f5ffd240a240ac94420285a4c47676104dead5183a52";
+export const TURBO_Q4_RESIDENT_BACKEND =
+  "burn-webgpu/browser-resident-packed-q4s-block-up-to-128/request-scoped-surface-acquire-suspended";
+export const TURBO_Q4_RESIDENT_WEIGHT_TRAFFIC_CONTRACT =
+  "eager-preload/qwen+vae+denoiser/resident-q4s-matrices+embedding+packed-f16-convolutions+f32-auxiliaries/zero-inference-artifact-transfers/no-model-unload";
+export const TURBO_Q4_RESIDENT_MULTI_REQUEST_POLICY =
+  "same-page/same-engine/two-request/resident-q4s/exact-cache-audit/zero-request-artifact-io/rendered-bevy-surface-gated";
+export const TURBO_Q4_STRICT_DEVICE_BYTES_EXCLUSIVE = 16_000_000_000;
 export const LOW_VRAM_PUBLIC_SELECTOR =
   "low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser";
 export const LOW_VRAM_BACKEND =
@@ -47,12 +60,14 @@ export const TURBO_RENDERED_ORDINARY_SMOKE_TEST =
   "burn_image_browser_rendered_turbo_1024_smoke";
 export const TURBO_RENDERED_ORDINARY_MULTI_REQUEST_TEST =
   "burn_image_browser_rendered_turbo_1024_multi_request_qualification";
+export const TURBO_RENDERED_Q4_RESIDENT_MULTI_REQUEST_TEST =
+  "burn_image_browser_rendered_turbo_q4_1024_resident_multi_request_qualification";
 export const TURBO_RENDERED_SERIALIZED_DIAGNOSTIC_TEST =
   "burn_image_browser_rendered_turbo_1024_qwen_block0_serialized_diagnostic";
 export const TURBO_RENDERED_SERIALIZED_MULTI_REQUEST_DIAGNOSTIC_TEST =
   "burn_image_browser_rendered_turbo_1024_multi_request_qwen_block0_serialized_diagnostic";
 export const TURBO_LOW_VRAM_WEIGHT_TRAFFIC_CONTRACT =
-  "persistent-part-cache+legacy-range-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage";
+  "persistent-transport-part-cache/qwen+vae+packed-f16-denoiser-rehydrated-before-each-request/zero-dmd-artifact-transfers/zero-repeat-network-required/request-scoped-packed-cache-evicted-before-vae/dense-f32-materialized-per-semantic-stage";
 export const TURBO_PACKED_F16_CACHED_STAGES = 46;
 export const TURBO_PACKED_F16_CACHED_OBJECTS = 106;
 export const TURBO_PACKED_F16_CACHED_TENSORS = 912;
@@ -286,6 +301,7 @@ export const TURBO_PACKED_F16_QWEN_HOST_EMBEDDING_PLAN = Object.freeze({
 export function renderedSurfaceReportIdentity({
   modelMode,
   multiRequestModelMode,
+  q4ResidentMode = false,
   qwenBlock0ExecutionMode,
   ok,
 }) {
@@ -305,6 +321,17 @@ export function renderedSurfaceReportIdentity({
     ].includes(qwenBlock0ExecutionMode)
   ) {
     throw new Error(`unknown rendered Turbo Qwen block-0 execution mode ${qwenBlock0ExecutionMode}`);
+  }
+  if (q4ResidentMode) {
+    if (!multiRequestModelMode) {
+      throw new Error("rendered resident-Q4 qualification requires two requests");
+    }
+    return {
+      test: TURBO_RENDERED_Q4_RESIDENT_MULTI_REQUEST_TEST,
+      claim: ok
+        ? "same-page same-engine two-request rendered Bevy UI Turbo 1024 resident-Q4 warm-session qualification; not numerical parity"
+        : "failed rendered resident-Q4 warm-session attempt; no model-smoke or numerical-parity claim",
+    };
   }
   if (qwenBlock0ExecutionMode === TURBO_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE) {
     return {
@@ -1693,7 +1720,7 @@ export function validateTestedPackageIdentity(identity, servedTransport) {
     [
       "sources.browser_runtime",
       identity.sources?.browser_runtime,
-      "crates/bevy_image/src/browser_boogu.rs",
+      "crates/bevy_image/src/browser_boogu/runtime.rs",
     ],
     [
       "sources.rendered_harness",
@@ -3192,14 +3219,6 @@ export function validateTurbo1024ModelEvidence(evidence) {
   } else {
     const failed = runtimeEvents.filter((event) => event?.event === "failed");
     if (failed.length > 0) failures.push(`browser model runtime failed: ${report(failed)}`);
-    const retiredPolicyEvents = runtimeEvents.filter((event) =>
-      ["low_vram_resource_plan", "denoiser_preload"].includes(event?.event),
-    );
-    if (retiredPolicyEvents.length > 0) {
-      failures.push(
-        `Turbo runtime emitted retired Q8-policy events: ${report(retiredPolicyEvents)}`,
-      );
-    }
     const ready = runtimeEvents.find(
       (event) => event?.event === "ready" && event?.model === TURBO_MODEL_ID,
     );
@@ -3227,15 +3246,6 @@ export function validateTurbo1024ModelEvidence(evidence) {
       );
     } else {
       const plan = plans[0];
-      for (const retiredField of [
-        "denoiser_quantized_load_policy",
-        "denoiser_runtime_q8_scope",
-        "denoiser_quantized_linear_execution_policy",
-      ]) {
-        if (Object.hasOwn(plan, retiredField)) {
-          failures.push(`packed-F16 plan exposes retired field ${retiredField}`);
-        }
-      }
       for (const [field, expected] of Object.entries(TURBO_PACKED_F16_RESOURCE_PLAN)) {
         if (plan[field] !== expected) {
           failures.push(
@@ -4289,6 +4299,235 @@ function validateSecondRequestInteraction(interaction, fixedPrompt, request, pre
   }
   if (interaction?.save_clicked_via_cdp !== true) {
     failures.push("second request did not click ordinary Save PNG through CDP");
+  }
+  return failures;
+}
+
+function validateTurboQ4OutputCore(output, label) {
+  const failures = [];
+  if (!output || typeof output !== "object") return [`${label} output-ready evidence is missing`];
+  if (output.event !== "ready") failures.push(`${label} output-ready event is absent`);
+  if (!isCanonicalU64DecimalString(output.job_id)) {
+    failures.push(`${label} output-ready job ID is not a canonical u64 decimal string`);
+  }
+  if (output.model !== TURBO_MODEL_ID) failures.push(`${label} output-ready model is not Turbo`);
+  if (output.width !== 1024 || output.height !== 1024) {
+    failures.push(`${label} output-ready dimensions are not 1024x1024`);
+  }
+  if (output.backend !== TURBO_Q4_RESIDENT_BACKEND) {
+    failures.push(`${label} output-ready backend is not the exact resident-Q4 surface-gated policy`);
+  }
+  if (output.artifacts_verified !== true) failures.push(`${label} output-ready artifacts are unverified`);
+  if (output.artifact_content_digest !== TURBO_Q4_PRODUCTION_CONTENT_DIGEST) {
+    failures.push(`${label} output-ready artifact digest is not canonical resident Q4`);
+  }
+  if (output.numeric_format !== "q4s-block-up-to128-f32") {
+    failures.push(`${label} output-ready numeric format is not the resident-Q4 identity`);
+  }
+  return failures;
+}
+
+function validateResidentQ4ZeroCdpNetwork(cdp, label) {
+  const failures = [];
+  if (!cdp || typeof cdp !== "object") return [`${label} CDP network evidence is missing`];
+  if (!Array.isArray(cdp.model_base_urls) || cdp.model_base_urls.length !== 1) {
+    failures.push(`${label} CDP evidence does not bind one exact Q4 bundle base`);
+  }
+  for (const field of [
+    "model_response_count",
+    "http_200_complete_part_response_count",
+    "http_206_response_count",
+    "complete_object_validated_response_count",
+    "content_range_validated_response_count",
+    "response_body_bytes",
+    "unexpected_status_response_count",
+    "missing_content_length_count",
+    "invalid_content_range_response_count",
+  ]) {
+    if (cdp[field] !== 0) {
+      failures.push(`${label} CDP ${field}=${report(cdp[field])}, expected 0`);
+    }
+  }
+  return failures;
+}
+
+function validateResidentQ4CacheAudits(request, label) {
+  const failures = [];
+  const audits = (request?.runtime_events ?? []).filter(
+    (event) => event?.event === "resident_cache_audit",
+  );
+  if (audits.length !== 2 || audits[0]?.boundary !== "before-request" || audits[1]?.boundary !== "after-request") {
+    return [`${label} does not contain the exact before/after resident-cache audit pair`];
+  }
+  const runStarted = request?.progress_events?.find((event) => event?.event === "run_started");
+  for (const [index, audit] of audits.entries()) {
+    if (JSON.stringify(audit.run_id) !== JSON.stringify(runStarted?.run_id)) {
+      failures.push(`${label} cache audit ${index + 1} run ID differs from run_started`);
+    }
+    for (const [cached, expected, exactExpected] of [
+      ["qwen_cached_stages", "qwen_expected_stages", 43],
+      ["vae_cached_stages", "vae_expected_stages", 1],
+      ["denoiser_cached_stages", "denoiser_expected_stages", 46],
+    ]) {
+      if (audit?.[cached] !== exactExpected || audit?.[expected] !== exactExpected) {
+        failures.push(
+          `${label} cache audit ${index + 1} ${cached}/${expected}=${report(audit?.[cached])}/${report(audit?.[expected])}, expected ${exactExpected}/${exactExpected}`,
+        );
+      }
+    }
+    if (
+      audit?.qwen_synchronization_pending !== false ||
+      audit?.denoiser_synchronization_pending !== false ||
+      audit?.resident_weights_preserved !== true
+    ) {
+      failures.push(`${label} cache audit ${index + 1} does not attest synchronized resident weights`);
+    }
+  }
+  return failures;
+}
+
+/** Validate two real rendered Bevy requests with one warm resident-Q4 WebGPU engine. */
+export function validateTurboQ4ResidentMultiRequestEvidence(evidence) {
+  const failures = [];
+  if (!evidence || typeof evidence !== "object") return ["resident-Q4 multi-request evidence is missing"];
+  if (evidence.policy !== TURBO_Q4_RESIDENT_MULTI_REQUEST_POLICY) {
+    failures.push("resident-Q4 multi-request policy is incorrect");
+  }
+  if (evidence.request_count !== 2 || !Array.isArray(evidence.requests) || evidence.requests.length !== 2) {
+    return [...failures, "resident-Q4 qualification does not contain exactly two requests"];
+  }
+  if (!/^[0-9a-f-]{16,}$/i.test(String(evidence.engine_session_id ?? ""))) {
+    failures.push("resident-Q4 same-engine page session identity is missing");
+  }
+  failures.push(
+    ...validateRenderedRuntimeWebGpuEvidence(
+      evidence.bevy_backend_ready,
+      evidence.runtime_webgpu_calls,
+      evidence.engine_session_id,
+      evidence.runtime_webgpu_dropped_calls,
+      evidence.runtime_webgpu_adapter_attestation,
+      BOOGU_WEB_REQUIRED_DEVICE_FEATURES,
+    ).map((failure) => `same-engine WebGPU attestation: ${failure}`),
+  );
+
+  const initial = Array.isArray(evidence.initial_runtime_events)
+    ? evidence.initial_runtime_events
+    : [];
+  const plans = initial.filter((event) => event?.event === "resident_resource_plan");
+  const ready = initial.filter(
+    (event) => event?.event === "ready" && event?.model === TURBO_MODEL_ID,
+  );
+  const preflight = initial.filter((event) => event?.event === "vram_preflight");
+  if (
+    plans.length !== 1 ||
+    plans[0]?.weight_storage_policy !==
+      "packed-q4s-block-up-to-128/f32-scales/packed-f16-convolutions/f32-auxiliaries" ||
+    !positiveInteger(plans[0]?.resident_weight_bytes) ||
+    plans[0]?.strict_device_cap_bytes !== TURBO_Q4_STRICT_DEVICE_BYTES_EXCLUSIVE ||
+    !positiveInteger(plans[0]?.conservative_planned_device_bytes) ||
+    plans[0].conservative_planned_device_bytes >= TURBO_Q4_STRICT_DEVICE_BYTES_EXCLUSIVE
+  ) {
+    failures.push("initial runtime partition does not contain one valid sub-16GB resident-Q4 resource plan");
+  }
+  if (
+    ready.length !== 1 ||
+    ready[0]?.request_enabled !== true ||
+    ready[0]?.selected_model_cache_complete !== true ||
+    ready[0]?.selected_model_device_resident !== true
+  ) {
+    failures.push("initial runtime partition does not attest a complete device-resident Q4 model");
+  }
+  if (
+    preflight.length !== 2 ||
+    preflight[0]?.status !== "started" ||
+    preflight[1]?.status !== "passed" ||
+    preflight[1]?.allocations_committed !== true ||
+    preflight[1]?.shared_device_and_queue !== true ||
+    preflight[1]?.required_device_bytes !== plans[0]?.conservative_planned_device_bytes
+  ) {
+    failures.push("resident-Q4 VRAM preflight did not commit the exact conservative plan before download");
+  }
+
+  const aggregateGpu = evidence.native_gpu_attestation;
+  if (
+    aggregateGpu?.provider !== "nvidia-smi" ||
+    aggregateGpu?.validated !== true ||
+    !positiveInteger(aggregateGpu?.observed_peak_aggregate_framebuffer_bytes) ||
+    aggregateGpu.observed_peak_aggregate_framebuffer_bytes >= TURBO_Q4_STRICT_DEVICE_BYTES_EXCLUSIVE
+  ) {
+    failures.push("aggregate resident-Q4 GPU evidence is absent, invalid, or not below 16GB");
+  }
+
+  const allAudits = [];
+  for (const [index, request] of evidence.requests.entries()) {
+    const label = `request ${index + 1}`;
+    if (request?.request_ordinal !== index + 1) failures.push(`${label} ordinal is incorrect`);
+    if (
+      request?.page_identity?.engine_session_id !== evidence.engine_session_id ||
+      request?.page_identity?.url !== evidence.page_url ||
+      request?.page_identity?.time_origin_epoch_ms !== evidence.time_origin_epoch_ms
+    ) {
+      failures.push(`${label} is not bound to the same page/runtime identity`);
+    }
+    failures.push(...validateRequestScopedSurfaceGate(request, label));
+    failures.push(...validateRequestDmdProgress(request?.progress_events, label));
+    failures.push(...validateTurboQ4OutputCore(request?.output_ready, label));
+    failures.push(...validateProductionPngDownload(request?.downloaded_png, label));
+    failures.push(...validateRequestGpuWindow(request?.native_gpu_attestation, request?.request_epoch_window, label));
+    if (
+      request?.native_gpu_attestation?.observed_peak_aggregate_framebuffer_bytes >=
+      TURBO_Q4_STRICT_DEVICE_BYTES_EXCLUSIVE
+    ) {
+      failures.push(`${label} GPU request-window peak is not below 16GB`);
+    }
+    failures.push(...validateExactArtifactTraffic(request?.artifact_traffic, TURBO_DMD_ZERO_IO, `${label} resident request`));
+    failures.push(...validateResidentQ4ZeroCdpNetwork(request?.cdp_network_traffic, `${label} request`));
+    failures.push(...validateResidentQ4ZeroCdpNetwork(request?.cdp_dmd_network_traffic, `${label} DMD`));
+    failures.push(...validateResidentQ4CacheAudits(request, label));
+    allAudits.push(
+      ...(request?.runtime_events ?? []).filter(
+        (event) => event?.event === "resident_cache_audit",
+      ),
+    );
+    if ((request?.runtime_events ?? []).some((event) => event?.event === "packed_f16_denoiser_preload")) {
+      failures.push(`${label} unexpectedly used request-scoped packed-F16 rehydration`);
+    }
+    if (!positiveInteger(request?.canvas_png_changed_bytes)) {
+      failures.push(`${label} did not materially change the rendered canvas`);
+    }
+  }
+  if (
+    allAudits.length !== 4 ||
+    allAudits.some(
+      (audit) =>
+        audit.qwen_cached_stages !== 43 ||
+        audit.vae_cached_stages !== 1 ||
+        audit.denoiser_cached_stages !== 46,
+    )
+  ) {
+    failures.push("resident-Q4 cache cardinality changed across the two requests");
+  }
+  const [first, second] = evidence.requests;
+  failures.push(...validateSecondRequestInteraction(second?.interaction, evidence.fixed_ascii_prompt, second, first));
+  if (
+    first?.output_ready?.job_id === second?.output_ready?.job_id ||
+    first?.downloaded_png?.sha256 === second?.downloaded_png?.sha256
+  ) {
+    failures.push("resident-Q4 requests did not produce distinct jobs and PNG outputs");
+  }
+  const transport = first?.modular_artifact_transport;
+  const transportDigests = new Set(
+    (transport?.bundles ?? []).map((bundle) => bundle?.content_digest),
+  );
+  if (
+    transport?.validated !== true ||
+    transport?.bundles?.length !== 3 ||
+    !transportDigests.has(TURBO_Q4_PRODUCTION_CONTENT_DIGEST) ||
+    !transportDigests.has(TURBO_Q4_QWEN_COMPONENT_CONTENT_DIGEST) ||
+    !transportDigests.has(TURBO_Q4_VAE_COMPONENT_CONTENT_DIGEST) ||
+    transport.maximum_physical_transport_part_bytes > ARTIFACT_TRANSPORT_HARD_MAX_PART_BYTES
+  ) {
+    failures.push("resident-Q4 request is not bound to the exact three-bundle modular transport closure");
   }
   return failures;
 }

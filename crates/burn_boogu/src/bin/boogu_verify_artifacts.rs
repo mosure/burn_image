@@ -8,7 +8,7 @@ use std::{
 };
 
 use burn_boogu::artifacts::{
-    BooguStorageProfile, VerifiedArtifactDirectory, promotable_legacy_artifact_digest,
+    BooguStorageProfile, VerifiedArtifactDirectory, release_source_artifact_digest,
     validate_canonical_release_artifact_digest, validate_edit_turbo_1k5_release_artifact_digest,
     verify_modular_release_artifact_directories, verify_published_release_artifact_directory,
     verify_release_artifact_directory,
@@ -36,7 +36,7 @@ struct Args {
             "artifacts",
             "require_edit_turbo_1k5_release",
             "require_published_release",
-            "require_legacy_flat_parity_release"
+            "require_source_release"
         ]
     )]
     manifest_only: Option<PathBuf>,
@@ -46,12 +46,12 @@ struct Args {
     /// Require the exact mixed-F16 artifact digest qualified for Edit-Turbo 1.5K.
     #[arg(long, default_value_t = false)]
     require_edit_turbo_1k5_release: bool,
-    /// Require the exact pinned digest for one of the three canonical production bundles.
+    /// Require the exact pinned digest for a canonical production bundle.
     #[arg(long, default_value_t = false)]
     require_published_release: bool,
-    /// Require the exact legacy schema-v1 flat digest consumed by native parity binaries.
+    /// Require the exact dependency-free conversion source consumed by parity binaries.
     #[arg(long, default_value_t = false)]
-    require_legacy_flat_parity_release: bool,
+    require_source_release: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,7 +86,7 @@ struct VerificationReport {
     component_contracts_verified: bool,
     reconstructed_inventory_verified: bool,
     published_release_verified: bool,
-    legacy_flat_parity_release_verified: bool,
+    source_release_verified: bool,
     semantic_contract_verified: bool,
     artifacts_verified: bool,
 }
@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .expect("clap requires --artifacts unless --manifest-only is selected"),
         args.require_edit_turbo_1k5_release,
         args.require_published_release,
-        args.require_legacy_flat_parity_release,
+        args.require_source_release,
     )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
@@ -208,11 +208,11 @@ fn verify_artifact_directory(
     root: &Path,
     require_edit_turbo_1k5_release: bool,
     require_published_release: bool,
-    require_legacy_flat_parity_release: bool,
+    require_source_release: bool,
 ) -> Result<VerificationReport, Box<dyn Error>> {
-    if require_published_release && require_legacy_flat_parity_release {
+    if require_published_release && require_source_release {
         return Err(
-            "canonical modular publication and legacy flat parity are distinct artifact contracts"
+            "canonical publication and conversion-source verification are distinct artifact contracts"
                 .into(),
         );
     }
@@ -222,8 +222,8 @@ fn verify_artifact_directory(
         .content_digest
         .expect("a verified sealed manifest has a digest");
     let modular = !manifest.dependencies.is_empty();
-    if modular && require_legacy_flat_parity_release {
-        return Err("legacy flat parity verification rejects dependency-composed artifacts".into());
+    if modular && require_source_release {
+        return Err("source verification rejects dependency-composed artifacts".into());
     }
     let (
         verified_files,
@@ -286,12 +286,8 @@ fn verify_artifact_directory(
         } else {
             verify_release_artifact_directory(root)?
         };
-        if require_legacy_flat_parity_release {
-            validate_legacy_flat_parity_release_digest(
-                semantic.variant,
-                semantic.profile,
-                content_digest,
-            )?;
+        if require_source_release {
+            validate_source_release_digest(semantic.variant, semantic.profile, content_digest)?;
         }
         (
             semantic.verified_files,
@@ -341,7 +337,7 @@ fn verify_artifact_directory(
         component_contracts_verified,
         reconstructed_inventory_verified,
         published_release_verified: require_published_release,
-        legacy_flat_parity_release_verified: require_legacy_flat_parity_release,
+        source_release_verified: require_source_release,
         semantic_contract_verified: true,
         artifacts_verified: true,
     })
@@ -550,20 +546,18 @@ impl TransportVerificationStats {
     }
 }
 
-fn validate_legacy_flat_parity_release_digest(
+fn validate_source_release_digest(
     variant: BooguVariant,
     profile: BooguStorageProfile,
     actual: Sha256Digest,
 ) -> Result<(), Box<dyn Error>> {
-    let expected = promotable_legacy_artifact_digest(variant, profile).ok_or_else(|| {
-        format!(
-            "{variant:?}/{profile:?} has no exact legacy flat artifact qualified for native parity"
-        )
+    let expected = release_source_artifact_digest(variant, profile).ok_or_else(|| {
+        format!("{variant:?}/{profile:?} has no exact conversion source qualified for parity")
     })?;
     let actual = actual.to_string();
     if actual != expected {
         return Err(format!(
-            "legacy flat parity artifact for {variant:?}/{profile:?} requires sealed digest {expected}, found {actual}"
+            "conversion source for {variant:?}/{profile:?} requires sealed digest {expected}, found {actual}"
         )
         .into());
     }
@@ -586,14 +580,14 @@ mod tests {
     use burn_boogu::{
         artifacts::{
             BooguStorageProfile, EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
-            LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
+            SOURCE_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST,
         },
         config::BooguVariant,
     };
 
     use super::{
-        Args, VerifiedArtifactDirectory, validate_legacy_flat_parity_release_digest,
-        verify_artifact_directory, verify_manifest_only, verify_transport_payloads,
+        Args, VerifiedArtifactDirectory, validate_source_release_digest, verify_artifact_directory,
+        verify_manifest_only, verify_transport_payloads,
     };
     use clap::Parser;
 
@@ -820,18 +814,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_flat_parity_digest_is_distinct_from_canonical_composition_correctness() {
+    fn source_digest_is_distinct_from_canonical_composition_correctness() {
         let variant = BooguVariant::Image01EditTurbo1k5;
         let profile = BooguStorageProfile::F16QwenVisionF32;
-        let legacy =
-            Sha256Digest::from_hex(LEGACY_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
+        let source =
+            Sha256Digest::from_hex(SOURCE_EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST)
                 .unwrap();
-        validate_legacy_flat_parity_release_digest(variant, profile, legacy).unwrap();
+        validate_source_release_digest(variant, profile, source).unwrap();
 
         let canonical =
             Sha256Digest::from_hex(EDIT_TURBO_1K5_F16_QWEN_VISION_F32_CONTENT_DIGEST).unwrap();
-        let error =
-            validate_legacy_flat_parity_release_digest(variant, profile, canonical).unwrap_err();
+        let error = validate_source_release_digest(variant, profile, canonical).unwrap_err();
         assert!(error.to_string().contains("requires sealed digest"));
     }
 

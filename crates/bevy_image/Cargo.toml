@@ -45,8 +45,8 @@ native-io = ["dep:rfd"]
 # Concrete native/browser implementations are selected by boogu-native/boogu-web;
 # the injection seam remains available to embedders.
 boogu = ["gpu-interop", "dep:burn_boogu", "burn_boogu/burnpack"]
-# Concrete native GPU-resident loader/worker for sealed bundles, with an explicit local-only
-# layer-streamed diagnostic. The asynchronous range-loaded browser runtime remains separate.
+# Concrete native GPU-resident loader/worker for sealed bundles. The asynchronous range-loaded
+# browser runtime remains separate.
 boogu-native = [
   "app",
   "boogu",
@@ -68,9 +68,9 @@ native-autotune = [
   "burn_boogu/autotune",
   "burn-wgpu/autotune",
 ]
-# Concrete browser-local runtime over bounded HTTP Range readers and asynchronous semantic
-# Qwen/VAE/denoiser sources. Production defaults to the bounded low-VRAM policy; explicit resident
-# mode eagerly retains dense-F32 WebGPU stages. Layer streaming remains diagnostic-only.
+# Concrete browser-local adapter over bounded HTTP Range readers and asynchronous semantic
+# Qwen/VAE/denoiser sources. Ordinary Turbo defaults to the resident direct-Q4 policy; Edit keeps
+# its qualified mixed-F16 policy. Bounded request streaming supports lower-memory devices.
 boogu-web = [
   "web",
   "boogu",

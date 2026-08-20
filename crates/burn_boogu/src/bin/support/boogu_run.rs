@@ -348,10 +348,6 @@ struct Args {
     /// every value is benchmarked with every selected denoiser query chunk in one process.
     #[arg(long, value_delimiter = ',')]
     benchmark_blackbox_seq_kv_tiles: Vec<u8>,
-    /// Permit a diagnostic 1.5K policy other than the released full-autotune p4/kv1/q1 mixed-F16
-    /// configuration. Such a run is reported as experimental and is not support evidence.
-    #[arg(long, default_value_t = false)]
-    allow_unvalidated_1k5_policy: bool,
 }
 
 pub(crate) trait RunnerDenoiser<B: burn::prelude::Backend>: DmdDenoiser<B> {
@@ -490,29 +486,6 @@ impl RunnerDenoiser<burn_boogu::NativeWgpuBackend> for burn_boogu::NativePaddedB
         burn_boogu::NativePaddedBlackboxDenoiser::set_split_double_stream_shared_projection(
             self, enabled,
         );
-        Ok(())
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl RunnerDenoiser<burn_boogu::NativeCudaBackend>
-    for burn_boogu::NativeCudaPaddedBlackboxDenoiser
-{
-    fn set_query_chunk_size(&mut self, query_chunk_size: usize) {
-        self.set_attention_query_chunk_size(query_chunk_size);
-    }
-
-    fn set_blackbox_configuration(
-        &mut self,
-        num_planes: u8,
-        seq_kv_tiles: u8,
-        seq_q_tiles: u8,
-    ) -> Result<(), &'static str> {
-        validate_blackbox_configuration(num_planes, seq_kv_tiles, seq_q_tiles)?;
-        if seq_q_tiles != 1 {
-            return Err("selected CUDA denoiser has not enabled query-partition tuning");
-        }
-        self.set_configuration(num_planes, seq_kv_tiles);
         Ok(())
     }
 }
@@ -712,17 +685,12 @@ where
         .into());
     }
     let release_policy_validated =
-        is_exact_native_release_policy(&args, variant, denoiser_attention_policy)
-            && !(variant == BooguVariant::Image01EditTurbo1k5 && args.allow_unvalidated_1k5_policy);
-    if variant == BooguVariant::Image01EditTurbo1k5
-        && !args.allow_unvalidated_1k5_policy
-        && !release_policy_validated
-    {
+        is_exact_native_release_policy(&args, variant, denoiser_attention_policy);
+    if variant == BooguVariant::Image01EditTurbo1k5 && !release_policy_validated {
         return Err(
             "Edit-Turbo 1.5K requires the released full-autotune mixed-F16 policy: \
                  deferred-sync qwen-q128, denoiser padded-blackbox p4/kv1/q1 q16384 with strict-f32 RMSNorm, \
-                 composed Q/K preparation, and VAE q4096 with preserve-f16/f16-storage-f32-accum; pass \
-                 --allow-unvalidated-1k5-policy only for explicitly diagnostic runs"
+                 composed Q/K preparation, and VAE q4096 with preserve-f16/f16-storage-f32-accum"
                 .into(),
         );
     }
@@ -737,7 +705,7 @@ where
         )
         .into());
     }
-    if variant == BooguVariant::Image01EditTurbo1k5 && !args.allow_unvalidated_1k5_policy {
+    if variant == BooguVariant::Image01EditTurbo1k5 {
         let content_digest = manifest
             .content_digest
             .ok_or("sealed Edit-Turbo 1.5K manifest has no content digest")?;

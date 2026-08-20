@@ -1,9 +1,10 @@
-//! Prepare the modular Boogu production CDN release from three exact legacy monoliths.
+//! Prepare the modular Boogu production CDN release from exact conversion-source bundles.
 //!
-//! The release deliberately keeps the three public Boogu bundle ids, but moves the byte-identical
-//! Qwen3-VL and FLUX VAE contracts into sibling component bundles.  A schema-v2 Boogu manifest
-//! seals the exact identities of both dependencies.  Legacy monoliths remain valid explicit/local
-//! inputs; this command never rewrites them or an existing upload tree.
+//! Each release keeps the three public Boogu bundle ids while moving byte-identical Qwen3-VL and
+//! FLUX VAE contracts into sibling components. Packed-Q4S releases share one Q4S Qwen component
+//! and one F16 VAE component across all three denoiser-only parents. Every output receives a
+//! sealed part-only transport layout; this command never rewrites a source bundle or existing
+//! upload tree.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,31 +17,32 @@ use std::{
 use burn_boogu::{
     BooguVariant,
     artifacts::{
-        BooguReleaseVerification, BooguStorageProfile, legacy_artifact_bundle_id,
-        promotable_legacy_artifact_digest, verify_modular_release_artifact_directories,
+        BooguReleaseVerification, BooguStorageProfile, release_source_artifact_digest,
+        source_artifact_bundle_id, verify_modular_release_artifact_directories,
         verify_release_artifact_directory,
     },
     boogu_model_descriptor,
 };
 use burn_flux_vae::{
-    FLUX_VAE_COMPONENT_BUNDLE_ID, FLUX_VAE_COMPONENT_MODEL_ID, FLUX_VAE_COMPONENT_MODEL_REVISION,
-    FLUX_VAE_COMPONENT_PROFILE, FLUX_VAE_COMPONENT_ROLE,
+    FLUX_VAE_COMPONENT_MODEL_ID, FLUX_VAE_COMPONENT_MODEL_REVISION, FLUX_VAE_COMPONENT_PROFILE,
+    FLUX_VAE_COMPONENT_ROLE, FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID,
 };
 use burn_image::{
-    ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY, ARTIFACT_MANIFEST_SCHEMA_V1,
-    ARTIFACT_MANIFEST_SCHEMA_V2, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
-    ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY, ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY,
-    ARTIFACT_TRANSPORT_LAYOUT_PATH, ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY,
-    ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION,
-    ARTIFACT_TRANSPORT_MAX_PART_BYTES, ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY,
-    ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY, ARTIFACT_TRANSPORT_TARGET_PART_BYTES, ArtifactBundleId,
-    ArtifactComponent, ArtifactComponentId, ArtifactDependency, ArtifactFile, ArtifactFileRole,
-    ArtifactManifest, ArtifactPath, ArtifactProfileId, ArtifactTransportLayout,
-    ArtifactTransportObject, ArtifactTransportPart, ModelId, NumericFormat, Sha256Digest,
+    ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_MANIFEST_SCHEMA_V2, ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES,
+    ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES_KEY, ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY,
+    ARTIFACT_TARGET_MAX_TRANSPORT_SHARD_BYTES_KEY, ARTIFACT_TRANSPORT_LAYOUT_PATH,
+    ARTIFACT_TRANSPORT_LAYOUT_PATH_KEY, ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_KEY,
+    ARTIFACT_TRANSPORT_LAYOUT_SCHEMA_VERSION, ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+    ARTIFACT_TRANSPORT_PART_TARGET_BYTES_KEY, ARTIFACT_TRANSPORT_PARTS_REQUIRED_KEY,
+    ARTIFACT_TRANSPORT_TARGET_PART_BYTES, ArtifactBundleId, ArtifactComponent, ArtifactComponentId,
+    ArtifactDependency, ArtifactFile, ArtifactFileRole, ArtifactManifest, ArtifactPath,
+    ArtifactProfileId, ArtifactTransportLayout, ArtifactTransportObject, ArtifactTransportPart,
+    ModelId, NumericFormat, Sha256Digest,
 };
 use burn_qwen3_vl::{
     QWEN_BASE_CONDITIONING_PROFILE, QWEN_COMPONENT_BUNDLE_ID, QWEN_COMPONENT_MODEL_ID,
-    QWEN_COMPONENT_MODEL_REVISION, QWEN_COMPONENT_ROLE,
+    QWEN_COMPONENT_MODEL_REVISION, QWEN_COMPONENT_ROLE, QWEN_Q4S_BASE_CONDITIONING_PROFILE,
+    QWEN_Q4S_COMPONENT_BUNDLE_ID,
 };
 use clap::Parser;
 use serde::Serialize;
@@ -61,7 +63,7 @@ const MAX_METADATA_BYTES: u64 = ARTIFACT_TRANSPORT_MAX_PART_BYTES;
 #[derive(Debug, Parser)]
 #[command(about = "Build the dependency-pinned modular Boogu CDN release")]
 struct Args {
-    /// Directory containing the three exact sealed legacy monoliths.
+    /// Directory containing the three mixed-F16 and three Q4S sealed semantic sources.
     #[arg(long, default_value = ".artifacts")]
     artifact_root: PathBuf,
     /// Fresh upload staging root. It must not already exist.
@@ -70,6 +72,9 @@ struct Args {
     /// Copy payloads rather than requiring same-filesystem hardlinks.
     #[arg(long, default_value_t = false)]
     copy: bool,
+    /// Stage only the dependency-first five-bundle Q4S release.
+    #[arg(long, default_value_t = false)]
+    q4_only: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -93,7 +98,22 @@ const BUNDLES: [BundleSpec; 3] = [
     },
 ];
 
-struct LegacyBundle {
+const Q4_BUNDLES: [BundleSpec; 3] = [
+    BundleSpec {
+        variant: BooguVariant::Image01Turbo,
+        canonical_id: "boogu-image-0.1-turbo-q4s-block-up-to128-f32",
+    },
+    BundleSpec {
+        variant: BooguVariant::Image01EditTurbo,
+        canonical_id: "boogu-image-0.1-edit-turbo-q4s-block-up-to128-f32",
+    },
+    BundleSpec {
+        variant: BooguVariant::Image01EditTurbo1k5,
+        canonical_id: "boogu-image-0.1-edit-turbo-1k5-q4s-block-up-to128-f32",
+    },
+];
+
+struct SourceBundle {
     spec: BundleSpec,
     id: String,
     directory: PathBuf,
@@ -193,7 +213,7 @@ struct UploadPlan {
 #[derive(Debug, Serialize)]
 struct SharedContractProof {
     schema_version: u32,
-    legacy_bundles: Vec<String>,
+    source_bundles: Vec<String>,
     qwen_declarations_identical: bool,
     qwen_upstream_sources_identical: bool,
     qwen_weight_objects: usize,
@@ -204,7 +224,7 @@ struct SharedContractProof {
     vae_weight_objects: usize,
     vae_weight_bytes: u64,
     denoiser_payloads_pairwise_disjoint: bool,
-    reconstructed_legacy_closures_exact: bool,
+    reconstructed_source_closures_exact: bool,
     dependency_closures_verified: bool,
     component_contracts_verified: bool,
     bounded_burnpacks_verified: bool,
@@ -214,6 +234,7 @@ struct SharedContractProof {
     duplicate_shared_bytes_removed: u64,
     component_revision_algorithm: &'static str,
     qwen_manifest_digest: String,
+    q4_qwen_manifest_digest: Option<String>,
     vae_manifest_digest: String,
     pipeline_manifest_digests: BTreeMap<String, String>,
 }
@@ -290,7 +311,7 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         .parent()
         .ok_or("output root must have a parent directory")?;
     let output_stage = create_temporary_directory(output_parent, ".cdn-upload-modular.prepare")?;
-    let mut cleanup = Cleanup {
+    let cleanup = Cleanup {
         path: output_stage.clone(),
         armed: true,
     };
@@ -299,8 +320,32 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&cdn_tree)?;
     fs::create_dir_all(&reports_root)?;
 
-    let legacy = read_and_verify_legacy_bundles(args)?;
-    for bundle in &legacy {
+    let q4_sources = read_and_verify_q4_bundles(args)?;
+    for source in &q4_sources {
+        if source.verification.variant != source.spec.variant
+            || source.verification.profile != BooguStorageProfile::Q4sBlockUpTo128F32
+            || source.verification.verified_files != source.manifest.files.len()
+        {
+            return Err(format!(
+                "{} Q4S semantic verification did not cover the exact source release",
+                source.id
+            )
+            .into());
+        }
+    }
+    if args.q4_only {
+        return prepare_q4_only(
+            args,
+            output_stage,
+            cdn_tree,
+            reports_root,
+            cleanup,
+            &q4_sources,
+        );
+    }
+
+    let sources = read_and_verify_source_bundles(args)?;
+    for bundle in &sources {
         if bundle.verification.variant != bundle.spec.variant
             || bundle.verification.profile != BooguStorageProfile::F16QwenVisionF32
             || bundle.verification.verified_files != bundle.manifest.files.len()
@@ -312,10 +357,12 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
             .into());
         }
     }
-    prove_shared_inputs(&legacy)?;
-    prove_denoisers_disjoint(&legacy)?;
+    prove_shared_inputs(&sources)?;
+    prove_denoisers_disjoint(&sources)?;
+    prove_shared_inputs(&q4_sources)?;
+    prove_denoisers_disjoint(&q4_sources)?;
 
-    let reference = &legacy[0];
+    let reference = &sources[0];
     let qwen_manifest = stage_component_bundle(
         &cdn_tree,
         reference,
@@ -326,6 +373,7 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
             model: QWEN_COMPONENT_MODEL_ID,
             model_revision: QWEN_COMPONENT_MODEL_REVISION,
             numeric_format: NumericFormat::Other(QWEN_BASE_CONDITIONING_PROFILE.to_owned()),
+            bind_source_bundle: true,
         },
         args.copy,
     )?;
@@ -334,19 +382,20 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         reference,
         ComponentSpec {
             owner: Owner::Vae,
-            bundle: FLUX_VAE_COMPONENT_BUNDLE_ID,
+            bundle: FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID,
             profile: FLUX_VAE_COMPONENT_PROFILE,
             model: FLUX_VAE_COMPONENT_MODEL_ID,
             model_revision: FLUX_VAE_COMPONENT_MODEL_REVISION,
             numeric_format: NumericFormat::F16,
+            bind_source_bundle: false,
         },
         args.copy,
     )?;
 
     let qwen_dependency = dependency_from_manifest(QWEN_COMPONENT_ROLE, &qwen_manifest)?;
     let vae_dependency = dependency_from_manifest(FLUX_VAE_COMPONENT_ROLE, &vae_manifest)?;
-    let mut pipeline_manifests = Vec::with_capacity(legacy.len());
-    for source in &legacy {
+    let mut pipeline_manifests = Vec::with_capacity(sources.len());
+    for source in &sources {
         pipeline_manifests.push(stage_pipeline_bundle(
             &cdn_tree,
             source,
@@ -354,10 +403,40 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
             args.copy,
         )?);
     }
+    let q4_reference = &q4_sources[0];
+    prove_cross_profile_vae(reference, q4_reference)?;
+    let q4_qwen_manifest = stage_component_bundle(
+        &cdn_tree,
+        q4_reference,
+        ComponentSpec {
+            owner: Owner::Qwen,
+            bundle: QWEN_Q4S_COMPONENT_BUNDLE_ID,
+            profile: QWEN_Q4S_BASE_CONDITIONING_PROFILE,
+            model: QWEN_COMPONENT_MODEL_ID,
+            model_revision: QWEN_COMPONENT_MODEL_REVISION,
+            numeric_format: NumericFormat::Other(QWEN_Q4S_BASE_CONDITIONING_PROFILE.to_owned()),
+            bind_source_bundle: true,
+        },
+        args.copy,
+    )?;
+    let q4_qwen_dependency = dependency_from_manifest(QWEN_COMPONENT_ROLE, &q4_qwen_manifest)?;
+    let q4_manifests = q4_sources
+        .iter()
+        .map(|source| {
+            stage_pipeline_bundle(
+                &cdn_tree,
+                source,
+                &[q4_qwen_dependency.clone(), vae_dependency.clone()],
+                args.copy,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let candidate_manifest_digests = std::iter::once(&qwen_manifest)
+        .chain(std::iter::once(&q4_qwen_manifest))
         .chain(std::iter::once(&vae_manifest))
         .chain(pipeline_manifests.iter())
+        .chain(q4_manifests.iter())
         .map(|manifest| (manifest.bundle.to_string(), sealed_digest(manifest)))
         .collect::<BTreeMap<_, _>>();
     write_json_new(
@@ -370,17 +449,19 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     );
 
     let manifests = std::iter::once(&qwen_manifest)
+        .chain(std::iter::once(&q4_qwen_manifest))
         .chain(std::iter::once(&vae_manifest))
         .chain(pipeline_manifests.iter())
+        .chain(q4_manifests.iter())
         .collect::<Vec<_>>();
     let resolved = manifests
         .iter()
         .map(|manifest| (manifest.bundle.clone(), *manifest))
         .collect::<BTreeMap<_, _>>();
-    for pipeline in &pipeline_manifests {
+    for pipeline in pipeline_manifests.iter().chain(q4_manifests.iter()) {
         pipeline.validate_dependency_closure(|bundle| resolved.get(bundle).copied())?;
     }
-    for (source, pipeline) in legacy.iter().zip(&pipeline_manifests) {
+    for (source, pipeline) in sources.iter().zip(&pipeline_manifests) {
         prove_reconstructed_closure(source, pipeline, &qwen_manifest, &vae_manifest, &cdn_tree)?;
         let modular = verify_modular_release_artifact_directories(
             cdn_tree.join(pipeline.bundle.as_str()),
@@ -405,19 +486,48 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         )?;
     }
 
-    if fs::read_dir(&cdn_tree)?.count() != 5 {
-        return Err("CDN tree must contain exactly two components and three pipelines".into());
+    for (source, manifest) in q4_sources.iter().zip(&q4_manifests) {
+        prove_reconstructed_closure(
+            source,
+            manifest,
+            &q4_qwen_manifest,
+            &vae_manifest,
+            &cdn_tree,
+        )?;
+        let verification = verify_modular_release_artifact_directories(
+            cdn_tree.join(manifest.bundle.as_str()),
+            cdn_tree.join(q4_qwen_manifest.bundle.as_str()),
+            cdn_tree.join(vae_manifest.bundle.as_str()),
+        )?;
+        require_matching_q4_modular_verification(&source.verification, &verification)?;
+        write_json_new(
+            &reports_root.join(format!("{}-semantic.json", manifest.bundle)),
+            &verification,
+        )?;
+    }
+
+    if fs::read_dir(&cdn_tree)?.count() != 9 {
+        return Err(
+            "CDN tree must contain exactly three shared components, three mixed-F16 pipelines, and three Q4S pipelines"
+                .into(),
+        );
     }
 
     let qwen_bytes = weight_bytes(&qwen_manifest)?;
+    let q4_qwen_bytes = weight_bytes(&q4_qwen_manifest)?;
     let vae_bytes = weight_bytes(&vae_manifest)?;
     let duplicate_shared_bytes_removed = qwen_bytes
-        .checked_add(vae_bytes)
+        .checked_add(q4_qwen_bytes)
         .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(vae_bytes.checked_mul(5)?))
         .ok_or("shared byte count overflow")?;
     let proof = SharedContractProof {
         schema_version: 2,
-        legacy_bundles: legacy.iter().map(|bundle| bundle.id.clone()).collect(),
+        source_bundles: sources
+            .iter()
+            .map(|bundle| bundle.id.clone())
+            .chain(q4_sources.iter().map(|bundle| bundle.id.clone()))
+            .collect(),
         qwen_declarations_identical: true,
         qwen_upstream_sources_identical: true,
         qwen_weight_objects: weight_count(&qwen_manifest),
@@ -428,7 +538,7 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         vae_weight_objects: weight_count(&vae_manifest),
         vae_weight_bytes: vae_bytes,
         denoiser_payloads_pairwise_disjoint: true,
-        reconstructed_legacy_closures_exact: true,
+        reconstructed_source_closures_exact: true,
         dependency_closures_verified: true,
         component_contracts_verified: true,
         bounded_burnpacks_verified: true,
@@ -438,20 +548,28 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         duplicate_shared_bytes_removed,
         component_revision_algorithm: "sha256(compact-json(owner-filtered-source-files-sorted-by-path) + LF)",
         qwen_manifest_digest: sealed_digest(&qwen_manifest),
+        q4_qwen_manifest_digest: Some(sealed_digest(&q4_qwen_manifest)),
         vae_manifest_digest: sealed_digest(&vae_manifest),
         pipeline_manifest_digests: pipeline_manifests
             .iter()
+            .chain(q4_manifests.iter())
             .map(|manifest| (manifest.bundle.to_string(), sealed_digest(manifest)))
             .collect(),
     };
     write_json_new(&reports_root.join("modular-equivalence.json"), &proof)?;
 
-    let mut plans = Vec::with_capacity(5);
+    let mut plans = Vec::with_capacity(9);
     plans.push(bundle_plan(
         args,
         &cdn_tree,
         &qwen_manifest,
         "shared-qwen3-vl",
+    )?);
+    plans.push(bundle_plan(
+        args,
+        &cdn_tree,
+        &q4_qwen_manifest,
+        "shared-qwen3-vl-packed-q4s",
     )?);
     plans.push(bundle_plan(
         args,
@@ -462,18 +580,28 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     for manifest in &pipeline_manifests {
         plans.push(bundle_plan(args, &cdn_tree, manifest, "boogu-pipeline")?);
     }
+    for manifest in &q4_manifests {
+        plans.push(bundle_plan(
+            args,
+            &cdn_tree,
+            manifest,
+            "boogu-packed-q4s-pipeline",
+        )?);
+    }
 
     let component_ids = vec![
         QWEN_COMPONENT_BUNDLE_ID.to_owned(),
-        FLUX_VAE_COMPONENT_BUNDLE_ID.to_owned(),
+        QWEN_Q4S_COMPONENT_BUNDLE_ID.to_owned(),
+        FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID.to_owned(),
     ];
     let pipeline_ids = BUNDLES
         .iter()
         .map(|spec| spec.canonical_id.to_owned())
+        .chain(Q4_BUNDLES.iter().map(|spec| spec.canonical_id.to_owned()))
         .collect::<Vec<_>>();
     let plan = UploadPlan {
         schema_version: 3,
-        release: "boogu-image-0.1-modular-production",
+        release: "boogu-image-0.1-production-with-packed-q4s",
         cdn_root: CDN_ROOT,
         generated_from: path_text(&args.artifact_root),
         cache_control: CACHE_CONTROL,
@@ -516,6 +644,24 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
             },
         ],
     };
+    finalize_output(
+        args,
+        output_stage,
+        cleanup,
+        plan,
+        "verification-reports/modular-equivalence.json",
+        duplicate_shared_bytes_removed,
+    )
+}
+
+fn finalize_output(
+    args: &Args,
+    output_stage: PathBuf,
+    mut cleanup: Cleanup,
+    plan: UploadPlan,
+    evidence_report: &str,
+    duplicate_shared_bytes_removed: u64,
+) -> Result<(), Box<dyn Error>> {
     let plan_bytes = json_bytes(&plan)?;
     let plan_sha256 = sha256_bytes(&plan_bytes);
     write_bytes_new(&output_stage.join("upload-plan.json"), &plan_bytes)?;
@@ -550,9 +696,7 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
         upload_tree: path_text(&absolute_output.join("aberration.technology/model")),
         upload_plan: path_text(&absolute_output.join("upload-plan.json")),
         upload_plan_sha256: plan_sha256,
-        equivalence_report: path_text(
-            &absolute_output.join("verification-reports/modular-equivalence.json"),
-        ),
+        equivalence_report: path_text(&absolute_output.join(evidence_report)),
         bundles: plan.bundles.len(),
         logical_declared_payload_bytes,
         physical_transport_parts,
@@ -564,22 +708,253 @@ fn prepare(args: &Args) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_and_verify_legacy_bundles(args: &Args) -> Result<Vec<LegacyBundle>, Box<dyn Error>> {
+fn prepare_q4_only(
+    args: &Args,
+    output_stage: PathBuf,
+    cdn_tree: PathBuf,
+    reports_root: PathBuf,
+    cleanup: Cleanup,
+    sources: &[SourceBundle],
+) -> Result<(), Box<dyn Error>> {
+    prove_shared_inputs(sources)?;
+    prove_denoisers_disjoint(sources)?;
+    let reference = sources.first().ok_or("no Q4 source bundles")?;
+    let qwen_manifest = stage_component_bundle(
+        &cdn_tree,
+        reference,
+        ComponentSpec {
+            owner: Owner::Qwen,
+            bundle: QWEN_Q4S_COMPONENT_BUNDLE_ID,
+            profile: QWEN_Q4S_BASE_CONDITIONING_PROFILE,
+            model: QWEN_COMPONENT_MODEL_ID,
+            model_revision: QWEN_COMPONENT_MODEL_REVISION,
+            numeric_format: NumericFormat::Other(QWEN_Q4S_BASE_CONDITIONING_PROFILE.to_owned()),
+            bind_source_bundle: true,
+        },
+        args.copy,
+    )?;
+    let vae_manifest = stage_component_bundle(
+        &cdn_tree,
+        reference,
+        ComponentSpec {
+            owner: Owner::Vae,
+            bundle: FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID,
+            profile: FLUX_VAE_COMPONENT_PROFILE,
+            model: FLUX_VAE_COMPONENT_MODEL_ID,
+            model_revision: FLUX_VAE_COMPONENT_MODEL_REVISION,
+            numeric_format: NumericFormat::F16,
+            bind_source_bundle: false,
+        },
+        args.copy,
+    )?;
+    let qwen_dependency = dependency_from_manifest(QWEN_COMPONENT_ROLE, &qwen_manifest)?;
+    let vae_dependency = dependency_from_manifest(FLUX_VAE_COMPONENT_ROLE, &vae_manifest)?;
+    let manifests = sources
+        .iter()
+        .map(|source| {
+            stage_pipeline_bundle(
+                &cdn_tree,
+                source,
+                &[qwen_dependency.clone(), vae_dependency.clone()],
+                args.copy,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let all_manifests = std::iter::once(&qwen_manifest)
+        .chain(std::iter::once(&vae_manifest))
+        .chain(manifests.iter())
+        .collect::<Vec<_>>();
+    let digest_map = all_manifests
+        .iter()
+        .map(|manifest| (manifest.bundle.to_string(), sealed_digest(manifest)))
+        .collect::<BTreeMap<_, _>>();
+    write_json_new(
+        &reports_root.join("candidate-manifest-digests.json"),
+        &digest_map,
+    )?;
+    eprintln!(
+        "candidate transport-sealed manifest digests:\n{}",
+        serde_json::to_string_pretty(&digest_map)?
+    );
+    let resolved = all_manifests
+        .iter()
+        .map(|manifest| (manifest.bundle.clone(), *manifest))
+        .collect::<BTreeMap<_, _>>();
+    for (source, manifest) in sources.iter().zip(&manifests) {
+        manifest.validate_dependency_closure(|bundle| resolved.get(bundle).copied())?;
+        prove_reconstructed_closure(source, manifest, &qwen_manifest, &vae_manifest, &cdn_tree)?;
+        let verification = verify_modular_release_artifact_directories(
+            cdn_tree.join(manifest.bundle.as_str()),
+            cdn_tree.join(qwen_manifest.bundle.as_str()),
+            cdn_tree.join(vae_manifest.bundle.as_str()),
+        )?;
+        require_matching_q4_modular_verification(&source.verification, &verification)?;
+        write_json_new(
+            &reports_root.join(format!("{}-semantic.json", manifest.bundle)),
+            &verification,
+        )?;
+    }
+    if fs::read_dir(&cdn_tree)?.count() != Q4_BUNDLES.len() + 2 {
+        return Err(
+            "Q4-only CDN tree must contain one shared Qwen component, one shared VAE component, and three denoiser parents"
+                .into(),
+        );
+    }
+    let component_ids = vec![
+        qwen_manifest.bundle.to_string(),
+        vae_manifest.bundle.to_string(),
+    ];
+    let pipeline_ids = manifests
+        .iter()
+        .map(|manifest| manifest.bundle.to_string())
+        .collect::<Vec<_>>();
+    let mut bundles = Vec::with_capacity(5);
+    bundles.push(bundle_plan(
+        args,
+        &cdn_tree,
+        &qwen_manifest,
+        "shared-qwen3-vl-packed-q4s",
+    )?);
+    bundles.push(bundle_plan(
+        args,
+        &cdn_tree,
+        &vae_manifest,
+        "shared-flux-vae",
+    )?);
+    for manifest in &manifests {
+        bundles.push(bundle_plan(
+            args,
+            &cdn_tree,
+            manifest,
+            "boogu-packed-q4s-pipeline",
+        )?);
+    }
+    let qwen_bytes = weight_bytes(&qwen_manifest)?;
+    let vae_bytes = weight_bytes(&vae_manifest)?;
+    let duplicate_shared_bytes_removed = qwen_bytes
+        .checked_add(vae_bytes)
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or("shared byte count overflow")?;
+    let proof = SharedContractProof {
+        schema_version: 2,
+        source_bundles: sources.iter().map(|source| source.id.clone()).collect(),
+        qwen_declarations_identical: true,
+        qwen_upstream_sources_identical: true,
+        qwen_weight_objects: weight_count(&qwen_manifest),
+        qwen_weight_bytes: qwen_bytes,
+        vae_declarations_identical: true,
+        vae_upstream_source_identical: true,
+        vae_config_semantically_identical_after_provenance_normalization: true,
+        vae_weight_objects: weight_count(&vae_manifest),
+        vae_weight_bytes: vae_bytes,
+        denoiser_payloads_pairwise_disjoint: true,
+        reconstructed_source_closures_exact: true,
+        dependency_closures_verified: true,
+        component_contracts_verified: true,
+        bounded_burnpacks_verified: true,
+        bounded_transport_parts_verified: true,
+        transport_part_target_bytes: ARTIFACT_TRANSPORT_TARGET_PART_BYTES,
+        maximum_transport_part_bytes: ARTIFACT_TRANSPORT_MAX_PART_BYTES,
+        duplicate_shared_bytes_removed,
+        component_revision_algorithm: "sha256(compact-json(owner-filtered-source-files-sorted-by-path) + LF)",
+        qwen_manifest_digest: sealed_digest(&qwen_manifest),
+        q4_qwen_manifest_digest: None,
+        vae_manifest_digest: sealed_digest(&vae_manifest),
+        pipeline_manifest_digests: manifests
+            .iter()
+            .map(|manifest| (manifest.bundle.to_string(), sealed_digest(manifest)))
+            .collect(),
+    };
+    write_json_new(&reports_root.join("modular-equivalence.json"), &proof)?;
+    let plan = UploadPlan {
+        schema_version: 3,
+        release: "boogu-image-0.1-packed-q4s",
+        cdn_root: CDN_ROOT,
+        generated_from: path_text(&args.artifact_root),
+        cache_control: CACHE_CONTROL,
+        dependency_first: true,
+        manifest_last: true,
+        bundle_count: bundles.len(),
+        bundles,
+        upload_phases: vec![
+            UploadPhase {
+                sequence: 1,
+                name: "dependency-payloads",
+                bundles: component_ids.clone(),
+                include: "all files except manifest.json",
+                cache_control: CACHE_CONTROL,
+                prerequisite: None,
+            },
+            UploadPhase {
+                sequence: 2,
+                name: "dependency-manifests",
+                bundles: component_ids,
+                include: "manifest.json only",
+                cache_control: "no-cache",
+                prerequisite: Some("dependency-payloads"),
+            },
+            UploadPhase {
+                sequence: 3,
+                name: "pipeline-payloads",
+                bundles: pipeline_ids.clone(),
+                include: "all files except manifest.json",
+                cache_control: CACHE_CONTROL,
+                prerequisite: Some("dependency-manifests"),
+            },
+            UploadPhase {
+                sequence: 4,
+                name: "pipeline-manifests",
+                bundles: pipeline_ids,
+                include: "manifest.json only",
+                cache_control: "no-cache",
+                prerequisite: Some("pipeline-payloads"),
+            },
+        ],
+    };
+    finalize_output(
+        args,
+        output_stage,
+        cleanup,
+        plan,
+        "verification-reports/modular-equivalence.json",
+        duplicate_shared_bytes_removed,
+    )
+}
+
+fn require_matching_q4_modular_verification(
+    source: &BooguReleaseVerification,
+    candidate: &burn_boogu::artifacts::BooguModularReleaseVerification,
+) -> Result<(), Box<dyn Error>> {
+    if candidate.variant != source.variant
+        || candidate.profile != source.profile
+        || candidate.verified_weight_objects != source.verified_weight_objects
+        || candidate.verified_tensors != source.verified_tensors
+        || candidate.largest_object_bytes != source.largest_object_bytes
+        || candidate.parent.max_shard_bytes != source.max_shard_bytes
+    {
+        return Err(
+            "Q4 transport candidate differs from its fully verified semantic source".into(),
+        );
+    }
+    Ok(())
+}
+
+fn read_and_verify_source_bundles(args: &Args) -> Result<Vec<SourceBundle>, Box<dyn Error>> {
     BUNDLES
         .iter()
         .copied()
         .map(|spec| {
             let profile = BooguStorageProfile::F16QwenVisionF32;
-            let id = legacy_artifact_bundle_id(spec.variant, profile);
+            let id = source_artifact_bundle_id(spec.variant, profile);
             let directory = args.artifact_root.join(&id);
-            let manifest = read_exact_legacy_manifest(&directory, spec, &id)?;
+            let manifest = read_exact_source_manifest(&directory, spec, profile, &id)?;
             // This is the expensive gate: parse configs/inventories and authenticate every bounded
-            // Burnpack from the exact legacy monolith before any of its files are promoted.
+            // Burnpack from the exact conversion source before any file is promoted.
             let verification = verify_release_artifact_directory(&directory)?;
             let inventory = read_json_array(&directory.join(INVENTORY_PATH))?;
             let source_files = read_json_array(&directory.join(SOURCE_FILES_PATH))?;
             let normalized_vae_config = normalized_vae_config(&directory.join(VAE_CONFIG_PATH))?;
-            Ok(LegacyBundle {
+            Ok(SourceBundle {
                 spec,
                 id,
                 directory,
@@ -593,9 +968,37 @@ fn read_and_verify_legacy_bundles(args: &Args) -> Result<Vec<LegacyBundle>, Box<
         .collect()
 }
 
-fn read_exact_legacy_manifest(
+fn read_and_verify_q4_bundles(args: &Args) -> Result<Vec<SourceBundle>, Box<dyn Error>> {
+    Q4_BUNDLES
+        .iter()
+        .copied()
+        .map(|spec| {
+            let profile = BooguStorageProfile::Q4sBlockUpTo128F32;
+            let id = source_artifact_bundle_id(spec.variant, profile);
+            let directory = args.artifact_root.join(&id);
+            let manifest = read_exact_source_manifest(&directory, spec, profile, &id)?;
+            let verification = verify_release_artifact_directory(&directory)?;
+            let inventory = read_json_array(&directory.join(INVENTORY_PATH))?;
+            let source_files = read_json_array(&directory.join(SOURCE_FILES_PATH))?;
+            let normalized_vae_config = normalized_vae_config(&directory.join(VAE_CONFIG_PATH))?;
+            Ok(SourceBundle {
+                spec,
+                id,
+                directory,
+                manifest,
+                verification,
+                inventory,
+                source_files,
+                normalized_vae_config,
+            })
+        })
+        .collect()
+}
+
+fn read_exact_source_manifest(
     source_dir: &Path,
     spec: BundleSpec,
+    profile: BooguStorageProfile,
     expected_bundle: &str,
 ) -> Result<ArtifactManifest, Box<dyn Error>> {
     require_real_directory(source_dir)?;
@@ -604,47 +1007,52 @@ fn read_exact_legacy_manifest(
         serde_json::from_slice(&fs::read(source_dir.join("manifest.json"))?)?;
     manifest.validate_sealed()?;
     if manifest.schema_version != 1 || !manifest.dependencies.is_empty() {
-        return Err(
-            format!("legacy source {expected_bundle} is not dependency-free schema v1").into(),
-        );
+        return Err(format!("source {expected_bundle} is not dependency-free schema v1").into());
     }
     if manifest.bundle.as_str() != expected_bundle {
         return Err(format!(
-            "legacy source bundle {} differs from expected {expected_bundle}",
+            "source bundle {} differs from expected {expected_bundle}",
             manifest.bundle
         )
         .into());
     }
     let actual = sealed_digest(&manifest);
-    let expected =
-        promotable_legacy_artifact_digest(spec.variant, BooguStorageProfile::F16QwenVisionF32)
-            .ok_or("mixed-F16 tuple has no pinned promotable legacy digest")?;
+    let expected = release_source_artifact_digest(spec.variant, profile)
+        .ok_or("release tuple has no pinned source digest")?;
     if actual != expected {
         return Err(format!(
-            "legacy source {expected_bundle} digest {actual} differs from pinned {expected}"
+            "source {expected_bundle} digest {actual} differs from pinned {expected}"
         )
         .into());
     }
+    let (expected_converter, expected_profile) = match profile {
+        BooguStorageProfile::F16QwenVisionF32 => ("0.1.0", "f16-qwen-vision-f32"),
+        BooguStorageProfile::Q4sBlockUpTo128F32 => {
+            (env!("CARGO_PKG_VERSION"), "q4s-block-up-to128-f32")
+        }
+        _ => return Err("CDN preparation received an unsupported source profile".into()),
+    };
     if manifest
         .metadata
         .get("conversion_crate")
         .map(String::as_str)
-        != Some("0.1.0")
-        || manifest.profile.as_str() != "f16-qwen-vision-f32"
+        != Some(expected_converter)
+        || manifest.profile.as_str() != expected_profile
     {
-        return Err(
-            format!("legacy source {expected_bundle} has the wrong converter/profile").into(),
-        );
+        return Err(format!(
+            "source {expected_bundle} has the wrong converter/profile; expected {expected_converter}/{expected_profile}"
+        )
+        .into());
     }
     let descriptor = boogu_model_descriptor(spec.variant);
     if manifest.model != descriptor.id || manifest.model_revision != descriptor.revision {
-        return Err(format!("legacy source {expected_bundle} has the wrong model identity").into());
+        return Err(format!("source {expected_bundle} has the wrong model identity").into());
     }
     Ok(manifest)
 }
 
-fn prove_shared_inputs(legacy: &[LegacyBundle]) -> Result<(), Box<dyn Error>> {
-    let reference = legacy.first().ok_or("no legacy bundles")?;
+fn prove_shared_inputs(sources: &[SourceBundle]) -> Result<(), Box<dyn Error>> {
+    let reference = sources.first().ok_or("no source bundles")?;
     let qwen_files = owner_weight_files(&reference.manifest, Owner::Qwen);
     let vae_files = owner_weight_files(&reference.manifest, Owner::Vae);
     let qwen_inventory = inventory_for(&reference.inventory, Owner::Qwen)?;
@@ -660,7 +1068,7 @@ fn prove_shared_inputs(legacy: &[LegacyBundle]) -> Result<(), Box<dyn Error>> {
     }
     let qwen_metadata = compact_files_for(&reference.manifest, Owner::Qwen)?;
 
-    for candidate in &legacy[1..] {
+    for candidate in &sources[1..] {
         if owner_weight_files(&candidate.manifest, Owner::Qwen) != qwen_files
             || inventory_for(&candidate.inventory, Owner::Qwen)? != qwen_inventory
             || source_files_for(&candidate.source_files, "mllm/")? != qwen_sources
@@ -683,8 +1091,27 @@ fn prove_shared_inputs(legacy: &[LegacyBundle]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn prove_denoisers_disjoint(legacy: &[LegacyBundle]) -> Result<(), Box<dyn Error>> {
-    let sets = legacy
+fn prove_cross_profile_vae(
+    mixed_f16: &SourceBundle,
+    packed_q4s: &SourceBundle,
+) -> Result<(), Box<dyn Error>> {
+    if owner_weight_files(&mixed_f16.manifest, Owner::Vae)
+        != owner_weight_files(&packed_q4s.manifest, Owner::Vae)
+        || inventory_for(&mixed_f16.inventory, Owner::Vae)?
+            != inventory_for(&packed_q4s.inventory, Owner::Vae)?
+        || source_files_for(&mixed_f16.source_files, "vae/")?
+            != source_files_for(&packed_q4s.source_files, "vae/")?
+        || mixed_f16.normalized_vae_config != packed_q4s.normalized_vae_config
+    {
+        return Err(
+            "mixed-F16 and packed-Q4S releases do not share the exact FLUX VAE contract".into(),
+        );
+    }
+    Ok(())
+}
+
+fn prove_denoisers_disjoint(sources: &[SourceBundle]) -> Result<(), Box<dyn Error>> {
+    let sets = sources
         .iter()
         .map(|bundle| {
             owner_weight_files(&bundle.manifest, Owner::Denoiser)
@@ -698,7 +1125,7 @@ fn prove_denoisers_disjoint(legacy: &[LegacyBundle]) -> Result<(), Box<dyn Error
             if let Some(shared) = sets[left].intersection(&sets[right]).next() {
                 return Err(format!(
                     "denoiser payloads for {} and {} overlap at {shared}",
-                    legacy[left].id, legacy[right].id
+                    sources[left].id, sources[right].id
                 )
                 .into());
             }
@@ -714,11 +1141,12 @@ struct ComponentSpec {
     model: &'static str,
     model_revision: &'static str,
     numeric_format: NumericFormat,
+    bind_source_bundle: bool,
 }
 
 fn stage_component_bundle(
     cdn_tree: &Path,
-    source: &LegacyBundle,
+    source: &SourceBundle,
     spec: ComponentSpec,
     copy: bool,
 ) -> Result<ArtifactManifest, Box<dyn Error>> {
@@ -761,7 +1189,7 @@ fn stage_component_bundle(
     }
 
     let components = components_for(&source.manifest, spec.owner);
-    let mut metadata = component_metadata(source, spec.owner, &inventory);
+    let mut metadata = component_metadata(source, spec.owner, &inventory, spec.bind_source_bundle);
     metadata.insert("component_bundle".into(), "true".into());
     metadata.insert(
         "component_kind".into(),
@@ -794,7 +1222,7 @@ fn stage_component_bundle(
 
 fn stage_pipeline_bundle(
     cdn_tree: &Path,
-    source: &LegacyBundle,
+    source: &SourceBundle,
     dependencies: &[ArtifactDependency],
     copy: bool,
 ) -> Result<ArtifactManifest, Box<dyn Error>> {
@@ -820,7 +1248,7 @@ fn stage_pipeline_bundle(
         ArtifactFileRole::Metadata,
     )?);
 
-    let mut metadata = component_metadata(source, Owner::Denoiser, &inventory);
+    let mut metadata = component_metadata(source, Owner::Denoiser, &inventory, true);
     metadata.insert("composition_manifest".into(), "true".into());
     metadata.insert(
         "artifact_layout".into(),
@@ -853,9 +1281,10 @@ fn stage_pipeline_bundle(
 }
 
 fn component_metadata(
-    source: &LegacyBundle,
+    source: &SourceBundle,
     owner: Owner,
     inventory: &[Value],
+    bind_source_bundle: bool,
 ) -> BTreeMap<String, String> {
     let included = inventory
         .iter()
@@ -884,17 +1313,19 @@ fn component_metadata(
     );
     metadata.insert("tensor_inventory_schema".into(), "2".into());
     metadata.insert(
-        ARTIFACT_LEGACY_TARGET_MAX_SHARD_BYTES_KEY.into(),
+        ARTIFACT_TARGET_MAX_SEMANTIC_SHARD_BYTES_KEY.into(),
         ARTIFACT_SEMANTIC_OBJECT_MAX_BYTES.to_string(),
     );
-    metadata.insert(
-        "verified_legacy_bundle".into(),
-        source.manifest.bundle.to_string(),
-    );
-    metadata.insert(
-        "verified_legacy_digest".into(),
-        sealed_digest(&source.manifest),
-    );
+    if bind_source_bundle {
+        metadata.insert(
+            "verified_source_bundle".into(),
+            source.manifest.bundle.to_string(),
+        );
+        metadata.insert(
+            "verified_source_digest".into(),
+            sealed_digest(&source.manifest),
+        );
+    }
     if owner == Owner::Qwen {
         metadata.insert("omitted_tensor_count".into(), "1".into());
         metadata.insert("qwen_embedding_row_chunks".into(), "6".into());
@@ -908,7 +1339,7 @@ fn component_metadata(
 }
 
 fn prove_reconstructed_closure(
-    source: &LegacyBundle,
+    source: &SourceBundle,
     pipeline: &ArtifactManifest,
     qwen: &ArtifactManifest,
     vae: &ArtifactManifest,
@@ -1016,7 +1447,7 @@ fn prove_reconstructed_closure(
     let staged_vae =
         normalized_vae_config(&cdn_tree.join(vae.bundle.as_str()).join(VAE_CONFIG_PATH))?;
     if staged_vae != source.normalized_vae_config {
-        return Err("normalized VAE config differs from the legacy semantic config".into());
+        return Err("normalized VAE config differs from the source semantic config".into());
     }
     let mut original_components = source.manifest.components.clone();
     let mut reconstructed_components = qwen
@@ -1029,7 +1460,7 @@ fn prove_reconstructed_closure(
     original_components.sort_by(|left, right| left.id.cmp(&right.id));
     reconstructed_components.sort_by(|left, right| left.id.cmp(&right.id));
     if original_components != reconstructed_components {
-        return Err("component closure does not reconstruct the legacy component set".into());
+        return Err("component closure does not reconstruct the source component set".into());
     }
     Ok(())
 }
@@ -1188,7 +1619,7 @@ fn require_json_multiset_equal(
     expected.sort();
     actual.sort();
     if expected != actual {
-        return Err(format!("reconstructed {label} differs from the legacy contract").into());
+        return Err(format!("reconstructed {label} differs from the source contract").into());
     }
     Ok(())
 }
@@ -1758,7 +2189,10 @@ fn path_text(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, fs};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+    };
 
     use burn_image::{
         ARTIFACT_MANIFEST_SCHEMA_V1, ARTIFACT_TRANSPORT_LAYOUT_PATH,
@@ -1767,7 +2201,30 @@ mod tests {
         NumericFormat, Sha256Digest,
     };
 
-    use super::{install_transport_layout, transport_stats};
+    use super::{
+        FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID, Q4_BUNDLES, QWEN_Q4S_COMPONENT_BUNDLE_ID,
+        install_transport_layout, transport_stats,
+    };
+
+    #[test]
+    fn q4_only_release_contains_shared_components_and_every_public_variant_correctness() {
+        assert_ne!(
+            QWEN_Q4S_COMPONENT_BUNDLE_ID,
+            FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID
+        );
+        assert_eq!(Q4_BUNDLES.len(), 3);
+        assert_eq!(
+            Q4_BUNDLES
+                .iter()
+                .map(|bundle| bundle.canonical_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "boogu-image-0.1-turbo-q4s-block-up-to128-f32",
+                "boogu-image-0.1-edit-turbo-q4s-block-up-to128-f32",
+                "boogu-image-0.1-edit-turbo-1k5-q4s-block-up-to128-f32",
+            ])
+        );
+    }
 
     fn install_fixture() -> (tempfile::TempDir, ArtifactManifest, Vec<u8>) {
         let directory = tempfile::tempdir().unwrap();

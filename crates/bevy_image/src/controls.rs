@@ -912,7 +912,7 @@ fn dispatch_browser_ui_contract(
         (With<RunButton>, Without<PromptInput>, Without<SeedInput>),
     >,
     saves: Query<
-        (&ComputedNode, &UiGlobalTransform, Has<InteractionDisabled>),
+        (&UiGlobalTransform, Has<InteractionDisabled>),
         (
             With<SaveButton>,
             Without<PromptInput>,
@@ -932,7 +932,7 @@ fn dispatch_browser_ui_contract(
         Ok((prompt_entity, prompt_node, prompt_transform, prompt_disabled)),
         Ok((seed_entity, seed_node, seed_transform, seed_disabled)),
         Ok((run_node, run_transform, run_disabled)),
-        Ok((save_node, save_transform, save_disabled)),
+        Ok((save_transform, save_disabled)),
     ) = (
         prompts.single(),
         seeds.single(),
@@ -942,8 +942,10 @@ fn dispatch_browser_ui_contract(
     else {
         return;
     };
-    if prompt_node.is_empty() || seed_node.is_empty() || run_node.is_empty() || save_node.is_empty()
-    {
+    // Save is deliberately hidden until an output exists. Initial Run automation must still
+    // receive the prompt/seed/Run geometry; once an output is presented, the Save node becomes
+    // non-empty and the changed contract emits its actionable geometry.
+    if prompt_node.is_empty() || seed_node.is_empty() || run_node.is_empty() {
         return;
     }
     let (Some(model), Some(dimensions)) = (&editor.model, editor.options.dimensions) else {
@@ -3417,8 +3419,18 @@ mod tests {
 
     #[test]
     fn rendered_model_smoke_uses_real_browser_input_and_download_correctness() {
+        let controls = include_str!("controls.rs");
+        let production_controls = controls
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("controls source must retain a test module")
+            .0;
         let contract = include_str!("../tests/wasm_rendered_surface_contract.mjs");
         let harness = include_str!("../tests/wasm_rendered_surface_smoke.mjs");
+        assert!(
+            production_controls
+                .contains("prompt_node.is_empty() || seed_node.is_empty() || run_node.is_empty()")
+        );
+        assert!(!production_controls.contains("|| save_node.is_empty()"));
         assert!(contract.contains(BROWSER_UI_CONTRACT_EVENT_NAME));
         assert!(harness.contains("UI_CONTRACT_EVENT_NAME"));
         assert!(harness.contains("Input.dispatchMouseEvent"));

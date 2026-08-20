@@ -14,7 +14,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.92"
 authors = ["mosure <mitchell@mosure.me>"]
@@ -28,7 +28,6 @@ categories = ["computer-vision", "multimedia::images", "science"]
 [workspace.dependencies]
 burn = { version = "=0.21.0", default-features = false, features = ["std"] }
 burn-cubecl = { version = "=0.21.0", default-features = false }
-burn-cuda = { version = "=0.21.0", default-features = false }
 burn-core = { version = "=0.21.0", default-features = false, features = ["std"] }
 burn-fusion = { version = "=0.21.0", default-features = false }
 burn-ir = { version = "=0.21.0", default-features = false }

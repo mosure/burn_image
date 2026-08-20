@@ -24,7 +24,7 @@ artifacts = ["dep:burn-store", "dep:burn_image"]
 [dependencies]
 burn.workspace = true
 burn-store = { workspace = true, optional = true, features = ["pytorch"] }
-burn_image = { version = "0.1.1", path = "../burn_image", optional = true }
+burn_image = { version = "0.1.2", path = "../burn_image", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

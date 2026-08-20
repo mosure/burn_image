@@ -6,10 +6,7 @@ mod denoiser;
 mod embedding;
 mod feed_forward;
 pub(crate) mod linear;
-#[cfg(all(
-    any(feature = "wgpu", feature = "cuda-experimental"),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 mod native_flash;
 mod norm;
 #[cfg(feature = "wgpu")]
@@ -25,14 +22,6 @@ pub(crate) use denoiser::BooguRoPeGeometry;
 pub use denoiser::{BooguDenoiser, BooguDenoiserInput};
 pub use embedding::{CombinedTimestepCaptionEmbedding, FinalProjection};
 pub use feed_forward::LuminaFeedForward;
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-pub(crate) use native_flash::assert_supported_blackbox_configuration;
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-pub use native_flash::{
-    NativeCudaBackend, required_chunked_cuda_flash_unit_attention,
-    required_chunked_cuda_padded_blackbox_attention,
-    required_chunked_cuda_padded_blackbox_attention_tiled, required_cuda_flash_unit_attention,
-};
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub use native_flash::{
     NativeWgpuBackend, required_chunked_flash_unit_attention,

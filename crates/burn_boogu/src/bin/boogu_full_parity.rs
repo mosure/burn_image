@@ -277,10 +277,6 @@ struct Args {
     /// Bounded query tile used by Boogu denoiser attention. Defaults to 128.
     #[arg(long)]
     denoiser_query_chunk_size: Option<usize>,
-    /// Deprecated compatibility control that sets both Qwen and denoiser query tiles. It cannot be
-    /// combined with either component-specific control.
-    #[arg(long)]
-    query_chunk_size: Option<usize>,
     /// Native WGPU denoiser attention implementation. The padded blackbox policy requires an F16
     /// denoiser and fails closed if the accelerated Cubek kernel cannot run.
     #[arg(long, value_enum, default_value = "portable")]
@@ -310,9 +306,6 @@ struct Args {
     /// Fail when the selected release/profile full-chain gates are exceeded.
     #[arg(long, default_value_t = false)]
     require: bool,
-    /// Permit a diagnostic 1.5K policy instead of the exact released native configuration.
-    #[arg(long, default_value_t = false)]
-    allow_unvalidated_1k5_policy: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,30 +486,13 @@ struct QueryChunkSizes {
 }
 
 fn resolve_query_chunk_sizes(args: &Args) -> Result<QueryChunkSizes, &'static str> {
-    if args.query_chunk_size.is_some()
-        && (args.qwen_query_chunk_size.is_some() || args.denoiser_query_chunk_size.is_some())
-    {
-        return Err(
-            "--query-chunk-size cannot be combined with --qwen-query-chunk-size or --denoiser-query-chunk-size",
-        );
-    }
-    if args.query_chunk_size == Some(0) {
-        return Err("--query-chunk-size must be greater than zero");
-    }
-    let sizes = if let Some(query_chunk_size) = args.query_chunk_size {
-        QueryChunkSizes {
-            qwen: query_chunk_size,
-            denoiser: query_chunk_size,
-        }
-    } else {
-        QueryChunkSizes {
-            qwen: args
-                .qwen_query_chunk_size
-                .unwrap_or(DEFAULT_QUERY_CHUNK_SIZE),
-            denoiser: args
-                .denoiser_query_chunk_size
-                .unwrap_or(DEFAULT_QUERY_CHUNK_SIZE),
-        }
+    let sizes = QueryChunkSizes {
+        qwen: args
+            .qwen_query_chunk_size
+            .unwrap_or(DEFAULT_QUERY_CHUNK_SIZE),
+        denoiser: args
+            .denoiser_query_chunk_size
+            .unwrap_or(DEFAULT_QUERY_CHUNK_SIZE),
     };
     if sizes.qwen == 0 {
         return Err("--qwen-query-chunk-size must be greater than zero");
@@ -532,8 +508,7 @@ fn policy_report(
     variant: BooguVariant,
     query_chunk_sizes: QueryChunkSizes,
 ) -> PolicyReport {
-    let release_policy_validated = is_exact_native_release_policy(args, variant, query_chunk_sizes)
-        && !(variant == BooguVariant::Image01EditTurbo1k5 && args.allow_unvalidated_1k5_policy);
+    let release_policy_validated = is_exact_native_release_policy(args, variant, query_chunk_sizes);
     PolicyReport {
         native_autotune: "full",
         native_runtime_policy: args.native_runtime_policy,
@@ -647,9 +622,6 @@ fn validate_native_runtime_policy(
             "--native-runtime-policy low-vram requires --require; numerical gates may not be disabled for qualification",
         );
     }
-    if args.allow_unvalidated_1k5_policy {
-        return Err("--native-runtime-policy low-vram rejects --allow-unvalidated-1k5-policy");
-    }
     if !is_exact_native_release_policy(args, variant, query_chunk_sizes) {
         return Err(
             "--native-runtime-policy low-vram requires profile=f16-qwen-vision-f32, streamed per-stage Qwen, preserve-F16 VAE q4096 with f16-storage-f32-accum GroupNorm, and the exact release padded-blackbox denoiser policy; its in-process PID-scoped nvidia-smi gate must additionally prove sampled total framebuffer stays strictly below 32,000,000,000 bytes",
@@ -669,13 +641,11 @@ fn validate_1k5_release_policy(
 ) -> Result<(), &'static str> {
     if variant == BooguVariant::Image01EditTurbo1k5
         && !is_exact_1k5_release_policy(args, query_chunk_sizes)
-        && !args.allow_unvalidated_1k5_policy
     {
         return Err(
             "Edit-Turbo 1.5K full-chain parity requires the exact native release policy: \
              retained deferred-sync Qwen q128, or explicit low-vram streamed per-stage Qwen q128; preserve-F16 VAE q4096 with f16-storage-f32-accum GroupNorm, \
-             and padded-blackbox p4/kv1/q1 denoiser q16384 with strict-f32 RMSNorm and composed Q/K preparation; pass \
-             --allow-unvalidated-1k5-policy only for explicitly diagnostic runs",
+             and padded-blackbox p4/kv1/q1 denoiser q16384 with strict-f32 RMSNorm and composed Q/K preparation",
         );
     }
     Ok(())
@@ -1374,7 +1344,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let artifact_content_digest = manifest
         .content_digest
         .ok_or("sealed artifact manifest has no content digest")?;
-    if variant == BooguVariant::Image01EditTurbo1k5 && !args.allow_unvalidated_1k5_policy {
+    if variant == BooguVariant::Image01EditTurbo1k5 {
         burn_boogu::artifacts::validate_edit_turbo_1k5_release_artifact_digest(
             artifact_content_digest,
         )?;
@@ -3266,7 +3236,6 @@ mod tests {
             "padded-blackbox",
             "--denoiser-qk-preparation-policy",
             "fused-strict-qk-norm-rope",
-            "--allow-unvalidated-1k5-policy",
         ])
         .unwrap();
         validate_denoiser_qk_preparation_policy(
@@ -3317,7 +3286,6 @@ mod tests {
             "padded-blackbox",
             "--denoiser-rms-norm-policy",
             "f16-storage-f32-accum",
-            "--allow-unvalidated-1k5-policy",
         ])
         .unwrap();
         validate_denoiser_rms_norm_policy(
@@ -3351,7 +3319,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_1k5_release_policy_is_exact_and_diagnostics_are_explicit_correctness() {
+    fn edit_1k5_release_policy_is_exact_and_fail_closed_correctness() {
         let exact = Args::try_parse_from([
             "boogu-full-parity",
             "--artifacts",
@@ -3402,43 +3370,24 @@ mod tests {
             serde_json::json!(true)
         );
 
-        let diagnostic = Args::try_parse_from([
+        let invalid = Args::try_parse_from([
             "boogu-full-parity",
             "--artifacts",
             "artifacts",
             "--fixture",
             "fixture",
-            "--allow-unvalidated-1k5-policy",
         ])
         .unwrap();
-        let sizes = resolve_query_chunk_sizes(&diagnostic).unwrap();
-        assert!(!is_exact_1k5_release_policy(&diagnostic, sizes));
-        validate_1k5_release_policy(&diagnostic, BooguVariant::Image01EditTurbo1k5, sizes).unwrap();
-        let report = serde_json::to_value(policy_report(
-            &diagnostic,
-            BooguVariant::Image01EditTurbo1k5,
-            sizes,
-        ))
-        .unwrap();
-        assert_eq!(
-            report["edit_1k5_release_policy_validated"],
-            serde_json::json!(false)
-        );
+        let sizes = resolve_query_chunk_sizes(&invalid).unwrap();
+        assert!(!is_exact_1k5_release_policy(&invalid, sizes));
         assert!(
-            validate_1k5_release_policy(
-                &Args {
-                    allow_unvalidated_1k5_policy: false,
-                    ..diagnostic
-                },
-                BooguVariant::Image01EditTurbo1k5,
-                sizes,
-            )
-            .is_err()
+            validate_1k5_release_policy(&invalid, BooguVariant::Image01EditTurbo1k5, sizes,)
+                .is_err()
         );
     }
 
     #[test]
-    fn component_query_chunk_controls_are_independent_and_legacy_compatible_correctness() {
+    fn component_query_chunk_controls_are_independent_correctness() {
         let parse = |extra: &[&str]| {
             let mut argv = vec![
                 "boogu-full-parity",
@@ -3471,23 +3420,6 @@ mod tests {
                 denoiser: 16_384,
             }
         );
-        assert_eq!(
-            resolve_query_chunk_sizes(&parse(&["--query-chunk-size", "8192"])).unwrap(),
-            QueryChunkSizes {
-                qwen: 8192,
-                denoiser: 8192,
-            }
-        );
-        assert!(
-            resolve_query_chunk_sizes(&parse(&[
-                "--query-chunk-size",
-                "8192",
-                "--qwen-query-chunk-size",
-                "128",
-            ]))
-            .unwrap_err()
-            .contains("cannot be combined")
-        );
         assert!(
             resolve_query_chunk_sizes(&parse(&["--qwen-query-chunk-size", "0"]))
                 .unwrap_err()
@@ -3497,11 +3429,6 @@ mod tests {
             resolve_query_chunk_sizes(&parse(&["--denoiser-query-chunk-size", "0"]))
                 .unwrap_err()
                 .contains("denoiser-query")
-        );
-        assert!(
-            resolve_query_chunk_sizes(&parse(&["--query-chunk-size", "0"]))
-                .unwrap_err()
-                .contains("--query-chunk-size")
         );
     }
 

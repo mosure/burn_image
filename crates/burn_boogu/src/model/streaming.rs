@@ -541,6 +541,13 @@ pub trait AsyncBooguDenoiserStageSource<B: Backend> {
     ) -> Result<SingleStreamBlock<B>, BooguError>;
     /// Load final normalization and projection.
     async fn load_tail(&mut self) -> Result<BooguDenoiserTail<B>, BooguError>;
+    /// Cooperatively yield to a single-threaded host without waiting for submitted device work.
+    ///
+    /// The default is a no-op. Browser sources override it so deferred resident execution keeps
+    /// the application event loop responsive while preserving one real barrier per DMD step.
+    async fn cooperative_yield(&mut self) -> Result<(), BooguError> {
+        Ok(())
+    }
     /// Await submitted device work before the current stage module is dropped.
     async fn synchronize(&mut self) -> Result<(), BooguError>;
 }
@@ -557,7 +564,7 @@ pub enum AsyncRetainingDenoiserSynchronizationPolicy {
 
 /// Execution materialization for retained denoiser modules containing Q8 weights.
 ///
-/// Artifact storage and the retained cache are unaffected. The compatibility policy maps only the
+/// Artifact storage and the retained cache are unaffected. The execution policy maps only the
 /// short-lived clone returned for a semantic stage to ordinary F32 weights, allowing the released
 /// dense [`nn::Linear`] path to run without the backend's mixed `Float x QFloat` matmul.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -981,7 +988,7 @@ where
             }
             AsyncRetainingDenoiserSynchronizationPolicy::Deferred => {
                 self.synchronization_pending = true;
-                Ok(())
+                self.source.cooperative_yield().await
             }
         }
     }
@@ -1453,6 +1460,7 @@ mod tests {
     struct CountingAsyncStageSource {
         inner: MemoryStageSource,
         loads: Vec<String>,
+        cooperative_yields: usize,
     }
 
     impl CountingAsyncStageSource {
@@ -1463,6 +1471,7 @@ mod tests {
                     synchronizations: 0,
                 },
                 loads: Vec::new(),
+                cooperative_yields: 0,
             }
         }
 
@@ -1542,6 +1551,11 @@ mod tests {
             self.loads.push("tail".into());
             <MemoryStageSource as AsyncBooguDenoiserStageSource<B>>::load_tail(&mut self.inner)
                 .await
+        }
+
+        async fn cooperative_yield(&mut self) -> Result<(), BooguError> {
+            self.cooperative_yields += 1;
+            Ok(())
         }
 
         async fn synchronize(&mut self) -> Result<(), BooguError> {
@@ -1906,6 +1920,11 @@ mod tests {
         }
 
         assert_eq!(streamed.source().source().loads.len(), 7);
+        assert_eq!(
+            streamed.source().source().cooperative_yields,
+            7 * 4,
+            "deferred resident execution must expose every semantic boundary to the host"
+        );
         assert_eq!(streamed.source().cached_stage_count(), 7);
         assert_eq!(streamed.rope_cache_misses(), 1);
     }
@@ -2107,9 +2126,8 @@ mod tests {
             artifacts::{
                 BooguArtifactInventory, BooguDenoiserRuntimeQuantizationPolicy,
                 BooguFloatLoadPolicy, BooguQuantizedLoadPolicy, BooguReleaseIdentity,
-                BooguRuntimeQ8Scope, BooguStorageProfile, DirectoryStageShardReader,
-                VerifiedArtifactDirectory, VerifiedAsyncBurnpackDenoiserStageSource,
-                VerifiedBurnpackStageSource,
+                BooguStorageProfile, DirectoryStageShardReader, VerifiedArtifactDirectory,
+                VerifiedAsyncBurnpackDenoiserStageSource, VerifiedBurnpackStageSource,
             },
         };
 
@@ -2158,8 +2176,7 @@ mod tests {
         ))
         .unwrap()
         .with_float_load_policy(BooguFloatLoadPolicy::AdaptToF32)
-        .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32)
-        .with_runtime_q8_scope(BooguRuntimeQ8Scope::AllInventoryEligible);
+        .with_runtime_quantization_policy(BooguDenoiserRuntimeQuantizationPolicy::Q8sBlock32F32);
         let mut source = RetainingAsyncBooguDenoiserStageSource::new(runtime_q8_source)
             .with_quantized_linear_execution_policy(
                 BooguQuantizedLinearExecutionPolicy::DenseF32PerSemanticStage,

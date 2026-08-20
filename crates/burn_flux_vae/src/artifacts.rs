@@ -58,6 +58,8 @@ pub const FLUX_VAE_ENCODER_STAGE: &str = "flux-vae-encoder";
 pub const FLUX_VAE_DECODER_STAGE: &str = "flux-vae-decoder";
 pub const FLUX_VAE_COMPONENT_ROLE: &str = "vae";
 pub const FLUX_VAE_COMPONENT_BUNDLE_ID: &str = "flux1-vae-boogu-image-0.1";
+/// Profile-explicit shared VAE bundle used by dependency-first Q4S releases.
+pub const FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID: &str = "flux1-vae-boogu-image-0.1-f16-shared";
 pub const FLUX_VAE_COMPONENT_PROFILE: &str = "f16";
 pub const FLUX_VAE_COMPONENT_MODEL_ID: &str = "BooguDerived/FLUX1-VAE-0.1";
 /// SHA-256 of the canonical sorted declaration for the shared upstream VAE source file.
@@ -66,6 +68,9 @@ pub const FLUX_VAE_COMPONENT_MODEL_REVISION: &str =
 /// Exact sealed digest of the canonical reusable FLUX VAE component manifest.
 pub const FLUX_VAE_COMPONENT_CONTENT_DIGEST: &str =
     "a7a4758d3334bf3c2749cc9e84bed748fd0dc9b982299708748e1343b08efab9";
+/// Exact sealed digest of the profile-explicit shared VAE component manifest.
+pub const FLUX_VAE_SHARED_COMPONENT_CONTENT_DIGEST: &str =
+    "fcd840d188556b3f8aa3f5ffd240a240ac94420285a4c47676104dead5183a52";
 
 /// Construct the complete immutable dependency pin for the released FLUX VAE component.
 pub fn flux_vae_component_dependency() -> ArtifactDependency {
@@ -78,6 +83,21 @@ pub fn flux_vae_component_dependency() -> ArtifactDependency {
         model: ModelId::new(FLUX_VAE_COMPONENT_MODEL_ID).expect("static model id is valid"),
         model_revision: FLUX_VAE_COMPONENT_MODEL_REVISION.to_owned(),
         content_digest: Sha256Digest::from_hex(FLUX_VAE_COMPONENT_CONTENT_DIGEST)
+            .expect("static digest is valid"),
+    }
+}
+
+/// Construct the immutable dependency pin used by the shared Q4S release family.
+pub fn flux_vae_shared_component_dependency() -> ArtifactDependency {
+    ArtifactDependency {
+        role: ArtifactComponentId::new(FLUX_VAE_COMPONENT_ROLE).expect("static role is valid"),
+        bundle: ArtifactBundleId::new(FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID)
+            .expect("static bundle is valid"),
+        profile: ArtifactProfileId::new(FLUX_VAE_COMPONENT_PROFILE)
+            .expect("static profile is valid"),
+        model: ModelId::new(FLUX_VAE_COMPONENT_MODEL_ID).expect("static model id is valid"),
+        model_revision: FLUX_VAE_COMPONENT_MODEL_REVISION.to_owned(),
+        content_digest: Sha256Digest::from_hex(FLUX_VAE_SHARED_COMPONENT_CONTENT_DIGEST)
             .expect("static digest is valid"),
     }
 }
@@ -290,12 +310,16 @@ fn validate_identity(manifest: &ArtifactManifest) -> Result<(), FluxVaeArtifactE
             manifest.profile
         )));
     }
+    let expected_digest = match manifest.bundle.as_str() {
+        FLUX_VAE_COMPONENT_BUNDLE_ID => FLUX_VAE_COMPONENT_CONTENT_DIGEST,
+        FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID => FLUX_VAE_SHARED_COMPONENT_CONTENT_DIGEST,
+        actual => {
+            return Err(FluxVaeArtifactError::Manifest(format!(
+                "bundle {actual:?} is not a canonical released VAE component"
+            )));
+        }
+    };
     for (field, actual, expected) in [
-        (
-            "bundle",
-            manifest.bundle.as_str(),
-            FLUX_VAE_COMPONENT_BUNDLE_ID,
-        ),
         (
             "model",
             manifest.model.as_str(),
@@ -313,8 +337,8 @@ fn validate_identity(manifest: &ArtifactManifest) -> Result<(), FluxVaeArtifactE
             )));
         }
     }
-    let expected_digest = Sha256Digest::from_hex(FLUX_VAE_COMPONENT_CONTENT_DIGEST)
-        .expect("static component digest is valid");
+    let expected_digest =
+        Sha256Digest::from_hex(expected_digest).expect("static component digest is valid");
     if manifest.content_digest != Some(expected_digest) {
         return Err(FluxVaeArtifactError::Manifest(format!(
             "content digest {:?} differs from canonical {expected_digest}",
@@ -955,6 +979,12 @@ mod tests {
     fn component_identity_fails_closed_correctness() {
         let manifest = identity_manifest();
         validate_identity(&manifest).unwrap();
+
+        let mut shared = manifest.clone();
+        shared.bundle = ArtifactBundleId::new(FLUX_VAE_SHARED_COMPONENT_BUNDLE_ID).unwrap();
+        shared.content_digest =
+            Some(Sha256Digest::from_hex(FLUX_VAE_SHARED_COMPONENT_CONTENT_DIGEST).unwrap());
+        validate_identity(&shared).unwrap();
 
         let mut wrong_bundle = manifest.clone();
         wrong_bundle.bundle = ArtifactBundleId::new("vae-unpinned").unwrap();

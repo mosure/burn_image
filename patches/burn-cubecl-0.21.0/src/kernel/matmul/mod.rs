@@ -1,4 +1,5 @@
 mod base;
+mod quantized;
 mod tune;
 
 /// Contains utilities for matmul operation

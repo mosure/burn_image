@@ -9,6 +9,9 @@ pub mod artifacts;
 pub mod conditioning;
 /// Released denoiser and task configuration.
 pub mod config;
+/// Canonical release selection and runtime artifact policy.
+#[cfg(feature = "burnpack")]
+pub mod deployment;
 /// Distribution-matching-distillation schedule and update equations.
 pub mod dmd;
 /// Boogu pipeline errors.
@@ -31,15 +34,18 @@ pub mod rope;
 /// Model-neutral [`burn_image`] adapter for an already loaded Boogu pipeline.
 #[cfg(feature = "runtime")]
 pub mod runtime;
+/// Frontend-independent browser execution policy.
+#[cfg(all(feature = "burnpack", feature = "runtime"))]
+pub mod web_policy;
 /// Fail-closed selection of a native hardware WGPU adapter for standalone tools.
 #[cfg(feature = "wgpu")]
 pub mod wgpu_device;
 
 pub use config::{
     BOOGU_1K_NATIVE_POLICY, BooguConfig, BooguTask, BooguVariant, EDIT_TURBO_1K5_NATIVE_POLICY,
-    EditTurbo1k5NativePolicy, NativeAutotunePolicy, NativeDenoiserAttentionPolicy,
-    NativeDenoiserQkPreparationPolicy, NativeDenoiserRmsNormPolicy, NativeHighVramPolicy,
-    NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy,
+    NativeAutotunePolicy, NativeDenoiserAttentionPolicy, NativeDenoiserQkPreparationPolicy,
+    NativeDenoiserRmsNormPolicy, NativeHighVramPolicy, NativeQwenSynchronizationPolicy,
+    NativeVaeExecutionPolicy,
 };
 pub use dmd::{DmdSchedule, dmd_prediction, dmd_renoise};
 pub use error::BooguError;
@@ -59,12 +65,6 @@ pub use model::{
     PACKED_F16_F32_VIEW_ALIGNMENT_ELEMENTS, PACKED_F16_MAX_BUFFER_BYTES, PackedF16Error,
     PackedF16Layout, PackedF16Object, PackedF16TensorLayout, align_packed_f16_f32_view_offset,
     materialize_packed_f16_object, materialize_packed_f16_objects,
-};
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-pub use model::{
-    NativeCudaBackend, required_chunked_cuda_flash_unit_attention,
-    required_chunked_cuda_padded_blackbox_attention,
-    required_chunked_cuda_padded_blackbox_attention_tiled, required_cuda_flash_unit_attention,
 };
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub use model::{
@@ -95,8 +95,6 @@ pub use pipeline::{
 };
 #[cfg(feature = "burnpack")]
 pub use pipeline::{AsyncFluxVaeStageSourceAdapter, FluxVaeStageSourceAdapter};
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-pub use pipeline::{NativeCudaFlashUnitDenoiser, NativeCudaPaddedBlackboxDenoiser};
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub use pipeline::{NativePaddedBlackboxDenoiser, NativePortableDenoiser};
 pub use processing::{

@@ -621,177 +621,6 @@ impl DmdDenoiser<crate::model::NativeWgpuBackend> for NativePaddedBlackboxDenois
     }
 }
 
-/// Native CUDA adapter that requires Cubek `FlashUnit` for every denoiser attention operation.
-///
-/// The wrapped model and checkpoint record are unchanged. Prediction uses bounded-query,
-/// fail-closed FlashUnit submissions and never invokes attention autotuning or dense fallback.
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-pub struct NativeCudaFlashUnitDenoiser {
-    denoiser: BooguDenoiser<crate::model::NativeCudaBackend>,
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl NativeCudaFlashUnitDenoiser {
-    /// Wrap an already loaded native CUDA denoiser without modifying its parameters.
-    pub const fn new(denoiser: BooguDenoiser<crate::model::NativeCudaBackend>) -> Self {
-        Self { denoiser }
-    }
-
-    /// Access the wrapped denoiser.
-    pub const fn denoiser(&self) -> &BooguDenoiser<crate::model::NativeCudaBackend> {
-        &self.denoiser
-    }
-
-    /// Mutably access the wrapped denoiser.
-    pub fn denoiser_mut(&mut self) -> &mut BooguDenoiser<crate::model::NativeCudaBackend> {
-        &mut self.denoiser
-    }
-
-    /// Set the maximum query rows submitted to each required-FlashUnit operation.
-    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
-        self.denoiser
-            .set_attention_query_chunk_size(query_chunk_size);
-    }
-
-    /// Return the wrapped denoiser.
-    pub fn into_inner(self) -> BooguDenoiser<crate::model::NativeCudaBackend> {
-        self.denoiser
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl DmdDenoiser<crate::model::NativeCudaBackend> for NativeCudaFlashUnitDenoiser {
-    fn execution_dtype(&self) -> Option<DType> {
-        self.denoiser
-            .x_embedder
-            .bias
-            .as_ref()
-            .map(|bias| bias.val().dtype())
-    }
-
-    fn predict(
-        &mut self,
-        input: BooguDenoiserInput<crate::model::NativeCudaBackend>,
-    ) -> Result<Tensor<crate::model::NativeCudaBackend, 4>, BooguError> {
-        self.denoiser.forward_native_cuda_flash_unit(input)
-    }
-}
-
-/// Experimental native CUDA adapter using padded, accelerated Cubek blackbox FlashAttention.
-///
-/// The adapter retains Boogu's configured bounded query chunks, pads 120-wide attention heads to
-/// 128, corrects the query scale, and forces a 16-by-16-by-16 CMMA blueprint. It accepts only F16
-/// activations and never routes through attention autotuning or a dense fallback. CUDA numerical
-/// parity remains an explicit prerequisite for any production support claim.
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-pub struct NativeCudaPaddedBlackboxDenoiser {
-    denoiser: BooguDenoiser<crate::model::NativeCudaBackend>,
-    num_planes: u8,
-    seq_kv_tiles: u8,
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl NativeCudaPaddedBlackboxDenoiser {
-    /// Wrap a native CUDA denoiser with the default four-plane experimental strategy.
-    pub const fn new(denoiser: BooguDenoiser<crate::model::NativeCudaBackend>) -> Self {
-        Self {
-            denoiser,
-            num_planes: 4,
-            seq_kv_tiles: 1,
-        }
-    }
-
-    /// Set the accelerated stage plane count to 2 or 4.
-    pub fn with_num_planes(mut self, num_planes: u8) -> Self {
-        self.set_num_planes(num_planes);
-        self
-    }
-
-    /// Set the key/value partition width to 1 or 2 CMMA tiles; two requires two planes.
-    pub fn with_seq_kv_tiles(mut self, seq_kv_tiles: u8) -> Self {
-        self.set_seq_kv_tiles(seq_kv_tiles);
-        self
-    }
-
-    /// Set the plane count and key/value partition width atomically.
-    pub fn with_configuration(mut self, num_planes: u8, seq_kv_tiles: u8) -> Self {
-        self.set_configuration(num_planes, seq_kv_tiles);
-        self
-    }
-
-    /// Access the wrapped denoiser.
-    pub const fn denoiser(&self) -> &BooguDenoiser<crate::model::NativeCudaBackend> {
-        &self.denoiser
-    }
-
-    /// Mutably access the wrapped denoiser.
-    pub fn denoiser_mut(&mut self) -> &mut BooguDenoiser<crate::model::NativeCudaBackend> {
-        &mut self.denoiser
-    }
-
-    /// Return the configured accelerated stage plane count.
-    pub const fn num_planes(&self) -> u8 {
-        self.num_planes
-    }
-
-    /// Return the number of 16-row key/value tiles processed in each partition.
-    pub const fn seq_kv_tiles(&self) -> u8 {
-        self.seq_kv_tiles
-    }
-
-    /// Set the accelerated stage plane count to 2 or 4.
-    pub fn set_num_planes(&mut self, num_planes: u8) {
-        crate::model::assert_supported_blackbox_configuration(num_planes, self.seq_kv_tiles);
-        self.num_planes = num_planes;
-    }
-
-    /// Set the number of 16-row key/value tiles processed in each partition.
-    pub fn set_seq_kv_tiles(&mut self, seq_kv_tiles: u8) {
-        crate::model::assert_supported_blackbox_configuration(self.num_planes, seq_kv_tiles);
-        self.seq_kv_tiles = seq_kv_tiles;
-    }
-
-    /// Set the plane count and key/value partition width atomically.
-    pub fn set_configuration(&mut self, num_planes: u8, seq_kv_tiles: u8) {
-        crate::model::assert_supported_blackbox_configuration(num_planes, seq_kv_tiles);
-        self.num_planes = num_planes;
-        self.seq_kv_tiles = seq_kv_tiles;
-    }
-
-    /// Set the maximum query rows submitted to each required blackbox operation.
-    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
-        self.denoiser
-            .set_attention_query_chunk_size(query_chunk_size);
-    }
-
-    /// Return the wrapped denoiser.
-    pub fn into_inner(self) -> BooguDenoiser<crate::model::NativeCudaBackend> {
-        self.denoiser
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl DmdDenoiser<crate::model::NativeCudaBackend> for NativeCudaPaddedBlackboxDenoiser {
-    fn execution_dtype(&self) -> Option<DType> {
-        self.denoiser
-            .x_embedder
-            .bias
-            .as_ref()
-            .map(|bias| bias.val().dtype())
-    }
-
-    fn predict(
-        &mut self,
-        input: BooguDenoiserInput<crate::model::NativeCudaBackend>,
-    ) -> Result<Tensor<crate::model::NativeCudaBackend, 4>, BooguError> {
-        self.denoiser.forward_native_cuda_padded_blackbox_tiled(
-            input,
-            self.num_planes,
-            self.seq_kv_tiles,
-        )
-    }
-}
-
 /// Fully deterministic input to the DMD student loop.
 ///
 /// Supplying every noise tensor explicitly avoids backend RNG differences and is required by the
@@ -875,7 +704,7 @@ pub trait BooguVaeStageSource<B: Backend> {
     fn load_decoder(&mut self) -> Result<AutoencoderKl<B>, BooguError>;
 }
 
-/// Thin compatibility adapter from the reusable FLUX VAE artifact source into Boogu composition.
+/// Thin integration adapter from the reusable FLUX VAE artifact source into Boogu composition.
 ///
 /// Shard verification, loading, and device residency remain owned by `burn_flux_vae`; this type
 /// only translates its model-neutral error at the pipeline boundary.
@@ -1024,7 +853,7 @@ pub trait AsyncBooguVaeStageSource<B: Backend> {
     async fn synchronize(&mut self) -> Result<(), BooguError>;
 }
 
-/// Wasm-local compatibility adapter for the reusable asynchronous FLUX VAE source.
+/// Wasm-local integration adapter for the reusable asynchronous FLUX VAE source.
 #[cfg(feature = "burnpack")]
 pub struct AsyncFluxVaeStageSourceAdapter<S> {
     source: S,
@@ -1529,6 +1358,12 @@ pub enum VaeDecoderMemoryPolicy {
     /// The decoder graph is synchronized while exact transient allocation mode is active, with a
     /// second synchronized cleanup immediately before its final full-resolution residual block.
     ExactTransientWithTailCleanup,
+    /// Use the exact strict-F32 two-slab VAE tail and reclaim dead buffers after every safe stage.
+    ///
+    /// The decoder parameters remain resident. Only the final full-resolution feature path is
+    /// split, with global GroupNorm statistics and convolution halos preserving the ordinary VAE
+    /// math. Each staged submission is synchronized before dead allocator pages are reclaimed.
+    ExactStripedTailWithStageCleanup,
 }
 
 /// Memory-bounded composition of reusable Qwen3-VL, FLUX VAE, and Boogu executors.
@@ -1703,6 +1538,56 @@ where
                 final_sync?;
                 image?
             }
+            VaeDecoderMemoryPolicy::ExactStripedTailWithStageCleanup => {
+                let latent_width = scaled_latents.dims()[3];
+                let upsample_count = decoder
+                    .decoder
+                    .up_blocks
+                    .iter()
+                    .map(|block| block.upsamplers.len())
+                    .sum::<usize>();
+                let scale_shift = u32::try_from(upsample_count).map_err(|error| {
+                    BooguError::Artifact(format!(
+                        "VAE striped decoder upsample count does not fit u32: {error}"
+                    ))
+                })?;
+                let spatial_scale = 1_usize.checked_shl(scale_shift).ok_or_else(|| {
+                    BooguError::Artifact("VAE striped decoder spatial scale exceeds usize".into())
+                })?;
+                let output_width = latent_width.checked_mul(spatial_scale).ok_or_else(|| {
+                    BooguError::Artifact("VAE striped decoder output width overflowed".into())
+                })?;
+                let split_width = output_width / 2;
+                if split_width < 2
+                    || split_width + 2 > output_width
+                    || !split_width.is_multiple_of(2)
+                {
+                    return Err(BooguError::Artifact(format!(
+                        "VAE striped decoder cannot split output width {output_width} at {split_width}"
+                    )));
+                }
+                B::memory_persistent_allocations(&device, scaled_latents, |scaled_latents| {
+                    let decode_input = decoder.unscale_latents(scaled_latents);
+                    let mut state =
+                        decoder.begin_decode_striped_tail_strict_f32(decode_input, split_width);
+                    release_unused_decoder_memory::<B>(
+                        &device,
+                        "initial convolution and middle block",
+                    )?;
+                    let stage_count = decoder.decoder.striped_tail_stage_count();
+                    let mut stage_index = 0_usize;
+                    while !state.is_complete() {
+                        decoder.advance_decode_striped_tail_strict_f32(&mut state);
+                        stage_index += 1;
+                        release_unused_decoder_memory::<B>(
+                            &device,
+                            &format!("striped stage {stage_index}/{stage_count}"),
+                        )?;
+                    }
+                    debug_assert_eq!(stage_index, stage_count);
+                    Ok(state.into_output())
+                })?
+            }
         };
         B::sync(&device).map_err(|error| {
             BooguError::Artifact(format!("VAE decoder synchronization failed: {error}"))
@@ -1710,6 +1595,23 @@ where
         drop(decoder);
         Ok(image)
     }
+}
+
+fn release_unused_decoder_memory<B: Backend>(
+    device: &B::Device,
+    phase: &str,
+) -> Result<(), BooguError> {
+    B::sync(device).map_err(|error| {
+        BooguError::Artifact(format!(
+            "VAE decoder {phase} synchronization failed: {error}"
+        ))
+    })?;
+    B::memory_cleanup(device);
+    B::sync(device).map_err(|error| {
+        BooguError::Artifact(format!(
+            "VAE decoder {phase} allocator cleanup synchronization failed: {error}"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1959,7 +1861,7 @@ mod tests {
         let qwen = StreamingQwen3Vl::<B, NeverQwenSource>::new(plan, NeverQwenSource);
         let mixed = StreamingBooguPipeline::new(
             BooguVariant::Image01Turbo,
-            config,
+            config.clone(),
             qwen,
             CountingVaeSource {
                 encoder_loads: 0,
@@ -1976,6 +1878,26 @@ mod tests {
         assert_eq!(
             mixed.decoder_memory_policy(),
             VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup
+        );
+
+        let plan =
+            Qwen3VlStreamingPlan::new(&config, RowChunkPlan::even(64, 8, 2, 4).unwrap(), None)
+                .unwrap();
+        let qwen = StreamingQwen3Vl::<B, NeverQwenSource>::new(plan, NeverQwenSource);
+        let striped = StreamingBooguPipeline::new(
+            BooguVariant::Image01Turbo,
+            config,
+            qwen,
+            CountingVaeSource {
+                encoder_loads: 0,
+                decoder_loads: 0,
+            },
+            IdentityVelocity,
+        )
+        .with_decoder_memory_policy(VaeDecoderMemoryPolicy::ExactStripedTailWithStageCleanup);
+        assert_eq!(
+            striped.decoder_memory_policy(),
+            VaeDecoderMemoryPolicy::ExactStripedTailWithStageCleanup
         );
     }
 

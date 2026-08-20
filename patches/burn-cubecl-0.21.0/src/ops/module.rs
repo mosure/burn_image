@@ -4,7 +4,7 @@ use crate::{
     kernel::{
         self,
         conv::ConvTranspose2dStrategy,
-        packed_f16::{packed_f16_conv2d, requires_packed_f16_compatibility},
+        packed_f16::{packed_f16_conv2d, requires_packed_f16_unpack},
     },
 };
 use burn_backend::tensor::{BoolTensor, FloatTensor, IntTensor};
@@ -70,7 +70,7 @@ where
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<2>,
     ) -> FloatTensor<Self> {
-        if x.dtype == burn_backend::DType::F32 && requires_packed_f16_compatibility(&weight) {
+        if x.dtype == burn_backend::DType::F32 && requires_packed_f16_unpack(&weight) {
             return packed_f16_conv2d(x, weight, bias, options);
         }
         kernel::conv::conv_forward::<R, 2>(x, weight, bias, options, Default::default()).unwrap()

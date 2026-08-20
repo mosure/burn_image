@@ -338,12 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn optional_dimension_allowlist_preserves_legacy_serde_correctness() {
+    fn optional_dimension_allowlist_round_trips_when_absent_correctness() {
         let dimensions = capabilities().dimensions;
         let serialized = serde_json::to_value(&dimensions).unwrap();
         assert!(serialized.get("allowed_dimensions").is_none());
 
-        let legacy = serde_json::json!({
+        let without_allowlist = serde_json::json!({
             "min_width": 256,
             "max_width": 1024,
             "min_height": 256,
@@ -353,7 +353,7 @@ mod tests {
             "max_pixels": 1048576
         });
         assert_eq!(
-            serde_json::from_value::<DimensionConstraints>(legacy).unwrap(),
+            serde_json::from_value::<DimensionConstraints>(without_allowlist).unwrap(),
             dimensions
         );
     }

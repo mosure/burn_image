@@ -1729,6 +1729,13 @@ pub trait AsyncQwen3VlStageSource<B: Backend> {
         index: usize,
     ) -> core::result::Result<Qwen3VlDecoderLayer<B>, Self::Error>;
     async fn load_text_final_norm(&mut self) -> core::result::Result<RmsNorm<B>, Self::Error>;
+    /// Cooperatively yield to a single-threaded host without waiting for submitted device work.
+    ///
+    /// Native and simple sources use the no-op default. Browser sources override this so a
+    /// deferred-resident forward does not monopolize the JavaScript task between GPU barriers.
+    async fn cooperative_yield(&mut self) -> core::result::Result<(), Self::Error> {
+        Ok(())
+    }
     async fn synchronize(&mut self) -> core::result::Result<(), Self::Error>;
 }
 
@@ -2020,7 +2027,7 @@ where
             AsyncRetainingSynchronizationPolicy::PerStage => self.source.synchronize().await,
             AsyncRetainingSynchronizationPolicy::Deferred => {
                 self.synchronization_pending = true;
-                Ok(())
+                self.source.cooperative_yield().await
             }
         }
     }
@@ -3218,6 +3225,7 @@ mod tests {
     struct ResidentStageSource<B: Backend> {
         model: Qwen3VlModel<B>,
         synchronizations: usize,
+        cooperative_yields: usize,
         loads: Vec<Qwen3VlStage>,
     }
 
@@ -3363,6 +3371,11 @@ mod tests {
             Ok(self.model.language_model.norm.clone())
         }
 
+        async fn cooperative_yield(&mut self) -> core::result::Result<(), Self::Error> {
+            self.cooperative_yields += 1;
+            Ok(())
+        }
+
         async fn synchronize(&mut self) -> core::result::Result<(), Self::Error> {
             self.synchronizations += 1;
             Ok(())
@@ -3440,6 +3453,7 @@ mod tests {
         let source = ResidentStageSource {
             model: Qwen3VlModel::<B>::new(config, &device).unwrap(),
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
         let streamed = StreamingQwen3Vl::<B, _>::new(plan, source);
@@ -3706,6 +3720,7 @@ mod tests {
         let source = |model| ResidentStageSource {
             model,
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
 
@@ -3811,6 +3826,7 @@ mod tests {
         let source = ResidentStageSource {
             model: resident.clone(),
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
         let mut streamed = StreamingQwen3Vl::<B, _>::new(plan.clone(), source);
@@ -3821,6 +3837,7 @@ mod tests {
         let async_source = ResidentStageSource {
             model: resident.clone(),
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
         let mut async_streamed = StreamingQwen3Vl::<B, _>::new(plan.clone(), async_source);
@@ -3834,6 +3851,7 @@ mod tests {
         let barrier_source = ResidentStageSource {
             model: resident,
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
         let mut barrier_streamed = StreamingQwen3Vl::<B, _>::new(plan, barrier_source)
@@ -4028,6 +4046,7 @@ mod tests {
         let source = ResidentStageSource {
             model: resident,
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
         let retaining = RetainingQwen3VlStageSource::new(source);
@@ -4113,6 +4132,7 @@ mod tests {
         let source = ResidentStageSource {
             model: resident,
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
         let source = RetainingAsyncQwen3VlStageSource::new(source)
@@ -4127,6 +4147,11 @@ mod tests {
             assert_eq!(streamed.source.source().synchronizations, forward);
         }
         assert_eq!(streamed.source.source().loads.len(), expected_loads);
+        assert_eq!(
+            streamed.source.source().cooperative_yields,
+            2 * expected_loads,
+            "deferred resident execution must expose every semantic boundary to the host"
+        );
         assert_eq!(streamed.source.cached_stage_count(), expected_loads);
         streamed.source.clear();
         assert_eq!(streamed.source.cached_stage_count(), 0);
@@ -4165,6 +4190,7 @@ mod tests {
         let source = ResidentStageSource {
             model: resident,
             synchronizations: 0,
+            cooperative_yields: 0,
             loads: Vec::new(),
         };
         let retaining = RetainingQwen3VlStageSource::new(source)

@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use bevy_burn_image::NativeOutputQualificationRequestIdentity;
+use bevy_burn_image::{BROWSER_SURFACE_INFERENCE_POLICY, NativeOutputQualificationRequestIdentity};
 use burn_boogu::{
     BOOGU_1K5_OUTPUT_PRESETS, BooguVariant,
     artifacts::{
@@ -16,6 +16,10 @@ use burn_boogu::{
         validate_canonical_release_artifact_digest,
     },
     boogu_model_descriptor,
+    web_policy::{
+        PACKED_F16_DMD_VAE_HANDOFF_POLICY as BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY,
+        PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY as BROWSER_PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY,
+    },
 };
 use burn_image::{Dimensions, Sha256Digest, ValidationError};
 use image::{ColorType, ImageReader};
@@ -31,11 +35,7 @@ const NATIVE_TEST: &str = "burn_image_native_low_vram_output";
 const BROWSER_TURBO_TEST: &str = "burn_image_browser_rendered_turbo_1024_smoke";
 const BROWSER_GENERIC_TEST: &str = "burn_image_browser_rendered_output_smoke";
 const BROWSER_LOW_VRAM_BACKEND: &str = "burn-webgpu/browser-low-vram-preloaded-packed-f16-dense-f32-per-stage-denoiser/request-scoped-packed-cache-evicted-before-vae/request-scoped-surface-acquire-suspended";
-const BROWSER_SURFACE_INFERENCE_POLICY: &str = "request-scoped-surface-acquire-suspended/primary-window-cameras-inactive-before-runtime-submit/exact-state-restored-after-terminal-before-output-ready";
 const BROWSER_QWEN_BLOCK0_ORDINARY_MODE: &str = "ordinary";
-const BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY: &str = "exact-f32-final-latent-host-handoff/drop-dmd-input-handles/pre-clear-async-webgpu-sync/clear-packed-source-wrapper-rope/async-webgpu-sync/backend-memory-cleanup/async-webgpu-sync/require-empty-packed-cache/exact-f32-reupload/post-upload-digest-verify";
-const BROWSER_PACKED_F16_NEXT_REQUEST_REHYDRATION_POLICY: &str =
-    "ensure-preloaded-low-vram-denoiser/verified-persistent-cache-storage/bounded-object-replay";
 const TURBO_PACKED_F16_STAGES: u64 = 46;
 const TURBO_PACKED_F16_OBJECTS: u64 = 106;
 const TURBO_PACKED_F16_TENSORS: u64 = 912;
@@ -386,16 +386,8 @@ fn validate_browser_report(report: &Value, bytes: &[u8]) -> Result<ValidatedOutp
     if expected_test == BROWSER_TURBO_TEST {
         validate_turbo_packed_f16_evidence(evidence)?;
     }
-    let request = match evidence.pointer("/request_identity") {
-        Some(identity) => serde_json::from_value(identity.clone())
-            .map_err(|error| format!("decode browser request identity: {error}"))?,
-        None if expected_test == BROWSER_TURBO_TEST => legacy_turbo_request_identity(evidence)?,
-        None => {
-            return Err(
-                "browser output report omits request_identity for a non-Turbo rendered gate".into(),
-            );
-        }
-    };
+    let request = serde_json::from_value(required(evidence, "/request_identity")?.clone())
+        .map_err(|error| format!("decode browser request identity: {error}"))?;
     validate_request_identity(&request)?;
     let published = canonical_published_bundle(
         request_variant(&request)?,
@@ -538,29 +530,7 @@ fn validate_turbo_packed_f16_evidence(evidence: &Value) -> Result<(), String> {
         json!(BROWSER_QWEN_BLOCK0_ORDINARY_MODE),
         "browser output-quality ready-event Qwen block-0 execution mode",
     )?;
-    for retired in ["low_vram_resource_plan", "denoiser_preload"] {
-        if events
-            .iter()
-            .any(|event| event.get("event").and_then(Value::as_str) == Some(retired))
-        {
-            return Err(format!(
-                "browser Turbo evidence contains retired runtime event {retired:?}"
-            ));
-        }
-    }
-
     let plan = exact_runtime_event(events, "packed_f16_resource_plan")?;
-    for retired in [
-        "denoiser_quantized_load_policy",
-        "denoiser_runtime_q8_scope",
-        "denoiser_quantized_linear_execution_policy",
-    ] {
-        if plan.get(retired).is_some() {
-            return Err(format!(
-                "browser packed-F16 resource plan exposes retired field {retired:?}"
-            ));
-        }
-    }
     for (field, expected) in [
         (
             "authenticated_artifact_bytes",
@@ -1121,47 +1091,6 @@ fn exact_runtime_event<'a>(events: &'a [Value], event_name: &str) -> Result<&'a 
             matches.len()
         )),
     }
-}
-
-fn legacy_turbo_request_identity(
-    evidence: &Value,
-) -> Result<NativeOutputQualificationRequestIdentity, String> {
-    let prompt = required_str(evidence, "/fixed_ascii_prompt")?;
-    exact(
-        evidence,
-        "/interaction/prompt_value",
-        json!(prompt),
-        "browser typed prompt",
-    )?;
-    exact(
-        evidence,
-        "/interaction/seed_value",
-        json!("0"),
-        "browser typed seed",
-    )?;
-    for pointer in [
-        "/interaction/prompt_typed_via_cdp",
-        "/interaction/seed_typed_via_cdp",
-        "/interaction/run_clicked_via_cdp",
-        "/interaction/save_clicked_via_cdp",
-    ] {
-        exact(evidence, pointer, json!(true), "browser CDP input")?;
-    }
-    let descriptor = boogu_model_descriptor(BooguVariant::Image01Turbo);
-    Ok(NativeOutputQualificationRequestIdentity {
-        variant: "turbo".into(),
-        task: "generate".into(),
-        model: descriptor.id.to_string(),
-        model_revision: descriptor.revision,
-        prompt: prompt.into(),
-        seed: 0,
-        width: required_u64(evidence, "/output_ready/width")? as u32,
-        height: required_u64(evidence, "/output_ready/height")? as u32,
-        steps: 4,
-        guidance_scale: 1.0,
-        batch_size: 1,
-        source: None,
-    })
 }
 
 fn validate_request_identity(

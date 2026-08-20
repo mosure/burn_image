@@ -62,6 +62,7 @@ import {
   TURBO_MODEL_ID,
   TURBO_MULTI_REQUEST_POLICY,
   TURBO_PRODUCTION_CONTENT_DIGEST,
+  TURBO_RENDERED_Q4_RESIDENT_MULTI_REQUEST_TEST,
   TURBO_REPEAT_GENERATE_REQUEST_TRAFFIC,
   TURBO_QWEN_TEXT_LAYER_ALLOCATION_POLICY,
   TURBO_QWEN_TEXT_BLOCK_LOAD_SYNCHRONIZATION_POLICY,
@@ -284,6 +285,18 @@ test("rendered harness conditionally applies shmem fallback and persists launch 
   );
 });
 
+test("rendered Q4 readiness requires its resident plan instead of the packed-F16 plan", async () => {
+  const source = await readFile(
+    new URL("./wasm_rendered_surface_smoke.mjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /q4ResidentMode \? "resident_resource_plan" : "packed_f16_resource_plan"/);
+  assert.match(
+    source,
+    /waitForTurboUiReady\(\s*cdp,\s*browser,\s*exactUrl,\s*deadline,\s*q4ResidentMode,/,
+  );
+});
+
 test("keeps serialized block-0 success diagnostic-only by outer report identity", () => {
   const ordinary = renderedSurfaceReportIdentity({
     modelMode: true,
@@ -319,6 +332,15 @@ test("keeps serialized block-0 success diagnostic-only by outer report identity"
     claim:
       "same-page same-engine two-request ordinary rendered Bevy UI Turbo 1024 low-VRAM qualification; not numerical parity",
   });
+  const residentQ4Multi = renderedSurfaceReportIdentity({
+    modelMode: true,
+    multiRequestModelMode: true,
+    q4ResidentMode: true,
+    qwenBlock0ExecutionMode: TURBO_QWEN_BLOCK0_ORDINARY_MODE,
+    ok: true,
+  });
+  assert.equal(residentQ4Multi.test, TURBO_RENDERED_Q4_RESIDENT_MULTI_REQUEST_TEST);
+  assert.match(residentQ4Multi.claim, /resident-Q4 warm-session qualification/);
   const diagnosticMulti = renderedSurfaceReportIdentity({
     modelMode: true,
     multiRequestModelMode: true,
@@ -482,8 +504,8 @@ function validTestedPackageIdentity() {
     },
     sources: {
       browser_runtime: entry(
-        "/workspace/crates/bevy_image/src/browser_boogu.rs",
-        "crates/bevy_image/src/browser_boogu.rs",
+        "/workspace/crates/bevy_image/src/browser_boogu/runtime.rs",
+        "crates/bevy_image/src/browser_boogu/runtime.rs",
         "3",
       ),
       rendered_harness: entry(
@@ -2311,7 +2333,6 @@ test("rejects drift from the exact Turbo packed-F16 resource, lifecycle, and tra
   ).lifecycle;
   lifecycle.stage_materializations -= 1;
   lifecycle.dmd_artifact_traffic.object_reads = 1;
-  evidence.runtime_events.push({ event: "low_vram_resource_plan" });
   const preload = evidence.packed_f16_denoiser_preload_traffic;
   preload.object_reads -= 1;
   preload.range_reads -= 1;
@@ -2320,8 +2341,6 @@ test("rejects drift from the exact Turbo packed-F16 resource, lifecycle, and tra
   traffic.cache_invalid_entries = 1;
   const failures = validateTurbo1024ModelEvidence(evidence);
   for (const pattern of [
-    /retired Q8-policy events/,
-    /retired field denoiser_runtime_q8_scope/,
     /qwen_text_block_load_synchronization_policy/,
     /inserted_padding_elements/,
     /max_materialized_stage_f32_bytes/,

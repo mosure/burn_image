@@ -64,13 +64,14 @@ impl BooguRuntimeDTypes {
         let qwen_visual = match profile {
             BooguStorageProfile::F16 | BooguStorageProfile::Q8sBlock32F32 => DType::F16,
             BooguStorageProfile::F16QwenVisionF32
-            | BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => DType::F32,
+            | BooguStorageProfile::Q8sBlock32F32QwenVisionF32
+            | BooguStorageProfile::Q4sBlockUpTo128F32 => DType::F32,
         };
         let vae = match vae_policy {
-            BooguFloatLoadPolicy::Preserve => DType::F16,
-            BooguFloatLoadPolicy::AdaptToF32
+            BooguFloatLoadPolicy::Preserve
             | BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
-            | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => DType::F32,
+            | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => DType::F16,
+            BooguFloatLoadPolicy::AdaptToF32 => DType::F32,
         };
         let denoiser = match denoiser_policy {
             BooguFloatLoadPolicy::Preserve => DType::F16,
@@ -834,5 +835,20 @@ mod tests {
         assert_eq!(dtypes.qwen_visual, DType::F32);
         assert_eq!(dtypes.vae, DType::F32);
         assert_eq!(dtypes.denoiser, DType::F16);
+    }
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn packed_q4_profile_uses_f16_vae_and_f32_quantized_matmul_boundaries_correctness() {
+        use crate::artifacts::{BooguFloatLoadPolicy, BooguStorageProfile};
+
+        let dtypes = BooguRuntimeDTypes::from_artifact_policies(
+            BooguStorageProfile::Q4sBlockUpTo128F32,
+            BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries,
+            BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries,
+        );
+        assert_eq!(dtypes.qwen_visual, DType::F32);
+        assert_eq!(dtypes.vae, DType::F16);
+        assert_eq!(dtypes.denoiser, DType::F32);
     }
 }

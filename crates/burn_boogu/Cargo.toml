@@ -21,17 +21,6 @@ flex = ["burn/flex"]
 autotune = [
   "burn/autotune",
   "burn-wgpu?/autotune",
-  "burn-cuda?/autotune",
-]
-cuda-experimental = [
-  "burn/cuda",
-  "burn/fusion",
-  "autotune",
-  "dep:burn-cubecl",
-  "dep:burn-cuda",
-  "dep:burn-fusion",
-  "dep:burn-ir",
-  "dep:cubek",
 ]
 wgpu = [
   "burn/wgpu",
@@ -63,9 +52,9 @@ reference-hooks = []
 
 [dependencies]
 burn.workspace = true
-burn_image = { version = "0.1.1", path = "../burn_image", default-features = false }
-burn_qwen3_vl = { version = "0.1.1", path = "../burn_qwen3_vl", default-features = false }
-burn_flux_vae = { version = "0.1.1", path = "../burn_flux_vae", default-features = false }
+burn_image = { version = "0.1.2", path = "../burn_image", default-features = false }
+burn_qwen3_vl = { version = "0.1.2", path = "../burn_qwen3_vl", default-features = false }
+burn_flux_vae = { version = "0.1.2", path = "../burn_flux_vae", default-features = false }
 burn-ndarray = { workspace = true, optional = true }
 burn-store = { workspace = true, optional = true }
 bytemuck.workspace = true
@@ -90,11 +79,6 @@ features = ["fusion", "std", "vulkan"]
 optional = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-cubecl]
-workspace = true
-features = ["fusion", "std"]
-optional = true
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies.burn-cuda]
 workspace = true
 features = ["fusion", "std"]
 optional = true
@@ -145,11 +129,6 @@ path = "src/bin/boogu_run.rs"
 required-features = ["runtime", "import", "wgpu"]
 
 [[bin]]
-name = "boogu-run-cuda"
-path = "src/bin/boogu_run_cuda.rs"
-required-features = ["runtime", "import", "cuda-experimental"]
-
-[[bin]]
 name = "boogu-run-wgpu-blackbox"
 path = "src/bin/boogu_run_wgpu_blackbox.rs"
 required-features = ["runtime", "import", "wgpu", "autotune"]
@@ -182,11 +161,6 @@ required-features = ["import"]
 [[bin]]
 name = "boogu-prepare-cdn-release"
 path = "src/bin/boogu_prepare_cdn_release.rs"
-required-features = ["import"]
-
-[[bin]]
-name = "boogu-prepare-vae-encoder-f32-diagnostic"
-path = "src/bin/boogu_prepare_vae_encoder_f32_diagnostic.rs"
 required-features = ["import"]
 
 [[bench]]

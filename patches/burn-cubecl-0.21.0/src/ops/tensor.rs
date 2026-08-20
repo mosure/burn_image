@@ -1,7 +1,7 @@
 use super::{expand, numeric, permute, unfold};
 use crate::CubeBackend;
 use crate::kernel::packed_f16::{
-    packed_f16_rhs_matmul, packed_f16_select_rows, requires_packed_f16_compatibility,
+    packed_f16_rhs_matmul, packed_f16_select_rows, requires_packed_f16_unpack,
 };
 use crate::kernel::prng::{random_bernoulli, random_normal, random_uniform};
 use crate::kernel::unary_basic::BasicFloatUnaryKind;
@@ -161,7 +161,7 @@ where
     }
 
     fn float_matmul(lhs: FloatTensor<Self>, rhs: FloatTensor<Self>) -> FloatTensor<Self> {
-        if lhs.dtype == DType::F32 && requires_packed_f16_compatibility(&rhs) {
+        if lhs.dtype == DType::F32 && requires_packed_f16_unpack(&rhs) {
             return packed_f16_rhs_matmul(lhs, rhs);
         }
         let dtype = lhs.dtype;
@@ -219,7 +219,7 @@ where
         dim: usize,
         indices: IntTensor<Self>,
     ) -> FloatTensor<Self> {
-        if requires_packed_f16_compatibility(&tensor) {
+        if requires_packed_f16_unpack(&tensor) {
             return packed_f16_select_rows(tensor, dim, indices);
         }
         kernel::select(tensor, dim, indices)

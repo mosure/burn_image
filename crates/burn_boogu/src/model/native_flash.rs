@@ -823,12 +823,6 @@ mod gqa_padding {
 #[cfg(feature = "wgpu")]
 pub type NativeWgpuBackend = Fusion<CubeBackend<WgpuRuntime, f32, i32, u32>>;
 
-/// Exact backend accepted by the native CUDA required-FlashUnit execution path.
-///
-/// This is the same fused backend as `burn::backend::Cuda<f32, i32>`.
-#[cfg(feature = "cuda-experimental")]
-pub type NativeCudaBackend = burn_cuda::Cuda<f32, i32>;
-
 trait RequiredFlashUnitBackend: FusionBackend {
     fn launch_required_flash_unit(
         query: Self::FloatTensorPrimitive,
@@ -1645,111 +1639,6 @@ pub(crate) fn required_chunked_gqa_wgpu_fused_strict_qk_norm_rope_padded_blackbo
         4,
         1,
         1,
-    )
-}
-
-/// Schedule one full-sequence FlashUnit operation on native CUDA inside Burn Fusion.
-///
-/// This has the same fail-closed F16 contract as the native WGPU operation, but executes through
-/// CubeCL's CUDA runtime. No autotuned or dense attention fallback is reachable.
-#[cfg(feature = "cuda-experimental")]
-pub fn required_cuda_flash_unit_attention(
-    query: Tensor<NativeCudaBackend, 4>,
-    key: Tensor<NativeCudaBackend, 4>,
-    value: Tensor<NativeCudaBackend, 4>,
-) -> Tensor<NativeCudaBackend, 4> {
-    required_flash_unit_attention_impl(query, key, value)
-}
-
-/// Schedule bounded-query required FlashUnit operations on native CUDA.
-///
-/// Every tile sees the complete key/value sequence and is forced through Cubek `FlashUnit`; no
-/// dense fallback or attention autotuning is reachable.
-#[cfg(feature = "cuda-experimental")]
-pub fn required_chunked_cuda_flash_unit_attention(
-    query: Tensor<NativeCudaBackend, 4>,
-    key: Tensor<NativeCudaBackend, 4>,
-    value: Tensor<NativeCudaBackend, 4>,
-    query_chunk_size: usize,
-) -> Tensor<NativeCudaBackend, 4> {
-    required_chunked_flash_unit_attention_impl(query, key, value, query_chunk_size)
-}
-
-/// Schedule bounded-query, head-dimension-padded blackbox FlashAttention on native CUDA.
-///
-/// This experimental path forces the same 16-by-16-by-16 Cubek blueprint as the validated native
-/// WGPU path. Boogu's 120-wide heads are zero-padded to 128, and query values are multiplied by
-/// `sqrt(128 / 120)` before padding so the kernel's scale remains `1 / sqrt(120)`. It accepts only
-/// F16 activations and fails closed without attention autotuning or a dense fallback.
-///
-/// `num_planes` must be 2 or 4. CUDA numerical parity must be established separately before this
-/// experimental API can support a production claim.
-#[cfg(feature = "cuda-experimental")]
-pub fn required_chunked_cuda_padded_blackbox_attention(
-    query: Tensor<NativeCudaBackend, 4>,
-    key: Tensor<NativeCudaBackend, 4>,
-    value: Tensor<NativeCudaBackend, 4>,
-    query_chunk_size: usize,
-    num_planes: u8,
-) -> Tensor<NativeCudaBackend, 4> {
-    required_chunked_cuda_padded_blackbox_attention_tiled(
-        query,
-        key,
-        value,
-        query_chunk_size,
-        num_planes,
-        1,
-    )
-}
-
-/// Schedule bounded-query, padded CUDA blackbox FlashAttention with an explicit key/value
-/// partition width.
-///
-/// `seq_kv_tiles` must be 1 or 2, with two tiles restricted to two planes. CUDA remains experimental
-/// and requires separate numerical validation even when the same forced blueprint has passed
-/// native WGPU parity.
-#[cfg(feature = "cuda-experimental")]
-pub fn required_chunked_cuda_padded_blackbox_attention_tiled(
-    query: Tensor<NativeCudaBackend, 4>,
-    key: Tensor<NativeCudaBackend, 4>,
-    value: Tensor<NativeCudaBackend, 4>,
-    query_chunk_size: usize,
-    num_planes: u8,
-    seq_kv_tiles: u8,
-) -> Tensor<NativeCudaBackend, 4> {
-    required_chunked_cuda_padded_blackbox_attention_partitioned(
-        query,
-        key,
-        value,
-        query_chunk_size,
-        num_planes,
-        seq_kv_tiles,
-        1,
-    )
-}
-
-/// Schedule padded CUDA blackbox FlashAttention with explicit query and key/value partition
-/// widths. CUDA remains experimental and requires an independent numerical gate. Query
-/// partitions wider than one tile are rejected because the equivalent WGPU blueprint failed its
-/// nonzero numerical gate.
-#[cfg(feature = "cuda-experimental")]
-pub(crate) fn required_chunked_cuda_padded_blackbox_attention_partitioned(
-    query: Tensor<NativeCudaBackend, 4>,
-    key: Tensor<NativeCudaBackend, 4>,
-    value: Tensor<NativeCudaBackend, 4>,
-    query_chunk_size: usize,
-    num_planes: u8,
-    seq_kv_tiles: u8,
-    seq_q_tiles: u8,
-) -> Tensor<NativeCudaBackend, 4> {
-    required_chunked_padded_blackbox_attention_impl(
-        query,
-        key,
-        value,
-        query_chunk_size,
-        num_planes,
-        seq_kv_tiles,
-        seq_q_tiles,
     )
 }
 
@@ -2692,11 +2581,6 @@ pub(crate) fn assert_supported_blackbox_seq_q_tiles(seq_q_tiles: u8) {
         seq_q_tiles == 1,
         "padded blackbox seq_q_tiles must be 1; two query tiles failed the native WGPU nonzero parity gate"
     );
-}
-
-#[cfg(feature = "cuda-experimental")]
-pub(crate) fn assert_supported_blackbox_configuration(num_planes: u8, seq_kv_tiles: u8) {
-    assert_supported_blackbox_partition_configuration(num_planes, seq_kv_tiles, 1);
 }
 
 pub(crate) fn assert_supported_blackbox_partition_configuration(
@@ -3736,55 +3620,5 @@ mod tests {
                 .fold(0.0_f32, f32::max);
             assert!(max_abs <= 0.002, "{name} fused prep max_abs={max_abs}");
         }
-    }
-
-    #[cfg(feature = "cuda-experimental")]
-    #[test]
-    #[allow(clippy::type_complexity)]
-    fn native_cuda_flash_unit_api_compiles_smoke() {
-        fn assert_dmd_denoiser<D: DmdDenoiser<NativeCudaBackend>>() {}
-        assert_dmd_denoiser::<crate::NativeCudaFlashUnitDenoiser>();
-        assert_dmd_denoiser::<crate::NativeCudaPaddedBlackboxDenoiser>();
-
-        let _forward: fn(
-            &BooguDenoiser<NativeCudaBackend>,
-            BooguDenoiserInput<NativeCudaBackend>,
-        ) -> Result<Tensor<NativeCudaBackend, 4>, BooguError> =
-            BooguDenoiser::forward_native_cuda_flash_unit;
-        let _chunked: fn(
-            Tensor<NativeCudaBackend, 4>,
-            Tensor<NativeCudaBackend, 4>,
-            Tensor<NativeCudaBackend, 4>,
-            usize,
-        ) -> Tensor<NativeCudaBackend, 4> = required_chunked_cuda_flash_unit_attention;
-        let _blackbox_forward: fn(
-            &BooguDenoiser<NativeCudaBackend>,
-            BooguDenoiserInput<NativeCudaBackend>,
-            u8,
-        ) -> Result<Tensor<NativeCudaBackend, 4>, BooguError> =
-            BooguDenoiser::forward_native_cuda_padded_blackbox;
-        let _blackbox_tiled_forward: fn(
-            &BooguDenoiser<NativeCudaBackend>,
-            BooguDenoiserInput<NativeCudaBackend>,
-            u8,
-            u8,
-        )
-            -> Result<Tensor<NativeCudaBackend, 4>, BooguError> =
-            BooguDenoiser::forward_native_cuda_padded_blackbox_tiled;
-        let _blackbox_chunked: fn(
-            Tensor<NativeCudaBackend, 4>,
-            Tensor<NativeCudaBackend, 4>,
-            Tensor<NativeCudaBackend, 4>,
-            usize,
-            u8,
-        ) -> Tensor<NativeCudaBackend, 4> = required_chunked_cuda_padded_blackbox_attention;
-        let _blackbox_tiled_chunked: fn(
-            Tensor<NativeCudaBackend, 4>,
-            Tensor<NativeCudaBackend, 4>,
-            Tensor<NativeCudaBackend, 4>,
-            usize,
-            u8,
-            u8,
-        ) -> Tensor<NativeCudaBackend, 4> = required_chunked_cuda_padded_blackbox_attention_tiled;
     }
 }

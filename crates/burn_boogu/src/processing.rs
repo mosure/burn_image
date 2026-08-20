@@ -107,13 +107,17 @@ pub fn boogu_model_descriptor(variant: BooguVariant) -> ModelDescriptor {
         ),
     };
     let numeric_formats = if variant == BooguVariant::Image01EditTurbo1k5 {
-        BTreeSet::from([NumericFormat::Other("f16-qwen-vision-f32".into())])
+        BTreeSet::from([
+            NumericFormat::Other("f16-qwen-vision-f32".into()),
+            NumericFormat::Other("q4s-block-up-to128-f32".into()),
+        ])
     } else {
         BTreeSet::from([
             NumericFormat::F16,
             NumericFormat::Other("f16-qwen-vision-f32".into()),
             NumericFormat::Other("q8s-block32-f32".into()),
             NumericFormat::Other("q8s-block32-f32-qwen-vision-f32".into()),
+            NumericFormat::Other("q4s-block-up-to128-f32".into()),
         ])
     };
     let allowed_dimensions = (variant == BooguVariant::Image01EditTurbo1k5).then(|| {
@@ -688,7 +692,10 @@ mod tests {
         );
         assert_eq!(
             edit_one_k_five.capabilities.numeric_formats,
-            BTreeSet::from([NumericFormat::Other("f16-qwen-vision-f32".into())])
+            BTreeSet::from([
+                NumericFormat::Other("f16-qwen-vision-f32".into()),
+                NumericFormat::Other("q4s-block-up-to128-f32".into()),
+            ])
         );
         assert!(generate.validate().is_ok());
         assert!(edit.validate().is_ok());

@@ -90,6 +90,9 @@ import {
   TURBO_MODEL_ID,
   TURBO_MULTI_REQUEST_POLICY,
   TURBO_PRODUCTION_CONTENT_DIGEST,
+  TURBO_Q4_PRODUCTION_CONTENT_DIGEST,
+  TURBO_Q4_RESIDENT_BACKEND,
+  TURBO_Q4_RESIDENT_MULTI_REQUEST_POLICY,
   TURBO_QWEN_BLOCK0_ORDINARY_MODE,
   TURBO_QWEN_BLOCK0_SERIALIZED_DIAGNOSTIC_MODE,
   UI_CONTRACT_EVENT_NAME,
@@ -101,6 +104,7 @@ import {
   validateRenderedSurfaceSnapshot,
   validateTurbo1024ModelEvidence,
   validateTurbo1024MultiRequestEvidence,
+  validateTurboQ4ResidentMultiRequestEvidence,
 } from "./wasm_rendered_surface_contract.mjs";
 import {
   ARTIFACT_TRANSPORT_LAYOUT_PATH,
@@ -117,6 +121,8 @@ const TIMEOUT_ENV = "BURN_IMAGE_RENDERED_SURFACE_TIMEOUT_MS";
 const MODEL_ENV = "BURN_IMAGE_RENDERED_TURBO_1024_SMOKE";
 const MULTI_REQUEST_MODEL_ENV =
   "BURN_IMAGE_RENDERED_TURBO_1024_MULTI_REQUEST_QUALIFICATION";
+const Q4_RESIDENT_MULTI_REQUEST_MODEL_ENV =
+  "BURN_IMAGE_RENDERED_TURBO_Q4_1024_MULTI_REQUEST_QUALIFICATION";
 const MODEL_ARTIFACT_ROOT_ENV = "BURN_IMAGE_RENDERED_TURBO_ARTIFACT_ROOT";
 const MODEL_TIMEOUT_ENV = "BURN_IMAGE_RENDERED_TURBO_TIMEOUT_MS";
 const QWEN_BLOCK0_EXECUTION_MODE_ENV =
@@ -149,7 +155,11 @@ const appSourcePath = join(crateDir, "src/app.rs");
 const controlsSourcePath = join(crateDir, "src/controls.rs");
 const displaySourcePath = join(crateDir, "src/display.rs");
 const booguSourcePath = join(crateDir, "src/boogu.rs");
-const browserBooguSourcePath = join(crateDir, "src/browser_boogu.rs");
+const browserBooguSourcePath = join(crateDir, "src/browser_boogu/runtime.rs");
+const browserModelPolicySourcePath = join(
+  repoRoot,
+  "crates/burn_boogu/src/web_policy.rs",
+);
 const artifactStreamSourcePath = join(crateDir, "src/artifact_stream.rs");
 const vaeDecoderSourcePath = join(repoRoot, "crates/burn_flux_vae/src/decoder.rs");
 const modelSelectorSourcePath = join(crateDir, "www/model_selector.mjs");
@@ -158,9 +168,13 @@ const renderedHarnessSourcePath = fileURLToPath(import.meta.url);
 const renderedContractSourcePath = join(testsDir, "wasm_rendered_surface_contract.mjs");
 const artifactTransportContractSourcePath = join(testsDir, "artifact_transport_contract.mjs");
 const TURBO_BUNDLE = "boogu-image-0.1-turbo";
+const TURBO_Q4_BUNDLE = "boogu-image-0.1-turbo-q4s-block-up-to128-f32";
 const QWEN_BUNDLE = "qwen3-vl-8b-base-boogu-image-0.1";
 const VAE_BUNDLE = "flux1-vae-boogu-image-0.1";
 const MODEL_BUNDLES = [TURBO_BUNDLE, QWEN_BUNDLE, VAE_BUNDLE];
+const Q4_QWEN_BUNDLE = "qwen3-vl-8b-base-boogu-image-0.1-q4s-block-up-to128-f32";
+const SHARED_VAE_BUNDLE = "flux1-vae-boogu-image-0.1-f16-shared";
+const Q4_MODEL_BUNDLES = [TURBO_Q4_BUNDLE, Q4_QWEN_BUNDLE, SHARED_VAE_BUNDLE];
 const MODEL_PROMPT = "A studio photograph of a blue ceramic bird on a plain white table.";
 
 let interruptedSignal;
@@ -238,7 +252,7 @@ async function collectTestedPackageIdentity(wwwOutDir) {
     exactFileIdentity(
       browserBooguSourcePath,
       repoRoot,
-      "crates/bevy_image/src/browser_boogu.rs",
+      "crates/bevy_image/src/browser_boogu/runtime.rs",
     ),
     exactFileIdentity(
       vaeDecoderSourcePath,
@@ -323,6 +337,7 @@ async function validateCommittedSources() {
     displaySourceBytes,
     booguSourceBytes,
     browserBooguSourceBytes,
+    browserModelPolicySourceBytes,
     artifactStreamSourceBytes,
     vaeDecoderSourceBytes,
     renderedHarnessSourceBytes,
@@ -336,6 +351,7 @@ async function validateCommittedSources() {
     readFile(displaySourcePath),
     readFile(booguSourcePath),
     readFile(browserBooguSourcePath),
+    readFile(browserModelPolicySourcePath),
     readFile(artifactStreamSourcePath),
     readFile(vaeDecoderSourcePath),
     readFile(renderedHarnessSourcePath),
@@ -349,6 +365,8 @@ async function validateCommittedSources() {
   const displaySource = displaySourceBytes.toString("utf8");
   const booguSource = booguSourceBytes.toString("utf8");
   const browserBooguSource = browserBooguSourceBytes.toString("utf8");
+  const browserModelPolicySource = browserModelPolicySourceBytes.toString("utf8");
+  const browserBooguContractSource = `${browserBooguSource}\n${browserModelPolicySource}`;
   const artifactStreamSource = artifactStreamSourceBytes.toString("utf8");
   const vaeDecoderSource = vaeDecoderSourceBytes.toString("utf8");
   const renderedHarnessSource = renderedHarnessSourceBytes.toString("utf8");
@@ -456,7 +474,6 @@ async function validateCommittedSources() {
     if (!booguSource.includes(required)) failures.push(`src/boogu.rs omits ${required}`);
   }
   for (const required of [
-    LOW_VRAM_BACKEND.replace("burn-webgpu/", ""),
     LOW_VRAM_PUBLIC_SELECTOR,
     TURBO_DENOISER_STORAGE_POLICY,
     TURBO_DENOISER_QUANTIZED_LOAD_POLICY,
@@ -504,13 +521,12 @@ async function validateCommittedSources() {
     "completed_dmd_steps == 4",
     "preserve_packed_cache",
     "fail_closed_packed_f16_request_cleanup",
-    "retained-Q8 dense-F32-per-stage Turbo policy is retired",
     "const BROWSER_PRODUCTION_DENOISER_QUERY_CHUNK_SIZE: usize = 1_024;",
     "denoiser_minimum_image_query_partitions:",
     "burn_boogu::PORTABLE_ATTENTION_MINIMUM_IMAGE_QUERY_PARTITIONS",
   ]) {
-    if (!browserBooguSource.includes(required)) {
-      failures.push(`src/browser_boogu.rs omits ${required}`);
+    if (!browserBooguContractSource.includes(required)) {
+      failures.push(`browser adapter/model policy sources omit ${required}`);
     }
   }
   const transportBootstrapCount = browserBooguSource.split(
@@ -518,18 +534,16 @@ async function validateCommittedSources() {
   ).length - 1;
   if (transportBootstrapCount < MODEL_BUNDLES.length) {
     failures.push(
-      `src/browser_boogu.rs authenticates ${transportBootstrapCount} transport layouts; expected pipeline, Qwen, and VAE`,
+      `src/browser_boogu/runtime.rs authenticates ${transportBootstrapCount} transport layouts; expected pipeline, Qwen, and VAE`,
     );
   }
   for (const required of [
     "fetch_browser_transport_layout",
-    "fetch_browser_range_with_total(request, Some(object_size))",
     "fetch_browser_complete_file",
     "BROWSER_ARTIFACT_PART_CACHE_NAME",
     "browser_part_cache_key",
     "fetch_transport_part_complete_attempt",
     "fetch_and_cache_transport_part",
-    "browser_complete_file_transport_required",
     "fetch_direct_complete_file_attempt",
     "fetch_and_cache_direct_complete_file",
     "read_browser_response_body_bounded",
@@ -656,13 +670,13 @@ async function validateCommittedSources() {
     "async fn packed_f16_qwen_instruction_handoff",
   );
   if (packedPreDmdCleanupCursor < 0) {
-    failures.push("src/browser_boogu.rs omits the packed-F16 Qwen handoff implementation");
+    failures.push("src/browser_boogu/runtime.rs omits the packed-F16 Qwen handoff implementation");
   } else {
     for (const primitive of packedPreDmdCleanupPrimitives) {
       const next = browserBooguSource.indexOf(primitive, packedPreDmdCleanupCursor + 1);
       if (next < 0) {
         failures.push(
-          `src/browser_boogu.rs omits or reorders packed-F16 pre-DMD primitive ${primitive}`,
+          `src/browser_boogu/runtime.rs omits or reorders packed-F16 pre-DMD primitive ${primitive}`,
         );
         break;
       }
@@ -686,13 +700,13 @@ async function validateCommittedSources() {
     "async fn packed_f16_dmd_vae_handoff",
   );
   if (packedDmdVaeCleanupCursor < 0) {
-    failures.push("src/browser_boogu.rs omits the packed-F16 DMD-to-VAE handoff implementation");
+    failures.push("src/browser_boogu/runtime.rs omits the packed-F16 DMD-to-VAE handoff implementation");
   } else {
     for (const primitive of packedDmdVaeCleanupPrimitives) {
       const next = browserBooguSource.indexOf(primitive, packedDmdVaeCleanupCursor + 1);
       if (next < 0) {
         failures.push(
-          `src/browser_boogu.rs omits or reorders packed-F16 DMD-to-VAE primitive ${primitive}`,
+          `src/browser_boogu/runtime.rs omits or reorders packed-F16 DMD-to-VAE primitive ${primitive}`,
         );
         break;
       }
@@ -711,13 +725,13 @@ async function validateCommittedSources() {
     "let latents = if self.policies.uses_packed_f16_denoiser_source()",
   );
   if (packedDmdVaeCallerCursor < 0) {
-    failures.push("src/browser_boogu.rs omits the packed-F16 DMD-to-VAE caller boundary");
+    failures.push("src/browser_boogu/runtime.rs omits the packed-F16 DMD-to-VAE caller boundary");
   } else {
     for (const primitive of packedDmdVaeCallerPrimitives) {
       const next = browserBooguSource.indexOf(primitive, packedDmdVaeCallerCursor + 1);
       if (next < 0) {
         failures.push(
-          `src/browser_boogu.rs omits or reorders packed-F16 DMD-to-VAE caller primitive ${primitive}`,
+          `src/browser_boogu/runtime.rs omits or reorders packed-F16 DMD-to-VAE caller primitive ${primitive}`,
         );
         break;
       }
@@ -725,13 +739,16 @@ async function validateCommittedSources() {
     }
   }
   const vaeStripedTailPrimitives = [
-    "let first_resnet = final_block",
-    "let (left, right) = resnet_two_width_slabs_strict_f32(first_resnet, left, right);",
-    "hidden = Tensor::cat(vec![left, right], 3);",
-    "for resnet in final_block.resnets.iter().skip(1)",
-    "resnet.forward_with_group_norm_policy(hidden, DecoderGroupNormPolicy::StrictF32);",
-    "self.conv_out.forward(silu(group_norm_with_policy(",
-    "&self.conv_norm_out,",
+    "let mut state = self.begin_striped_tail_strict_f32(input, split_width);",
+    "while !state.is_complete()",
+    "self.advance_striped_tail_strict_f32(&mut state);",
+    "state.into_output()",
+    "pub fn begin_striped_tail_strict_f32",
+    "pub fn striped_tail_stage_count",
+    "pub fn advance_striped_tail_strict_f32",
+    "let final_resnets = &self.up_blocks[final_block_index].resnets;",
+    "upsample_two_width_slabs(",
+    "resnet_two_width_slabs_strict_f32(",
   ];
   let vaeStripedTailCursor = vaeDecoderSource.indexOf(
     "pub fn forward_striped_tail_strict_f32",
@@ -761,13 +778,13 @@ async function validateCommittedSources() {
     "let qwen_output_result = if",
   );
   if (qwenFailureEmbeddingCursor < 0) {
-    failures.push("src/browser_boogu.rs omits the streamed Qwen output result boundary");
+    failures.push("src/browser_boogu/runtime.rs omits the streamed Qwen output result boundary");
   } else {
     for (const primitive of qwenFailureEmbeddingPrimitives.slice(1)) {
       const next = browserBooguSource.indexOf(primitive, qwenFailureEmbeddingCursor + 1);
       if (next < 0) {
         failures.push(
-          `src/browser_boogu.rs does not preserve host-embedding failure provenance before ${primitive}`,
+          `src/browser_boogu/runtime.rs does not preserve host-embedding failure provenance before ${primitive}`,
         );
         break;
       }
@@ -784,13 +801,13 @@ async function validateCommittedSources() {
     packedFailureCleanupPrimitives[0],
   );
   if (packedFailureCleanupCursor < 0) {
-    failures.push("src/browser_boogu.rs omits the outer packed-F16 terminal cleanup boundary");
+    failures.push("src/browser_boogu/runtime.rs omits the outer packed-F16 terminal cleanup boundary");
   } else {
     for (const primitive of packedFailureCleanupPrimitives.slice(1)) {
       const next = browserBooguSource.indexOf(primitive, packedFailureCleanupCursor + 1);
       if (next < 0) {
         failures.push(
-          `src/browser_boogu.rs omits or reorders packed-F16 terminal cleanup before ${primitive}`,
+          `src/browser_boogu/runtime.rs omits or reorders packed-F16 terminal cleanup before ${primitive}`,
         );
         break;
       }
@@ -931,6 +948,7 @@ async function validateCommittedSources() {
     display_source_sha256: sha256(displaySourceBytes),
     boogu_frontend_source_sha256: sha256(booguSourceBytes),
     browser_runtime_source_sha256: sha256(browserBooguSourceBytes),
+    browser_model_policy_source_sha256: sha256(browserModelPolicySourceBytes),
     artifact_stream_source_sha256: sha256(artifactStreamSourceBytes),
     vae_decoder_source_sha256: sha256(vaeDecoderSourceBytes),
     rendered_harness_source_sha256: sha256(renderedHarnessSourceBytes),
@@ -965,7 +983,12 @@ function commonHeaders(type, length) {
   };
 }
 
-async function createAppServer(indexBytes, wwwOutDir, artifactRoot = undefined) {
+async function createAppServer(
+  indexBytes,
+  wwwOutDir,
+  artifactRoot = undefined,
+  activeModelBundles = MODEL_BUNDLES,
+) {
   const generated = new Map([
     ["/out/bevy_burn_image.js", join(wwwOutDir, "bevy_burn_image.js")],
     ["/out/bevy_burn_image_bg.wasm", join(wwwOutDir, "bevy_burn_image_bg.wasm")],
@@ -1002,7 +1025,7 @@ async function createAppServer(indexBytes, wwwOutDir, artifactRoot = undefined) 
   let canonicalArtifactRoot;
   if (artifactRoot) {
     canonicalArtifactRoot = await realpath(artifactRoot);
-    for (const bundle of MODEL_BUNDLES) {
+    for (const bundle of activeModelBundles) {
       const manifestPath = join(canonicalArtifactRoot, bundle, "manifest.json");
       if (!existsSync(manifestPath)) {
         throw new Error(`required modular browser manifest is missing: ${manifestPath}`);
@@ -1038,7 +1061,7 @@ async function createAppServer(indexBytes, wwwOutDir, artifactRoot = undefined) 
     const artifactMatch = /^\/model\/([^/]+)\/(.+)$/.exec(url.pathname);
     if (artifactMatch && canonicalArtifactRoot) {
       const [, bundle, encodedPath] = artifactMatch;
-      if (!MODEL_BUNDLES.includes(bundle)) {
+      if (!activeModelBundles.includes(bundle)) {
         response.writeHead(404, { "Cache-Control": "no-store" });
         response.end();
         return;
@@ -1081,7 +1104,8 @@ async function createAppServer(indexBytes, wwwOutDir, artifactRoot = undefined) 
             "Access-Control-Allow-Headers": "Range",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Expose-Headers": "Accept-Ranges, Content-Length, Content-Range",
+            "Access-Control-Expose-Headers":
+              "Accept-Ranges, Content-Length, Content-Range, Content-Encoding",
           };
           if (request.method === "OPTIONS") {
             response.writeHead(204, { ...baseHeaders, "Content-Length": "0" });
@@ -1266,7 +1290,12 @@ async function validateServedApp(baseUrl, sourceEvidence, testedPackageIdentity)
   };
 }
 
-async function validateModelArtifactTransport(baseUrl, artifactRoot) {
+async function validateModelArtifactTransport(
+  baseUrl,
+  artifactRoot,
+  activeModelBundles = MODEL_BUNDLES,
+  q4ResidentMode = false,
+) {
   const bundles = [];
   const transportTelemetryByPath = new Map();
   let totalLogicalFiles = 0;
@@ -1274,7 +1303,7 @@ async function validateModelArtifactTransport(baseUrl, artifactRoot) {
   let totalPhysicalParts = 0;
   let totalPhysicalPartBytes = 0;
   let maximumPhysicalPartBytes = 0;
-  for (const bundle of MODEL_BUNDLES) {
+  for (const bundle of activeModelBundles) {
     const localRoot = join(artifactRoot, bundle);
     const localManifestBytes = await readFile(join(localRoot, "manifest.json"));
     const manifest = JSON.parse(localManifestBytes.toString("utf8"));
@@ -1284,7 +1313,34 @@ async function validateModelArtifactTransport(baseUrl, artifactRoot) {
     if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
       throw new Error(`modular manifest ${bundle} has no files`);
     }
-    if (bundle === TURBO_BUNDLE) {
+    if (q4ResidentMode && bundle === TURBO_Q4_BUNDLE) {
+      if (
+        activeModelBundles.length !== 3 ||
+        bundle !== TURBO_Q4_BUNDLE ||
+        manifest.schema_version !== 2 ||
+        manifest.profile !== "q4s-block-up-to128-f32" ||
+        manifest.content_digest !== TURBO_Q4_PRODUCTION_CONTENT_DIGEST ||
+        (manifest.dependencies ?? []).length !== 2
+      ) {
+        throw new Error("local Turbo Q4 parent is not the exact sealed modular production bundle");
+      }
+      const dependencies = new Map(
+        (manifest.dependencies ?? []).map((dependency) => [dependency.bundle, dependency]),
+      );
+      for (const dependency of [Q4_QWEN_BUNDLE, SHARED_VAE_BUNDLE]) {
+        if (!dependencies.has(dependency)) {
+          throw new Error(`Turbo Q4 parent omits shared dependency ${dependency}`);
+        }
+      }
+    } else if (q4ResidentMode) {
+      if (
+        ![Q4_QWEN_BUNDLE, SHARED_VAE_BUNDLE].includes(bundle) ||
+        manifest.schema_version !== 1 ||
+        (manifest.dependencies ?? []).length !== 0
+      ) {
+        throw new Error(`Q4 modular leaf ${bundle} is not an exact dependency-free component`);
+      }
+    } else if (bundle === TURBO_BUNDLE) {
       if (manifest.content_digest !== TURBO_PRODUCTION_CONTENT_DIGEST) {
         throw new Error("local Turbo parent is not the canonical production composition");
       }
@@ -1406,7 +1462,9 @@ async function validateModelArtifactTransport(baseUrl, artifactRoot) {
     );
   }
   const evidence = {
-    policy: "exact-local-modular-part-only-parent-plus-qwen-vae-siblings-range-cors",
+    policy: q4ResidentMode
+      ? "exact-local-modular-q4s-parent-plus-shared-qwen-vae-part-only-range-cors"
+      : "exact-local-modular-part-only-parent-plus-qwen-vae-siblings-range-cors",
     bundles,
     total_logical_artifact_files: totalLogicalFiles,
     total_logical_artifact_bytes: totalLogicalBytes,
@@ -3063,7 +3121,13 @@ function throwBrowserFailure(cdp, browser, snapshot, phase) {
   }
 }
 
-async function waitForTurboUiReady(cdp, browser, expectedUrl, deadline) {
+async function waitForTurboUiReady(
+  cdp,
+  browser,
+  expectedUrl,
+  deadline,
+  q4ResidentMode = false,
+) {
   let lastSnapshot;
   while (Date.now() < deadline) {
     throwIfInterrupted();
@@ -3074,8 +3138,10 @@ async function waitForTurboUiReady(cdp, browser, expectedUrl, deadline) {
     const runtimeReady = lastSnapshot.runtime_events?.find(
       (event) => event?.event === "ready" && event?.model === TURBO_MODEL_ID,
     );
-    const packedF16Plan = lastSnapshot.runtime_events?.find(
-      (event) => event?.event === "packed_f16_resource_plan",
+    const resourcePlan = lastSnapshot.runtime_events?.find(
+      (event) =>
+        event?.event ===
+        (q4ResidentMode ? "resident_resource_plan" : "packed_f16_resource_plan"),
     );
     const uiContract = [...(lastSnapshot.ui_events ?? [])]
       .reverse()
@@ -3084,14 +3150,14 @@ async function waitForTurboUiReady(cdp, browser, expectedUrl, deadline) {
       surfaceFailures.length === 0 &&
       backendReady &&
       runtimeReady &&
-      packedF16Plan &&
+      resourcePlan &&
       uiContract?.model === TURBO_MODEL_ID &&
       uiContract.width === 1024 &&
       uiContract.height === 1024 &&
       uiContract.prompt_enabled === true &&
       uiContract.seed_enabled === true
     ) {
-      return { snapshot: lastSnapshot, backendReady, runtimeReady, packedF16Plan, uiContract };
+      return { snapshot: lastSnapshot, backendReady, runtimeReady, resourcePlan, uiContract };
     }
     await delay(500);
   }
@@ -3453,7 +3519,7 @@ async function waitForCompletedPngDownload(cdp, browser, downloadDir, eventStart
   };
 }
 
-function assertValidatedTurboOutputBeforeSave(output, runId) {
+function assertValidatedTurboOutputBeforeSave(output, runId, q4ResidentMode = false) {
   const failures = [];
   if (output?.event !== "ready") failures.push("output-ready event is absent");
   if (!isCanonicalU64DecimalString(output?.job_id)) {
@@ -3465,16 +3531,23 @@ function assertValidatedTurboOutputBeforeSave(output, runId) {
   if (output?.width !== 1024 || output?.height !== 1024) {
     failures.push("output-ready dimensions are not 1024x1024");
   }
-  if (output?.backend !== LOW_VRAM_BACKEND) {
+  const expectedBackend = q4ResidentMode ? TURBO_Q4_RESIDENT_BACKEND : LOW_VRAM_BACKEND;
+  if (output?.backend !== expectedBackend) {
     failures.push(
-      "output-ready backend is not the Turbo preloaded packed-F16 dense-F32-per-stage policy",
+      `output-ready backend=${output?.backend}, expected ${expectedBackend}`,
     );
   }
   if (output?.artifacts_verified !== true) failures.push("output-ready artifacts are unverified");
-  if (output?.artifact_content_digest !== TURBO_PRODUCTION_CONTENT_DIGEST) {
+  const expectedDigest = q4ResidentMode
+    ? TURBO_Q4_PRODUCTION_CONTENT_DIGEST
+    : TURBO_PRODUCTION_CONTENT_DIGEST;
+  if (output?.artifact_content_digest !== expectedDigest) {
     failures.push("output-ready artifact digest is not the canonical Turbo digest");
   }
-  if (output?.numeric_format !== "f16-qwen-vision-f32") {
+  const expectedNumericFormat = q4ResidentMode
+    ? "q4s-block-up-to128-f32"
+    : "f16-qwen-vision-f32";
+  if (output?.numeric_format !== expectedNumericFormat) {
     failures.push("output-ready numeric format does not identify the production artifact");
   }
   if (failures.length > 0) {
@@ -3542,21 +3615,32 @@ async function captureScreenshot(cdp, path) {
 async function main() {
   const enabled = process.env[ENABLE_ENV] === "1";
   const singleRequestModelMode = process.env[MODEL_ENV] === "1";
-  const multiRequestModelMode = process.env[MULTI_REQUEST_MODEL_ENV] === "1";
+  const lowVramMultiRequestModelMode = process.env[MULTI_REQUEST_MODEL_ENV] === "1";
+  const q4ResidentMode = process.env[Q4_RESIDENT_MULTI_REQUEST_MODEL_ENV] === "1";
+  const multiRequestModelMode = lowVramMultiRequestModelMode || q4ResidentMode;
   const modelMode = singleRequestModelMode || multiRequestModelMode;
+  const activeModelBundles = q4ResidentMode ? Q4_MODEL_BUNDLES : MODEL_BUNDLES;
   const requiredDeviceFeatures = modelMode
     ? BOOGU_WEB_REQUIRED_DEVICE_FEATURES
     : GENERIC_WEB_REQUIRED_DEVICE_FEATURES;
   const validateOnly = process.env[VALIDATE_ONLY_ENV] === "1";
   if (!enabled && !modelMode && !validateOnly) {
     console.log(
-      `burn_image rendered-surface smoke: skipped (set ${ENABLE_ENV}=1, ${MODEL_ENV}=1, or ${MULTI_REQUEST_MODEL_ENV}=1; CI may set ${VALIDATE_ONLY_ENV}=1)`,
+      `burn_image rendered-surface smoke: skipped (set ${ENABLE_ENV}=1, ${MODEL_ENV}=1, ${MULTI_REQUEST_MODEL_ENV}=1, or ${Q4_RESIDENT_MULTI_REQUEST_MODEL_ENV}=1; CI may set ${VALIDATE_ONLY_ENV}=1)`,
     );
     return;
   }
-  if ([enabled, singleRequestModelMode, multiRequestModelMode, validateOnly].filter(Boolean).length !== 1) {
+  if (
+    [
+      enabled,
+      singleRequestModelMode,
+      lowVramMultiRequestModelMode,
+      q4ResidentMode,
+      validateOnly,
+    ].filter(Boolean).length !== 1
+  ) {
     throw new Error(
-      `${ENABLE_ENV}, ${MODEL_ENV}, ${MULTI_REQUEST_MODEL_ENV}, and ${VALIDATE_ONLY_ENV} are mutually exclusive`,
+      `${ENABLE_ENV}, ${MODEL_ENV}, ${MULTI_REQUEST_MODEL_ENV}, ${Q4_RESIDENT_MULTI_REQUEST_MODEL_ENV}, and ${VALIDATE_ONLY_ENV} are mutually exclusive`,
     );
   }
 
@@ -3568,7 +3652,9 @@ async function main() {
   const reportPath = join(
     outputDir,
     modelMode
-      ? multiRequestModelMode
+      ? q4ResidentMode
+        ? "burn-image-rendered-turbo-q4-1024-resident-multi-request-report.json"
+        : multiRequestModelMode
         ? "burn-image-rendered-turbo-1024-multi-request-report.json"
         : "burn-image-rendered-turbo-1024-report.json"
       : "burn-image-rendered-surface-report.json",
@@ -3611,7 +3697,9 @@ async function main() {
         process.env[MODEL_ARTIFACT_ROOT_ENV] ??
           join(
             repoRoot,
-            ".artifacts/cdn-upload-modular/aberration.technology/model",
+            q4ResidentMode
+              ? ".artifacts/cdn-upload-q4s/aberration.technology/model"
+              : ".artifacts/cdn-upload-modular/aberration.technology/model",
           ),
       )
     : undefined;
@@ -3648,7 +3736,12 @@ async function main() {
   try {
     chromeSharedMemory = await inspectChromeSharedMemory();
     testedPackageIdentity = await collectTestedPackageIdentity(wwwOutDir);
-    const hosted = await createAppServer(indexBytes, wwwOutDir, artifactRoot);
+    const hosted = await createAppServer(
+      indexBytes,
+      wwwOutDir,
+      artifactRoot,
+      activeModelBundles,
+    );
     server = hosted.server;
     const baseUrl = `http://127.0.0.1:${hosted.port}`;
     const transport = await validateServedApp(
@@ -3657,7 +3750,12 @@ async function main() {
       testedPackageIdentity,
     );
     const modelTransport = modelMode
-      ? await validateModelArtifactTransport(baseUrl, artifactRoot)
+      ? await validateModelArtifactTransport(
+          baseUrl,
+          artifactRoot,
+          activeModelBundles,
+          q4ResidentMode,
+        )
       : null;
     const query = new URLSearchParams({
       "rendered-surface-smoke": sourceEvidence.committed_index_sha256,
@@ -3667,12 +3765,10 @@ async function main() {
       query.set("surface-gate", "1");
       query.set("qwen-block0-execution-mode", requestedQwenBlock0ExecutionMode);
       query.set("variant", "turbo");
-      query.set("profile", "production");
-      // This harness is the strict low-VRAM release gate. Keep it independent from the app's
-      // evolving default residency policy and from the resident packed-F16 qualification.
-      query.set("residency", "low-vram");
-      modelBaseUrl = `${baseUrl}/model/${TURBO_BUNDLE}`;
-      modelBaseUrls = MODEL_BUNDLES.map((bundle) => `${baseUrl}/model/${bundle}`);
+      query.set("profile", q4ResidentMode ? "q4s-block-up-to128-f32" : "production");
+      query.set("residency", q4ResidentMode ? "resident-q4" : "low-vram");
+      modelBaseUrl = `${baseUrl}/model/${q4ResidentMode ? TURBO_Q4_BUNDLE : TURBO_BUNDLE}`;
+      modelBaseUrls = activeModelBundles.map((bundle) => `${baseUrl}/model/${bundle}`);
       query.set("artifacts", modelBaseUrl);
     }
     const exactUrl = `${baseUrl}/index.html?${query}`;
@@ -3706,7 +3802,13 @@ async function main() {
     bevyBackendReady = readySurface.ready;
     let finalSnapshot = readySurface.snapshot;
     if (modelMode) {
-      const uiReady = await waitForTurboUiReady(cdp, browser, exactUrl, deadline);
+      const uiReady = await waitForTurboUiReady(
+        cdp,
+        browser,
+        exactUrl,
+        deadline,
+        q4ResidentMode,
+      );
       canvasBefore = await captureCanvasScreenshot(
         cdp,
         join(outputDir, "burn-image-rendered-turbo-1024-before.png"),
@@ -3790,7 +3892,11 @@ async function main() {
         progressStartIndex: firstStarts.progress,
         outputStartIndex: firstStarts.output,
       });
-      assertValidatedTurboOutputBeforeSave(completed.output, completed.started?.run_id);
+      assertValidatedTurboOutputBeforeSave(
+        completed.output,
+        completed.started?.run_id,
+        q4ResidentMode,
+      );
       const saveReady = await waitForSaveReady(cdp, browser, deadline);
       const downloadDir = join(outputDir, "downloads");
       await mkdir(downloadDir, { recursive: true });
@@ -4103,6 +4209,7 @@ async function main() {
         assertValidatedTurboOutputBeforeSave(
           secondCompleted.output,
           secondCompleted.started?.run_id,
+          q4ResidentMode,
         );
         const secondSaveReady = await waitForSaveReady(cdp, browser, deadline);
         const secondDownloadEventStart = cdp.events.length;
@@ -4372,7 +4479,9 @@ async function main() {
       };
       if (multiRequestModelMode) {
         multiRequestEvidence = {
-          policy: TURBO_MULTI_REQUEST_POLICY,
+          policy: q4ResidentMode
+            ? TURBO_Q4_RESIDENT_MULTI_REQUEST_POLICY
+            : TURBO_MULTI_REQUEST_POLICY,
           request_count: 2,
           engine_session_id: finalSnapshot.engine_session_id,
           page_url: finalSnapshot.url,
@@ -4422,7 +4531,9 @@ async function main() {
           native_gpu_attestation: gpuAttestation,
           requests: [firstRequestDraft, secondRequestDraft],
         };
-        const multiFailures = validateTurbo1024MultiRequestEvidence(multiRequestEvidence);
+        const multiFailures = q4ResidentMode
+          ? validateTurboQ4ResidentMultiRequestEvidence(multiRequestEvidence)
+          : validateTurbo1024MultiRequestEvidence(multiRequestEvidence);
         if (multiFailures.length > 0) {
           throw new Error(
             `ordinary Turbo 1024 multi-request evidence failed:\n${multiFailures.join("\n")}`,
@@ -4482,6 +4593,9 @@ async function main() {
       screenshot_sha256: screenshot.sha256,
       turbo_1024_model: modelEvidence ?? null,
       turbo_1024_multi_request: multiRequestEvidence ?? null,
+      turbo_q4_1024_resident_multi_request: q4ResidentMode
+        ? (multiRequestEvidence ?? null)
+        : null,
     };
     const failures = validateRenderedSurfaceEvidence(evidence);
     if (failures.length > 0) {
@@ -4492,6 +4606,7 @@ async function main() {
       ...renderedSurfaceReportIdentity({
         modelMode,
         multiRequestModelMode,
+        q4ResidentMode,
         qwenBlock0ExecutionMode: requestedQwenBlock0ExecutionMode,
         ok: true,
       }),
@@ -4543,6 +4658,7 @@ async function main() {
       ...renderedSurfaceReportIdentity({
         modelMode,
         multiRequestModelMode,
+        q4ResidentMode,
         qwenBlock0ExecutionMode: requestedQwenBlock0ExecutionMode,
         ok: false,
       }),
@@ -4684,7 +4800,9 @@ async function main() {
         multiRequestEvidence ??
         (multiRequestModelMode
           ? {
-              policy: TURBO_MULTI_REQUEST_POLICY,
+              policy: q4ResidentMode
+                ? TURBO_Q4_RESIDENT_MULTI_REQUEST_POLICY
+                : TURBO_MULTI_REQUEST_POLICY,
               first_request: firstRequestDraft ?? null,
               second_request: secondRequestDraft ?? null,
               engine_session_id: failureSnapshot?.engine_session_id ?? null,
@@ -4773,6 +4891,7 @@ async function main() {
         renderedSurfaceReportIdentity({
           modelMode,
           multiRequestModelMode,
+          q4ResidentMode,
           qwenBlock0ExecutionMode: requestedQwenBlock0ExecutionMode,
           ok: false,
         }),

@@ -9,11 +9,6 @@ use super::{
     norm::{DenoiserRmsNormPolicy, rms_norm_with_policy},
 };
 
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-use super::native_flash::{
-    NativeCudaBackend, required_chunked_cuda_flash_unit_attention,
-    required_chunked_cuda_padded_blackbox_attention_partitioned,
-};
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::native_flash::{
     NativeWgpuBackend, required_chunked_flash_unit_attention,
@@ -204,16 +199,10 @@ impl<B: Backend> AttentionKernel<B> for PortableChunkedAttention {
     }
 }
 
-#[cfg(all(
-    any(feature = "wgpu", feature = "cuda-experimental"),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub(crate) struct NativeFlashUnitAttention;
 
-#[cfg(all(
-    any(feature = "wgpu", feature = "cuda-experimental"),
-    not(target_arch = "wasm32")
-))]
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 pub(crate) struct NativePaddedBlackboxAttention<
     const NUM_PLANES: u8,
     const SEQ_KV_TILES: u8 = 1,
@@ -400,41 +389,6 @@ impl<
     }
 }
 
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl AttentionKernel<NativeCudaBackend> for NativeFlashUnitAttention {
-    fn execute(
-        query: Tensor<NativeCudaBackend, 4>,
-        key: Tensor<NativeCudaBackend, 4>,
-        value: Tensor<NativeCudaBackend, 4>,
-        query_chunk_size: usize,
-    ) -> Tensor<NativeCudaBackend, 4> {
-        required_chunked_cuda_flash_unit_attention(query, key, value, query_chunk_size)
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl<const NUM_PLANES: u8, const SEQ_KV_TILES: u8, const SEQ_Q_TILES: u8>
-    AttentionKernel<NativeCudaBackend>
-    for NativePaddedBlackboxAttention<NUM_PLANES, SEQ_KV_TILES, SEQ_Q_TILES, false, false, false>
-{
-    fn execute(
-        query: Tensor<NativeCudaBackend, 4>,
-        key: Tensor<NativeCudaBackend, 4>,
-        value: Tensor<NativeCudaBackend, 4>,
-        query_chunk_size: usize,
-    ) -> Tensor<NativeCudaBackend, 4> {
-        required_chunked_cuda_padded_blackbox_attention_partitioned(
-            query,
-            key,
-            value,
-            query_chunk_size,
-            NUM_PLANES,
-            SEQ_KV_TILES,
-            SEQ_Q_TILES,
-        )
-    }
-}
-
 /// Multi-head attention with grouped key/value projections and Q/K RMSNorm.
 #[derive(Module, Debug)]
 pub struct GqaAttention<B: Backend> {
@@ -462,7 +416,7 @@ pub struct GqaAttention<B: Backend> {
 /// eight independent matrices, concatenates the projected streams, attends jointly,
 /// splits the result, applies stream-specific output matrices, and only then applies
 /// the enclosing attention output projection. Keeping this topology explicit is
-/// required both for checkpoint key compatibility and numerical parity.
+/// required both for checkpoint key mapping and numerical parity.
 #[derive(Module, Debug)]
 pub struct DoubleStreamAttention<B: Backend> {
     /// Image query projection.
@@ -800,32 +754,6 @@ impl GqaAttention<NativeWgpuBackend> {
         key_value_tokens: Tensor<NativeWgpuBackend, 3>,
         rope: Option<(Tensor<NativeWgpuBackend, 3>, Tensor<NativeWgpuBackend, 3>)>,
     ) -> Tensor<NativeWgpuBackend, 3> {
-        self.forward_with_kernel::<NativeFlashUnitAttention>(query_tokens, key_value_tokens, rope)
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl DoubleStreamAttention<NativeCudaBackend> {
-    /// Execute bounded-query native CUDA attention with required Cubek `FlashUnit` kernels.
-    pub fn forward_native_cuda_flash_unit(
-        &self,
-        image: Tensor<NativeCudaBackend, 3>,
-        instruction: Tensor<NativeCudaBackend, 3>,
-        rope: (Tensor<NativeCudaBackend, 3>, Tensor<NativeCudaBackend, 3>),
-    ) -> (Tensor<NativeCudaBackend, 3>, Tensor<NativeCudaBackend, 3>) {
-        self.forward_with_kernel::<NativeFlashUnitAttention>(image, instruction, rope)
-    }
-}
-
-#[cfg(all(feature = "cuda-experimental", not(target_arch = "wasm32")))]
-impl GqaAttention<NativeCudaBackend> {
-    /// Execute bounded-query native CUDA attention with required Cubek `FlashUnit` kernels.
-    pub fn forward_native_cuda_flash_unit(
-        &self,
-        query_tokens: Tensor<NativeCudaBackend, 3>,
-        key_value_tokens: Tensor<NativeCudaBackend, 3>,
-        rope: Option<(Tensor<NativeCudaBackend, 3>, Tensor<NativeCudaBackend, 3>)>,
-    ) -> Tensor<NativeCudaBackend, 3> {
         self.forward_with_kernel::<NativeFlashUnitAttention>(query_tokens, key_value_tokens, rope)
     }
 }

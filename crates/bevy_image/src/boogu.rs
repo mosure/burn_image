@@ -17,23 +17,44 @@ use bevy::{
     camera::RenderTarget,
     window::{PrimaryWindow, WindowRef},
 };
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+use burn_boogu::boogu_model_descriptor;
 use burn_boogu::{
     BooguTask, BooguVariant, ResolvedBooguRequest,
-    artifacts::{
-        BooguFloatLoadPolicy, BooguQuantizedLoadPolicy, BooguReleaseIdentity, BooguStorageProfile,
-        canonical_published_bundle, legacy_artifact_bundle_id, preferred_artifact_bundle_id,
-    },
-    boogu_model_descriptor,
+    artifacts::{BooguReleaseIdentity, BooguStorageProfile, canonical_published_bundle},
     conditioning::InstructionPolicy,
+    deployment::{
+        descriptor as boogu_release_descriptor,
+        validate_variant_profile as validate_boogu_variant_profile,
+    },
     resolve_request,
 };
 use burn_image::{
-    ArtifactCachePolicy, ArtifactProfileId, ArtifactSource, CancellationToken, ImageRequest,
-    IntegrityPolicy, ModelDescriptor, ModelId, NumericFormat, RuntimeConfig, RuntimeError,
+    CancellationToken, ImageRequest, IntegrityPolicy, ModelDescriptor, ModelId, NumericFormat,
+    RuntimeConfig, RuntimeError,
 };
 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
 use burn_image::{Dimensions, GenerateRequest, GenerationOptions, Prompt};
 use serde::{Deserialize, Serialize};
+
+pub use burn_boogu::deployment::{
+    BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES as BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES,
+    BROWSER_1K5_MIN_REQUIRED_BUFFER_LIMIT_BYTES as BOOGU_BROWSER_1K5_MIN_REQUIRED_BUFFER_LIMIT_BYTES,
+    BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES as BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES,
+    BROWSER_1K5_PARITY_OUTPUT_EDGE as BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE,
+    BROWSER_1K5_PARITY_OUTPUT_PIXELS as BOOGU_BROWSER_1K5_PARITY_OUTPUT_PIXELS,
+    BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES as BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES,
+    BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES as BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES,
+    BROWSER_MAX_APPLIED_BUFFER_BYTES as BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES,
+    BROWSER_REQUESTED_BUFFER_LIMIT_BYTES as BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES,
+    BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE as BOOGU_BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE,
+    BooguDeploymentSettings as BooguAdapterSettings, BrowserBufferPlan, BrowserVaeDecodePolicy,
+    artifact_profile_id as boogu_artifact_profile_id, bundle_id as boogu_bundle_id,
+    bundle_slug as boogu_bundle_slug, default_storage_profile as default_boogu_storage_profile,
+    model_id as boogu_model_id, numeric_format as boogu_numeric_format,
+    profile_slug as boogu_profile_slug, source_bundle_id as boogu_source_bundle_id,
+    variant_for_model,
+};
 
 use crate::{
     BackendState, BackendStatus, CompleteImageJob, FailImageJob, FrontendError, ImageFrontendSet,
@@ -42,61 +63,6 @@ use crate::{
     ReportImageProgress, WgpuExecutionKind,
 };
 
-/// Largest current browser tensor after verified F16 Qwen row storage is adapted to F32.
-pub const BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES: u64 = 414_892_032;
-/// F32 `[1, 256, 1536, 1536]` feature buffer the ordinary untiled VAE would require.
-pub const BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES: u64 = 2_415_919_104;
-/// Conservative largest buffer in the exact two-slab VAE tail.
-///
-/// This covers one F32 `[1, 256, 1538, 772]` explicitly padded convolution input. The actual
-/// 1536-square core slab is `[1, 256, 1536, 768]`; the extra rows/columns cover its 3x3 halo and
-/// Burn's current explicit padding materialization.
-pub const BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES: u64 = 1_215_832_064;
-/// Measured F32 denoiser feed-forward buffer from the pinned exact 1.5K browser parity fixture.
-/// Shape preflight below computes the conservative released-shape bound including the maximum
-/// allowed instruction length.
-pub const BOOGU_BROWSER_1K5_DENOISER_FFN_BUFFER_BYTES: u64 = 522_042_368;
-/// Largest single runtime buffer required by the exact 1.5K browser parity fixture.
-pub const BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES: u64 =
-    BOOGU_BROWSER_1K5_VAE_STRIPED_TAIL_BUFFER_BYTES;
-/// Device-buffer limit requested by the ordinary Boogu browser runtime.
-///
-/// This is the maximum shape-aware buffer plan across the released Turbo/Edit 1K surface and all
-/// ten official Edit-Turbo 1.5K aspect-ratio presets. The maximum is the strict-F32 striped VAE
-/// tail for the 1392x1696 preset.
-pub const BOOGU_BROWSER_REQUESTED_BUFFER_LIMIT_BYTES: u64 = 1_217_126_400;
-/// Minimum applied device-buffer limit required by the exact 1.5K parity route.
-///
-/// The exact two-slab decoder tail keeps this below Chrome's observed 2,147,483,644-byte WebGPU
-/// ceiling without changing the global middle attention or GroupNorm semantics.
-pub const BOOGU_BROWSER_1K5_MIN_REQUIRED_BUFFER_LIMIT_BYTES: u64 =
-    BOOGU_BROWSER_1K5_MIN_RUNTIME_BUFFER_BYTES;
-/// Legacy 256-square browser edge retained for source compatibility.
-///
-/// This is no longer the browser output ceiling. Released browser descriptors now expose their
-/// native shape presets, with Turbo and Edit defaulting to 1024 square.
-#[deprecated(
-    since = "0.1.1",
-    note = "the browser now uses descriptor-specific full-resolution presets"
-)]
-pub const BOOGU_BROWSER_OUTPUT_EDGE: u32 = 256;
-/// Legacy pixel count corresponding to [`BOOGU_BROWSER_OUTPUT_EDGE`].
-///
-/// This value is retained only for source compatibility and is not a current browser limit.
-#[allow(deprecated)]
-#[deprecated(
-    since = "0.1.1",
-    note = "the browser now validates descriptor-specific full-resolution shapes"
-)]
-pub const BOOGU_BROWSER_MAX_OUTPUT_PIXELS: u64 =
-    BOOGU_BROWSER_OUTPUT_EDGE as u64 * BOOGU_BROWSER_OUTPUT_EDGE as u64;
-/// Output side at which browser VAE decode switches to the bounded strict-F32 striped tail.
-pub const BOOGU_BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE: u32 = 1024;
-/// Exact output edge replayed by the dedicated 1.5K browser parity route.
-pub const BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE: u32 = 1536;
-/// Exact output pixel count replayed by the dedicated 1.5K browser parity route.
-pub const BOOGU_BROWSER_1K5_PARITY_OUTPUT_PIXELS: u64 =
-    BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64 * BOOGU_BROWSER_1K5_PARITY_OUTPUT_EDGE as u64;
 /// Canonical public origin for immutable Boogu artifact bundles.
 pub const BOOGU_CDN_ROOT: &str = "https://aberration.technology/model";
 
@@ -104,124 +70,7 @@ pub const BOOGU_CDN_ROOT: &str = "https://aberration.technology/model";
 ///
 /// Inactive primary-window cameras are removed during render extraction, which prevents Bevy from
 /// acquiring or presenting the WebGPU canvas while model inference owns the shared device/queue.
-#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-pub(crate) const BROWSER_SURFACE_INFERENCE_POLICY: &str = "request-scoped-surface-acquire-suspended/primary-window-cameras-inactive-before-runtime-submit/exact-state-restored-after-terminal-before-output-ready";
-
-/// VAE decode strategy selected by the browser's shape-aware buffer plan.
-#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BrowserVaeDecodePolicy {
-    /// Ordinary strict-F32 decode for shapes whose full final feature fits the device contract.
-    FullStrictF32,
-    /// Exact strict-F32 two-slab final tail, split at this output-width coordinate.
-    StripedTailStrictF32 { split_width: usize },
-}
-
-/// Largest individual buffers planned for one browser inference shape.
-#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BrowserBufferPlan {
-    pub vae_decode_policy: BrowserVaeDecodePolicy,
-    pub vae_decode_max_buffer_bytes: u64,
-    pub denoiser_ffn_max_buffer_bytes: u64,
-    pub required_buffer_limit_bytes: u64,
-}
-
-/// Artifact and cache policy supplied to a concrete native or browser runtime.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BooguAdapterSettings {
-    pub artifact_source: ArtifactSource,
-    pub storage_profile: BooguStorageProfile,
-    pub integrity: IntegrityPolicy,
-    pub cache: ArtifactCachePolicy,
-}
-
-impl BooguAdapterSettings {
-    /// Construct the parity-oriented production policy for a caller-selected source.
-    pub fn verified_default(artifact_source: ArtifactSource) -> Self {
-        Self {
-            artifact_source,
-            storage_profile: BooguStorageProfile::F16QwenVisionF32,
-            integrity: IntegrityPolicy::RequireSha256,
-            cache: ArtifactCachePolicy::UseCached,
-        }
-    }
-
-    /// Construct the diagnostic all-F16 policy for a caller-selected source.
-    pub fn verified_f16(artifact_source: ArtifactSource) -> Self {
-        Self {
-            artifact_source,
-            storage_profile: BooguStorageProfile::F16,
-            integrity: IntegrityPolicy::RequireSha256,
-            cache: ArtifactCachePolicy::UseCached,
-        }
-    }
-
-    /// Canonical model-neutral runtime configuration for one release.
-    pub fn runtime_config(&self, variant: BooguVariant) -> RuntimeConfig {
-        RuntimeConfig {
-            model: boogu_model_id(variant),
-            artifact_profile: artifact_profile_id(self.storage_profile),
-            artifact_source: self.artifact_source.clone(),
-            integrity: self.integrity,
-            cache: self.cache,
-        }
-    }
-
-    pub fn numeric_format(&self) -> NumericFormat {
-        numeric_format(self.storage_profile)
-    }
-
-    /// Baseline VAE execution follows Diffusers `force_upcast=true`.
-    ///
-    /// The separately parity-qualified native high-VRAM mixed-F16 factory overrides this with its
-    /// typed preserved-F16 policy. Browser, layer-streamed, Q8, and all-F16 routes retain this
-    /// baseline.
-    pub const fn vae_float_load_policy(&self) -> BooguFloatLoadPolicy {
-        BooguFloatLoadPolicy::AdaptToF32
-    }
-
-    /// Q8 denoiser weights require F32 activations on Burn 0.21 WGPU; F16 profiles preserve F16.
-    pub const fn denoiser_float_load_policy(&self) -> BooguFloatLoadPolicy {
-        match self.storage_profile {
-            BooguStorageProfile::F16 | BooguStorageProfile::F16QwenVisionF32 => {
-                BooguFloatLoadPolicy::Preserve
-            }
-            BooguStorageProfile::Q8sBlock32F32
-            | BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => BooguFloatLoadPolicy::AdaptToF32,
-        }
-    }
-
-    /// Qwen's Col-layout matrices must be dequantized stage-locally before transpose on Burn 0.21.
-    pub const fn qwen_quantized_load_policy(&self) -> BooguQuantizedLoadPolicy {
-        match self.storage_profile {
-            BooguStorageProfile::F16 | BooguStorageProfile::F16QwenVisionF32 => {
-                BooguQuantizedLoadPolicy::Preserve
-            }
-            BooguStorageProfile::Q8sBlock32F32
-            | BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => {
-                BooguQuantizedLoadPolicy::DequantizeF16
-            }
-        }
-    }
-
-    /// Boogu denoiser matrices use the accurate row-layout Q8 kernel and remain quantized.
-    pub const fn denoiser_quantized_load_policy(&self) -> BooguQuantizedLoadPolicy {
-        BooguQuantizedLoadPolicy::Preserve
-    }
-
-    /// Concrete directory/range sources currently rely on their platform's natural cache and do
-    /// not implement refresh or bypass semantics.
-    #[cfg(any(test, feature = "boogu-native", feature = "boogu-web"))]
-    pub(crate) fn validate_concrete_cache_policy(&self) -> Result<(), &'static str> {
-        match self.cache {
-            ArtifactCachePolicy::UseCached => Ok(()),
-            ArtifactCachePolicy::Refresh | ArtifactCachePolicy::Bypass => {
-                Err("concrete Boogu factories implement only ArtifactCachePolicy::UseCached")
-            }
-        }
-    }
-}
+pub const BROWSER_SURFACE_INFERENCE_POLICY: &str = "request-scoped-surface-acquire-suspended/primary-window-cameras-inactive-before-runtime-submit/exact-state-restored-after-terminal-before-output-ready";
 
 /// Inputs available when the shared Bevy/Burn WGPU device is ready.
 ///
@@ -1521,68 +1370,8 @@ pub(crate) fn validate_variant_profile(
     variant: BooguVariant,
     profile: BooguStorageProfile,
 ) -> Result<(), RuntimeError> {
-    let descriptor = boogu_model_descriptor(variant);
-    let format = numeric_format(profile);
-    if !descriptor.capabilities.numeric_formats.contains(&format) {
-        return Err(model_execution(
-            &descriptor.id,
-            format!(
-                "artifact profile {} is not validated for this immutable release",
-                artifact_profile_id(profile).as_str()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-pub fn boogu_model_id(variant: BooguVariant) -> ModelId {
-    boogu_model_descriptor(variant).id
-}
-
-pub fn variant_for_model(model: &ModelId) -> Option<BooguVariant> {
-    [
-        BooguVariant::Image01Turbo,
-        BooguVariant::Image01EditTurbo,
-        BooguVariant::Image01EditTurbo1k5,
-    ]
-    .into_iter()
-    .find(|variant| boogu_model_descriptor(*variant).id == *model)
-}
-
-/// Stable directory stem for one logical Boogu release.
-pub const fn boogu_bundle_slug(variant: BooguVariant) -> &'static str {
-    match variant {
-        BooguVariant::Image01Turbo => "boogu-image-0.1-turbo",
-        BooguVariant::Image01EditTurbo => "boogu-image-0.1-edit-turbo",
-        BooguVariant::Image01EditTurbo1k5 => "boogu-image-0.1-edit-turbo-1k5",
-    }
-}
-
-/// Stable internal storage-profile identity used by manifests and runtime provenance.
-///
-/// The production CDN uses concise model-name bundle ids. This precise profile name remains
-/// unchanged so existing local bundles, CLI arguments, and sealed Burnpack metadata stay
-/// compatible.
-pub const fn boogu_profile_slug(profile: BooguStorageProfile) -> &'static str {
-    match profile {
-        BooguStorageProfile::F16 => "f16",
-        BooguStorageProfile::F16QwenVisionF32 => "f16-qwen-vision-f32",
-        BooguStorageProfile::Q8sBlock32F32 => "q8s-block32-f32",
-        BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => "q8s-block32-f32-qwen-vision-f32",
-    }
-}
-
-/// Legacy descriptive manifest identity used by explicit-source bundles and diagnostic conversions.
-pub fn boogu_legacy_bundle_id(variant: BooguVariant, profile: BooguStorageProfile) -> String {
-    legacy_artifact_bundle_id(variant, profile)
-}
-
-/// Preferred manifest bundle id used as the single `{model_name}` CDN path segment.
-///
-/// Published tuples take their immutable id from `burn_boogu`'s release registry. Unpublished
-/// diagnostic tuples retain the legacy variant/profile identity and require an explicit source.
-pub fn boogu_bundle_id(variant: BooguVariant, profile: BooguStorageProfile) -> String {
-    preferred_artifact_bundle_id(variant, profile)
+    validate_boogu_variant_profile(variant, profile)
+        .map_err(|error| model_execution(&boogu_model_id(variant), error))
 }
 
 /// Canonical immutable CDN base URL for one published variant/profile bundle.
@@ -1595,7 +1384,8 @@ pub fn boogu_cdn_base_url(variant: BooguVariant, profile: BooguStorageProfile) -
 }
 
 pub fn boogu_descriptor(variant: BooguVariant, profile: BooguStorageProfile) -> ModelDescriptor {
-    boogu_descriptor_for_execution(variant, profile, current_execution_kind())
+    let _execution = current_execution_kind();
+    boogu_release_descriptor(variant, profile)
 }
 
 /// Exact descriptor used by the surface-free 1.5K browser parity replay.
@@ -1665,75 +1455,13 @@ pub(crate) fn validate_browser_1k5_buffer_limits(
 }
 
 /// Build the exact maximum-single-buffer plan for one released browser output shape.
-#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+#[cfg(test)]
 pub(crate) fn browser_buffer_plan(
     variant: BooguVariant,
     dimensions: Dimensions,
 ) -> Result<BrowserBufferPlan, RuntimeError> {
-    let model = boogu_model_id(variant);
-    boogu_model_descriptor(variant)
-        .capabilities
-        .dimensions
-        .supports(dimensions)
-        .map_err(|error| model_execution(&model, error.to_string()))?;
-
-    let width = u64::from(dimensions.width());
-    let height = u64::from(dimensions.height());
-    let uses_striped_tail = dimensions.width() >= BOOGU_BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE
-        || dimensions.height() >= BOOGU_BROWSER_STRIPED_VAE_MIN_OUTPUT_SIDE;
-    let (vae_decode_policy, vae_decode_max_buffer_bytes) = if uses_striped_tail {
-        let split_width = dimensions.width() / 2;
-        debug_assert!(split_width >= 2 && split_width.is_multiple_of(2));
-        let largest_slab_width = u64::from(split_width.max(dimensions.width() - split_width));
-        // The first strict-F32 residual after the final upsample operates on 256 channels. Add
-        // two rows for explicit vertical padding and four columns for the split halo plus explicit
-        // horizontal padding. This reproduces the measured 1536-square [1,256,1538,772] bound.
-        let bytes = 256_u64
-            .checked_mul(
-                height
-                    .checked_add(2)
-                    .ok_or_else(|| model_execution(&model, "browser VAE height plan overflowed"))?,
-            )
-            .and_then(|value| value.checked_mul(largest_slab_width.checked_add(4)?))
-            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
-            .ok_or_else(|| model_execution(&model, "browser striped VAE buffer plan overflowed"))?;
-        (
-            BrowserVaeDecodePolicy::StripedTailStrictF32 {
-                split_width: usize::try_from(split_width)
-                    .map_err(|error| model_execution(&model, error.to_string()))?,
-            },
-            bytes,
-        )
-    } else {
-        let bytes = 256_u64
-            .checked_mul(height)
-            .and_then(|value| value.checked_mul(width))
-            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
-            .ok_or_else(|| model_execution(&model, "browser full VAE buffer plan overflowed"))?;
-        (BrowserVaeDecodePolicy::FullStrictF32, bytes)
-    };
-    // The denoiser patches the /8 latent at 2x2, hence one image token per 16x16 output region.
-    // InstructionPolicy::upstream rejects, rather than truncates, sequences above 1280 tokens.
-    let image_tokens = width
-        .checked_div(16)
-        .and_then(|width| width.checked_mul(height / 16))
-        .ok_or_else(|| model_execution(&model, "browser denoiser token plan overflowed"))?;
-    let joint_tokens = image_tokens
-        .checked_add(1_280)
-        .ok_or_else(|| model_execution(&model, "browser denoiser sequence plan overflowed"))?;
-    let denoiser_ffn_max_buffer_bytes = joint_tokens
-        .checked_mul(burn_boogu::BooguConfig::default().ffn_inner_dim() as u64)
-        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>() as u64))
-        .ok_or_else(|| model_execution(&model, "browser denoiser FFN plan overflowed"))?;
-    let required_buffer_limit_bytes = BOOGU_BROWSER_MAX_APPLIED_BUFFER_BYTES
-        .max(denoiser_ffn_max_buffer_bytes)
-        .max(vae_decode_max_buffer_bytes);
-    Ok(BrowserBufferPlan {
-        vae_decode_policy,
-        vae_decode_max_buffer_bytes,
-        denoiser_ffn_max_buffer_bytes,
-        required_buffer_limit_bytes,
-    })
+    burn_boogu::deployment::browser_buffer_plan(variant, dimensions)
+        .map_err(|error| model_execution(&boogu_model_id(variant), error.to_string()))
 }
 
 /// Fail before model execution when either applied WebGPU limit cannot cover the selected shape.
@@ -1744,31 +1472,13 @@ pub(crate) fn validate_browser_buffer_limits_for_dimensions(
     max_storage_buffer_binding_size: u64,
     max_buffer_size: u64,
 ) -> Result<BrowserBufferPlan, RuntimeError> {
-    let plan = browser_buffer_plan(variant, dimensions)?;
-    let model = boogu_model_id(variant);
-    for (name, actual) in [
-        (
-            "max_storage_buffer_binding_size",
-            max_storage_buffer_binding_size,
-        ),
-        ("max_buffer_size", max_buffer_size),
-    ] {
-        if actual < plan.required_buffer_limit_bytes {
-            return Err(model_execution(
-                &model,
-                format!(
-                    "browser {name} is {actual} bytes; {}x{} requires at least {} bytes (VAE decode plan {}, untiled 1536-square feature {} bytes, shape-aware maximum denoiser FFN {} bytes)",
-                    dimensions.width(),
-                    dimensions.height(),
-                    plan.required_buffer_limit_bytes,
-                    plan.vae_decode_max_buffer_bytes,
-                    BOOGU_BROWSER_1K5_VAE_FINAL_FEATURE_BUFFER_BYTES,
-                    plan.denoiser_ffn_max_buffer_bytes,
-                ),
-            ));
-        }
-    }
-    Ok(plan)
+    burn_boogu::deployment::validate_browser_buffer_limits_for_dimensions(
+        variant,
+        dimensions,
+        max_storage_buffer_binding_size,
+        max_buffer_size,
+    )
+    .map_err(|error| model_execution(&boogu_model_id(variant), error.to_string()))
 }
 
 /// Validate that the applied limits cover every output shape advertised by one browser release.
@@ -1778,30 +1488,12 @@ pub(crate) fn validate_browser_variant_buffer_limits(
     max_storage_buffer_binding_size: u64,
     max_buffer_size: u64,
 ) -> Result<(), RuntimeError> {
-    let descriptor = boogu_model_descriptor(variant);
-    if let Some(allowed) = descriptor.capabilities.dimensions.allowed_dimensions {
-        for dimensions in allowed {
-            validate_browser_buffer_limits_for_dimensions(
-                variant,
-                dimensions,
-                max_storage_buffer_binding_size,
-                max_buffer_size,
-            )?;
-        }
-    } else {
-        let dimensions = Dimensions::new(
-            descriptor.capabilities.dimensions.max_width,
-            descriptor.capabilities.dimensions.max_height,
-        )
-        .expect("released Boogu maximum dimensions are valid");
-        validate_browser_buffer_limits_for_dimensions(
-            variant,
-            dimensions,
-            max_storage_buffer_binding_size,
-            max_buffer_size,
-        )?;
-    }
-    Ok(())
+    burn_boogu::deployment::validate_browser_variant_buffer_limits(
+        variant,
+        max_storage_buffer_binding_size,
+        max_buffer_size,
+    )
+    .map_err(|error| model_execution(&boogu_model_id(variant), error.to_string()))
 }
 
 fn boogu_descriptor_for_execution(
@@ -1809,35 +1501,7 @@ fn boogu_descriptor_for_execution(
     profile: BooguStorageProfile,
     _execution: WgpuExecutionKind,
 ) -> ModelDescriptor {
-    let numeric_format = numeric_format(profile);
-    let mut descriptor = boogu_model_descriptor(variant);
-    // The model descriptor lists every supported artifact format; one adapter
-    // instance advertises only the profile its factory was asked to load. An unsupported
-    // selection must never overwrite the release's validated format set with a false claim.
-    if descriptor
-        .capabilities
-        .numeric_formats
-        .contains(&numeric_format)
-    {
-        descriptor.capabilities.numeric_formats = [numeric_format].into_iter().collect();
-    }
-    descriptor
-}
-
-fn artifact_profile_id(profile: BooguStorageProfile) -> ArtifactProfileId {
-    ArtifactProfileId::new(boogu_profile_slug(profile))
-        .expect("canonical Boogu artifact profile ids are valid")
-}
-
-fn numeric_format(profile: BooguStorageProfile) -> NumericFormat {
-    match profile {
-        BooguStorageProfile::F16 => NumericFormat::F16,
-        BooguStorageProfile::F16QwenVisionF32 => NumericFormat::Other("f16-qwen-vision-f32".into()),
-        BooguStorageProfile::Q8sBlock32F32 => NumericFormat::Other("q8s-block32-f32".into()),
-        BooguStorageProfile::Q8sBlock32F32QwenVisionF32 => {
-            NumericFormat::Other("q8s-block32-f32-qwen-vision-f32".into())
-        }
-    }
+    boogu_release_descriptor(variant, profile)
 }
 
 const fn current_execution_kind() -> WgpuExecutionKind {
@@ -1865,12 +1529,14 @@ mod tests {
     use bevy::prelude::*;
     use bevy::window::PrimaryWindow;
     use burn_boogu::artifacts::{
-        BooguStorageProfile, EDIT_TURBO_1K5_REVISION, EDIT_TURBO_REVISION, TURBO_REVISION,
-        artifact_bundle_id_is_compatible,
+        BooguFloatLoadPolicy, BooguQuantizedLoadPolicy, BooguStorageProfile,
+        EDIT_TURBO_1K5_REVISION, EDIT_TURBO_REVISION, TURBO_REVISION,
+        artifact_bundle_id_matches_selection,
     };
     use burn_image::{
-        ArtifactSource, ColorSpace, EditRequest, GenerateRequest, GenerationOptions, ImageRequest,
-        InputImage, PixelBuffer, PixelFormat, Prompt, RemoteBaseUrl,
+        ArtifactCachePolicy, ArtifactSource, ColorSpace, EditRequest, GenerateRequest,
+        GenerationOptions, ImageRequest, InputImage, PixelBuffer, PixelFormat, Prompt,
+        RemoteBaseUrl,
     };
 
     use crate::{
@@ -1887,7 +1553,7 @@ mod tests {
     )>;
 
     fn settings() -> BooguAdapterSettings {
-        BooguAdapterSettings::verified_f16(ArtifactSource::Remote {
+        BooguAdapterSettings::f16(ArtifactSource::Remote {
             base_url: RemoteBaseUrl::new("https://cdn.example/boogu").unwrap(),
         })
     }
@@ -2062,7 +1728,7 @@ mod tests {
             "boogu-image-0.1-edit-turbo-1k5"
         );
         assert_eq!(
-            boogu_legacy_bundle_id(
+            boogu_source_bundle_id(
                 BooguVariant::Image01EditTurbo1k5,
                 BooguStorageProfile::F16QwenVisionF32,
             ),
@@ -2076,15 +1742,25 @@ mod tests {
             Some("https://aberration.technology/model/boogu-image-0.1-turbo".into())
         );
         assert_eq!(
+            boogu_cdn_base_url(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            Some(
+                "https://aberration.technology/model/boogu-image-0.1-turbo-q4s-block-up-to128-f32"
+                    .into()
+            )
+        );
+        assert_eq!(
             boogu_cdn_base_url(BooguVariant::Image01Turbo, BooguStorageProfile::F16),
             None
         );
-        assert!(artifact_bundle_id_is_compatible(
+        assert!(artifact_bundle_id_matches_selection(
             BooguVariant::Image01Turbo,
             BooguStorageProfile::F16QwenVisionF32,
             "boogu-image-0.1-turbo-f16-qwen-vision-f32",
         ));
-        assert!(artifact_bundle_id_is_compatible(
+        assert!(artifact_bundle_id_matches_selection(
             BooguVariant::Image01Turbo,
             BooguStorageProfile::F16QwenVisionF32,
             "boogu-image-0.1-turbo",
@@ -2190,7 +1866,7 @@ mod tests {
 
     #[test]
     fn edit_turbo_1k5_native_and_browser_expose_the_same_released_shapes_correctness() {
-        let supported = BooguAdapterSettings::verified_default(ArtifactSource::Remote {
+        let supported = BooguAdapterSettings::mixed_f16(ArtifactSource::Remote {
             base_url: RemoteBaseUrl::new("https://cdn.example/boogu").unwrap(),
         });
         let native_job = prepare_runtime_job_for_execution(
@@ -2267,15 +1943,18 @@ mod tests {
         );
         assert_eq!(
             descriptor.capabilities.numeric_formats,
-            [NumericFormat::Other("f16-qwen-vision-f32".into())]
-                .into_iter()
-                .collect()
+            [
+                NumericFormat::Other("f16-qwen-vision-f32".into()),
+                NumericFormat::Other("q4s-block-up-to128-f32".into()),
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
     #[test]
-    fn production_settings_select_mixed_qwen_vision_profile_correctness() {
-        let settings = BooguAdapterSettings::verified_default(ArtifactSource::Remote {
+    fn deployment_settings_keep_mixed_f16_explicit_and_prioritize_q4_production_correctness() {
+        let settings = BooguAdapterSettings::mixed_f16(ArtifactSource::Remote {
             base_url: RemoteBaseUrl::new("https://cdn.example/boogu").unwrap(),
         });
         assert_eq!(
@@ -2295,6 +1974,25 @@ mod tests {
         );
         assert_eq!(
             settings.vae_float_load_policy(),
+            BooguFloatLoadPolicy::AdaptToF32
+        );
+
+        let preferred = BooguAdapterSettings::production(
+            BooguVariant::Image01Turbo,
+            ArtifactSource::Remote {
+                base_url: RemoteBaseUrl::new("https://cdn.example/boogu-q4s").unwrap(),
+            },
+        );
+        assert_eq!(
+            preferred.storage_profile,
+            BooguStorageProfile::Q4sBlockUpTo128F32
+        );
+        assert_eq!(
+            preferred.numeric_format(),
+            NumericFormat::Other("q4s-block-up-to128-f32".into())
+        );
+        assert_eq!(
+            preferred.vae_float_load_policy(),
             BooguFloatLoadPolicy::AdaptToF32
         );
         assert_eq!(

@@ -29,9 +29,11 @@ pub mod weights;
 pub use artifacts::{
     QWEN_BASE_CONDITIONING_PROFILE, QWEN_COMPONENT_BUNDLE_ID, QWEN_COMPONENT_CONTENT_DIGEST,
     QWEN_COMPONENT_MODEL_ID, QWEN_COMPONENT_MODEL_REVISION, QWEN_COMPONENT_ROLE,
-    Qwen3VlArtifactError, Qwen3VlArtifactFloatPolicy, Qwen3VlComponentContract,
-    VerifiedAsyncBurnpackQwen3VlStageSource, VerifiedBurnpackQwen3VlStageSource,
-    qwen_component_dependency, qwen_row_slice_target, qwen_streaming_stage_name,
+    QWEN_Q4S_BASE_CONDITIONING_PROFILE, QWEN_Q4S_COMPONENT_BUNDLE_ID,
+    QWEN_Q4S_COMPONENT_CONTENT_DIGEST, Qwen3VlArtifactError, Qwen3VlArtifactFloatPolicy,
+    Qwen3VlComponentContract, VerifiedAsyncBurnpackQwen3VlStageSource,
+    VerifiedBurnpackQwen3VlStageSource, qwen_component_dependency, qwen_q4s_component_dependency,
+    qwen_row_slice_target, qwen_streaming_stage_name,
 };
 pub use builder::Qwen3VlBuilder;
 pub use chat::{ChatContent, ChatMessage, ChatRole, ChatTemplate, ChatTemplateConfig, ToolCall};
