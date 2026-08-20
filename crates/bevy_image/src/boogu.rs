@@ -282,17 +282,25 @@ impl Default for BrowserSurfaceInferenceGate {
     }
 }
 
+#[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
+/// Keep the rendered surface off the shared queue during inference. Only an explicit diagnostic
+/// opt-out may disable the gate; a missing or malformed query value must retain the safe default.
+fn browser_surface_inference_gate_enabled(query_value: Option<&str>) -> bool {
+    !matches!(query_value, Some("0"))
+}
+
 #[cfg(all(feature = "boogu-web", target_arch = "wasm32"))]
-fn browser_surface_inference_gate_requested() -> bool {
-    web_sys::window()
+pub(crate) fn browser_surface_inference_gate_requested() -> bool {
+    let query_value = web_sys::window()
         .and_then(|window| window.location().search().ok())
         .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
-        .is_some_and(|params| params.get("surface-gate").as_deref() == Some("1"))
+        .and_then(|params| params.get("surface-gate"));
+    browser_surface_inference_gate_enabled(query_value.as_deref())
 }
 
 #[cfg(test)]
-const fn browser_surface_inference_gate_requested() -> bool {
-    false
+fn browser_surface_inference_gate_requested() -> bool {
+    browser_surface_inference_gate_enabled(None)
 }
 
 #[cfg(any(test, all(feature = "boogu-web", target_arch = "wasm32")))]
@@ -1580,6 +1588,15 @@ mod tests {
         assert!(browser_vram_preflight_chunks(0, 20).is_err());
         assert!(browser_vram_preflight_chunks(16, 3).is_err());
         assert!(browser_vram_preflight_chunks(18, 20).is_err());
+    }
+
+    #[test]
+    fn browser_surface_gate_defaults_on_with_explicit_diagnostic_opt_out_correctness() {
+        assert!(browser_surface_inference_gate_enabled(None));
+        assert!(browser_surface_inference_gate_enabled(Some("1")));
+        assert!(browser_surface_inference_gate_enabled(Some("unexpected")));
+        assert!(!browser_surface_inference_gate_enabled(Some("0")));
+        assert!(browser_surface_inference_gate_requested());
     }
 
     fn request() -> ImageRequest {

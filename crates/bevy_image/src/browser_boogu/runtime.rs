@@ -5639,7 +5639,7 @@ impl BooguRuntimeFactory for BrowserBooguFactory {
                         inputs.base_url,
                         inputs.settings,
                         policies.for_ordinary_browser_factory(
-                            browser_surface_inference_gate_requested(),
+                            crate::boogu::browser_surface_inference_gate_requested(),
                         ),
                         inputs.device,
                         inputs.allocation_device,
@@ -10803,13 +10803,6 @@ fn rendered_model_smoke_requested() -> bool {
         .and_then(|window| window.location().search().ok())
         .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
         .is_some_and(|params| params.get("rendered-model-smoke").as_deref() == Some("1"))
-}
-
-fn browser_surface_inference_gate_requested() -> bool {
-    web_sys::window()
-        .and_then(|window| window.location().search().ok())
-        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
-        .is_some_and(|params| params.get("surface-gate").as_deref() == Some("1"))
 }
 
 /// Request-local distinction between the serialized localization branch and the ordinary model
