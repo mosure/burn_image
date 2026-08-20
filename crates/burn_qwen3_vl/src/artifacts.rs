@@ -1316,7 +1316,7 @@ fn quantize_q4s_block128_f32(data: TensorData) -> Result<TensorData, TensorSnaps
         .map_err(|error| TensorSnapshotError::DataError(error.to_string()))?;
     let mut packed = Vec::with_capacity(values.len() / VALUES_PER_WORD);
     let mut scales = Vec::with_capacity(values.len() / BLOCK);
-    for block in values.chunks_exact(BLOCK) {
+    for block in values.as_chunks::<BLOCK>().0 {
         if block.iter().any(|value| !value.is_finite()) {
             return Err(TensorSnapshotError::DataError(
                 "cannot quantize a non-finite Qwen checkpoint value".into(),
@@ -1332,7 +1332,7 @@ fn quantize_q4s_block128_f32(data: TensorData) -> Result<TensorData, TensorSnaps
         };
         scales.push(scale);
         let inverse = scale.recip();
-        for values in block.chunks_exact(VALUES_PER_WORD) {
+        for values in block.as_chunks::<VALUES_PER_WORD>().0 {
             let mut word = 0_u32;
             for (lane, value) in values.iter().enumerate() {
                 let quantized = (value * inverse).round().clamp(-7.0, 7.0) as i8;
@@ -1776,7 +1776,9 @@ mod tests {
         }
         .into_vec_i8();
         let reconstructed = quantized_values
-            .chunks_exact(128)
+            .as_chunks::<128>()
+            .0
+            .iter()
             .zip(qparams.scales)
             .flat_map(|(block, scale)| block.iter().map(move |value| f32::from(*value) * scale))
             .collect::<Vec<_>>();
@@ -1938,7 +1940,9 @@ mod tests {
         file.read_exact(&mut bytes)
             .expect("read pinned Qwen tensor");
         let weights = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
             .collect::<Vec<_>>();
         assert!(weights.iter().all(|value| value.is_finite()));
@@ -1947,7 +1951,9 @@ mod tests {
             .map(|index| ((index * 19 % 251) as f32 - 125.0) / 256.0)
             .collect::<Vec<_>>();
         let reference = weights
-            .chunks_exact(INPUT_WIDTH)
+            .as_chunks::<INPUT_WIDTH>()
+            .0
+            .iter()
             .map(|row| {
                 row.iter()
                     .zip(&input)

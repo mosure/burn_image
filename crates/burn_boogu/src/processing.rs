@@ -1030,8 +1030,10 @@ mod tests {
             let view = fixture.tensor(name).unwrap();
             assert_eq!(view.dtype(), Dtype::I64);
             view.data()
-                .chunks_exact(8)
-                .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|bytes| i64::from_le_bytes(*bytes))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -1056,22 +1058,24 @@ mod tests {
             let values = |view: TensorView<'_>| match view.dtype() {
                 Dtype::F32 => view
                     .data()
-                    .chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes))
                     .collect::<Vec<_>>(),
                 Dtype::F16 => view
                     .data()
-                    .chunks_exact(2)
-                    .map(|bytes| {
-                        f16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32()
-                    })
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| f16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
                     .collect::<Vec<_>>(),
                 Dtype::BF16 => view
                     .data()
-                    .chunks_exact(2)
-                    .map(|bytes| {
-                        bf16::from_bits(u16::from_le_bytes(bytes.try_into().unwrap())).to_f32()
-                    })
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|bytes| bf16::from_bits(u16::from_le_bytes(*bytes)).to_f32())
                     .collect::<Vec<_>>(),
                 dtype => panic!("unsupported fixture dtype {dtype:?}"),
             };

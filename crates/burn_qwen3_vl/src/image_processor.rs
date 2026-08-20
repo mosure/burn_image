@@ -419,8 +419,10 @@ mod tests {
     fn safetensors_f32(view: safetensors::tensor::TensorView<'_>) -> Vec<f32> {
         assert_eq!(view.dtype(), safetensors::Dtype::F32);
         view.data()
-            .chunks_exact(size_of::<f32>())
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<{ size_of::<f32>() }>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect()
     }
 
@@ -428,8 +430,10 @@ mod tests {
     fn safetensors_i64(view: safetensors::tensor::TensorView<'_>) -> Vec<i64> {
         assert_eq!(view.dtype(), safetensors::Dtype::I64);
         view.data()
-            .chunks_exact(size_of::<i64>())
-            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<{ size_of::<i64>() }>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_le_bytes(*bytes))
             .collect()
     }
 

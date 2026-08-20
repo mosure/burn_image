@@ -1086,8 +1086,8 @@ impl PackedWordBuilder {
     }
 
     fn push_f16_bytes(&mut self, bytes: &[u8]) -> Result<(), BooguError> {
-        let chunks = bytes.chunks_exact(2);
-        if !chunks.remainder().is_empty() {
+        let (chunks, remainder) = bytes.as_chunks::<2>();
+        if !remainder.is_empty() {
             return Err(BooguError::Artifact(
                 "canonical F16 tensor has an odd byte count".into(),
             ));

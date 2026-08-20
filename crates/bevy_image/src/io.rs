@@ -55,7 +55,7 @@ pub fn pixel_buffer_rgba8(pixels: &PixelBuffer) -> Result<(Dimensions, Vec<u8>),
             }
         }
         PixelFormat::Rgb8 => {
-            for pixel in pixels.bytes().chunks_exact(3) {
+            for pixel in pixels.bytes().as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[
                     encode_u8_channel(pixel[0], pixels.color_space()),
                     encode_u8_channel(pixel[1], pixels.color_space()),
@@ -65,7 +65,7 @@ pub fn pixel_buffer_rgba8(pixels: &PixelBuffer) -> Result<(Dimensions, Vec<u8>),
             }
         }
         PixelFormat::Rgba8 => {
-            for pixel in pixels.bytes().chunks_exact(4) {
+            for pixel in pixels.bytes().as_chunks::<4>().0 {
                 rgba.extend_from_slice(&[
                     encode_u8_channel(pixel[0], pixels.color_space()),
                     encode_u8_channel(pixel[1], pixels.color_space()),
@@ -75,7 +75,7 @@ pub fn pixel_buffer_rgba8(pixels: &PixelBuffer) -> Result<(Dimensions, Vec<u8>),
             }
         }
         PixelFormat::Rgba16Float => {
-            for pixel in pixels.bytes().chunks_exact(8) {
+            for pixel in pixels.bytes().as_chunks::<8>().0 {
                 let channel =
                     |index: usize| f16::from_le_bytes([pixel[index], pixel[index + 1]]).to_f32();
                 rgba.extend_from_slice(&[
@@ -87,7 +87,7 @@ pub fn pixel_buffer_rgba8(pixels: &PixelBuffer) -> Result<(Dimensions, Vec<u8>),
             }
         }
         PixelFormat::Rgba32Float => {
-            for pixel in pixels.bytes().chunks_exact(16) {
+            for pixel in pixels.bytes().as_chunks::<16>().0 {
                 let channel = |index: usize| {
                     f32::from_le_bytes(pixel[index..index + 4].try_into().expect("four bytes"))
                 };
@@ -209,7 +209,9 @@ fn looks_like_heif(bytes: &[u8]) -> bool {
         return false;
     }
     bytes[8..box_size.min(bytes.len())]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(index, _)| *index != 1) // the second word is the minor version, not a brand
         .any(|(_, brand)| {

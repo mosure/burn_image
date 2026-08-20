@@ -1691,7 +1691,7 @@ mod tests {
                 let values = tensor.into_data().to_vec::<f32>().unwrap();
                 let mut quantized = Vec::with_capacity(values.len());
                 let mut scales = Vec::with_capacity(values.len() / 32);
-                for block in values.chunks_exact(32) {
+                for block in values.as_chunks::<32>().0 {
                     let alpha = block
                         .iter()
                         .fold(0.0_f32, |value, element| value.max(element.abs()));
@@ -1878,7 +1878,7 @@ mod tests {
         }
         assert_eq!(source.source().inner.synchronizations, 7 * 4);
         assert_eq!(observer.boundaries.len(), 11 * 4);
-        for pass in observer.boundaries.chunks_exact(11).skip(1) {
+        for pass in observer.boundaries.as_chunks::<11>().0.iter().skip(1) {
             for (actual, first) in pass.iter().zip(&observer.boundaries[..11]) {
                 assert_eq!(actual.name, first.name);
                 assert_eq!(actual.shape, first.shape);

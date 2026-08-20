@@ -600,21 +600,27 @@ mod tests {
         match view.dtype() {
             Dtype::F32 => view
                 .data()
-                .chunks_exact(size_of::<f32>())
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<{ size_of::<f32>() }>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
             Dtype::BF16 => view
                 .data()
-                .chunks_exact(size_of::<u16>())
+                .as_chunks::<{ size_of::<u16>() }>()
+                .0
+                .iter()
                 .map(|bytes| {
-                    let bits = u16::from_le_bytes(bytes.try_into().unwrap());
+                    let bits = u16::from_le_bytes(*bytes);
                     f32::from_bits(u32::from(bits) << 16)
                 })
                 .collect(),
             Dtype::F16 => view
                 .data()
-                .chunks_exact(size_of::<u16>())
-                .map(|bytes| f16_bits_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())))
+                .as_chunks::<{ size_of::<u16>() }>()
+                .0
+                .iter()
+                .map(|bytes| f16_bits_to_f32(u16::from_le_bytes(*bytes)))
                 .collect(),
             dtype => panic!("unsupported fixture float dtype {dtype:?}"),
         }
@@ -643,8 +649,10 @@ mod tests {
     fn fixture_i64(view: safetensors::tensor::TensorView<'_>) -> Vec<i64> {
         assert_eq!(view.dtype(), Dtype::I64);
         view.data()
-            .chunks_exact(size_of::<i64>())
-            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<{ size_of::<i64>() }>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_le_bytes(*bytes))
             .collect()
     }
 
@@ -904,7 +912,9 @@ mod tests {
 
             let image_grids = match tensors.tensor("processor.image_grid_thw") {
                 Ok(view) => fixture_i64(view)
-                    .chunks_exact(3)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
                     .map(|grid| {
                         Grid::new(
                             usize::try_from(grid[0]).unwrap(),

@@ -1232,7 +1232,9 @@ fn decode_bf16(name: &str, bytes: &[u8]) -> Result<Vec<bf16>, RuntimeError> {
         )));
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, word)| {
             let value = bf16::from_bits(u16::from_le_bytes([word[0], word[1]]));
@@ -1253,7 +1255,9 @@ fn decode_f32(name: &str, bytes: &[u8]) -> Result<Vec<f32>, RuntimeError> {
         )));
     }
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, word)| {
             let value = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
@@ -1269,7 +1273,9 @@ fn decode_f32(name: &str, bytes: &[u8]) -> Result<Vec<f32>, RuntimeError> {
 
 fn decode_i64(bytes: &[u8]) -> Vec<i64> {
     bytes
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|word| {
             i64::from_le_bytes([
                 word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7],
@@ -1635,7 +1641,7 @@ mod tests {
 
         let expected = vec![128_u8; 8 * 8 * 3];
         let mut actual = expected.clone();
-        for pixel in actual.chunks_exact_mut(3) {
+        for pixel in actual.as_chunks_mut::<3>().0 {
             pixel[1] = 0;
         }
         let metric = compare_rgb(&actual, &expected, 8, 8).unwrap();

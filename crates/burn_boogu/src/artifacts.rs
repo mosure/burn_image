@@ -7102,7 +7102,7 @@ mod loading {
         }
         let mut quantized = Vec::with_capacity(values.len());
         let mut scales = Vec::with_capacity(values.len() / 32);
-        for block in values.chunks_exact(32) {
+        for block in values.as_chunks::<32>().0 {
             if block.iter().any(|value| !value.is_finite()) {
                 return Err(TensorSnapshotError::DataError(
                     "cannot quantize a non-finite checkpoint value".into(),
@@ -7166,7 +7166,7 @@ mod loading {
 
         let mut packed = Vec::with_capacity(values.len() / VALUES_PER_WORD);
         let mut scales = Vec::with_capacity(values.len() / BLOCK);
-        for block in values.chunks_exact(BLOCK) {
+        for block in values.as_chunks::<BLOCK>().0 {
             if block.iter().any(|value| !value.is_finite()) {
                 return Err(TensorSnapshotError::DataError(
                     "cannot quantize a non-finite checkpoint value".into(),
@@ -7182,7 +7182,7 @@ mod loading {
             };
             scales.push(scale);
             let inverse = scale.recip();
-            for values in block.chunks_exact(VALUES_PER_WORD) {
+            for values in block.as_chunks::<VALUES_PER_WORD>().0 {
                 let mut word = 0_u32;
                 for (lane, value) in values.iter().enumerate() {
                     let quantized = (value * inverse).round().clamp(-7.0, 7.0) as i8;
@@ -7429,7 +7429,7 @@ mod loading {
             )));
         }
         let mut dequantized = Vec::with_capacity(values.len());
-        for (block, scale) in values.chunks_exact(32).zip(qparams.scales) {
+        for (block, scale) in values.as_chunks::<32>().0.iter().zip(qparams.scales) {
             if !scale.is_finite() {
                 return Err(TensorSnapshotError::DataError(
                     "Q8S block-32 payload contains a non-finite scale".into(),
@@ -10326,7 +10326,9 @@ mod tests {
         }
         .into_vec_i8();
         let reconstructed = packed_values
-            .chunks_exact(128)
+            .as_chunks::<128>()
+            .0
+            .iter()
             .zip(qparams.scales)
             .flat_map(|(block, scale)| block.iter().map(move |value| f32::from(*value) * scale))
             .collect::<Vec<_>>();
@@ -10510,7 +10512,9 @@ mod tests {
         file.read_exact(&mut bytes)
             .expect("read pinned x_embedder tensor");
         let source = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| f32::from_bits(u32::from(u16::from_le_bytes([pair[0], pair[1]])) << 16))
             .collect::<Vec<_>>();
         assert!(source.iter().all(|value| value.is_finite()));
@@ -10637,7 +10641,9 @@ mod tests {
         let mut source_raw = vec![0_u8; source_bytes];
         source_file.read_exact(&mut source_raw).unwrap();
         let source = source_raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32())
             .collect::<Vec<_>>();
         assert!(source.iter().all(|value| value.is_finite()));
@@ -10843,7 +10849,9 @@ mod tests {
                 vec![0_u8; row_entry["source_bytes"].as_u64().unwrap() as usize];
             row_source_file.read_exact(&mut row_source_raw).unwrap();
             let row_source_raw = row_source_raw
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32())
                 .collect::<Vec<_>>();
             let mut row_source = Vec::with_capacity(row_source_raw.len());

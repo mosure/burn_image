@@ -362,7 +362,9 @@ fn fixture_input<B: Backend>(
             return Err("processor.image_grid_thw must have shape [N,3]".into());
         }
         values
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|value| {
                 Ok(Grid::new(
                     usize::try_from(value[0])?,
@@ -639,8 +641,10 @@ impl FixtureStore {
         }
         let values = tensor
             .bytes
-            .chunks_exact(8)
-            .map(|chunk| i64::from_le_bytes(chunk.try_into().expect("eight-byte chunk")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| i64::from_le_bytes(*chunk))
             .collect();
         Ok((tensor.shape, values))
     }
@@ -650,17 +654,23 @@ impl FixtureStore {
         let values = match tensor.dtype {
             Dtype::F32 => tensor
                 .bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| f32::from_le_bytes(*chunk))
                 .collect(),
             Dtype::F16 => tensor
                 .bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
                 .collect(),
             Dtype::BF16 => tensor
                 .bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
                 .collect(),
             dtype => return Err(format!("fixture tensor {name} has unsupported {dtype:?}").into()),

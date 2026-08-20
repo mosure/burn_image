@@ -1403,7 +1403,7 @@ fn convert_f16(tensor: &SourceTensor, source: &[u8]) -> Result<TensorData, Box<d
     let mut output = Vec::with_capacity(tensor.shape.iter().product::<usize>() * 2);
     match tensor.dtype.as_str() {
         "F16" => {
-            for pair in source.chunks_exact(2) {
+            for pair in source.as_chunks::<2>().0 {
                 let value = f16::from_bits(u16::from_le_bytes([pair[0], pair[1]]));
                 if !value.is_finite() {
                     return Err(format!(
@@ -1416,13 +1416,13 @@ fn convert_f16(tensor: &SourceTensor, source: &[u8]) -> Result<TensorData, Box<d
             }
         }
         "BF16" => {
-            for pair in source.chunks_exact(2) {
+            for pair in source.as_chunks::<2>().0 {
                 let value = bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32();
                 output.extend_from_slice(&checked_f16_bits(tensor, value)?.to_le_bytes());
             }
         }
         "F32" => {
-            for word in source.chunks_exact(4) {
+            for word in source.as_chunks::<4>().0 {
                 let value = f32::from_le_bytes([word[0], word[1], word[2], word[3]]);
                 output.extend_from_slice(&checked_f16_bits(tensor, value)?.to_le_bytes());
             }
@@ -1465,15 +1465,21 @@ fn decode_transposed_f32(
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn Error>> {
     let mut values = match tensor.dtype.as_str() {
         "F16" => source
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| f16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32())
             .collect::<Vec<_>>(),
         "BF16" => source
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32())
             .collect::<Vec<_>>(),
         "F32" => source
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
             .collect::<Vec<_>>(),
         other => return Err(format!("unsupported quantization dtype {other}").into()),

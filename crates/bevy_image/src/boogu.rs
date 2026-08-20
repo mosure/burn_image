@@ -1534,7 +1534,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bevy::ecs::system::SystemState;
-    use bevy::prelude::*;
     use bevy::window::PrimaryWindow;
     use burn_boogu::artifacts::{
         BooguFloatLoadPolicy, BooguQuantizedLoadPolicy, BooguStorageProfile,

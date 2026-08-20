@@ -1160,15 +1160,21 @@ fn decode_f32(view: &TensorView<'_>) -> Result<Vec<f32>, Box<dyn Error>> {
     let bytes = view.data();
     let values = match view.dtype() {
         Dtype::F32 => bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect(),
         Dtype::F16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
             .collect(),
         Dtype::BF16 => bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
             .collect(),
         other => return Err(format!("unsupported fixture dtype {other:?}").into()),
@@ -1235,7 +1241,7 @@ mod tests {
     fn block_ssim_detects_a_changed_channel_correctness() {
         let expected = vec![128_u8; 8 * 8 * 3];
         let mut actual = expected.clone();
-        for pixel in actual.chunks_exact_mut(3) {
+        for pixel in actual.as_chunks_mut::<3>().0 {
             pixel[1] = 0;
         }
         let score = mean_block_ssim_8x8(&actual, &expected, 8, 8).unwrap();

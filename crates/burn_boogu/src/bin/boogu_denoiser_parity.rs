@@ -740,15 +740,21 @@ fn decode_f32(view: &TensorView<'_>) -> Result<Vec<f32>, String> {
     let bytes = view.data();
     match view.dtype() {
         Dtype::F32 => Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect()),
         Dtype::F16 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
             .collect()),
         Dtype::BF16 => Ok(bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
             .collect()),
         dtype => Err(format!("unsupported fixture dtype {dtype:?}")),

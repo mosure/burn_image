@@ -2981,7 +2981,9 @@ mod tests {
             .to_vec::<f32>()
             .expect("balanced RMSNorm reference values");
         let expected = input_values
-            .chunks_exact(BOOGU_ATTENTION_HEAD_DIM)
+            .as_chunks::<BOOGU_ATTENTION_HEAD_DIM>()
+            .0
+            .iter()
             .flat_map(|row| {
                 let rms = (row.iter().map(|value| value * value).sum::<f32>()
                     / BOOGU_ATTENTION_HEAD_DIM as f32
