@@ -1174,6 +1174,10 @@ fn is_packed_q4s_block128_f32(dtype: DType) -> bool {
     )
 }
 
+fn is_q4s_block128_matrix_shape(shape: &[usize]) -> bool {
+    shape.len() == 2 && shape.last().is_some_and(|inner| inner.is_multiple_of(128))
+}
+
 fn validate_artifact_dtype(
     stage: &str,
     name: &str,
@@ -1182,12 +1186,17 @@ fn validate_artifact_dtype(
     shape: &[usize],
     float_policy: Qwen3VlArtifactFloatPolicy,
 ) -> Result<(), Qwen3VlArtifactError> {
-    if float_policy == Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries
-        && shape.len() == 2
-        && shape.last().is_some_and(|inner| inner.is_multiple_of(128))
-        && is_packed_q4s_block128_f32(actual)
-    {
-        return Ok(());
+    if float_policy == Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries {
+        if is_q4s_block128_matrix_shape(shape) && is_packed_q4s_block128_f32(actual) {
+            return Ok(());
+        }
+        // The sealed Q4 release stores source F16 for vision tensors that are not eligible for
+        // block-128 packing. The load adapter widens those tensors to the released F32 vision
+        // execution dtype before applying them to the module. Validate that explicit conversion
+        // policy here without weakening Preserve or the ordinary packed-F16 release contract.
+        if expected == Qwen3VlStageDType::F32 && actual == DType::F16 {
+            return Ok(());
+        }
     }
     validate_dtype(stage, name, actual, expected)
 }
@@ -1367,7 +1376,7 @@ impl ModuleAdapter for FloatAdapter {
     fn adapt(&self, snapshot: &TensorSnapshot) -> TensorSnapshot {
         if self.0 == Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries
             && matches!(snapshot.dtype, DType::F16 | DType::F32)
-            && snapshot.shape.len() == 2
+            && is_q4s_block128_matrix_shape(&snapshot.shape)
         {
             let data = snapshot.clone_data_fn();
             return TensorSnapshot::from_closure(
@@ -1397,6 +1406,8 @@ impl ModuleAdapter for FloatAdapter {
                 return snapshot.clone();
             }
             Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries => DType::F32,
+            // Unaligned matrices, Conv3d weights, norms, and biases in the sealed Q4 profile are
+            // the explicit F32 fallback. Eligible matrices returned from the branch above.
             Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries => DType::F32,
         };
         let data = snapshot.clone_data_fn();
@@ -1692,6 +1703,18 @@ mod tests {
             Vec::new(),
             ParamId::new(),
         );
+        let unaligned_matrix = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 2 * 129], [2, 129]).convert_dtype(DType::F16),
+            vec!["unaligned".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let convolution = TensorSnapshot::from_data(
+            TensorData::new(vec![0.25_f32; 8], [2, 1, 1, 2, 2]).convert_dtype(DType::F16),
+            vec!["conv3d".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
         let adapter =
             FloatAdapter(Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries);
         let packed_snapshot = adapter.adapt(&matrix);
@@ -1708,6 +1731,8 @@ mod tests {
         assert_eq!(values.len(), 256);
         assert_eq!(qparams.scales.len(), 2);
         assert_eq!(adapter.adapt(&bias).dtype, DType::F32);
+        assert_eq!(adapter.adapt(&unaligned_matrix).dtype, DType::F32);
+        assert_eq!(adapter.adapt(&convolution).dtype, DType::F32);
 
         let prepacked_snapshot =
             TensorSnapshot::from_data(packed, vec!["weight".into()], Vec::new(), ParamId::new());
@@ -1732,6 +1757,42 @@ mod tests {
                     && scheme.level == QuantLevel::block([128])
                     && scheme.param == QuantParam::F32
         ));
+    }
+
+    #[test]
+    fn packed_q4s_contract_admits_widened_f16_vision_tensors_correctness() {
+        for (name, shape) in [
+            ("model.visual.patch_embed.proj.bias", vec![1152]),
+            (
+                "model.visual.patch_embed.proj.weight",
+                vec![1152, 3, 2, 16, 16],
+            ),
+            (
+                "model.visual.blocks.0.mlp.linear_fc2.weight",
+                vec![1152, 4304],
+            ),
+        ] {
+            validate_artifact_dtype(
+                "qwen-vision-prelude",
+                name,
+                DType::F16,
+                Qwen3VlStageDType::F32,
+                &shape,
+                Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries,
+            )
+            .unwrap();
+
+            let preserve_error = validate_artifact_dtype(
+                "qwen-vision-prelude",
+                name,
+                DType::F16,
+                Qwen3VlStageDType::F32,
+                &shape,
+                Qwen3VlArtifactFloatPolicy::Preserve,
+            )
+            .unwrap_err();
+            assert!(preserve_error.to_string().contains("expected F32, got F16"));
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -2106,7 +2167,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires BURN_QWEN3_VL_Q4_COMPONENT_ROOT pointing at the released Q4 component bundle"]
-    fn released_packed_q4s_embedding_and_text_stage_load_reference() {
+    fn released_packed_q4s_embedding_text_and_vision_stage_load_reference() {
         let root = std::env::var("BURN_QWEN3_VL_Q4_COMPONENT_ROOT").expect(
             "set BURN_QWEN3_VL_Q4_COMPONENT_ROOT to the released Q4 Qwen component directory",
         );
@@ -2135,6 +2196,10 @@ mod tests {
         ));
         drop(embedding);
         drop(source.load_text_block(0).unwrap());
+        drop(source.load_vision_prelude().unwrap());
+        drop(source.load_vision_block(0).unwrap());
+        drop(source.load_vision_deepstack_merger(0).unwrap());
+        drop(source.load_vision_final_merger().unwrap());
     }
 
     #[test]

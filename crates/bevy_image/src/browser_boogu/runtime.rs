@@ -6561,7 +6561,7 @@ impl BrowserBooguEngine {
                 execution_error(
                     variant,
                     format!(
-                        "browser resident preload failed without fallback: {error}; use residency=low-vram for the bounded-memory production path"
+                        "browser resident preload failed without fallback under the selected high-throughput residency policy: {error}"
                     ),
                 )
             })?;
