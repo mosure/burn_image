@@ -183,7 +183,7 @@ jobs:
           cargo test -p burn_boogu --features runtime,import,wgpu,ndarray,autotune --bins --locked
           cargo test -p bevy_burn_image --all-features \
             --lib \
-            --bin burn-image-viewer \
+            --bin bevy_image \
             --bin burn-image-output-quality \
             --locked
       - name: Documentation

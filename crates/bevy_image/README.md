@@ -9,7 +9,15 @@ schedules, and artifact semantics live in the model/runtime crates.
 ## Run
 
 ```sh
-cargo run -p bevy_burn_image --features boogu-native --bin burn-image-viewer --release
+cargo install --path crates/bevy_image --locked --force
+bevy_image
+```
+
+The default feature set installs the concrete native Boogu WGPU runtime. Run the workspace binary
+without installing it with:
+
+```sh
+cargo run -p bevy_burn_image --bin bevy_image --release
 ```
 
 The interactive UI can switch between Generate, Edit 1K, and Edit 1.5K. It loads only the selected
@@ -24,11 +32,11 @@ the current output to the next request's reference.
 
 ```sh
 # Generate
-cargo run -p bevy_burn_image --features boogu-native --bin burn-image-viewer --release -- \
+cargo run -p bevy_burn_image --bin bevy_image --release -- \
   --variant turbo --prompt "a blue ceramic bird" --output result.png
 
 # Edit
-cargo run -p bevy_burn_image --features boogu-native --bin burn-image-viewer --release -- \
+cargo run -p bevy_burn_image --bin bevy_image --release -- \
   --variant edit-turbo --source input.jpg --prompt "make it red" --output result.png
 ```
 
@@ -67,6 +75,7 @@ that contract cannot be established; they do not fall back to CPU inference.
 | `app` | Bevy UI and display |
 | `gpu-interop` | shared Bevy/Burn WGPU device |
 | `boogu-native` | native model runtime and verified CDN cache |
+| `output-quality` | release-only native/browser output comparison helper |
 | `boogu-web` | browser runtime and bounded Range loading |
 | `native-autotune` | explicit native kernel tuning |
 

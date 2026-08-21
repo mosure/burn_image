@@ -32,16 +32,24 @@ CPU inference fallback.
 
 ## Run the app
 
-Launch the native model-enabled UI:
+Install the native WGPU application from the workspace and launch it:
 
 ```sh
-cargo run -p bevy_burn_image --features boogu-native --bin burn-image-viewer --release
+cargo install --path crates/bevy_image --locked --force
+bevy_image
+```
+
+The default feature set includes the concrete native Boogu WGPU runtime. For development, run the
+same binary directly from Cargo:
+
+```sh
+cargo run -p bevy_burn_image --bin bevy_image --release
 ```
 
 The default source is the verified CDN cache. Use a local sealed bundle when developing artifacts:
 
 ```sh
-cargo run -p bevy_burn_image --features boogu-native --bin burn-image-viewer --release -- \
+cargo run -p bevy_burn_image --bin bevy_image --release -- \
   --variant turbo \
   --artifacts .artifacts/cdn-upload-q4s-complete/aberration.technology/model/boogu-image-0.1-turbo-q4s-block-up-to128-f32
 ```
@@ -49,7 +57,7 @@ cargo run -p bevy_burn_image --features boogu-native --bin burn-image-viewer --r
 Run one unattended request:
 
 ```sh
-cargo run -p bevy_burn_image --features boogu-native --bin burn-image-viewer --release -- \
+cargo run -p bevy_burn_image --bin bevy_image --release -- \
   --variant turbo \
   --prompt "a blue ceramic bird" \
   --output result.png

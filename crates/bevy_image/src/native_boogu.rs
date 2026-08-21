@@ -275,7 +275,7 @@ fn native_low_vram_resource_plan_with_budget(
 ///
 /// Builds with `native-autotune` must configure the selected CubeCL policy before Bevy creates or
 /// imports its WGPU device. Builds without that opt-in feature use static kernels and skip tuning,
-/// which keeps interactive first-use latency predictable. The packaged `burn-image-viewer`
+/// which keeps interactive first-use latency predictable. The packaged `bevy_image`
 /// performs the feature-enabled setup automatically.
 pub struct NativeBooguFactory {
     variant: BooguVariant,

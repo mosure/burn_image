@@ -559,7 +559,7 @@ jobs:
             crates/bevy_image/tests/wasm_rendered_surface_smoke.mjs
           cargo run -p bevy_burn_image --release --locked \
             --features boogu-native,native-autotune \
-            --bin burn-image-viewer -- \
+            --bin bevy_image -- \
             --artifacts "$artifact_root/boogu-image-0.1-turbo" \
             --variant turbo \
             --profile production \
@@ -580,7 +580,7 @@ jobs:
           output_dir="$RUNNER_TEMP/burn-image-native-browser-same-seed-output-quality"
           mkdir -p "$output_dir"
           cargo run -p bevy_burn_image --release --locked \
-            --features boogu-native \
+            --features output-quality \
             --bin burn-image-output-quality -- \
             --native-report "$RUNNER_TEMP/burn-image-native-low-vram-turbo-1024/burn-image-native-low-vram-turbo-1024x1024-report.json" \
             --browser-report "$RUNNER_TEMP/burn-image-rendered-turbo-1024/burn-image-rendered-turbo-1024-report.json" \

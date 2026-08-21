@@ -12,9 +12,10 @@ homepage.workspace = true
 repository.workspace = true
 readme = "README.md"
 publish = false
+default-run = "bevy_image"
 
 [features]
-default = ["app", "gpu-interop", "native-io"]
+default = ["boogu-native"]
 app = [
   "dep:bevy_pancam",
   "dep:rand",
@@ -61,6 +62,9 @@ boogu-native = [
   "dep:serde_json",
   "dep:ureq",
 ]
+# Release-output comparison helper. Keep this out of the default install so `cargo install`
+# produces only the interactive `bevy_image` application.
+output-quality = ["boogu-native"]
 # Optional CubeCL candidate tuning for long-running or qualification workloads. The interactive
 # default deliberately uses static kernels so first-use latency is predictable.
 native-autotune = [
@@ -165,11 +169,11 @@ winit = { version = "=0.30.13", default-features = false, optional = true }
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
-name = "burn-image-viewer"
+name = "bevy_image"
 path = "src/main.rs"
-required-features = ["app", "gpu-interop"]
+required-features = ["boogu-native"]
 
 [[bin]]
 name = "burn-image-output-quality"
 path = "src/bin/output_quality.rs"
-required-features = ["boogu-native"]
+required-features = ["output-quality"]

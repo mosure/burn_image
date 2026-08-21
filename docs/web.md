@@ -100,7 +100,7 @@ user control and are not automatically substituted as edit references.
 
 ## Automation
 
-Native automation uses the `burn-image-viewer` CLI. Browser qualification uses explicit query/env
+Native automation uses the `bevy_image` CLI. Browser qualification uses explicit query/env
 routes in the checked-in harnesses; ordinary users interact through the Bevy UI. Headless routes
 emit structured reports and terminal markers and are not part of the interactive control surface.
 

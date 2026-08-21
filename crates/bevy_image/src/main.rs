@@ -1,8 +1,3 @@
-#[cfg(not(feature = "boogu-native"))]
-fn main() {
-    bevy_burn_image::app::build_app().run();
-}
-
 #[cfg(feature = "boogu-native")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum ProfileArg {
@@ -91,7 +86,7 @@ impl From<VariantArg> for burn_boogu::BooguVariant {
 #[derive(Debug, clap::Parser)]
 #[command(
     about = "Run the Bevy frontend with a sealed Boogu bundle",
-    after_help = "UNATTENDED EXAMPLES:\n  Generate:\n    burn-image-viewer --variant turbo --prompt 'a blue ceramic bird' --output result.png\n\n  Edit:\n    burn-image-viewer --variant edit-turbo --prompt 'make the bird red' --source input.jpg --output result.png\n\nSupplying --output enables unattended mode: the GPU runtime is initialized, one ordinary image job is submitted, the PNG and JSON report are written, and the process exits without UI interaction."
+    after_help = "UNATTENDED EXAMPLES:\n  Generate:\n    bevy_image --variant turbo --prompt 'a blue ceramic bird' --output result.png\n\n  Edit:\n    bevy_image --variant edit-turbo --prompt 'make the bird red' --source input.jpg --output result.png\n\nSupplying --output enables unattended mode: the GPU runtime is initialized, one ordinary image job is submitted, the PNG and JSON report are written, and the process exits without UI interaction."
 )]
 struct Args {
     /// Local sealed bundle override. Omit to use the verified Aberration CDN cache.
@@ -171,13 +166,11 @@ fn validate_autotune_feature_request(args: &Args) -> Result<(), &'static str> {
         return Ok(());
     }
     if args.autotune.is_some() {
-        return Err(
-            "--autotune requires building burn-image-viewer with --features native-autotune",
-        );
+        return Err("--autotune requires building bevy_image with --features native-autotune");
     }
     if args.qualification_output_dir.is_some() {
         return Err(
-            "--qualification-output-dir requires building burn-image-viewer with --features native-autotune",
+            "--qualification-output-dir requires building bevy_image with --features native-autotune",
         );
     }
     Ok(())
@@ -417,9 +410,27 @@ mod tests {
 
     #[test]
     fn native_cli_defaults_interactive_ui_to_generate_turbo_correctness() {
-        let args = Args::try_parse_from(["burn-image-viewer"]).unwrap();
+        let args = Args::try_parse_from(["bevy_image"]).unwrap();
         assert_eq!(args.variant, VariantArg::Turbo);
         assert!(args.output.is_none());
+    }
+
+    #[test]
+    fn default_install_builds_only_the_native_wgpu_application_correctness() {
+        let manifest = include_str!("../Cargo.toml");
+        assert!(manifest.contains("default-run = \"bevy_image\""));
+        assert!(manifest.contains("default = [\"boogu-native\"]"));
+        let bins = manifest
+            .split_once("[[bin]]")
+            .expect("bevy_image manifest must declare its application binary")
+            .1;
+        let (application, qualification) = bins
+            .split_once("[[bin]]")
+            .expect("bevy_image manifest must isolate its qualification helper");
+        assert!(application.contains("name = \"bevy_image\""));
+        assert!(application.contains("required-features = [\"boogu-native\"]"));
+        assert!(qualification.contains("name = \"burn-image-output-quality\""));
+        assert!(qualification.contains("required-features = [\"output-quality\"]"));
     }
 
     #[test]
@@ -438,11 +449,10 @@ mod tests {
 
     #[test]
     fn native_cli_autotune_option_tracks_the_build_feature_correctness() {
-        let ordinary = Args::try_parse_from(["burn-image-viewer"]).unwrap();
+        let ordinary = Args::try_parse_from(["bevy_image"]).unwrap();
         assert!(validate_autotune_feature_request(&ordinary).is_ok());
 
-        let requested =
-            Args::try_parse_from(["burn-image-viewer", "--autotune", "balanced"]).unwrap();
+        let requested = Args::try_parse_from(["bevy_image", "--autotune", "balanced"]).unwrap();
         assert_eq!(
             validate_autotune_feature_request(&requested).is_ok(),
             cfg!(feature = "native-autotune")
@@ -452,7 +462,7 @@ mod tests {
     #[test]
     fn native_cli_parses_unattended_generate_contract_correctness() {
         let args = Args::try_parse_from([
-            "burn-image-viewer",
+            "bevy_image",
             "--variant",
             "turbo",
             "--prompt",
@@ -484,7 +494,7 @@ mod tests {
     #[test]
     fn native_cli_parses_unattended_edit_source_and_visible_debug_window_correctness() {
         let args = Args::try_parse_from([
-            "burn-image-viewer",
+            "bevy_image",
             "--variant",
             "edit-turbo",
             "--prompt",
@@ -503,27 +513,17 @@ mod tests {
 
     #[test]
     fn native_cli_rejects_incomplete_unattended_invocation_correctness() {
-        let missing_prompt = Args::try_parse_from([
-            "burn-image-viewer",
-            "--variant",
-            "turbo",
-            "--output",
-            "result.png",
-        ])
-        .unwrap_err();
+        let missing_prompt =
+            Args::try_parse_from(["bevy_image", "--variant", "turbo", "--output", "result.png"])
+                .unwrap_err();
         assert_eq!(
             missing_prompt.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
 
-        let orphan_prompt = Args::try_parse_from([
-            "burn-image-viewer",
-            "--variant",
-            "turbo",
-            "--prompt",
-            "a bird",
-        ])
-        .unwrap_err();
+        let orphan_prompt =
+            Args::try_parse_from(["bevy_image", "--variant", "turbo", "--prompt", "a bird"])
+                .unwrap_err();
         assert_eq!(
             orphan_prompt.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
