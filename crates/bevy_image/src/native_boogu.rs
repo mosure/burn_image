@@ -35,19 +35,18 @@ use burn_boogu::{
     NativePortableDenoiser, NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy,
     RetainingBooguVaeStageSource, StreamingBooguPipeline, VaeDecoderMemoryPolicy,
     artifacts::{
-        BooguArtifactInventory, BooguReleaseIdentity, BooguResidentLoadMemoryPolicy,
-        BooguStorageProfile, DirectoryStageShardReader, VerifiedArtifactDirectory,
-        VerifiedBurnpackQwenStageSource, VerifiedDirectoryVaeStageSource,
-        artifact_bundle_id_matches_selection, canonical_published_bundle,
-        load_resident_denoiser_from_directory_with_memory_policy,
+        BooguArtifactInventory, BooguFloatLoadPolicy, BooguReleaseIdentity,
+        BooguResidentLoadMemoryPolicy, BooguStorageProfile, DirectoryStageShardReader,
+        VerifiedArtifactDirectory, VerifiedBurnpackQwenStageSource,
+        VerifiedDirectoryVaeStageSource, artifact_bundle_id_matches_selection,
+        canonical_published_bundle, load_resident_denoiser_from_directory_with_memory_policy,
         load_resident_denoiser_from_directory_with_policies,
         validate_canonical_release_artifact_digest,
     },
     boogu_model_descriptor, boogu_processor_config,
 };
 use burn_flux_vae::{
-    AutoencoderKl, AutoencoderKlConfig, DecoderGroupNormPolicy, FluxVaeArtifactFloatPolicy,
-    VerifiedBurnpackFluxVaeStageSource,
+    AutoencoderKl, AutoencoderKlConfig, DecoderGroupNormPolicy, VerifiedBurnpackFluxVaeStageSource,
 };
 use burn_image::{
     ArtifactSource, CancellationToken, ColorSpace, Dimensions, DirectoryArtifactShardReader,
@@ -56,12 +55,11 @@ use burn_image::{
     RuntimeConfig, RuntimeError,
 };
 use burn_qwen3_vl::{
-    EmbeddingRowChunk, Qwen3VlArtifactFloatPolicy, Qwen3VlConfig, Qwen3VlDecoderLayer,
-    Qwen3VlImageProcessor, Qwen3VlImageProcessorConfig, Qwen3VlProcessor, Qwen3VlStage,
-    Qwen3VlStageSource, Qwen3VlStreamingPlan, Qwen3VlTokenizer, Qwen3VlVisionBlock,
-    Qwen3VlVisionPatchMerger, Qwen3VlVisionPrelude, RetainingQwen3VlStageSource,
-    RetainingSynchronizationPolicy, RowChunkSpec, StreamingQwen3Vl,
-    VerifiedBurnpackQwen3VlStageSource, tokenizer::HfTokenizer,
+    EmbeddingRowChunk, Qwen3VlConfig, Qwen3VlDecoderLayer, Qwen3VlImageProcessor,
+    Qwen3VlImageProcessorConfig, Qwen3VlProcessor, Qwen3VlStage, Qwen3VlStageSource,
+    Qwen3VlStreamingPlan, Qwen3VlTokenizer, Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger,
+    Qwen3VlVisionPrelude, RetainingQwen3VlStageSource, RetainingSynchronizationPolicy,
+    RowChunkSpec, StreamingQwen3Vl, VerifiedBurnpackQwen3VlStageSource, tokenizer::HfTokenizer,
 };
 
 use crate::{
@@ -1370,7 +1368,7 @@ fn load_native_runtime(
             NativeVaeExecutionPolicy::PreserveF16StorageF32GroupNorm => {
                 // The qualified native numerical and synchronized performance gates preserve the
                 // authenticated mixed-F16 VAE. Adapting it to F32 selects a different runtime.
-                burn_boogu::artifacts::BooguFloatLoadPolicy::Preserve
+                BooguFloatLoadPolicy::Preserve
             }
         }
     } else {
@@ -1423,22 +1421,13 @@ fn load_native_runtime(
             device.clone(),
         )
         .map_err(|error| execution_error(variant, error))?
-        .with_float_policy(Qwen3VlArtifactFloatPolicy::Preserve);
+        .with_float_policy(
+            context
+                .settings
+                .qwen_float_load_policy()
+                .qwen_artifact_policy(),
+        );
         let qwen_plan = qwen_source.contract().plan().clone();
-        let component_vae_policy = match vae_policy {
-            burn_boogu::artifacts::BooguFloatLoadPolicy::Preserve => {
-                FluxVaeArtifactFloatPolicy::Preserve
-            }
-            burn_boogu::artifacts::BooguFloatLoadPolicy::AdaptToF32 => {
-                FluxVaeArtifactFloatPolicy::AdaptToF32
-            }
-            burn_boogu::artifacts::BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
-                FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
-            }
-            burn_boogu::artifacts::BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => {
-                FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
-            }
-        };
         let vae = VerifiedBurnpackFluxVaeStageSource::<
             NativeBackend,
             DirectoryArtifactShardReader,
@@ -1446,7 +1435,7 @@ fn load_native_runtime(
             artifact_directories.vae_root(), vae_config, device.clone()
         )
         .map_err(|error| execution_error(variant, error))?
-        .with_float_policy(component_vae_policy);
+        .with_float_policy(vae_policy.vae_artifact_policy());
         (
             NativeQwenSource::Component(Box::new(qwen_source)),
             qwen_plan,
@@ -2273,6 +2262,21 @@ mod tests {
             ),
             128
         );
+    }
+
+    #[test]
+    fn composed_native_qwen_uses_the_selected_profile_float_policy_correctness() {
+        let source = include_str!("native_boogu.rs");
+        let composed_constructor = source
+            .split_once("let qwen_source = VerifiedBurnpackQwen3VlStageSource")
+            .unwrap()
+            .1
+            .split_once("let qwen_plan = qwen_source.contract()")
+            .unwrap()
+            .0;
+        assert!(!composed_constructor.contains("Qwen3VlArtifactFloatPolicy::Preserve"));
+        assert!(composed_constructor.contains(".qwen_float_load_policy()"));
+        assert!(composed_constructor.contains(".qwen_artifact_policy()"));
     }
 
     #[test]

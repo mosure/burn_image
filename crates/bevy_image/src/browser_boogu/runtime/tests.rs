@@ -255,7 +255,7 @@ fn browser_public_variants_resident_q4_keep_all_modules_warm_correctness() {
         policy.weight_traffic_contract(),
         "eager-preload/qwen+vae+denoiser/resident-q4s-matrices+embedding+packed-f16-convolutions+f32-auxiliaries/zero-inference-artifact-transfers/no-model-unload"
     );
-        let source = include_str!("../runtime.rs");
+    let source = include_str!("../runtime.rs");
     let production_source = source
         .split("#[cfg(test)]")
         .next()
@@ -270,6 +270,15 @@ fn browser_public_variants_resident_q4_keep_all_modules_warm_correctness() {
     assert!(source.contains("resident_weights_preserved"));
     assert!(production_source.contains("decoder.decoder_float_dtype()"));
     assert!(!production_source.contains("let loaded_dtype: DType = decoder.float_dtype()"));
+    assert!(production_source.contains("set_qwen_resident_preload(true)"));
+    assert!(production_source.contains("set_qwen_resident_preload(false)"));
+    assert!(production_source.contains("qwen-resident-preload-text-final-norm"));
+    assert!(production_source.contains("\"upload-sync\""));
+    assert!(production_source.contains("\"post-forward-sync\""));
+    assert!(production_source.contains(".qwen_artifact_policy()"));
+    assert!(production_source.contains(".vae_artifact_policy()"));
+    assert!(!production_source.contains("Qwen3VlArtifactFloatPolicy::"));
+    assert!(!production_source.contains("FluxVaeArtifactFloatPolicy::"));
     assert!(
         BrowserExecutionPolicies::resident_packed_q4s(
             BooguVariant::Image01Turbo,

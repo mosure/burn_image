@@ -58,8 +58,8 @@ use burn_boogu::{
     },
 };
 use burn_flux_vae::{
-    AutoencoderKl, AutoencoderKlConfig, DiagonalGaussian, FluxVaeArtifactFloatPolicy,
-    FluxVaeComponentContract, VerifiedAsyncBurnpackFluxVaeStageSource,
+    AutoencoderKl, AutoencoderKlConfig, DiagonalGaussian, FluxVaeComponentContract,
+    VerifiedAsyncBurnpackFluxVaeStageSource,
 };
 use burn_image::{
     ArtifactDependency, ArtifactFile, ArtifactManifest, ArtifactPath, CancellationToken,
@@ -72,14 +72,13 @@ use burn_image::{
 use burn_qwen3_vl::Qwen3VlEmbeddingExecutionPolicy;
 use burn_qwen3_vl::{
     AsyncQwen3VlStageSource, AsyncRetainingSynchronizationPolicy, EmbeddingRowChunk,
-    HostRoutedEmbedding, HostRoutedEmbeddingReport, Qwen3VlArtifactFloatPolicy,
-    Qwen3VlComponentContract, Qwen3VlConfig, Qwen3VlDecoderLayer, Qwen3VlImageProcessor,
-    Qwen3VlImageProcessorConfig, Qwen3VlProcessor, Qwen3VlStage, Qwen3VlStageObserver,
-    Qwen3VlStreamingPlan, Qwen3VlTextBlockLoadSynchronizationPolicy,
-    Qwen3VlTextLayerAllocationPolicy, Qwen3VlTextLayerDiagnosticBoundary, Qwen3VlTokenizer,
-    Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger, Qwen3VlVisionPrelude,
-    RetainingAsyncQwen3VlStageSource, RowChunkSpec, StreamingQwen3Vl,
-    VerifiedAsyncBurnpackQwen3VlStageSource, tokenizer::HfTokenizer,
+    HostRoutedEmbedding, HostRoutedEmbeddingReport, Qwen3VlComponentContract, Qwen3VlConfig,
+    Qwen3VlDecoderLayer, Qwen3VlImageProcessor, Qwen3VlImageProcessorConfig, Qwen3VlProcessor,
+    Qwen3VlStage, Qwen3VlStageObserver, Qwen3VlStreamingPlan,
+    Qwen3VlTextBlockLoadSynchronizationPolicy, Qwen3VlTextLayerAllocationPolicy,
+    Qwen3VlTextLayerDiagnosticBoundary, Qwen3VlTokenizer, Qwen3VlVisionBlock,
+    Qwen3VlVisionPatchMerger, Qwen3VlVisionPrelude, RetainingAsyncQwen3VlStageSource, RowChunkSpec,
+    StreamingQwen3Vl, VerifiedAsyncBurnpackQwen3VlStageSource, tokenizer::HfTokenizer,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -3157,6 +3156,7 @@ struct BrowserAsyncStageSource<S> {
     inner: S,
     synchronizer: BrowserAsyncSynchronizer,
     pending_stage: Option<String>,
+    qwen_resident_preload: bool,
     deferred_stages_since_yield: usize,
     parity: Option<BrowserParityControl>,
     denoiser_query_chunk_size: Option<usize>,
@@ -3168,6 +3168,7 @@ impl<S> BrowserAsyncStageSource<S> {
             inner,
             synchronizer,
             pending_stage: None,
+            qwen_resident_preload: false,
             deferred_stages_since_yield: 0,
             parity: None,
             denoiser_query_chunk_size: None,
@@ -3180,6 +3181,13 @@ impl<S> BrowserAsyncStageSource<S> {
 
     fn set_denoiser_query_chunk_size(&mut self, query_chunk_size: usize) {
         self.denoiser_query_chunk_size = Some(query_chunk_size);
+    }
+
+    fn set_qwen_resident_preload(&mut self, active: bool) {
+        self.qwen_resident_preload = active;
+        if !active {
+            self.pending_stage = None;
+        }
     }
 
     fn inner(&self) -> &S {
@@ -3281,7 +3289,11 @@ where
         &mut self,
         index: usize,
     ) -> Result<Qwen3VlDecoderLayer<BrowserBackend>, Self::Error> {
-        let stage = format!("qwen-text-block-{index:02}");
+        let stage = if self.qwen_resident_preload {
+            format!("qwen-resident-preload-text-block-{index:02}")
+        } else {
+            format!("qwen-text-block-{index:02}")
+        };
         browser_stage_milestone(&format!("{stage}-source-load-apply-start"));
         self.pending_stage = Some(stage.clone());
         let layer = self.inner.load_text_block(index).await?;
@@ -3290,7 +3302,16 @@ where
     }
 
     async fn load_text_final_norm(&mut self) -> Result<RmsNorm<BrowserBackend>, Self::Error> {
-        self.inner.load_text_final_norm().await
+        let stage = if self.qwen_resident_preload {
+            "qwen-resident-preload-text-final-norm"
+        } else {
+            "qwen-text-final-norm"
+        };
+        browser_stage_milestone(&format!("{stage}-source-load-apply-start"));
+        self.pending_stage = Some(stage.into());
+        let norm = self.inner.load_text_final_norm().await?;
+        browser_stage_milestone(&format!("{stage}-source-load-apply-complete"));
+        Ok(norm)
     }
 
     async fn cooperative_yield(&mut self) -> Result<(), Self::Error> {
@@ -3299,10 +3320,15 @@ where
 
     async fn synchronize(&mut self) -> Result<(), Self::Error> {
         let stage = self.pending_stage.as_deref().unwrap_or("qwen-stage");
-        browser_stage_milestone(&format!("{stage}-post-forward-sync-start"));
+        let boundary = if self.qwen_resident_preload {
+            "upload-sync"
+        } else {
+            "post-forward-sync"
+        };
+        browser_stage_milestone(&format!("{stage}-{boundary}-start"));
         let result = self.synchronize_with_parity(stage).await;
         if result.is_ok() {
-            browser_stage_milestone(&format!("{stage}-post-forward-sync-complete"));
+            browser_stage_milestone(&format!("{stage}-{boundary}-complete"));
             self.pending_stage = None;
             self.deferred_stages_since_yield = 0;
         }
@@ -6277,19 +6303,9 @@ impl BrowserBooguEngine {
             )
             .map_err(|error| execution_error(variant, error))?;
             let plan = contract.plan().clone();
-            let float_policy = match policies.qwen_float {
-                BooguFloatLoadPolicy::Preserve => Qwen3VlArtifactFloatPolicy::Preserve,
-                BooguFloatLoadPolicy::AdaptToF32 => Qwen3VlArtifactFloatPolicy::AdaptToF32,
-                BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
-                    Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
-                }
-                BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => {
-                    Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries
-                }
-            };
             let source =
                 VerifiedAsyncBurnpackQwen3VlStageSource::new(contract, device.clone(), qwen_reader)
-                    .with_float_policy(float_policy);
+                    .with_float_policy(policies.qwen_float.qwen_artifact_policy());
             (BrowserVerifiedQwenSource::Component(source), plan)
         };
         let low_vram_resource_plan =
@@ -6424,22 +6440,9 @@ impl BrowserBooguEngine {
             let contract =
                 FluxVaeComponentContract::new(composition.vae_manifest.clone(), vae_config)
                     .map_err(|error| execution_error(variant, error))?;
-            let float_policy = match policies.vae_float {
-                BooguFloatLoadPolicy::Preserve => FluxVaeArtifactFloatPolicy::Preserve,
-                BooguFloatLoadPolicy::AdaptToF32 => FluxVaeArtifactFloatPolicy::AdaptToF32,
-                BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries => {
-                    FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
-                }
-                BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries => {
-                    // Convolution weights stay packed F16; the component VAE has no Q4 conv
-                    // kernel and its small rank-two attention projections do not justify a
-                    // separate loader policy.
-                    FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
-                }
-            };
             let source =
                 VerifiedAsyncBurnpackFluxVaeStageSource::new(contract, device.clone(), vae_reader)
-                    .with_float_policy(float_policy);
+                    .with_float_policy(policies.vae_float.vae_artifact_policy());
             BrowserVerifiedVaeSource::Component(AsyncFluxVaeStageSourceAdapter::new(source))
         };
         let vae_source = BrowserAsyncStageSource::new(verified_vae_source, synchronizer.clone());
@@ -6705,6 +6708,10 @@ impl BrowserBooguEngine {
             }
             _ => "Verifying and materializing dense-F32 Qwen, VAE, and denoiser weights on WebGPU",
         });
+        self.qwen
+            .source
+            .source_mut()
+            .set_qwen_resident_preload(true);
 
         if !self.policies.uses_host_routed_qwen_embedding() {
             for spec in self.qwen.plan.embedding_rows.chunks.clone() {
@@ -6780,6 +6787,10 @@ impl BrowserBooguEngine {
         );
         self.synchronize_preloaded_qwen_stage().await?;
         self.finish_preloaded_qwen_uploads().await?;
+        self.qwen
+            .source
+            .source_mut()
+            .set_qwen_resident_preload(false);
 
         if variant.is_edit() {
             drop(

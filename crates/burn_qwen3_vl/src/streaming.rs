@@ -26,7 +26,7 @@ use crate::{
     text::Qwen3VlDecoderLayer,
     vision::{
         Qwen3VlVisionBlock, Qwen3VlVisionModel, Qwen3VlVisionPatchEmbed, Qwen3VlVisionPatchMerger,
-        VisionPositionPlan,
+        VisionPositionPlan, interpolate_learned_positions,
     },
 };
 
@@ -911,32 +911,8 @@ impl<B: Backend> Qwen3VlVisionPrelude<B> {
         )?;
         let mut hidden_states = self.patch_embed.forward(patches);
         let device = hidden_states.device();
-        let dtype = self.pos_embed.weight.val().dtype();
-        let mut positions =
-            Tensor::<B, 2>::zeros([plan.patch_count(), self.config.hidden_size], &device)
-                .cast(dtype);
-        for corner in 0..4 {
-            let indices = Tensor::<B, 2, Int>::from_data(
-                TensorData::new(
-                    plan.interpolation_indices[corner].clone(),
-                    [1, plan.patch_count()],
-                ),
-                &device,
-            );
-            let embedding = self
-                .pos_embed
-                .forward(indices)
-                .reshape([plan.patch_count(), self.config.hidden_size]);
-            let weights = Tensor::<B, 2>::from_data(
-                TensorData::new(
-                    plan.interpolation_weights[corner].clone(),
-                    [plan.patch_count(), 1],
-                ),
-                &device,
-            )
-            .cast(dtype);
-            positions = positions + embedding * weights;
-        }
+        let positions =
+            interpolate_learned_positions(&self.pos_embed, &plan, self.config.hidden_size, &device);
         hidden_states = hidden_states + positions;
         let (cos, sin) = plan.vision_cos_sin::<B>(self.config.head_dim(), &device)?;
         Ok(Qwen3VlVisionState {

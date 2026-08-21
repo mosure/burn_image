@@ -1200,7 +1200,8 @@ mod loading {
         },
     };
     use burn_flux_vae::{
-        AutoencoderKl, AutoencoderKlConfig, FLUX_VAE_COMPONENT_ROLE, FluxVaeComponentContract,
+        AutoencoderKl, AutoencoderKlConfig, FLUX_VAE_COMPONENT_ROLE, FluxVaeArtifactFloatPolicy,
+        FluxVaeComponentContract,
     };
     use burn_image::{
         ArtifactFile, ArtifactFileRole, ArtifactManifest,
@@ -1211,10 +1212,10 @@ mod loading {
     };
     use burn_qwen3_vl::{
         AsyncQwen3VlCausalLmStageSource, AsyncQwen3VlStageSource, EmbeddingRowChunk,
-        OutputProjectionRowChunk, QWEN_COMPONENT_ROLE, Qwen3VlCausalLmStageSource,
-        Qwen3VlComponentContract, Qwen3VlForConditionalGeneration, Qwen3VlImageProcessorConfig,
-        Qwen3VlModel, Qwen3VlStage, Qwen3VlStageSource, Qwen3VlStreamingPlan, Qwen3VlVisionPrelude,
-        RowChunkPlan, RowChunkSpec,
+        OutputProjectionRowChunk, QWEN_COMPONENT_ROLE, Qwen3VlArtifactFloatPolicy,
+        Qwen3VlCausalLmStageSource, Qwen3VlComponentContract, Qwen3VlForConditionalGeneration,
+        Qwen3VlImageProcessorConfig, Qwen3VlModel, Qwen3VlStage, Qwen3VlStageSource,
+        Qwen3VlStreamingPlan, Qwen3VlVisionPrelude, RowChunkPlan, RowChunkSpec,
         text::Qwen3VlDecoderLayer,
         vision::{Qwen3VlVisionBlock, Qwen3VlVisionPatchMerger},
     };
@@ -1685,6 +1686,33 @@ mod loading {
         /// Retain eligible matrices as packed signed Q4S with F32 block scales, keep convolution
         /// weights packed F16, and widen normalization/bias auxiliaries to F32.
         PackedQ4sWeightsF32Auxiliaries,
+    }
+
+    impl BooguFloatLoadPolicy {
+        /// Translate the composed Boogu policy into the Qwen-owned artifact policy.
+        pub const fn qwen_artifact_policy(self) -> Qwen3VlArtifactFloatPolicy {
+            match self {
+                Self::Preserve => Qwen3VlArtifactFloatPolicy::Preserve,
+                Self::AdaptToF32 => Qwen3VlArtifactFloatPolicy::AdaptToF32,
+                Self::PackedF16WeightsF32Auxiliaries => {
+                    Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+                }
+                Self::PackedQ4sWeightsF32Auxiliaries => {
+                    Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries
+                }
+            }
+        }
+
+        /// Translate the composed Boogu policy into the FLUX-VAE-owned artifact policy.
+        pub const fn vae_artifact_policy(self) -> FluxVaeArtifactFloatPolicy {
+            match self {
+                Self::Preserve => FluxVaeArtifactFloatPolicy::Preserve,
+                Self::AdaptToF32 => FluxVaeArtifactFloatPolicy::AdaptToF32,
+                Self::PackedF16WeightsF32Auxiliaries | Self::PackedQ4sWeightsF32Auxiliaries => {
+                    FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+                }
+            }
+        }
     }
 
     /// Policy for verified quantized snapshots when applying a Burnpack stage.
@@ -7635,6 +7663,34 @@ mod tests {
     use burn_image::Sha256Digest;
     #[cfg(feature = "burnpack")]
     use burn_image::{ArtifactFile, ArtifactManifest};
+
+    #[cfg(feature = "burnpack")]
+    #[test]
+    fn composed_float_policies_map_once_for_native_and_web_correctness() {
+        use burn_flux_vae::FluxVaeArtifactFloatPolicy;
+        use burn_qwen3_vl::Qwen3VlArtifactFloatPolicy;
+
+        assert_eq!(
+            BooguFloatLoadPolicy::Preserve.qwen_artifact_policy(),
+            Qwen3VlArtifactFloatPolicy::Preserve
+        );
+        assert_eq!(
+            BooguFloatLoadPolicy::AdaptToF32.qwen_artifact_policy(),
+            Qwen3VlArtifactFloatPolicy::AdaptToF32
+        );
+        assert_eq!(
+            BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries.qwen_artifact_policy(),
+            Qwen3VlArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+        );
+        assert_eq!(
+            BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries.qwen_artifact_policy(),
+            Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries
+        );
+        assert_eq!(
+            BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries.vae_artifact_policy(),
+            FluxVaeArtifactFloatPolicy::PackedF16WeightsF32Auxiliaries
+        );
+    }
 
     #[test]
     fn runtime_q8_denoiser_footprint_is_inventory_derived_and_variant_exact_correctness() {

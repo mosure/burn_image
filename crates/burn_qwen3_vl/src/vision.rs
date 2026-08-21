@@ -119,6 +119,44 @@ impl VisionPositionPlan {
     }
 }
 
+/// Interpolate the learned vision-position table without widening the full table.
+///
+/// A released Q4 profile stores this table as a packed rank-two tensor. Burn's ordinary
+/// [`Embedding::forward`] leaves a selected result quantized, while `Tensor::cast` accepts only
+/// ordinary floating source tensors. Select the small set of required rows while the table is
+/// still packed, then dequantize only those rows before interpolation. Floating tables follow the
+/// same path because `dequantize` is an identity for them.
+pub(crate) fn interpolate_learned_positions<B: Backend>(
+    pos_embed: &Embedding<B>,
+    plan: &VisionPositionPlan,
+    hidden_size: usize,
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let patches = plan.patch_count();
+    let table = pos_embed.weight.val();
+    let mut output = None;
+    for corner in 0..4 {
+        let indices = Tensor::<B, 1, Int>::from_data(
+            TensorData::new(plan.interpolation_indices[corner].clone(), [patches]),
+            device,
+        );
+        let embedding = table.clone().select(0, indices).dequantize();
+        let weights = Tensor::<B, 2>::from_data(
+            TensorData::new(plan.interpolation_weights[corner].clone(), [patches, 1]),
+            device,
+        )
+        .cast(embedding.dtype());
+        let contribution = embedding * weights;
+        output = Some(match output {
+            Some(previous) => previous + contribution,
+            None => contribution,
+        });
+    }
+    output
+        .expect("vision position interpolation has exactly four corners")
+        .reshape([patches, hidden_size])
+}
+
 fn merge_order_coordinates(height: usize, width: usize, merge: usize) -> Vec<[usize; 2]> {
     let mut coordinates = Vec::with_capacity(height * width);
     for block_row in 0..height / merge {
@@ -535,27 +573,7 @@ impl<B: Backend> Qwen3VlVisionModel<B> {
         plan: &VisionPositionPlan,
         device: &B::Device,
     ) -> Tensor<B, 2> {
-        let patches = plan.patch_count();
-        let dtype = self.pos_embed.weight.val().dtype();
-        let mut output =
-            Tensor::<B, 2>::zeros([patches, self.config.hidden_size], device).cast(dtype);
-        for corner in 0..4 {
-            let indices = Tensor::<B, 2, Int>::from_data(
-                TensorData::new(plan.interpolation_indices[corner].clone(), [1, patches]),
-                device,
-            );
-            let embedding = self
-                .pos_embed
-                .forward(indices)
-                .reshape([patches, self.config.hidden_size]);
-            let weights = Tensor::<B, 2>::from_data(
-                TensorData::new(plan.interpolation_weights[corner].clone(), [patches, 1]),
-                device,
-            )
-            .cast(dtype);
-            output = output + embedding * weights;
-        }
-        output
+        interpolate_learned_positions(&self.pos_embed, plan, self.config.hidden_size, device)
     }
 }
 

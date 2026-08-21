@@ -178,8 +178,8 @@ pub enum Qwen3VlArtifactFloatPolicy {
     /// Convert authenticated rank-two weights to packed signed Q4S block-128/F32 storage while
     /// keeping normalization parameters and biases in F32.
     ///
-    /// Execution uses F32 activations and a quantization-aware matmul. Embedding row objects stay
-    /// F16 because browser execution selects the required rows on the host before upload.
+    /// Execution uses F32 activations with quantization-aware matrix multiplication and embedding
+    /// row selection. Packed embedding tables select only requested rows before widening them.
     PackedQ4sBlock128WeightsF32Auxiliaries,
 }
 
@@ -1760,6 +1760,82 @@ mod tests {
     }
 
     #[test]
+    fn packed_q4s_vision_position_embedding_selects_before_widening_correctness() {
+        use burn::nn::EmbeddingConfig;
+
+        let device = Default::default();
+        let mut embedding = EmbeddingConfig::new(16, 128).init::<Flex>(&device);
+        let values = (0..(16 * 128))
+            .map(|index| ((index % 251) as f32 - 125.0) / 128.0)
+            .collect::<Vec<_>>();
+        let snapshot = TensorSnapshot::from_data(
+            TensorData::new(values, [16, 128]).convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let adapter =
+            FloatAdapter(Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries);
+        let applied = embedding.apply(vec![snapshot], None, Some(Box::new(adapter)), false);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert!(matches!(embedding.weight.val().dtype(), DType::QFloat(_)));
+
+        let plan =
+            crate::vision::VisionPositionPlan::new(&[crate::Grid::new(1, 2, 2)], 1, 16).unwrap();
+        let output = crate::vision::interpolate_learned_positions(&embedding, &plan, 128, &device);
+        assert_eq!(output.dims(), [4, 128]);
+        assert_eq!(output.dtype(), DType::F32);
+        assert!(
+            output
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[ignore = "requires an explicitly selected native WGPU adapter"]
+    fn packed_q4s_vision_position_embedding_wgpu_reference() {
+        use burn::nn::EmbeddingConfig;
+
+        type B = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+
+        let device = burn_wgpu::WgpuDevice::default();
+        let mut embedding = EmbeddingConfig::new(16, 128).init::<B>(&device);
+        let values = (0..(16 * 128))
+            .map(|index| ((index % 251) as f32 - 125.0) / 128.0)
+            .collect::<Vec<_>>();
+        let snapshot = TensorSnapshot::from_data(
+            TensorData::new(values, [16, 128]).convert_dtype(DType::F16),
+            vec!["weight".into()],
+            Vec::new(),
+            ParamId::new(),
+        );
+        let adapter =
+            FloatAdapter(Qwen3VlArtifactFloatPolicy::PackedQ4sBlock128WeightsF32Auxiliaries);
+        let applied = embedding.apply(vec![snapshot], None, Some(Box::new(adapter)), false);
+        assert!(applied.errors.is_empty(), "{:?}", applied.errors);
+        assert!(matches!(embedding.weight.val().dtype(), DType::QFloat(_)));
+
+        let plan =
+            crate::vision::VisionPositionPlan::new(&[crate::Grid::new(1, 2, 2)], 1, 16).unwrap();
+        let output = crate::vision::interpolate_learned_positions(&embedding, &plan, 128, &device);
+        assert_eq!(output.dims(), [4, 128]);
+        assert_eq!(output.dtype(), DType::F32);
+        assert!(
+            output
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+    }
+
+    #[test]
     fn packed_q4s_contract_admits_widened_f16_vision_tensors_correctness() {
         for (name, shape) in [
             ("model.visual.patch_embed.proj.bias", vec![1152]),
@@ -2175,6 +2251,8 @@ mod tests {
         let config_bytes =
             std::fs::read(Path::new(&root).join("metadata/source/mllm/config.json")).unwrap();
         let config = Qwen3VlConfig::from_json(std::str::from_utf8(&config_bytes).unwrap()).unwrap();
+        let vision_patch_volume = config.vision_config.patch_volume();
+        let vision_hidden_size = config.vision_config.hidden_size;
         let contract =
             Qwen3VlComponentContract::released_base(directory.manifest().clone(), config).unwrap();
         let first_embedding = contract.plan.embedding_rows.chunks[0].clone();
@@ -2196,7 +2274,17 @@ mod tests {
         ));
         drop(embedding);
         drop(source.load_text_block(0).unwrap());
-        drop(source.load_vision_prelude().unwrap());
+        let prelude = source.load_vision_prelude().unwrap();
+        assert!(matches!(
+            prelude.pos_embed.weight.val().dtype(),
+            DType::QFloat(_)
+        ));
+        let patches = Tensor::<Flex, 2>::zeros([4, vision_patch_volume], &Default::default());
+        let state = prelude
+            .begin(patches, &[crate::Grid::new(1, 2, 2)])
+            .unwrap();
+        assert_eq!(state.hidden_states.dims(), [4, vision_hidden_size]);
+        assert_eq!(state.hidden_states.dtype(), DType::F32);
         drop(source.load_vision_block(0).unwrap());
         drop(source.load_vision_deepstack_merger(0).unwrap());
         drop(source.load_vision_final_merger().unwrap());
