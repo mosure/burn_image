@@ -20,9 +20,13 @@ use burn_image::{
 use crate::{
     CancelImageJob, CompleteImageJob, EditorMode, ImageBytesLoaded, ImageDisplayFailed,
     ImageEditorState, ImageFrontendSet, ImageIoFailed, ImageJobId, ImageJobPhase, ImageJobRejected,
-    ImageJobs, ImageRunnerReadiness, ImageRunnerState, ImageRunnerStatus, LoadImageBytes,
-    MODEL_SWITCH_PROGRESS_STAGE_PREFIX, PrepareImageDownload, REFERENCE_IMAGE_IO_ID,
+    ImageJobs, ImageModelPreparationEvent, ImageRunnerReadiness, ImageRunnerState,
+    ImageRunnerStatus, LoadImageBytes, MODEL_SWITCH_PROGRESS_STAGE_PREFIX, PrepareImageDownload,
+    REFERENCE_IMAGE_IO_ID,
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::PrepareImageModel;
 
 #[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
 use crate::ImageIoId;
@@ -298,7 +302,10 @@ impl Plugin for ImageControlPanelPlugin {
                     handle_random_seed_button
                         .after(sync_text_inputs)
                         .before(update_action_availability),
-                    handle_model_option.after(handle_model_button),
+                    handle_model_option
+                        .after(handle_model_button)
+                        .before(ImageFrontendSet::Dispatch)
+                        .before(update_action_availability),
                     close_model_dropdown_on_outside_click.after(handle_model_option),
                     sync_model_dropdown
                         .after(update_action_availability)
@@ -314,6 +321,9 @@ impl Plugin for ImageControlPanelPlugin {
                     sync_output_action_visibility
                         .after(update_action_availability)
                         .after(capture_outputs),
+                    handle_model_preparation_events
+                        .after(ImageFrontendSet::Dispatch)
+                        .before(update_action_availability),
                 ),
             )
             .add_systems(
@@ -1333,6 +1343,7 @@ fn handle_model_option(
     mut editor: ResMut<ImageEditorState>,
     mut panel: ResMut<ImageControlPanelState>,
     mut dropdown: ResMut<ModelDropdownState>,
+    #[cfg(not(target_arch = "wasm32"))] mut prepare: MessageWriter<PrepareImageModel>,
     #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))] mut browser_switch: ResMut<
         BrowserModelSwitchState,
     >,
@@ -1411,18 +1422,77 @@ fn handle_model_option(
         editor.mode = mode;
     }
     apply_descriptor_size(descriptor, &mut editor, &mut panel);
-    panel.notice = if edit_context.is_some() && target_mode == Some(EditorMode::Edit) {
-        format!(
-            "{} selected; the current image is its Edit reference and remains in view",
-            descriptor.display_name
-        )
-    } else {
-        format!(
-            "{} selected; it will load on the next Run",
-            descriptor.display_name
-        )
-    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        prepare.write(PrepareImageModel {
+            model: descriptor.id.clone(),
+        });
+        panel.model_switch_pending = true;
+        panel.notice = if edit_context.is_some() && target_mode == Some(EditorMode::Edit) {
+            format!(
+                "Switching to {}; the current image remains in view as its Edit reference while the previous model unloads",
+                descriptor.display_name
+            )
+        } else {
+            format!(
+                "Switching to {}; unloading the previous model before loading the selected release",
+                descriptor.display_name
+            )
+        };
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        panel.notice = if edit_context.is_some() && target_mode == Some(EditorMode::Edit) {
+            format!(
+                "{} selected; the current image is its Edit reference and remains in view",
+                descriptor.display_name
+            )
+        } else {
+            format!("{} selected", descriptor.display_name)
+        };
+    }
     dropdown.open = false;
+}
+
+fn handle_model_preparation_events(
+    mut events: MessageReader<ImageModelPreparationEvent>,
+    runner: Res<ImageRunnerStatus>,
+    editor: Res<ImageEditorState>,
+    mut panel: ResMut<ImageControlPanelState>,
+) {
+    for event in events.read() {
+        let (model, terminal) = match event {
+            ImageModelPreparationEvent::Progress { model, message } => {
+                if editor.model.as_ref() == Some(model) {
+                    panel.notice = format!("Model switch: {message}");
+                }
+                (model, false)
+            }
+            ImageModelPreparationEvent::Ready { model } => {
+                if editor.model.as_ref() == Some(model) {
+                    let display_name = match &runner.state {
+                        ImageRunnerState::Ready { capabilities } => capabilities
+                            .models
+                            .iter()
+                            .find(|item| &item.id == model)
+                            .map_or_else(|| model.to_string(), |item| item.display_name.clone()),
+                        _ => model.to_string(),
+                    };
+                    panel.notice = format!("{display_name} is loaded and ready on the GPU");
+                }
+                (model, true)
+            }
+            ImageModelPreparationEvent::Failed { model, error } => {
+                if editor.model.as_ref() == Some(model) {
+                    panel.notice = format!("Model switch failed: {error}");
+                }
+                (model, true)
+            }
+        };
+        if terminal && editor.model.as_ref() == Some(model) {
+            panel.model_switch_pending = false;
+        }
+    }
 }
 
 fn close_model_dropdown_on_outside_click(
@@ -3914,6 +3984,7 @@ mod tests {
             .init_resource::<super::ImageControlPanelState>()
             .init_resource::<super::ModelDropdownState>()
             .init_resource::<super::SizeDropdownState>()
+            .add_message::<crate::PrepareImageModel>()
             .add_systems(
                 Update,
                 (super::handle_model_button, super::handle_model_option).chain(),
@@ -3933,6 +4004,19 @@ mod tests {
         assert_eq!(
             editor.model.as_ref().unwrap().as_str(),
             "Boogu/Boogu-Image-0.1-Edit-Turbo"
+        );
+        let mut preparations = app
+            .world_mut()
+            .resource_mut::<Messages<crate::PrepareImageModel>>();
+        let preparation = preparations.drain().next().unwrap();
+        assert_eq!(
+            preparation.model.as_str(),
+            "Boogu/Boogu-Image-0.1-Edit-Turbo"
+        );
+        assert!(
+            app.world()
+                .resource::<super::ImageControlPanelState>()
+                .model_switch_pending
         );
     }
 
@@ -3970,6 +4054,7 @@ mod tests {
                 ..Default::default()
             })
             .init_resource::<super::ModelDropdownState>()
+            .add_message::<crate::PrepareImageModel>()
             .add_systems(Update, super::handle_model_option);
         app.world_mut().spawn((
             Button,
@@ -3990,6 +4075,43 @@ mod tests {
         let panel = app.world().resource::<super::ImageControlPanelState>();
         assert!(panel.latest_output.is_some());
         assert!(panel.notice.contains("remains in view"), "{}", panel.notice);
+    }
+
+    #[test]
+    fn model_preparation_feedback_keeps_run_blocked_until_gpu_runtime_is_ready_correctness() {
+        let model = ModelId::new("test/edit").unwrap();
+        let runner = runner_with_models(&[("test/edit", "Edit 1.5K", &[ImageTaskKind::Edit])]);
+        let mut app = App::new();
+        app.insert_resource(crate::ImageRunnerStatus { state: runner })
+            .insert_resource(crate::ImageEditorState {
+                model: Some(model.clone()),
+                ..Default::default()
+            })
+            .insert_resource(super::ImageControlPanelState {
+                model_switch_pending: true,
+                ..Default::default()
+            })
+            .add_message::<crate::ImageModelPreparationEvent>()
+            .add_systems(Update, super::handle_model_preparation_events);
+
+        app.world_mut()
+            .write_message(crate::ImageModelPreparationEvent::Progress {
+                model: model.clone(),
+                message: "Model setup 3/5: loading Qwen stages to GPU".into(),
+            });
+        app.update();
+        let panel = app.world().resource::<super::ImageControlPanelState>();
+        assert!(panel.model_switch_pending);
+        assert!(panel.notice.contains("loading Qwen stages"));
+
+        app.world_mut()
+            .write_message(crate::ImageModelPreparationEvent::Ready {
+                model: model.clone(),
+            });
+        app.update();
+        let panel = app.world().resource::<super::ImageControlPanelState>();
+        assert!(!panel.model_switch_pending);
+        assert_eq!(panel.notice, "Edit 1.5K is loaded and ready on the GPU");
     }
 
     #[test]

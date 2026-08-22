@@ -15,7 +15,8 @@ use crate::{
 
 use super::{
     CombinedTimestepCaptionEmbedding, DoubleStreamBlock, FinalProjection, SingleStreamBlock,
-    denoiser::BooguRoPeGeometry, linear::linear_forward,
+    denoiser::{BooguRoPeGeometry, selected_image_index_embedding},
+    linear::linear_forward,
 };
 
 /// Optional observer for numerical checks at streamed denoiser boundaries.
@@ -171,12 +172,11 @@ impl<B: Backend> BooguDenoiserPrelude<B> {
                 patchify(reference, self.config.patch_size)?,
             );
             observer.rank3("ref_image_patch_embedder", reference.clone())?;
-            let index_embedding = self
-                .image_index_embedding
-                .weight
-                .val()
-                .slice([0..1, 0..self.config.hidden_size])
-                .reshape([1, 1, self.config.hidden_size]);
+            let index_embedding = selected_image_index_embedding(
+                &self.image_index_embedding,
+                self.config.hidden_size,
+                reference.dtype(),
+            );
             reference = reference + index_embedding;
             (
                 Some(reference),

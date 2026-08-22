@@ -82,6 +82,28 @@ pub struct SubmitImageJob {
     pub request: ImageRequest,
 }
 
+/// Frontend request to prepare a selected model before an inference job is submitted.
+#[derive(Message, Clone, Debug)]
+pub struct PrepareImageModel {
+    pub model: ModelId,
+}
+
+/// Nonblocking model-preparation feedback used by selectors and host automation.
+#[derive(Message, Clone, Debug)]
+pub enum ImageModelPreparationEvent {
+    Progress {
+        model: ModelId,
+        message: String,
+    },
+    Ready {
+        model: ModelId,
+    },
+    Failed {
+        model: ModelId,
+        error: FrontendError,
+    },
+}
+
 /// Validated request consumed by a concrete model integration plugin.
 #[derive(Message, Clone, Debug)]
 pub struct ImageJobDispatched {
@@ -142,6 +164,8 @@ impl Plugin for ImageJobPlugin {
         app.init_resource::<ImageJobs>()
             .init_resource::<ImageRunnerStatus>()
             .add_message::<SubmitImageJob>()
+            .add_message::<PrepareImageModel>()
+            .add_message::<ImageModelPreparationEvent>()
             .add_message::<ImageJobDispatched>()
             .add_message::<CancelImageJob>()
             .add_message::<ImageJobCancellationRequested>()

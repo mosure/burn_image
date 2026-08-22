@@ -13,6 +13,27 @@ use super::{
     norm::DenoiserRmsNormPolicy,
 };
 
+/// Select the one edit-image index row while it is still packed, then widen only that row.
+///
+/// Q4 releases retain this embedding as a quantized table. Adding a selected `QFloat` row to the
+/// floating reference activation is invalid, while widening the entire table would add avoidable
+/// traffic to every edit request. Floating releases follow the same path because `dequantize` is
+/// an identity for ordinary float tensors.
+pub(super) fn selected_image_index_embedding<B: Backend>(
+    embedding: &nn::Embedding<B>,
+    hidden_size: usize,
+    dtype: burn::tensor::DType,
+) -> Tensor<B, 3> {
+    embedding
+        .weight
+        .val()
+        .clone()
+        .slice([0..1, 0..hidden_size])
+        .dequantize()
+        .cast(dtype)
+        .reshape([1, 1, hidden_size])
+}
+
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::attention::NativeFlashUnitAttention;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
@@ -351,13 +372,11 @@ impl<B: Backend> BooguDenoiser<B> {
                 &self.ref_image_patch_embedder,
                 patchify(reference, self.config.patch_size)?,
             );
-            let embedding = self
-                .image_index_embedding
-                .weight
-                .val()
-                .clone()
-                .slice([0..1, 0..self.config.hidden_size])
-                .reshape([1, 1, self.config.hidden_size]);
+            let embedding = selected_image_index_embedding(
+                &self.image_index_embedding,
+                self.config.hidden_size,
+                reference.dtype(),
+            );
             reference = reference + embedding;
             let reference_rope = (
                 joint_cos
@@ -775,12 +794,46 @@ fn scalar_rope_values_reference(
 
 #[cfg(all(test, feature = "ndarray"))]
 mod tests {
-    use burn::tensor::{DType, TensorData};
+    use burn::{
+        module::Param,
+        tensor::{DType, TensorData, quantization::*},
+    };
     use burn_ndarray::{NdArray, NdArrayDevice};
 
     use super::*;
 
     type TestBackend = NdArray<f32>;
+
+    #[test]
+    fn quantized_image_index_selects_before_widening_correctness() {
+        let device = Default::default();
+        let scheme = QuantScheme::default()
+            .with_value(QuantValue::Q8S)
+            .with_level(QuantLevel::Tensor)
+            .with_param(QuantParam::F32)
+            .with_store(QuantStore::PackedU32(0));
+        let weight = Tensor::<TestBackend, 2>::from_data(
+            TensorData::quantized(vec![1_i8; 160], [5, 32], scheme, &[0.125_f32]),
+            &device,
+        );
+        let embedding = nn::Embedding {
+            weight: Param::from_tensor(weight),
+        };
+
+        let selected = selected_image_index_embedding(&embedding, 32, DType::F32);
+
+        assert_eq!(selected.dims(), [1, 1, 32]);
+        assert_eq!(selected.dtype(), DType::F32);
+        assert!(
+            selected
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(matches!(embedding.weight.val().dtype(), DType::QFloat(_)));
+    }
 
     fn tiny_config() -> BooguConfig {
         BooguConfig {

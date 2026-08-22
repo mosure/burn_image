@@ -58,9 +58,9 @@ pub use burn_boogu::deployment::{
 
 use crate::{
     BackendState, BackendStatus, CompleteImageJob, FailImageJob, FrontendError, ImageFrontendSet,
-    ImageJobCancellationRequested, ImageJobDispatched, ImageJobId, ImageRunnerCapabilities,
-    ImageRunnerEvent, ImageRunnerReadiness, ImageRunnerState, ImageRunnerStatus,
-    ReportImageProgress, WgpuExecutionKind,
+    ImageJobCancellationRequested, ImageJobDispatched, ImageJobId, ImageModelPreparationEvent,
+    ImageRunnerCapabilities, ImageRunnerEvent, ImageRunnerReadiness, ImageRunnerState,
+    ImageRunnerStatus, PrepareImageModel, ReportImageProgress, WgpuExecutionKind,
 };
 
 /// Canonical public origin for immutable Boogu artifact bundles.
@@ -178,11 +178,49 @@ pub trait BooguRuntime: Send + Sync + 'static {
         ImageRunnerReadiness::default()
     }
 
+    /// Start preparing another advertised release without submitting an inference request.
+    fn prepare_variant(
+        &mut self,
+        variant: BooguVariant,
+    ) -> Result<BooguRuntimePreparation, RuntimeError> {
+        if self.variants().contains(&variant) {
+            Ok(BooguRuntimePreparation::Ready)
+        } else {
+            Err(RuntimeError::UnknownModel(boogu_model_id(variant)))
+        }
+    }
+
+    /// Drain bounded asynchronous preparation feedback without blocking Bevy's main thread.
+    fn poll_preparation(&mut self, _emit: &mut dyn FnMut(BooguRuntimePreparationEvent)) {}
+
     fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError>;
 
     fn cancel(&mut self, id: ImageJobId) -> Result<(), RuntimeError>;
 
     fn poll(&mut self, emit: &mut dyn FnMut(ImageRunnerEvent));
+}
+
+/// Immediate result of requesting a runtime release preparation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BooguRuntimePreparation {
+    Ready,
+    Started,
+}
+
+/// Runtime-owned progress for a model preparation that is independent of an inference job.
+#[derive(Clone, Debug)]
+pub enum BooguRuntimePreparationEvent {
+    Progress {
+        variant: BooguVariant,
+        message: String,
+    },
+    Ready {
+        variant: BooguVariant,
+    },
+    Failed {
+        variant: BooguVariant,
+        error: RuntimeError,
+    },
 }
 
 /// Device-aware asynchronous construction seam for real Boogu runtimes.
@@ -388,6 +426,7 @@ impl<F: BooguRuntimeFactory> Plugin for BooguAdapterPlugin<F> {
                 Update,
                 (
                     stop_on_backend_loss,
+                    prepare_boogu_models,
                     submit_boogu_jobs,
                     cancel_boogu_jobs,
                     poll_boogu_runtime,
@@ -395,6 +434,63 @@ impl<F: BooguRuntimeFactory> Plugin for BooguAdapterPlugin<F> {
                     .chain()
                     .in_set(ImageFrontendSet::Dispatch),
             );
+    }
+}
+
+fn prepare_boogu_models(
+    mut host: ResMut<BooguAdapterHost>,
+    mut requests: MessageReader<PrepareImageModel>,
+    mut feedback: MessageWriter<ImageModelPreparationEvent>,
+) {
+    let Some(runtime) = host.runtime.as_mut() else {
+        return;
+    };
+    for request in requests.read() {
+        let Some(variant) = variant_for_model(&request.model) else {
+            feedback.write(ImageModelPreparationEvent::Failed {
+                model: request.model.clone(),
+                error: FrontendError::from(RuntimeError::UnknownModel(request.model.clone())),
+            });
+            continue;
+        };
+        match runtime.prepare_variant(variant) {
+            Ok(BooguRuntimePreparation::Ready) => {
+                feedback.write(ImageModelPreparationEvent::Ready {
+                    model: request.model.clone(),
+                });
+            }
+            Ok(BooguRuntimePreparation::Started) => {}
+            Err(error) => {
+                feedback.write(ImageModelPreparationEvent::Failed {
+                    model: request.model.clone(),
+                    error: FrontendError::from(error),
+                });
+            }
+        }
+    }
+
+    let mut events = Vec::new();
+    runtime.poll_preparation(&mut |event| events.push(event));
+    for event in events {
+        match event {
+            BooguRuntimePreparationEvent::Progress { variant, message } => {
+                feedback.write(ImageModelPreparationEvent::Progress {
+                    model: boogu_model_id(variant),
+                    message,
+                });
+            }
+            BooguRuntimePreparationEvent::Ready { variant } => {
+                feedback.write(ImageModelPreparationEvent::Ready {
+                    model: boogu_model_id(variant),
+                });
+            }
+            BooguRuntimePreparationEvent::Failed { variant, error } => {
+                feedback.write(ImageModelPreparationEvent::Failed {
+                    model: boogu_model_id(variant),
+                    error: FrontendError::from(error),
+                });
+            }
+        }
     }
 }
 

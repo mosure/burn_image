@@ -63,9 +63,10 @@ use burn_qwen3_vl::{
 };
 
 use crate::{
-    BooguFactoryContext, BooguRuntime, BooguRuntimeFactory, BooguRuntimeJob, ImageJobId,
-    ImageRunnerEvent, WgpuExecutionKind, boogu_bundle_id, boogu_profile_slug,
-    boogu_source_bundle_id, default_boogu_storage_profile, default_native_boogu_model_base_url,
+    BooguFactoryContext, BooguRuntime, BooguRuntimeFactory, BooguRuntimeJob,
+    BooguRuntimePreparation, BooguRuntimePreparationEvent, ImageJobId, ImageRunnerEvent,
+    WgpuExecutionKind, boogu_bundle_id, boogu_profile_slug, boogu_source_bundle_id,
+    default_boogu_storage_profile, default_native_boogu_model_base_url,
     native_boogu_source_requires_canonical_digest, prepare_runtime_job,
     resolve_native_boogu_artifact_directory,
 };
@@ -667,7 +668,20 @@ impl BooguRuntime for NativeBooguRuntime {
             };
             let event = match event {
                 Ok(event) => event,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.busy.store(false, Ordering::Release);
+                    if let Some((id, _)) = self.active.take() {
+                        emit(ImageRunnerEvent::Failed {
+                            id,
+                            error: execution_error(
+                                self.variant,
+                                "native Boogu inference worker exited unexpectedly before a terminal event",
+                            ),
+                        });
+                    }
+                    break;
+                }
             };
             let terminal_id = match &event {
                 ImageRunnerEvent::Completed { id, .. }
@@ -705,6 +719,9 @@ impl Drop for NativeBooguRuntime {
 }
 
 enum SwitchableWorkerCommand {
+    Prepare {
+        variant: BooguVariant,
+    },
     Infer {
         job: Box<BooguRuntimeJob>,
         cancellation: CancellationToken,
@@ -712,13 +729,23 @@ enum SwitchableWorkerCommand {
     Shutdown,
 }
 
-/// Long-lived native UI runtime that keeps one dense release resident and swaps it only when the
-/// next submitted request selects a different canonical model.
+struct SwitchableWorkerIo {
+    commands: Receiver<SwitchableWorkerCommand>,
+    events: mpsc::Sender<ImageRunnerEvent>,
+    preparation_events: mpsc::Sender<BooguRuntimePreparationEvent>,
+    resident: Arc<Mutex<Option<BooguVariant>>>,
+}
+
+/// Long-lived native UI runtime that keeps one dense release resident and swaps it as soon as the
+/// frontend selects another canonical model. Direct host submissions retain a lazy safety path.
 pub struct NativeSwitchableBooguRuntime {
     variants: Vec<BooguVariant>,
     commands: mpsc::Sender<SwitchableWorkerCommand>,
     events: Mutex<Receiver<ImageRunnerEvent>>,
+    preparation_events: Mutex<Receiver<BooguRuntimePreparationEvent>>,
     active: Option<(ImageJobId, CancellationToken)>,
+    preparing: Option<BooguVariant>,
+    resident: Arc<Mutex<Option<BooguVariant>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -733,6 +760,10 @@ impl NativeSwitchableBooguRuntime {
     ) -> Result<Self, RuntimeError> {
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
+        let (preparation_tx, preparation_rx) = mpsc::channel();
+        let initial_variant = runtime.variant;
+        let resident = Arc::new(Mutex::new(Some(initial_variant)));
+        let worker_resident = Arc::clone(&resident);
         let worker = thread::Builder::new()
             .name("burn-image-boogu-model-switcher".into())
             .spawn(move || {
@@ -742,8 +773,12 @@ impl NativeSwitchableBooguRuntime {
                     residency,
                     autotune,
                     variant_aware_profiles,
-                    command_rx,
-                    event_tx,
+                    SwitchableWorkerIo {
+                        commands: command_rx,
+                        events: event_tx,
+                        preparation_events: preparation_tx,
+                        resident: worker_resident,
+                    },
                 )
             })
             .map_err(|error| {
@@ -759,7 +794,10 @@ impl NativeSwitchableBooguRuntime {
             variants,
             commands: command_tx,
             events: Mutex::new(event_rx),
+            preparation_events: Mutex::new(preparation_rx),
             active: None,
+            preparing: None,
+            resident,
             worker: Some(worker),
         })
     }
@@ -770,11 +808,82 @@ impl BooguRuntime for NativeSwitchableBooguRuntime {
         self.variants.clone()
     }
 
-    fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError> {
+    fn prepare_variant(
+        &mut self,
+        variant: BooguVariant,
+    ) -> Result<BooguRuntimePreparation, RuntimeError> {
+        if !self.variants.contains(&variant) {
+            return Err(execution_error(
+                variant,
+                "the selected release is not available to this native runtime",
+            ));
+        }
         if self.active.is_some() {
             return Err(execution_error(
+                variant,
+                "cannot switch native models while an inference request is active",
+            ));
+        }
+        if let Some(preparing) = self.preparing {
+            return Err(execution_error(
+                variant,
+                format!("native model preparation for {preparing:?} is already active"),
+            ));
+        }
+        let resident = *self
+            .resident
+            .lock()
+            .map_err(|_| execution_error(variant, "native resident-model state was poisoned"))?;
+        if resident == Some(variant) {
+            return Ok(BooguRuntimePreparation::Ready);
+        }
+        self.commands
+            .send(SwitchableWorkerCommand::Prepare { variant })
+            .map_err(|_| {
+                execution_error(variant, "native Boogu model-switch worker is unavailable")
+            })?;
+        self.preparing = Some(variant);
+        Ok(BooguRuntimePreparation::Started)
+    }
+
+    fn poll_preparation(&mut self, emit: &mut dyn FnMut(BooguRuntimePreparationEvent)) {
+        for _ in 0..MAX_EVENTS_PER_POLL {
+            let event = match self.preparation_events.lock() {
+                Ok(receiver) => receiver.try_recv(),
+                Err(_) => return,
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if let Some(variant) = self.preparing.take() {
+                        emit(BooguRuntimePreparationEvent::Failed {
+                            variant,
+                            error: execution_error(
+                                variant,
+                                "native Boogu model-switch worker exited unexpectedly during model preparation",
+                            ),
+                        });
+                    }
+                    break;
+                }
+            };
+            if matches!(
+                event,
+                BooguRuntimePreparationEvent::Ready { .. }
+                    | BooguRuntimePreparationEvent::Failed { .. }
+            ) {
+                self.preparing = None;
+            }
+            emit(event);
+        }
+    }
+
+    fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError> {
+        if self.active.is_some() || self.preparing.is_some() {
+            return Err(execution_error(
                 job.variant,
-                "the native model-switch runtime executes one request at a time",
+                "the native model-switch runtime is already executing or preparing a model",
             ));
         }
         if !self.variants.contains(&job.variant) {
@@ -817,7 +926,25 @@ impl BooguRuntime for NativeSwitchableBooguRuntime {
             };
             let event = match event {
                 Ok(event) => event,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if let Some((id, _)) = self.active.take() {
+                        let variant = self
+                            .resident
+                            .lock()
+                            .ok()
+                            .and_then(|resident| *resident)
+                            .unwrap_or(self.variants[0]);
+                        emit(ImageRunnerEvent::Failed {
+                            id,
+                            error: execution_error(
+                                variant,
+                                "native Boogu model-switch worker exited unexpectedly before a terminal event",
+                            ),
+                        });
+                    }
+                    break;
+                }
             };
             let terminal_id = match &event {
                 ImageRunnerEvent::Completed { id, .. }
@@ -839,12 +966,12 @@ impl BooguRuntime for NativeSwitchableBooguRuntime {
 
 impl Drop for NativeSwitchableBooguRuntime {
     fn drop(&mut self) {
-        let was_active = self.active.is_some();
+        let was_working = self.active.is_some() || self.preparing.is_some();
         if let Some((_, cancellation)) = self.active.take() {
             cancellation.cancel();
         }
         let _ = self.commands.send(SwitchableWorkerCommand::Shutdown);
-        if !was_active && let Some(worker) = self.worker.take() {
+        if !was_working && let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
@@ -856,140 +983,202 @@ fn run_switchable_worker(
     residency: NativeBooguResidencyPolicy,
     autotune: NativeAutotunePolicy,
     variant_aware_profiles: bool,
-    commands: Receiver<SwitchableWorkerCommand>,
-    events: mpsc::Sender<ImageRunnerEvent>,
+    io: SwitchableWorkerIo,
 ) {
+    let SwitchableWorkerIo {
+        commands,
+        events,
+        preparation_events,
+        resident,
+    } = io;
     let mut runtime = Some(initial_runtime);
     while let Ok(command) = commands.recv() {
-        let SwitchableWorkerCommand::Infer {
-            mut job,
-            cancellation,
-        } = command
-        else {
-            break;
-        };
-        let id = job.id;
-        if cancellation.is_cancelled() {
-            let _ = events.send(ImageRunnerEvent::Cancelled { id });
-            continue;
-        }
-
-        let target = job.variant;
-        let target_context =
-            match native_switch_context(&base_context, target, variant_aware_profiles) {
-                Ok(context) => context,
-                Err(error) => {
-                    let _ = events.send(ImageRunnerEvent::Failed { id, error });
-                    continue;
-                }
-            };
-        job.runtime_config = target_context.settings.runtime_config(target);
-        let current = runtime.as_ref().map(|runtime| runtime.variant);
-        if current != Some(target) {
-            let run_id = RunId(id.0);
-            let setup_steps = native_setup_step_count(residency);
-            let _ = events.send(ImageRunnerEvent::Progress {
-                id,
-                event: ProgressEvent::StageStarted {
-                    run_id,
-                    stage: "model-switch".into(),
-                    total_steps: None,
-                },
-            });
-            let switch_started = Instant::now();
-            let _ = events.send(model_switch_progress_event(
-                id,
-                run_id,
-                setup_steps,
-                "Unloading the previous model from GPU memory".into(),
-            ));
-            let retirement = runtime
-                .take()
-                .map_or(Ok(()), NativeBooguRuntime::retire_before_model_switch);
-            // The old worker owns every retained module. Only clean the allocator after it has
-            // joined and dropped those handles, so old and new release residency cannot overlap.
-            let cleanup = cleanup_native_device_allocations(&target_context.device, target);
-            if let Err(error) = retirement {
-                let _ = events.send(ImageRunnerEvent::Failed { id, error });
-                continue;
-            }
-            if let Err(error) = cleanup {
-                let _ = events.send(ImageRunnerEvent::Failed { id, error });
-                continue;
-            }
-            bevy::log::info!(
-                "switching resident native Boogu model to {:?}; only this release will remain on the GPU",
-                target
-            );
-            let progress_events = events.clone();
-            let loaded = load_native_runtime_for_interactive(
-                target_context,
-                target,
-                residency,
-                autotune,
-                move |message| {
+        match command {
+            SwitchableWorkerCommand::Prepare { variant } => {
+                let target_context =
+                    match native_switch_context(&base_context, variant, variant_aware_profiles) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            let _ = preparation_events
+                                .send(BooguRuntimePreparationEvent::Failed { variant, error });
+                            continue;
+                        }
+                    };
+                let report_progress = |message: String| {
                     bevy::log::info!("model switch: {message}");
-                    let _ = progress_events.send(model_switch_progress_event(
-                        id,
-                        run_id,
-                        setup_steps,
-                        message,
-                    ));
-                },
-            );
-            let loaded = match loaded {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                    let _ = preparation_events
+                        .send(BooguRuntimePreparationEvent::Progress { variant, message });
+                };
+                match switch_native_runtime(
+                    &mut runtime,
+                    target_context,
+                    variant,
+                    residency,
+                    autotune,
+                    &resident,
+                    &report_progress,
+                ) {
+                    Ok(()) => {
+                        let _ = preparation_events
+                            .send(BooguRuntimePreparationEvent::Ready { variant });
+                    }
+                    Err(error) => {
+                        let _ = preparation_events
+                            .send(BooguRuntimePreparationEvent::Failed { variant, error });
+                    }
+                }
+            }
+            SwitchableWorkerCommand::Infer {
+                mut job,
+                cancellation,
+            } => {
+                let id = job.id;
+                if cancellation.is_cancelled() {
+                    let _ = events.send(ImageRunnerEvent::Cancelled { id });
                     continue;
                 }
-            };
-            runtime = Some(loaded);
-            let _ = events.send(ImageRunnerEvent::Progress {
-                id,
-                event: ProgressEvent::StageCompleted {
-                    run_id,
-                    stage: "model-switch".into(),
-                    elapsed_micros: u64::try_from(switch_started.elapsed().as_micros())
-                        .unwrap_or(u64::MAX),
-                },
-            });
-        }
 
-        let Some(active_runtime) = runtime.as_mut() else {
-            let _ = events.send(ImageRunnerEvent::Failed {
-                id,
-                error: execution_error(target, "native model switch did not produce a runtime"),
-            });
-            continue;
-        };
-        let inner_token = match active_runtime.submit(*job) {
-            Ok(token) => token,
-            Err(error) => {
-                let _ = events.send(ImageRunnerEvent::Failed { id, error });
-                continue;
+                let target = job.variant;
+                let target_context =
+                    match native_switch_context(&base_context, target, variant_aware_profiles) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                            continue;
+                        }
+                    };
+                job.runtime_config = target_context.settings.runtime_config(target);
+                if runtime.as_ref().map(|runtime| runtime.variant) != Some(target) {
+                    let run_id = RunId(id.0);
+                    let setup_steps = native_setup_step_count(residency);
+                    let _ = events.send(ImageRunnerEvent::Progress {
+                        id,
+                        event: ProgressEvent::StageStarted {
+                            run_id,
+                            stage: "model-switch".into(),
+                            total_steps: None,
+                        },
+                    });
+                    let switch_started = Instant::now();
+                    let report_progress = |message: String| {
+                        bevy::log::info!("model switch: {message}");
+                        let _ = events.send(model_switch_progress_event(
+                            id,
+                            run_id,
+                            setup_steps,
+                            message,
+                        ));
+                    };
+                    if let Err(error) = switch_native_runtime(
+                        &mut runtime,
+                        target_context,
+                        target,
+                        residency,
+                        autotune,
+                        &resident,
+                        &report_progress,
+                    ) {
+                        let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                        continue;
+                    }
+                    let _ = events.send(ImageRunnerEvent::Progress {
+                        id,
+                        event: ProgressEvent::StageCompleted {
+                            run_id,
+                            stage: "model-switch".into(),
+                            elapsed_micros: u64::try_from(switch_started.elapsed().as_micros())
+                                .unwrap_or(u64::MAX),
+                        },
+                    });
+                }
+
+                let Some(active_runtime) = runtime.as_mut() else {
+                    let _ = events.send(ImageRunnerEvent::Failed {
+                        id,
+                        error: execution_error(
+                            target,
+                            "native model switch did not produce a runtime",
+                        ),
+                    });
+                    continue;
+                };
+                let inner_token = match active_runtime.submit(*job) {
+                    Ok(token) => token,
+                    Err(error) => {
+                        let _ = events.send(ImageRunnerEvent::Failed { id, error });
+                        continue;
+                    }
+                };
+                let mut terminal = false;
+                while !terminal {
+                    if cancellation.is_cancelled() {
+                        inner_token.cancel();
+                        let _ = active_runtime.cancel(id);
+                    }
+                    active_runtime.poll(&mut |event| {
+                        terminal = matches!(
+                            event,
+                            ImageRunnerEvent::Completed { .. }
+                                | ImageRunnerEvent::Failed { .. }
+                                | ImageRunnerEvent::Cancelled { .. }
+                        );
+                        let _ = events.send(event);
+                    });
+                    if !terminal {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }
             }
-        };
-        let mut terminal = false;
-        while !terminal {
-            if cancellation.is_cancelled() {
-                inner_token.cancel();
-                let _ = active_runtime.cancel(id);
-            }
-            active_runtime.poll(&mut |event| {
-                terminal = matches!(
-                    event,
-                    ImageRunnerEvent::Completed { .. }
-                        | ImageRunnerEvent::Failed { .. }
-                        | ImageRunnerEvent::Cancelled { .. }
-                );
-                let _ = events.send(event);
-            });
-            if !terminal {
-                thread::sleep(Duration::from_millis(2));
-            }
+            SwitchableWorkerCommand::Shutdown => break,
         }
     }
+}
+
+fn switch_native_runtime(
+    runtime: &mut Option<NativeBooguRuntime>,
+    target_context: BooguFactoryContext,
+    target: BooguVariant,
+    residency: NativeBooguResidencyPolicy,
+    autotune: NativeAutotunePolicy,
+    resident: &Mutex<Option<BooguVariant>>,
+    report_progress: &dyn Fn(String),
+) -> Result<(), RuntimeError> {
+    if runtime.as_ref().map(|runtime| runtime.variant) == Some(target) {
+        *resident
+            .lock()
+            .map_err(|_| execution_error(target, "native resident-model state was poisoned"))? =
+            Some(target);
+        return Ok(());
+    }
+
+    report_progress("Unloading the previous model from GPU memory".into());
+    let previous = runtime.take();
+    *resident
+        .lock()
+        .map_err(|_| execution_error(target, "native resident-model state was poisoned"))? = None;
+    if let Some(previous) = previous {
+        previous.retire_before_model_switch()?;
+    }
+    // The old worker owns every retained module. Only clean the allocator after it has joined and
+    // dropped those handles, so old and new release residency cannot overlap.
+    cleanup_native_device_allocations(&target_context.device, target)?;
+    bevy::log::info!(
+        "switching resident native Boogu model to {:?}; only this release will remain on the GPU",
+        target
+    );
+    let loaded = load_native_runtime_for_interactive(
+        target_context,
+        target,
+        residency,
+        autotune,
+        report_progress,
+    )?;
+    *runtime = Some(loaded);
+    *resident
+        .lock()
+        .map_err(|_| execution_error(target, "native resident-model state was poisoned"))? =
+        Some(target);
+    Ok(())
 }
 
 fn model_switch_progress_event(
@@ -2136,6 +2325,103 @@ mod tests {
         assert!(submit.contains("self.cancellation.clone()"));
         assert!(!submit.contains("recv("));
         assert!(!submit.contains("sync_channel"));
+    }
+
+    #[test]
+    fn disconnected_native_worker_fails_the_active_job_once_correctness() {
+        let (commands, command_rx) = mpsc::channel();
+        let (event_tx, events) = mpsc::channel();
+        drop(command_rx);
+        drop(event_tx);
+        let busy = Arc::new(AtomicBool::new(true));
+        let id = ImageJobId(73);
+        let mut runtime = NativeBooguRuntime {
+            variant: BooguVariant::Image01EditTurbo1k5,
+            commands,
+            events: Mutex::new(events),
+            busy: Arc::clone(&busy),
+            cancellation: CancellationToken::default(),
+            active: Some((id, CancellationToken::default())),
+            worker: None,
+        };
+        let mut emitted = Vec::new();
+
+        runtime.poll(&mut |event| emitted.push(event));
+        runtime.poll(&mut |event| emitted.push(event));
+
+        assert_eq!(emitted.len(), 1);
+        let ImageRunnerEvent::Failed {
+            id: failed_id,
+            error,
+        } = &emitted[0]
+        else {
+            panic!("disconnected worker must emit a terminal failure");
+        };
+        assert_eq!(*failed_id, id);
+        assert!(error.to_string().contains("exited unexpectedly"));
+        assert!(runtime.active.is_none());
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn selecting_native_variant_enqueues_preparation_before_any_job_correctness() {
+        let (commands, command_rx) = mpsc::channel();
+        let (event_tx, events) = mpsc::channel();
+        let (preparation_tx, preparation_events) = mpsc::channel();
+        let resident = Arc::new(Mutex::new(Some(BooguVariant::Image01Turbo)));
+        let mut runtime = NativeSwitchableBooguRuntime {
+            variants: vec![
+                BooguVariant::Image01Turbo,
+                BooguVariant::Image01EditTurbo,
+                BooguVariant::Image01EditTurbo1k5,
+            ],
+            commands,
+            events: Mutex::new(events),
+            preparation_events: Mutex::new(preparation_events),
+            active: None,
+            preparing: None,
+            resident: Arc::clone(&resident),
+            worker: None,
+        };
+        let target = BooguVariant::Image01EditTurbo1k5;
+
+        assert_eq!(
+            runtime.prepare_variant(target).unwrap(),
+            BooguRuntimePreparation::Started
+        );
+        assert_eq!(runtime.preparing, Some(target));
+        assert!(matches!(
+            command_rx.try_recv().unwrap(),
+            SwitchableWorkerCommand::Prepare { variant } if variant == target
+        ));
+
+        preparation_tx
+            .send(BooguRuntimePreparationEvent::Progress {
+                variant: target,
+                message: "Model setup 3/5: loading Qwen stages to GPU".into(),
+            })
+            .unwrap();
+        *resident.lock().unwrap() = Some(target);
+        preparation_tx
+            .send(BooguRuntimePreparationEvent::Ready { variant: target })
+            .unwrap();
+        let mut emitted = Vec::new();
+        runtime.poll_preparation(&mut |event| emitted.push(event));
+
+        assert_eq!(emitted.len(), 2);
+        assert!(matches!(
+            &emitted[0],
+            BooguRuntimePreparationEvent::Progress { variant, message }
+                if *variant == target && message.contains("loading Qwen stages")
+        ));
+        assert!(matches!(
+            emitted[1],
+            BooguRuntimePreparationEvent::Ready { variant } if variant == target
+        ));
+        assert!(runtime.preparing.is_none());
+        assert_eq!(*runtime.resident.lock().unwrap(), Some(target));
+
+        drop(event_tx);
     }
 
     #[test]
