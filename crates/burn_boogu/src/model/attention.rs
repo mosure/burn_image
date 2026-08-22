@@ -1,3 +1,5 @@
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+use burn::tensor::DType;
 use burn::{
     nn,
     prelude::*,
@@ -215,6 +217,18 @@ pub(crate) struct NativePaddedBlackboxAttention<
     const BALANCED_STRICT_QK_NORM_ROPE: bool = false,
 >;
 
+/// Native padded-blackbox attention bridge for packed-Q4 denoisers with F32 activations.
+///
+/// Quantized projections and residuals stay in F32. Only normalized Q/K/V are narrowed for the
+/// established F16 cooperative-matrix attention kernel, and its result is widened immediately
+/// before the following Q4 projection or residual operation.
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub(crate) struct NativeF32ToF16PaddedBlackboxAttention<
+    const NUM_PLANES: u8,
+    const SEQ_KV_TILES: u8 = 1,
+    const SEQ_Q_TILES: u8 = 1,
+>;
+
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 impl AttentionKernel<NativeWgpuBackend> for NativeFlashUnitAttention {
     fn execute(
@@ -386,6 +400,99 @@ impl<
             None => (query, key),
         };
         Self::execute_gqa(query, key, value, query_chunk_size)
+    }
+}
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+impl<const NUM_PLANES: u8, const SEQ_KV_TILES: u8, const SEQ_Q_TILES: u8>
+    AttentionKernel<NativeWgpuBackend>
+    for NativeF32ToF16PaddedBlackboxAttention<NUM_PLANES, SEQ_KV_TILES, SEQ_Q_TILES>
+{
+    fn execute(
+        query: Tensor<NativeWgpuBackend, 4>,
+        key: Tensor<NativeWgpuBackend, 4>,
+        value: Tensor<NativeWgpuBackend, 4>,
+        query_chunk_size: usize,
+    ) -> Tensor<NativeWgpuBackend, 4> {
+        assert_eq!(query.dtype(), DType::F32, "Q4 attention query must be F32");
+        assert_eq!(key.dtype(), DType::F32, "Q4 attention key must be F32");
+        assert_eq!(value.dtype(), DType::F32, "Q4 attention value must be F32");
+        NativePaddedBlackboxAttention::<NUM_PLANES, SEQ_KV_TILES, SEQ_Q_TILES>::execute(
+            query.cast(DType::F16),
+            key.cast(DType::F16),
+            value.cast(DType::F16),
+            query_chunk_size,
+        )
+        .cast(DType::F32)
+    }
+
+    fn execute_gqa(
+        query: Tensor<NativeWgpuBackend, 4>,
+        key: Tensor<NativeWgpuBackend, 4>,
+        value: Tensor<NativeWgpuBackend, 4>,
+        query_chunk_size: usize,
+    ) -> Tensor<NativeWgpuBackend, 4> {
+        assert_eq!(query.dtype(), DType::F32, "Q4 GQA query must be F32");
+        assert_eq!(key.dtype(), DType::F32, "Q4 GQA key must be F32");
+        assert_eq!(value.dtype(), DType::F32, "Q4 GQA value must be F32");
+        NativePaddedBlackboxAttention::<NUM_PLANES, SEQ_KV_TILES, SEQ_Q_TILES>::execute_gqa(
+            query.cast(DType::F16),
+            key.cast(DType::F16),
+            value.cast(DType::F16),
+            query_chunk_size,
+        )
+        .cast(DType::F32)
+    }
+
+    fn execute_gqa_with_qk_norm_rope(
+        query: Tensor<NativeWgpuBackend, 4>,
+        key: Tensor<NativeWgpuBackend, 4>,
+        value: Tensor<NativeWgpuBackend, 4>,
+        norm_q: &nn::RmsNorm<NativeWgpuBackend>,
+        norm_k: &nn::RmsNorm<NativeWgpuBackend>,
+        rope: Option<(Tensor<NativeWgpuBackend, 3>, Tensor<NativeWgpuBackend, 3>)>,
+        query_chunk_size: usize,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+    ) -> Tensor<NativeWgpuBackend, 4> {
+        assert_eq!(
+            rms_norm_policy,
+            DenoiserRmsNormPolicy::StrictF32,
+            "packed-Q4 fused attention preparation requires strict-F32 RMSNorm"
+        );
+        for (name, dtype) in [
+            ("query", query.dtype()),
+            ("key", key.dtype()),
+            ("value", value.dtype()),
+            ("query gamma", norm_q.gamma.val().dtype()),
+            ("key gamma", norm_k.gamma.val().dtype()),
+        ] {
+            assert_eq!(dtype, DType::F32, "packed-Q4 fused {name} must be F32");
+        }
+        let (cos, sin) = rope.expect("packed-Q4 fused attention preparation requires RoPE");
+        assert_eq!(
+            cos.dtype(),
+            DType::F32,
+            "packed-Q4 fused RoPE cosine must be F32"
+        );
+        assert_eq!(
+            sin.dtype(),
+            DType::F32,
+            "packed-Q4 fused RoPE sine must be F32"
+        );
+        required_chunked_gqa_wgpu_fused_strict_qk_norm_rope_padded_blackbox_attention(
+            query.permute([0, 2, 1, 3]),
+            key.permute([0, 2, 1, 3]),
+            value.permute([0, 2, 1, 3]),
+            norm_q.gamma.val(),
+            norm_k.gamma.val(),
+            cos,
+            sin,
+            norm_q.epsilon,
+            norm_k.epsilon,
+            query_chunk_size,
+        )
+        .permute([0, 2, 1, 3])
+        .cast(DType::F32)
     }
 }
 

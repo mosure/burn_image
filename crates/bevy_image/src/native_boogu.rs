@@ -31,9 +31,10 @@ use burn_boogu::{
     BooguConfig, BooguError, BooguExecution, BooguImageModel, BooguRuntimeDTypes,
     BooguRuntimeMetadata, BooguVaeStageSource, BooguVariant, DenoiserRmsNormPolicy,
     FluxVaeStageSourceAdapter, NativeAutotunePolicy, NativeDenoiserAttentionPolicy,
-    NativeDenoiserQkPreparationPolicy, NativeDenoiserRmsNormPolicy, NativePaddedBlackboxDenoiser,
-    NativePortableDenoiser, NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy,
-    RetainingBooguVaeStageSource, StreamingBooguPipeline, VaeDecoderMemoryPolicy,
+    NativeDenoiserAttentionPrecisionPolicy, NativeDenoiserQkPreparationPolicy,
+    NativeDenoiserRmsNormPolicy, NativePaddedBlackboxDenoiser, NativePortableDenoiser,
+    NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy, RetainingBooguVaeStageSource,
+    StreamingBooguPipeline, VaeDecoderMemoryPolicy,
     artifacts::{
         BooguArtifactInventory, BooguFloatLoadPolicy, BooguReleaseIdentity,
         BooguResidentLoadMemoryPolicy, BooguStorageProfile, DirectoryStageShardReader,
@@ -72,9 +73,11 @@ use crate::{
 };
 
 pub use burn_boogu::deployment::NativeBooguResidencyPolicy;
+#[cfg(test)]
+use burn_boogu::deployment::qualified_native_execution_policy;
 use burn_boogu::deployment::{
-    native_kernel_policy_label, native_qwen_query_chunk_size, native_resident_allocation_policy,
-    native_runtime_policy_label, qualified_native_execution_policy,
+    native_execution_policy, native_kernel_policy_label, native_qwen_query_chunk_size,
+    native_resident_allocation_policy, native_runtime_policy_label,
 };
 
 type NativeBackend = burn_wgpu::Wgpu<f32, i32, u32>;
@@ -341,7 +344,7 @@ impl NativeBooguFactory {
         profile: BooguStorageProfile,
     ) -> bool {
         cfg!(feature = "native-autotune")
-            && qualified_native_execution_policy(variant, residency, profile)
+            && native_execution_policy(variant, residency, profile)
                 .is_some_and(|policy| matches!(policy.autotune, NativeAutotunePolicy::Full))
     }
 }
@@ -383,7 +386,7 @@ impl BooguRuntimeFactory for NativeBooguFactory {
             ));
         }
         #[cfg(feature = "native-autotune")]
-        if qualified_native_execution_policy(
+        if native_execution_policy(
             self.variant,
             self.residency,
             context.settings.storage_profile,
@@ -1431,7 +1434,7 @@ fn load_native_runtime(
         residency.label()
     );
     let native_policy =
-        qualified_native_execution_policy(variant, residency, context.settings.storage_profile);
+        native_execution_policy(variant, residency, context.settings.storage_profile);
     let qwen_query_chunk_size = native_policy
         .map(|policy| native_qwen_query_chunk_size(variant, residency, autotune, policy));
     let artifact_directories = resolve_native_boogu_artifact_directory(
@@ -1671,7 +1674,7 @@ fn load_native_runtime(
             if profile == BooguStorageProfile::Q4sBlockUpTo128F32 =>
         {
             format!(
-                "{}/q4-packed-resident/vae-exact-striped-tail-stage-cleanup/phase-boundary-allocator-cleanup",
+                "{}/q4-packed-resident/vae-exact-transient-pre-tail-cleanup/retained-interphase-allocator-cache",
                 residency.label()
             )
         }
@@ -1806,11 +1809,20 @@ fn load_native_runtime(
                                 policy.blackbox_seq_kv_tiles,
                                 policy.blackbox_seq_q_tiles,
                             )
+                            .with_attention_precision(policy.denoiser_attention_precision)
                             .with_rms_norm_policy(denoiser_rms_norm_policy)
                     }
                 };
                 let denoiser = match policy.denoiser_qk_preparation {
                     NativeDenoiserQkPreparationPolicy::Composed => denoiser,
+                    NativeDenoiserQkPreparationPolicy::FusedStrictF32ToF16 => {
+                        assert_eq!(
+                            policy.denoiser_attention_precision,
+                            NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge,
+                            "fused F32-to-F16 Q/K preparation requires the packed-Q4 attention bridge"
+                        );
+                        denoiser
+                    }
                     NativeDenoiserQkPreparationPolicy::BalancedStrictQkNormRope => {
                         denoiser.with_balanced_strict_qk_norm_rope(true)
                     }
@@ -1929,11 +1941,20 @@ fn load_native_runtime(
                             policy.blackbox_seq_kv_tiles,
                             policy.blackbox_seq_q_tiles,
                         )
+                        .with_attention_precision(policy.denoiser_attention_precision)
                         .with_rms_norm_policy(denoiser_rms_norm_policy)
                 }
             };
             let denoiser = match policy.denoiser_qk_preparation {
                 NativeDenoiserQkPreparationPolicy::Composed => denoiser,
+                NativeDenoiserQkPreparationPolicy::FusedStrictF32ToF16 => {
+                    assert_eq!(
+                        policy.denoiser_attention_precision,
+                        NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge,
+                        "fused F32-to-F16 Q/K preparation requires the packed-Q4 attention bridge"
+                    );
+                    denoiser
+                }
                 NativeDenoiserQkPreparationPolicy::BalancedStrictQkNormRope => {
                     denoiser.with_balanced_strict_qk_norm_rope(true)
                 }
@@ -2474,7 +2495,7 @@ mod tests {
                 interactive_qwen_chunk,
             ),
             format!(
-                "native-high-vram-retained-qwen-deferred-sync/{}/1k-mixed-f16/qwen-q1024/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum",
+                "native-high-vram-retained-qwen-deferred-sync/{}/1k-mixed-f16/qwen-q1024/denoiser-padded-blackbox-p4-kv1-q1-split-rows-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum",
                 if cfg!(feature = "native-autotune") {
                     "balanced-autotune"
                 } else {
@@ -2570,9 +2591,9 @@ mod tests {
         let q4 = native_resident_allocation_policy(BooguStorageProfile::Q4sBlockUpTo128F32);
         assert_eq!(
             q4.vae_decoder,
-            VaeDecoderMemoryPolicy::ExactStripedTailWithStageCleanup
+            VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup
         );
-        assert!(q4.phase_boundary_cleanup);
+        assert!(!q4.phase_boundary_cleanup);
 
         for profile in [
             BooguStorageProfile::F16,
@@ -2586,7 +2607,9 @@ mod tests {
         }
 
         let source = include_str!("native_boogu.rs");
-        assert!(source.contains("q4-packed-resident/vae-exact-striped-tail-stage-cleanup"));
+        assert!(source.contains(
+            "q4-packed-resident/vae-exact-transient-pre-tail-cleanup/retained-interphase-allocator-cache"
+        ));
         assert!(source.contains("Live tensors and cached module parameters remain referenced"));
         let high_vram = source
             .split_once("NativeBooguResidencyPolicy::HighVram => {")

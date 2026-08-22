@@ -61,17 +61,33 @@ impl<B: Backend> CombinedTimestepCaptionEmbedding<B> {
         instruction: Tensor<B, 3>,
         rms_norm_policy: DenoiserRmsNormPolicy,
     ) -> (Tensor<B, 2>, Tensor<B, 3>) {
+        (
+            self.embed_timestep(timestep),
+            self.embed_caption_with_rms_norm_policy(instruction, rms_norm_policy),
+        )
+    }
+
+    /// Embed only the timestep-dependent conditioning branch.
+    pub(crate) fn embed_timestep(&self, timestep: Tensor<B, 1>) -> Tensor<B, 2> {
         let time = timestep_embedding(timestep, self.frequency_width, self.timestep_scale);
         let time = linear_forward(
             &self.time_linear_2,
             silu(linear_forward(&self.time_linear_1, time)),
         );
         debug_assert_eq!(time.dims()[1], self.conditioning_width);
-        let caption = linear_forward(
+        time
+    }
+
+    /// Embed only the timestep-invariant caption branch.
+    pub(crate) fn embed_caption_with_rms_norm_policy(
+        &self,
+        instruction: Tensor<B, 3>,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+    ) -> Tensor<B, 3> {
+        linear_forward(
             &self.caption_linear,
             rms_norm_with_policy(&self.caption_norm, instruction, rms_norm_policy),
-        );
-        (time, caption)
+        )
     }
 }
 

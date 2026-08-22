@@ -399,7 +399,7 @@ mod gqa_padding {
     /// and duplicate source loads for grouped heads.
     #[allow(clippy::too_many_arguments)]
     #[cube(launch)]
-    fn prepare_gqa_strict_norm_rope_padded_qkv_kernel<F: Float>(
+    fn prepare_gqa_strict_norm_rope_padded_qkv_kernel<F: Float, O: Float>(
         query: &Tensor<F>,
         key: &Tensor<F>,
         value: &Tensor<F>,
@@ -407,13 +407,13 @@ mod gqa_padding {
         key_gamma: &Tensor<F>,
         cos: &Tensor<F>,
         sin: &Tensor<F>,
-        padded_query: &mut Tensor<F>,
-        padded_key: &mut Tensor<F>,
-        padded_value: &mut Tensor<F>,
+        padded_query: &mut Tensor<O>,
+        padded_key: &mut Tensor<O>,
+        padded_value: &mut Tensor<O>,
         query_epsilon: InputScalar,
         key_epsilon: InputScalar,
         query_scale: InputScalar,
-        #[define(F)] _dtype: StorageType,
+        #[define(F, O)] _dtype: [StorageType; 2],
     ) {
         let component = UNIT_POS as usize;
         let row = CUBE_POS;
@@ -475,9 +475,9 @@ mod gqa_padding {
                     + sequence * sin.stride(1)
                     + component * sin.stride(2);
                 let roped = normalized * cos[rope_index] + rotated * sin[sin_index];
-                padded_query[target] = roped * query_scale.get::<F>();
+                padded_query[target] = O::cast_from(roped) * query_scale.get::<O>();
             } else {
-                padded_query[target] = F::new(0.0_f32);
+                padded_query[target] = O::new(0.0_f32);
             }
         }
 
@@ -541,7 +541,7 @@ mod gqa_padding {
                         + query_head * padded_key.stride(1)
                         + sequence * padded_key.stride(2)
                         + component * padded_key.stride(3);
-                    padded_key[target] = roped;
+                    padded_key[target] = O::cast_from(roped);
                 }
             } else {
                 for group in 0..groups {
@@ -550,7 +550,7 @@ mod gqa_padding {
                         + query_head * padded_key.stride(1)
                         + sequence * padded_key.stride(2)
                         + component * padded_key.stride(3);
-                    padded_key[target] = F::new(0.0_f32);
+                    padded_key[target] = O::new(0.0_f32);
                 }
             }
         }
@@ -567,9 +567,9 @@ mod gqa_padding {
                     + key_value_head * value.stride(1)
                     + sequence * value.stride(2)
                     + component * value.stride(3);
-                value[source]
+                O::cast_from(value[source])
             } else {
-                F::new(0.0_f32)
+                O::new(0.0_f32)
             };
             for group in 0..groups {
                 let query_head = key_value_head * groups + group;
@@ -763,24 +763,25 @@ mod gqa_padding {
         let value_len = value.meta.shape[2];
         let client = query.client.clone();
         let device = query.device.clone();
-        let dtype = query.dtype;
+        let input_dtype = query.dtype;
+        let output_dtype = DType::F16;
         let padded_query = empty_device_dtype::<R>(
             client.clone(),
             device.clone(),
             Shape::new([batch, query_heads, query_len, PADDED_BLACKBOX_HEAD_DIM]),
-            dtype,
+            output_dtype,
         );
         let padded_key = empty_device_dtype::<R>(
             client.clone(),
             device.clone(),
             Shape::new([batch, query_heads, key_len, PADDED_BLACKBOX_HEAD_DIM]),
-            dtype,
+            output_dtype,
         );
         let padded_value = empty_device_dtype::<R>(
             client.clone(),
             device,
             Shape::new([batch, query_heads, value_len, PADDED_BLACKBOX_HEAD_DIM]),
-            dtype,
+            output_dtype,
         );
         let query_rows = query.meta.shape[0] * query.meta.shape[1] * query.meta.shape[2];
         let key_rows = key.meta.shape[0] * key.meta.shape[1] * key.meta.shape[2];
@@ -808,8 +809,8 @@ mod gqa_padding {
             padded_value.clone().into_tensor_arg(),
             InputScalar::new(query_epsilon, DType::F32),
             InputScalar::new(key_epsilon, DType::F32),
-            InputScalar::new(query_scale, dtype),
-            dtype.into(),
+            InputScalar::new(query_scale, output_dtype),
+            [input_dtype.into(), output_dtype.into()],
         );
 
         (padded_query, padded_key, padded_value)
@@ -1056,7 +1057,7 @@ fn forced_blackbox_attention<R: CubeRuntime>(
         hypercube_blueprint: HypercubeBlueprint::builder().build(),
         tiling_scheme,
         plane_dim: client.properties().hardware.plane_size_max,
-        two_rows_in_array_tile: false,
+        two_rows_in_array_tile: true,
         vector_sizes,
         masked: false,
         causal: false,
@@ -1604,8 +1605,8 @@ pub(crate) fn required_chunked_gqa_wgpu_balanced_strict_qk_norm_rope_padded_blac
 ///
 /// This route is intentionally not used by the released denoiser aliases. It exists behind the
 /// attention-kernel type marker so real-checkpoint numerical and performance gates can validate
-/// it before policy promotion. Unlike the ordinary preparation route, its inputs are raw projected
-/// F16 Q/K plus their RMSNorm weights and the repeated-pair RoPE tables.
+/// it before policy promotion. Inputs may be raw projected F16 or F32 Q/K/V plus matching RMSNorm
+/// weights and RoPE tables; the fused output boundary is always F16 for the blackbox kernel.
 #[cfg(feature = "wgpu")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn required_chunked_gqa_wgpu_fused_strict_qk_norm_rope_padded_blackbox_attention(
@@ -2252,6 +2253,11 @@ where
         key_epsilon.is_finite() && key_epsilon > 0.0,
         "fused key RMSNorm epsilon must be finite and positive"
     );
+    let input_dtype = query.dtype();
+    assert!(
+        matches!(input_dtype, DType::F16 | DType::F32),
+        "fused strict Q/K norm+RoPE input must be F16 or F32"
+    );
     for (name, dtype) in [
         ("query", query.dtype()),
         ("key", key.dtype()),
@@ -2262,9 +2268,8 @@ where
         ("RoPE sine", sin.dtype()),
     ] {
         assert_eq!(
-            dtype,
-            DType::F16,
-            "fused strict Q/K norm+RoPE {name} must be F16"
+            dtype, input_dtype,
+            "fused strict Q/K norm+RoPE {name} dtype mismatch"
         );
     }
 
@@ -3622,5 +3627,198 @@ mod tests {
                 .fold(0.0_f32, f32::max);
             assert!(max_abs <= 0.002, "{name} fused prep max_abs={max_abs}");
         }
+    }
+
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[ignore = "requires an explicitly selected native hardware WGPU adapter"]
+    fn native_wgpu_f32_to_f16_fused_qk_preparation_reference() {
+        let device = crate::require_native_wgpu_device().expect("native hardware WGPU adapter");
+        let tensor = |shape: [usize; 4], offset: usize| {
+            let elements = shape.iter().product();
+            let values = (0..elements)
+                .map(|index| {
+                    let integer = ((index + offset) * 23 + 11) % 67;
+                    (integer as f32 - 33.0) / 19.0
+                })
+                .collect::<Vec<_>>();
+            Tensor::<NativeWgpuBackend, 4>::from_data(TensorData::new(values, shape), &device)
+        };
+        let query = tensor([1, 4, 17, BOOGU_ATTENTION_HEAD_DIM], 61);
+        let key = tensor([1, 1, 17, BOOGU_ATTENTION_HEAD_DIM], 67);
+        let value = tensor([1, 1, 17, BOOGU_ATTENTION_HEAD_DIM], 71);
+        let gamma_data = TensorData::new(
+            (0..BOOGU_ATTENTION_HEAD_DIM)
+                .map(|index| 0.75 + (index % 11) as f32 / 22.0)
+                .collect::<Vec<_>>(),
+            [BOOGU_ATTENTION_HEAD_DIM],
+        );
+        let query_gamma = Tensor::<NativeWgpuBackend, 1>::from_data(gamma_data.clone(), &device);
+        let key_gamma = Tensor::<NativeWgpuBackend, 1>::from_data(gamma_data, &device);
+        let phase = Tensor::<NativeWgpuBackend, 3>::from_data(
+            TensorData::new(
+                (0..17 * BOOGU_ATTENTION_HEAD_DIM)
+                    .map(|index| ((index / 2) % 29) as f32 / 31.0)
+                    .collect::<Vec<_>>(),
+                [1, 17, BOOGU_ATTENTION_HEAD_DIM],
+            ),
+            &device,
+        );
+        let cos = phase.clone().cos();
+        let sin = phase.sin();
+        let epsilon = 1.0e-5;
+        let normalize_and_rope =
+            |input: Tensor<NativeWgpuBackend, 4>, gamma: Tensor<NativeWgpuBackend, 1>| {
+                let rms = (input.clone().square().mean_dim(3) + epsilon).sqrt();
+                let normalized = input / rms * gamma.unsqueeze();
+                let [batch, heads, sequence, width] = normalized.dims();
+                let token_major = normalized.permute([0, 2, 1, 3]);
+                let pairs = width / 2;
+                let paired = token_major
+                    .clone()
+                    .reshape([batch, sequence, heads, pairs, 2]);
+                let real = paired
+                    .clone()
+                    .slice([0..batch, 0..sequence, 0..heads, 0..pairs, 0..1]);
+                let imag = paired.slice([0..batch, 0..sequence, 0..heads, 0..pairs, 1..2]);
+                let rotated =
+                    Tensor::cat(vec![imag.neg(), real], 4).reshape([batch, sequence, heads, width]);
+                (token_major * cos.clone().unsqueeze_dim(2)
+                    + rotated * sin.clone().unsqueeze_dim(2))
+                .permute([0, 2, 1, 3])
+                .cast(DType::F16)
+            };
+        let expected = reference_prepare_gqa_padded_blackbox_inputs(
+            normalize_and_rope(query.clone(), query_gamma.clone()),
+            normalize_and_rope(key.clone(), key_gamma.clone()),
+            value.clone().cast(DType::F16),
+        );
+        let actual = prepare_gqa_strict_norm_rope_padded_blackbox_inputs(
+            query,
+            key,
+            value,
+            query_gamma,
+            key_gamma,
+            cos,
+            sin,
+            epsilon,
+            epsilon,
+        );
+
+        for (name, actual, expected) in [
+            ("query", actual.0, expected.0),
+            ("key", actual.1, expected.1),
+            ("value", actual.2, expected.2),
+        ] {
+            assert_eq!(actual.dims(), expected.dims(), "{name} shape");
+            let expected = expected
+                .into_data()
+                .to_vec::<half::f16>()
+                .expect("composed F16 preparation values");
+            let actual = actual
+                .into_data()
+                .to_vec::<half::f16>()
+                .expect("fused F16 preparation values");
+            let max_abs = expected
+                .into_iter()
+                .zip(actual)
+                .map(|(expected, actual)| (f32::from(expected) - f32::from(actual)).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(max_abs <= 0.003, "{name} fused prep max_abs={max_abs}");
+        }
+    }
+
+    /// Measures only the production 1.5K fused-preparation and attention boundary so policy
+    /// chunk changes can be selected without repeatedly loading the full checkpoint.
+    #[cfg(feature = "wgpu")]
+    #[test]
+    #[ignore = "opt-in representative native WGPU 1.5K attention timing"]
+    fn native_wgpu_1k5_fused_attention_query_chunk_throughput_reference() {
+        use std::time::{Duration, Instant};
+
+        use burn::tensor::backend::Backend as _;
+
+        const SEQUENCE: usize = 18_579;
+        const QUERY_HEADS: usize = 28;
+        const KEY_VALUE_HEADS: usize = 4;
+        const ATTEMPTS: usize = 5;
+        const QUERY_CHUNKS: [usize; 6] = [8_192, 9_216, 10_240, 12_288, 14_336, 16_384];
+
+        let device = crate::require_native_wgpu_device().expect("native hardware WGPU adapter");
+        let query = Tensor::<NativeWgpuBackend, 4>::ones(
+            [1, QUERY_HEADS, SEQUENCE, BOOGU_ATTENTION_HEAD_DIM],
+            &device,
+        );
+        let key = Tensor::<NativeWgpuBackend, 4>::ones(
+            [1, KEY_VALUE_HEADS, SEQUENCE, BOOGU_ATTENTION_HEAD_DIM],
+            &device,
+        );
+        let value = Tensor::<NativeWgpuBackend, 4>::ones(
+            [1, KEY_VALUE_HEADS, SEQUENCE, BOOGU_ATTENTION_HEAD_DIM],
+            &device,
+        );
+        let gamma = Tensor::<NativeWgpuBackend, 1>::ones([BOOGU_ATTENTION_HEAD_DIM], &device);
+        let cos =
+            Tensor::<NativeWgpuBackend, 3>::ones([1, SEQUENCE, BOOGU_ATTENTION_HEAD_DIM], &device);
+        let sin =
+            Tensor::<NativeWgpuBackend, 3>::zeros([1, SEQUENCE, BOOGU_ATTENTION_HEAD_DIM], &device);
+
+        let execute = |query_chunk_size| {
+            let (query, key, value) = prepare_gqa_strict_norm_rope_padded_blackbox_inputs(
+                query.clone(),
+                key.clone(),
+                value.clone(),
+                gamma.clone(),
+                gamma.clone(),
+                cos.clone(),
+                sin.clone(),
+                1.0e-5,
+                1.0e-5,
+            );
+            required_chunked_prepared_padded_blackbox_attention_impl_unchecked(
+                query,
+                key,
+                value,
+                query_chunk_size,
+                4,
+                1,
+                1,
+            )
+            .cast(DType::F32)
+        };
+
+        for query_chunk_size in QUERY_CHUNKS {
+            let warm = execute(query_chunk_size);
+            NativeWgpuBackend::sync(&device).expect("warm representative 1.5K attention");
+            drop(warm);
+        }
+
+        let mut timings = QUERY_CHUNKS
+            .map(|query_chunk_size| (query_chunk_size, Vec::<Duration>::with_capacity(ATTEMPTS)));
+        for attempt in 0..ATTEMPTS {
+            for offset in 0..QUERY_CHUNKS.len() {
+                let index = (offset + attempt) % QUERY_CHUNKS.len();
+                let query_chunk_size = timings[index].0;
+                let started = Instant::now();
+                let output = execute(query_chunk_size);
+                NativeWgpuBackend::sync(&device).expect("time representative 1.5K attention");
+                timings[index].1.push(started.elapsed());
+                drop(output);
+            }
+        }
+        for (query_chunk_size, samples) in &mut timings {
+            samples.sort_unstable();
+            let median = samples[samples.len() / 2];
+            eprintln!(
+                "1.5K fused Q4 attention p4/kv1/q1/q{query_chunk_size}: median {:.3} ms",
+                median.as_secs_f64() * 1_000.0,
+            );
+        }
+        let sample = execute(16_384)
+            .slice([0..1, 0..1, 0..1, 0..1])
+            .into_data()
+            .to_vec::<f32>()
+            .expect("representative attention output")[0];
+        assert!(sample.is_finite(), "unexpected sample {sample}");
     }
 }

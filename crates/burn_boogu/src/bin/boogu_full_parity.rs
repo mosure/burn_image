@@ -2750,6 +2750,7 @@ mod tests {
         let policy = native_release_policy(variant);
         let qk_preparation = match policy.denoiser_qk_preparation {
             NativeDenoiserQkPreparationPolicy::Composed => "composed",
+            NativeDenoiserQkPreparationPolicy::FusedStrictF32ToF16 => "fused-strict-f32-to-f16",
             NativeDenoiserQkPreparationPolicy::BalancedStrictQkNormRope => {
                 "balanced-strict-qk-norm-rope"
             }

@@ -47,6 +47,15 @@ pub enum NativeDenoiserAttentionPolicy {
     PaddedBlackbox,
 }
 
+/// Activation precision presented to the native denoiser attention kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeDenoiserAttentionPrecisionPolicy {
+    /// The surrounding denoiser already executes with F16 activations.
+    PreserveF16,
+    /// Keep Q4 linear/residual execution in F32, but run normalized Q/K/V attention in F16.
+    F32ToF16Bridge,
+}
+
 /// Denoiser normalization contract attached to a qualified native policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeDenoiserRmsNormPolicy {
@@ -59,6 +68,8 @@ pub enum NativeDenoiserRmsNormPolicy {
 pub enum NativeDenoiserQkPreparationPolicy {
     /// Preserve the stock sequence of strict-F32 RMSNorm, RoPE, and padded-GQA preparation.
     Composed,
+    /// Fuse strict-F32 RMSNorm, RoPE, GQA expansion, and padding into the F16 attention boundary.
+    FusedStrictF32ToF16,
     /// Normalize Q and K in balanced native kernels before fused RoPE/GQA preparation.
     BalancedStrictQkNormRope,
 }
@@ -93,6 +104,8 @@ pub struct NativeHighVramPolicy {
     pub autotune: NativeAutotunePolicy,
     /// Required denoiser attention implementation.
     pub denoiser_attention: NativeDenoiserAttentionPolicy,
+    /// Precision boundary applied immediately around the native attention kernel.
+    pub denoiser_attention_precision: NativeDenoiserAttentionPrecisionPolicy,
     /// Required denoiser RMSNorm execution policy.
     pub denoiser_rms_norm: NativeDenoiserRmsNormPolicy,
     /// Required denoiser Q/K preparation implementation.
@@ -123,9 +136,10 @@ pub struct NativeHighVramPolicy {
 /// residency specifically; low-VRAM provenance supplies its own streamed-per-stage label.
 /// Browser, Q8, and all-F16 execution retain independent policies.
 pub const BOOGU_1K_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
-    provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum",
+    provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-split-rows-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum",
     autotune: NativeAutotunePolicy::Full,
     denoiser_attention: NativeDenoiserAttentionPolicy::PaddedBlackbox,
+    denoiser_attention_precision: NativeDenoiserAttentionPrecisionPolicy::PreserveF16,
     denoiser_rms_norm: NativeDenoiserRmsNormPolicy::StrictF32,
     denoiser_qk_preparation: NativeDenoiserQkPreparationPolicy::BalancedStrictQkNormRope,
     vae_execution: NativeVaeExecutionPolicy::PreserveF16StorageF32GroupNorm,
@@ -140,11 +154,51 @@ pub const BOOGU_1K_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
 
 /// Parity- and performance-qualified native Edit-Turbo 1.5K execution controls.
 pub const EDIT_TURBO_1K5_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
-    provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum",
+    provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-split-rows-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum",
     autotune: NativeAutotunePolicy::Full,
     denoiser_attention: NativeDenoiserAttentionPolicy::PaddedBlackbox,
+    denoiser_attention_precision: NativeDenoiserAttentionPrecisionPolicy::PreserveF16,
     denoiser_rms_norm: NativeDenoiserRmsNormPolicy::StrictF32,
     denoiser_qk_preparation: NativeDenoiserQkPreparationPolicy::Composed,
+    vae_execution: NativeVaeExecutionPolicy::PreserveF16StorageF32GroupNorm,
+    qwen_synchronization: NativeQwenSynchronizationPolicy::DeferredToStageBoundary,
+    qwen_query_chunk_size: 128,
+    denoiser_query_chunk_size: 16_384,
+    vae_attention_query_chunk_size: 4_096,
+    blackbox_num_planes: 4,
+    blackbox_seq_kv_tiles: 1,
+    blackbox_seq_q_tiles: 1,
+};
+
+/// Native packed-Q4S controls for 1K generation and editing.
+///
+/// Matrix and residual execution remains Q4S/F32. Only normalized Q/K/V and the attended output
+/// cross the explicit F16 bridge required by the accelerated padded-blackbox attention kernel.
+pub const BOOGU_Q4_1K_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
+    provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k-q4s-f32/qwen-q128/denoiser-q4s-f32-padded-blackbox-f16-attention-bridge-p4-kv1-q1-split-rows-q8192-rms-strict-f32-qk-fused-f32-to-f16/vae-q4096-f16-storage-f32-accum",
+    autotune: NativeAutotunePolicy::Full,
+    denoiser_attention: NativeDenoiserAttentionPolicy::PaddedBlackbox,
+    denoiser_attention_precision: NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge,
+    denoiser_rms_norm: NativeDenoiserRmsNormPolicy::StrictF32,
+    denoiser_qk_preparation: NativeDenoiserQkPreparationPolicy::FusedStrictF32ToF16,
+    vae_execution: NativeVaeExecutionPolicy::PreserveF16StorageF32GroupNorm,
+    qwen_synchronization: NativeQwenSynchronizationPolicy::DeferredToStageBoundary,
+    qwen_query_chunk_size: 128,
+    denoiser_query_chunk_size: 8_192,
+    vae_attention_query_chunk_size: 4_096,
+    blackbox_num_planes: 4,
+    blackbox_seq_kv_tiles: 1,
+    blackbox_seq_q_tiles: 1,
+};
+
+/// Native packed-Q4S controls for Edit-Turbo 1.5K.
+pub const EDIT_TURBO_1K5_Q4_NATIVE_POLICY: NativeHighVramPolicy = NativeHighVramPolicy {
+    provenance_label: "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k5-q4s-f32/qwen-q128/denoiser-q4s-f32-padded-blackbox-f16-attention-bridge-p4-kv1-q1-split-rows-q16384-rms-strict-f32-qk-fused-f32-to-f16/vae-q4096-f16-storage-f32-accum",
+    autotune: NativeAutotunePolicy::Full,
+    denoiser_attention: NativeDenoiserAttentionPolicy::PaddedBlackbox,
+    denoiser_attention_precision: NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge,
+    denoiser_rms_norm: NativeDenoiserRmsNormPolicy::StrictF32,
+    denoiser_qk_preparation: NativeDenoiserQkPreparationPolicy::FusedStrictF32ToF16,
     vae_execution: NativeVaeExecutionPolicy::PreserveF16StorageF32GroupNorm,
     qwen_synchronization: NativeQwenSynchronizationPolicy::DeferredToStageBoundary,
     qwen_query_chunk_size: 128,
@@ -293,12 +347,16 @@ mod tests {
         assert_eq!(BOOGU_1K_NATIVE_POLICY.blackbox_seq_q_tiles, 1);
         assert_eq!(
             BOOGU_1K_NATIVE_POLICY.provenance_label,
-            "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum"
+            "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-split-rows-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum"
         );
         assert_eq!(BOOGU_1K_NATIVE_POLICY.autotune, NativeAutotunePolicy::Full);
         assert_eq!(
             BOOGU_1K_NATIVE_POLICY.denoiser_attention,
             NativeDenoiserAttentionPolicy::PaddedBlackbox
+        );
+        assert_eq!(
+            BOOGU_1K_NATIVE_POLICY.denoiser_attention_precision,
+            NativeDenoiserAttentionPrecisionPolicy::PreserveF16
         );
         assert_eq!(
             BOOGU_1K_NATIVE_POLICY.denoiser_rms_norm,
@@ -329,6 +387,10 @@ mod tests {
         assert_eq!(EDIT_TURBO_1K5_NATIVE_POLICY.blackbox_seq_kv_tiles, 1);
         assert_eq!(EDIT_TURBO_1K5_NATIVE_POLICY.blackbox_seq_q_tiles, 1);
         assert_eq!(
+            EDIT_TURBO_1K5_NATIVE_POLICY.denoiser_attention_precision,
+            NativeDenoiserAttentionPrecisionPolicy::PreserveF16
+        );
+        assert_eq!(
             EDIT_TURBO_1K5_NATIVE_POLICY.denoiser_rms_norm,
             NativeDenoiserRmsNormPolicy::StrictF32
         );
@@ -338,11 +400,31 @@ mod tests {
         );
         assert_eq!(
             EDIT_TURBO_1K5_NATIVE_POLICY.provenance_label,
-            "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum"
+            "native-high-vram-retained-qwen-deferred-sync/full-autotune/1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-split-rows-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum"
         );
         assert_eq!(
             EDIT_TURBO_1K5_NATIVE_POLICY.qwen_synchronization,
             NativeQwenSynchronizationPolicy::DeferredToStageBoundary
+        );
+        assert_eq!(
+            BOOGU_Q4_1K_NATIVE_POLICY.denoiser_attention_precision,
+            NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge
+        );
+        assert_eq!(
+            BOOGU_Q4_1K_NATIVE_POLICY.denoiser_qk_preparation,
+            NativeDenoiserQkPreparationPolicy::FusedStrictF32ToF16
+        );
+        assert_eq!(
+            EDIT_TURBO_1K5_Q4_NATIVE_POLICY.denoiser_attention_precision,
+            NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge
+        );
+        assert_eq!(
+            EDIT_TURBO_1K5_Q4_NATIVE_POLICY.denoiser_qk_preparation,
+            NativeDenoiserQkPreparationPolicy::FusedStrictF32ToF16
+        );
+        assert_eq!(
+            EDIT_TURBO_1K5_Q4_NATIVE_POLICY.denoiser_query_chunk_size,
+            16_384
         );
     }
 }

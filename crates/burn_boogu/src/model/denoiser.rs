@@ -37,9 +37,9 @@ pub(super) fn selected_image_index_embedding<B: Backend>(
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::attention::NativeFlashUnitAttention;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-use super::attention::NativePaddedBlackboxAttention;
-#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::attention::SplitDoubleStreamSharedProjection;
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+use super::attention::{NativeF32ToF16PaddedBlackboxAttention, NativePaddedBlackboxAttention};
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
 use super::native_flash::NativeWgpuBackend;
 #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
@@ -322,20 +322,37 @@ impl<B: Backend> BooguDenoiser<B> {
                 "cached RoPE geometry does not match denoiser input".into(),
             ));
         }
-        let [_, _, height, width] = input.latent.dims();
-        let (time, mut instruction) = self.time_caption_embed.forward_with_rms_norm_policy(
-            input.timestep,
-            input.instruction,
+        let instruction = self.prepare_instruction_with_kernel::<K>(
+            input.instruction.clone(),
+            geometry,
             rms_norm_policy,
         );
-        let text_len = instruction.dims()[1];
-        let joint_cos = geometry.joint_cos.clone();
-        let joint_sin = geometry.joint_sin.clone();
-        let text_rope = (
-            joint_cos.clone().narrow(1, 0, text_len),
-            joint_sin.clone().narrow(1, 0, text_len),
-        );
+        self.forward_with_kernel_and_rope_and_prepared_instruction::<K>(
+            input,
+            geometry,
+            rms_norm_policy,
+            instruction,
+        )
+    }
 
+    pub(crate) fn prepare_instruction_with_kernel<K: AttentionKernel<B>>(
+        &self,
+        instruction: Tensor<B, 3>,
+        geometry: &BooguRoPeGeometry<B>,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+    ) -> Tensor<B, 3> {
+        let mut instruction = self
+            .time_caption_embed
+            .embed_caption_with_rms_norm_policy(instruction, rms_norm_policy);
+        let text_len = instruction.dims()[1];
+        assert_eq!(
+            text_len, geometry.key.text_len,
+            "prepared instruction length must match cached RoPE geometry"
+        );
+        let text_rope = (
+            geometry.joint_cos.clone().narrow(1, 0, text_len),
+            geometry.joint_sin.clone().narrow(1, 0, text_len),
+        );
         for block in &self.context_refiner {
             instruction = block.forward_with_kernel_and_rms_norm_policy::<K>(
                 instruction,
@@ -344,6 +361,71 @@ impl<B: Backend> BooguDenoiser<B> {
                 rms_norm_policy,
             );
         }
+        instruction
+    }
+
+    /// Project the step-invariant edit reference once for an entire DMD schedule.
+    ///
+    /// The timestep-conditioned reference refiner still executes on every step. Only patchifying,
+    /// the input projection, and the fixed image-index embedding are retained here.
+    pub(crate) fn prepare_reference_embedding(
+        &self,
+        reference: Tensor<B, 4>,
+    ) -> Result<Tensor<B, 3>, BooguError> {
+        let mut reference = linear_forward(
+            &self.ref_image_patch_embedder,
+            patchify(reference, self.config.patch_size)?,
+        );
+        let embedding = selected_image_index_embedding(
+            &self.image_index_embedding,
+            self.config.hidden_size,
+            reference.dtype(),
+        );
+        reference = reference + embedding;
+        Ok(reference)
+    }
+
+    fn forward_with_kernel_and_rope_and_prepared_instruction<K: AttentionKernel<B>>(
+        &self,
+        input: BooguDenoiserInput<B>,
+        geometry: &BooguRoPeGeometry<B>,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+        instruction: Tensor<B, 3>,
+    ) -> Result<Tensor<B, 4>, BooguError> {
+        self.forward_with_kernel_and_rope_and_prepared_conditioning::<K>(
+            input,
+            geometry,
+            rms_norm_policy,
+            instruction,
+            None,
+        )
+    }
+
+    fn forward_with_kernel_and_rope_and_prepared_conditioning<K: AttentionKernel<B>>(
+        &self,
+        input: BooguDenoiserInput<B>,
+        geometry: &BooguRoPeGeometry<B>,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+        mut instruction: Tensor<B, 3>,
+        prepared_reference: Option<Tensor<B, 3>>,
+    ) -> Result<Tensor<B, 4>, BooguError> {
+        self.validate_input(&input)?;
+        if !geometry.matches(&input) {
+            return Err(BooguError::InvalidShape(
+                "cached RoPE geometry does not match denoiser input".into(),
+            ));
+        }
+        let [_, _, height, width] = input.latent.dims();
+        let time = self.time_caption_embed.embed_timestep(input.timestep);
+        let text_len = instruction.dims()[1];
+        if text_len != input.instruction.dims()[1] {
+            return Err(BooguError::InvalidShape(format!(
+                "prepared instruction has {text_len} tokens, expected {}",
+                input.instruction.dims()[1]
+            )));
+        }
+        let joint_cos = geometry.joint_cos.clone();
+        let joint_sin = geometry.joint_sin.clone();
 
         let mut generated = linear_forward(
             &self.x_embedder,
@@ -368,16 +450,21 @@ impl<B: Backend> BooguDenoiser<B> {
         }
 
         let mut image = if let Some(reference) = input.reference {
-            let mut reference = linear_forward(
-                &self.ref_image_patch_embedder,
-                patchify(reference, self.config.patch_size)?,
-            );
-            let embedding = selected_image_index_embedding(
-                &self.image_index_embedding,
-                self.config.hidden_size,
-                reference.dtype(),
-            );
-            reference = reference + embedding;
+            let mut reference = if let Some(prepared) = prepared_reference {
+                let [batch, tokens, width] = prepared.dims();
+                if batch != 1
+                    || tokens != geometry.reference_len
+                    || width != self.config.hidden_size
+                {
+                    return Err(BooguError::InvalidShape(format!(
+                        "prepared reference has shape [{batch},{tokens},{width}], expected [1,{},{}]",
+                        geometry.reference_len, self.config.hidden_size
+                    )));
+                }
+                prepared
+            } else {
+                self.prepare_reference_embedding(reference)?
+            };
             let reference_rope = (
                 joint_cos
                     .clone()
@@ -396,6 +483,11 @@ impl<B: Backend> BooguDenoiser<B> {
             }
             Tensor::cat(vec![reference, generated], 1)
         } else {
+            if prepared_reference.is_some() {
+                return Err(BooguError::InvalidShape(
+                    "prepared reference was supplied without an edit reference latent".into(),
+                ));
+            }
             generated
         };
 
@@ -685,6 +777,147 @@ impl BooguDenoiser<NativeWgpuBackend> {
         }
     }
 
+    /// Execute an F32 packed-Q4 denoiser through the native F16 padded-blackbox attention core.
+    ///
+    /// Q4 projections, residuals, norms, and FFNs remain in their released F32 execution policy.
+    /// The attention marker narrows only normalized/rotated Q/K/V and widens the attended result.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_native_q4_padded_blackbox_with_prepared_rope(
+        &self,
+        input: BooguDenoiserInput<NativeWgpuBackend>,
+        geometry: &BooguRoPeGeometry<NativeWgpuBackend>,
+        num_planes: u8,
+        seq_kv_tiles: u8,
+        seq_q_tiles: u8,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+        split_double_stream_shared_projection: bool,
+    ) -> Result<Tensor<NativeWgpuBackend, 4>, BooguError> {
+        assert_supported_wgpu_blackbox_partition_configuration(
+            num_planes,
+            seq_kv_tiles,
+            seq_q_tiles,
+        );
+        assert_eq!(
+            input.latent.dtype(),
+            burn::tensor::DType::F32,
+            "packed-Q4 native attention bridge requires F32 denoiser execution"
+        );
+        match (num_planes, seq_kv_tiles, seq_q_tiles) {
+            (2, 1, 1) => self.forward_with_native_projection_policy::<
+                NativeF32ToF16PaddedBlackboxAttention<2, 1, 1>,
+            >(
+                input,
+                geometry,
+                rms_norm_policy,
+                split_double_stream_shared_projection,
+            ),
+            (2, 2, 1) => self.forward_with_native_projection_policy::<
+                NativeF32ToF16PaddedBlackboxAttention<2, 2, 1>,
+            >(
+                input,
+                geometry,
+                rms_norm_policy,
+                split_double_stream_shared_projection,
+            ),
+            (4, 1, 1) => self.forward_with_native_projection_policy::<
+                NativeF32ToF16PaddedBlackboxAttention<4, 1, 1>,
+            >(
+                input,
+                geometry,
+                rms_norm_policy,
+                split_double_stream_shared_projection,
+            ),
+            _ => unreachable!("validated packed-Q4 padded blackbox blueprint"),
+        }
+    }
+
+    /// Prepare the timestep-invariant caption projection and context-refiner graph once per DMD
+    /// run for a packed-Q4 native attention policy.
+    pub(crate) fn prepare_native_q4_instruction_with_prepared_rope(
+        &self,
+        instruction: Tensor<NativeWgpuBackend, 3>,
+        geometry: &BooguRoPeGeometry<NativeWgpuBackend>,
+        num_planes: u8,
+        seq_kv_tiles: u8,
+        seq_q_tiles: u8,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+    ) -> Tensor<NativeWgpuBackend, 3> {
+        match (num_planes, seq_kv_tiles, seq_q_tiles) {
+            (2, 1, 1) => self
+                .prepare_instruction_with_kernel::<NativeF32ToF16PaddedBlackboxAttention<2, 1, 1>>(
+                    instruction,
+                    geometry,
+                    rms_norm_policy,
+                ),
+            (2, 2, 1) => self
+                .prepare_instruction_with_kernel::<NativeF32ToF16PaddedBlackboxAttention<2, 2, 1>>(
+                    instruction,
+                    geometry,
+                    rms_norm_policy,
+                ),
+            (4, 1, 1) => self
+                .prepare_instruction_with_kernel::<NativeF32ToF16PaddedBlackboxAttention<4, 1, 1>>(
+                    instruction,
+                    geometry,
+                    rms_norm_policy,
+                ),
+            _ => unreachable!("validated packed-Q4 padded blackbox blueprint"),
+        }
+    }
+
+    /// Execute one packed-Q4 denoiser step with a caption/context tensor prepared once for the
+    /// current four-step DMD run.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_native_q4_padded_blackbox_with_prepared_instruction(
+        &self,
+        input: BooguDenoiserInput<NativeWgpuBackend>,
+        geometry: &BooguRoPeGeometry<NativeWgpuBackend>,
+        num_planes: u8,
+        seq_kv_tiles: u8,
+        seq_q_tiles: u8,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+        split_double_stream_shared_projection: bool,
+        instruction: Tensor<NativeWgpuBackend, 3>,
+        prepared_reference: Option<Tensor<NativeWgpuBackend, 3>>,
+    ) -> Result<Tensor<NativeWgpuBackend, 4>, BooguError> {
+        match (num_planes, seq_kv_tiles, seq_q_tiles) {
+            (2, 1, 1) => self
+                .forward_with_native_projection_policy_and_prepared_instruction::<
+                    NativeF32ToF16PaddedBlackboxAttention<2, 1, 1>,
+                >(
+                    input,
+                    geometry,
+                    rms_norm_policy,
+                    split_double_stream_shared_projection,
+                    instruction,
+                    prepared_reference,
+                ),
+            (2, 2, 1) => self
+                .forward_with_native_projection_policy_and_prepared_instruction::<
+                    NativeF32ToF16PaddedBlackboxAttention<2, 2, 1>,
+                >(
+                    input,
+                    geometry,
+                    rms_norm_policy,
+                    split_double_stream_shared_projection,
+                    instruction,
+                    prepared_reference,
+                ),
+            (4, 1, 1) => self
+                .forward_with_native_projection_policy_and_prepared_instruction::<
+                    NativeF32ToF16PaddedBlackboxAttention<4, 1, 1>,
+                >(
+                    input,
+                    geometry,
+                    rms_norm_policy,
+                    split_double_stream_shared_projection,
+                    instruction,
+                    prepared_reference,
+                ),
+            _ => unreachable!("validated packed-Q4 padded blackbox blueprint"),
+        }
+    }
+
     fn forward_with_native_projection_policy<K: AttentionKernel<NativeWgpuBackend>>(
         &self,
         input: BooguDenoiserInput<NativeWgpuBackend>,
@@ -701,6 +934,38 @@ impl BooguDenoiser<NativeWgpuBackend> {
                 input,
                 geometry,
                 rms_norm_policy,
+            )
+        }
+    }
+
+    fn forward_with_native_projection_policy_and_prepared_instruction<
+        K: AttentionKernel<NativeWgpuBackend>,
+    >(
+        &self,
+        input: BooguDenoiserInput<NativeWgpuBackend>,
+        geometry: &BooguRoPeGeometry<NativeWgpuBackend>,
+        rms_norm_policy: DenoiserRmsNormPolicy,
+        split_double_stream_shared_projection: bool,
+        instruction: Tensor<NativeWgpuBackend, 3>,
+        prepared_reference: Option<Tensor<NativeWgpuBackend, 3>>,
+    ) -> Result<Tensor<NativeWgpuBackend, 4>, BooguError> {
+        if split_double_stream_shared_projection {
+            self.forward_with_kernel_and_rope_and_prepared_conditioning::<
+                SplitDoubleStreamSharedProjection<K>,
+            >(
+                input,
+                geometry,
+                rms_norm_policy,
+                instruction,
+                prepared_reference,
+            )
+        } else {
+            self.forward_with_kernel_and_rope_and_prepared_conditioning::<K>(
+                input,
+                geometry,
+                rms_norm_policy,
+                instruction,
+                prepared_reference,
             )
         }
     }
@@ -972,5 +1237,87 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn prepared_instruction_matches_per_step_context_forward_correctness() {
+        let device = Default::default();
+        TestBackend::seed(&device, 73);
+        let model = BooguDenoiser::<TestBackend>::new(tiny_config(), &device).unwrap();
+        let geometry = model
+            .prepare_rope_geometry(&tiny_input(&device, 3, true, [4, 4]))
+            .unwrap();
+        let expected = model
+            .forward_with_kernel_and_rope::<PortableChunkedAttention>(
+                tiny_input(&device, 3, true, [4, 4]),
+                &geometry,
+            )
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let instruction = model.prepare_instruction_with_kernel::<PortableChunkedAttention>(
+            tiny_input(&device, 3, true, [4, 4]).instruction,
+            &geometry,
+            DenoiserRmsNormPolicy::StrictF32,
+        );
+        let actual = model
+            .forward_with_kernel_and_rope_and_prepared_instruction::<PortableChunkedAttention>(
+                tiny_input(&device, 3, true, [4, 4]),
+                &geometry,
+                DenoiserRmsNormPolicy::StrictF32,
+                instruction,
+            )
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn prepared_reference_projection_matches_per_step_projection_correctness() {
+        let device = Default::default();
+        TestBackend::seed(&device, 79);
+        let model = BooguDenoiser::<TestBackend>::new(tiny_config(), &device).unwrap();
+        let input = tiny_input(&device, 3, true, [4, 4]);
+        let geometry = model.prepare_rope_geometry(&input).unwrap();
+        let expected = model
+            .forward_with_kernel_and_rope::<PortableChunkedAttention>(
+                tiny_input(&device, 3, true, [4, 4]),
+                &geometry,
+            )
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let instruction = model.prepare_instruction_with_kernel::<PortableChunkedAttention>(
+            input.instruction.clone(),
+            &geometry,
+            DenoiserRmsNormPolicy::StrictF32,
+        );
+        let prepared_reference = model
+            .prepare_reference_embedding(
+                input
+                    .reference
+                    .clone()
+                    .expect("the edit fixture carries a reference"),
+            )
+            .unwrap();
+        let actual = model
+            .forward_with_kernel_and_rope_and_prepared_conditioning::<PortableChunkedAttention>(
+                input,
+                &geometry,
+                DenoiserRmsNormPolicy::StrictF32,
+                instruction,
+                Some(prepared_reference),
+            )
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        assert_eq!(actual, expected);
     }
 }

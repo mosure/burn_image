@@ -139,6 +139,14 @@ struct Args {
     /// Keep the Bevy window visible during an unattended run. It is hidden by default.
     #[arg(long, requires = "output")]
     show_window: bool,
+    /// Repeat the same unattended request against one retained runtime (default: 1).
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u16).range(1..),
+        requires = "output"
+    )]
+    repeat: u16,
     /// Run one exact released native/browser output-comparison candidate through the ordinary
     /// Bevy frontend, write its production Save-PNG output and report here, then exit.
     #[arg(long, value_name = "DIRECTORY")]
@@ -268,6 +276,7 @@ fn main() -> bevy::app::AppExit {
             report_path,
             timeout: std::time::Duration::from_secs(args.timeout_seconds.unwrap_or(7_200)),
             show_window: args.show_window,
+            repeat: args.repeat,
         }
     });
     let qualification = args.qualification_output_dir.as_ref().map(|output_directory| {

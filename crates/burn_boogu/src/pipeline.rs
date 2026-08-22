@@ -5,6 +5,8 @@
 //! each step, and finally load only the VAE decoder. [`ResidentBooguPipeline`] is the convenient
 //! all-resident native form and uses the same numerical path.
 
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+use burn::tensor::TensorPrimitive;
 use burn::{
     prelude::Backend,
     tensor::{DType, Tensor, TensorData},
@@ -15,12 +17,26 @@ use burn_qwen3_vl::{
     StreamingQwen3Vl,
 };
 
-#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-use crate::DenoiserRmsNormPolicy;
 use crate::{
     BooguDenoiser, BooguDenoiserInput, BooguError, BooguTask, BooguVariant, DmdSchedule,
     dmd_prediction, dmd_renoise,
 };
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+use crate::{DenoiserRmsNormPolicy, NativeDenoiserAttentionPrecisionPolicy};
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+use burn_ir::TensorId;
+
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+fn native_float_tensor_id<const D: usize>(
+    tensor: &Tensor<crate::model::NativeWgpuBackend, D>,
+) -> Result<TensorId, BooguError> {
+    match tensor.clone().into_primitive() {
+        TensorPrimitive::Float(primitive) => Ok(primitive.id),
+        TensorPrimitive::QFloat(_) => Err(BooguError::InvalidRequest(
+            "native prepared conditioning requires a floating activation tensor".into(),
+        )),
+    }
+}
 
 /// A denoiser implementation usable by the DMD loop.
 ///
@@ -36,8 +52,19 @@ pub trait DmdDenoiser<B: Backend> {
         None
     }
 
+    /// Prepare tensors that are invariant across one complete DMD schedule.
+    ///
+    /// Streamed denoisers normally keep the default no-op. Resident implementations may cache
+    /// exact request-local tensors, but must release them in [`Self::finish_run`].
+    fn prepare_for_run(&mut self, _input: &BooguDenoiserInput<B>) -> Result<(), BooguError> {
+        Ok(())
+    }
+
     /// Predict the rectified-flow velocity for one sigma.
     fn predict(&mut self, input: BooguDenoiserInput<B>) -> Result<Tensor<B, 4>, BooguError>;
+
+    /// Release request-local tensors created by [`Self::prepare_for_run`].
+    fn finish_run(&mut self) {}
 }
 
 impl<B: Backend> DmdDenoiser<B> for BooguDenoiser<B> {
@@ -192,10 +219,15 @@ impl DmdDenoiser<crate::model::NativeWgpuBackend> for NativeFlashUnitDenoiser {
 pub struct NativePaddedBlackboxDenoiser {
     denoiser: BooguDenoiser<crate::model::NativeWgpuBackend>,
     rope_geometry: Option<crate::model::BooguRoPeGeometry<crate::model::NativeWgpuBackend>>,
+    prepared_instruction: Option<Tensor<crate::model::NativeWgpuBackend, 3>>,
+    prepared_instruction_source_id: Option<TensorId>,
+    prepared_reference: Option<Tensor<crate::model::NativeWgpuBackend, 3>>,
+    prepared_reference_source_id: Option<TensorId>,
     rope_cache_misses: usize,
     num_planes: u8,
     seq_kv_tiles: u8,
     seq_q_tiles: u8,
+    attention_precision: NativeDenoiserAttentionPrecisionPolicy,
     rms_norm_policy: DenoiserRmsNormPolicy,
     fused_strict_qk_norm_rope: bool,
     fused_rope_gqa_padding: bool,
@@ -210,10 +242,15 @@ impl NativePaddedBlackboxDenoiser {
         Self {
             denoiser,
             rope_geometry: None,
+            prepared_instruction: None,
+            prepared_instruction_source_id: None,
+            prepared_reference: None,
+            prepared_reference_source_id: None,
             rope_cache_misses: 0,
             num_planes: 4,
             seq_kv_tiles: 1,
             seq_q_tiles: 1,
+            attention_precision: NativeDenoiserAttentionPrecisionPolicy::PreserveF16,
             rms_norm_policy: DenoiserRmsNormPolicy::StrictF32,
             fused_strict_qk_norm_rope: false,
             fused_rope_gqa_padding: false,
@@ -255,6 +292,15 @@ impl NativePaddedBlackboxDenoiser {
         seq_q_tiles: u8,
     ) -> Self {
         self.set_partition_configuration(num_planes, seq_kv_tiles, seq_q_tiles);
+        self
+    }
+
+    /// Select the activation precision boundary immediately around native attention.
+    pub fn with_attention_precision(
+        mut self,
+        precision: NativeDenoiserAttentionPrecisionPolicy,
+    ) -> Self {
+        self.set_attention_precision(precision);
         self
     }
 
@@ -313,7 +359,15 @@ impl NativePaddedBlackboxDenoiser {
     /// Mutably access the wrapped denoiser.
     pub fn denoiser_mut(&mut self) -> &mut BooguDenoiser<crate::model::NativeWgpuBackend> {
         self.rope_geometry = None;
+        self.clear_prepared_conditioning();
         &mut self.denoiser
+    }
+
+    fn clear_prepared_conditioning(&mut self) {
+        self.prepared_instruction = None;
+        self.prepared_instruction_source_id = None;
+        self.prepared_reference = None;
+        self.prepared_reference_source_id = None;
     }
 
     /// Number of exact input geometries built and uploaded since construction.
@@ -338,6 +392,11 @@ impl NativePaddedBlackboxDenoiser {
     /// Return the number of 16-row query tiles retained by each plane.
     pub const fn seq_q_tiles(&self) -> u8 {
         self.seq_q_tiles
+    }
+
+    /// Return the activation precision boundary used by native attention.
+    pub const fn attention_precision(&self) -> NativeDenoiserAttentionPrecisionPolicy {
+        self.attention_precision
     }
 
     /// Return the configured denoiser RMSNorm numerical policy.
@@ -379,6 +438,24 @@ impl NativePaddedBlackboxDenoiser {
         );
         self.num_planes = num_planes;
         self.seq_q_tiles = 1;
+        self.clear_prepared_conditioning();
+    }
+
+    /// Set the activation precision boundary immediately around native attention.
+    pub fn set_attention_precision(&mut self, precision: NativeDenoiserAttentionPrecisionPolicy) {
+        if matches!(
+            precision,
+            NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge
+        ) {
+            assert!(
+                !(self.fused_strict_qk_norm_rope
+                    || self.fused_rope_gqa_padding
+                    || self.balanced_strict_qk_norm_rope),
+                "packed-Q4 attention bridge requires composed Q/K preparation"
+            );
+        }
+        self.attention_precision = precision;
+        self.clear_prepared_conditioning();
     }
 
     /// Set the number of 16-row key/value tiles processed in each partition.
@@ -395,6 +472,7 @@ impl NativePaddedBlackboxDenoiser {
         );
         self.seq_kv_tiles = seq_kv_tiles;
         self.seq_q_tiles = 1;
+        self.clear_prepared_conditioning();
     }
 
     /// Set the plane count and key/value partition width atomically.
@@ -412,6 +490,7 @@ impl NativePaddedBlackboxDenoiser {
         self.num_planes = num_planes;
         self.seq_kv_tiles = seq_kv_tiles;
         self.seq_q_tiles = 1;
+        self.clear_prepared_conditioning();
     }
 
     /// Set the number of 16-row query tiles retained by each plane.
@@ -431,6 +510,7 @@ impl NativePaddedBlackboxDenoiser {
             self.balanced_strict_qk_norm_rope,
         );
         self.seq_q_tiles = seq_q_tiles;
+        self.clear_prepared_conditioning();
     }
 
     /// Set the plane count and both partition widths atomically.
@@ -457,6 +537,7 @@ impl NativePaddedBlackboxDenoiser {
         self.num_planes = num_planes;
         self.seq_kv_tiles = seq_kv_tiles;
         self.seq_q_tiles = seq_q_tiles;
+        self.clear_prepared_conditioning();
     }
 
     /// Select the denoiser RMSNorm numerical policy.
@@ -473,6 +554,7 @@ impl NativePaddedBlackboxDenoiser {
             self.balanced_strict_qk_norm_rope,
         );
         self.rms_norm_policy = policy;
+        self.clear_prepared_conditioning();
     }
 
     /// Enable or disable fused strict Q/K RMSNorm+RoPE preparation.
@@ -480,6 +562,13 @@ impl NativePaddedBlackboxDenoiser {
     /// Enabling fails closed unless the adapter is configured for p4/kv1/q1 with StrictF32
     /// RMSNorm. Disabling always succeeds and restores the established preparation graph.
     pub fn set_fused_strict_qk_norm_rope(&mut self, enabled: bool) {
+        if enabled {
+            assert_eq!(
+                self.attention_precision,
+                NativeDenoiserAttentionPrecisionPolicy::PreserveF16,
+                "fused Q/K preparation requires native F16 denoiser activations"
+            );
+        }
         self.assert_fused_preparation_configuration(
             self.num_planes,
             self.seq_kv_tiles,
@@ -490,6 +579,7 @@ impl NativePaddedBlackboxDenoiser {
             self.balanced_strict_qk_norm_rope,
         );
         self.fused_strict_qk_norm_rope = enabled;
+        self.clear_prepared_conditioning();
     }
 
     /// Enable or disable narrow RoPE+GQA padding fusion.
@@ -497,6 +587,13 @@ impl NativePaddedBlackboxDenoiser {
     /// Enabling fails closed unless the adapter is p4/kv1/q1 with stock StrictF32 RMSNorm and the
     /// rejected full Q/K fusion candidate is disabled.
     pub fn set_fused_rope_gqa_padding(&mut self, enabled: bool) {
+        if enabled {
+            assert_eq!(
+                self.attention_precision,
+                NativeDenoiserAttentionPrecisionPolicy::PreserveF16,
+                "fused RoPE preparation requires native F16 denoiser activations"
+            );
+        }
         self.assert_fused_preparation_configuration(
             self.num_planes,
             self.seq_kv_tiles,
@@ -507,6 +604,7 @@ impl NativePaddedBlackboxDenoiser {
             self.balanced_strict_qk_norm_rope,
         );
         self.fused_rope_gqa_padding = enabled;
+        self.clear_prepared_conditioning();
     }
 
     /// Enable or disable balanced strict Q/K RMSNorm feeding narrow preparation fusion.
@@ -514,6 +612,13 @@ impl NativePaddedBlackboxDenoiser {
     /// Enabling fails closed unless the adapter is p4/kv1/q1 with StrictF32 RMSNorm and both
     /// other preparation candidates are disabled.
     pub fn set_balanced_strict_qk_norm_rope(&mut self, enabled: bool) {
+        if enabled {
+            assert_eq!(
+                self.attention_precision,
+                NativeDenoiserAttentionPrecisionPolicy::PreserveF16,
+                "balanced Q/K preparation requires native F16 denoiser activations"
+            );
+        }
         self.assert_fused_preparation_configuration(
             self.num_planes,
             self.seq_kv_tiles,
@@ -524,6 +629,7 @@ impl NativePaddedBlackboxDenoiser {
             enabled,
         );
         self.balanced_strict_qk_norm_rope = enabled;
+        self.clear_prepared_conditioning();
     }
 
     /// Enable or disable separate application of the final shared dual-stream projection.
@@ -571,6 +677,7 @@ impl NativePaddedBlackboxDenoiser {
     pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
         self.denoiser
             .set_attention_query_chunk_size(query_chunk_size);
+        self.clear_prepared_conditioning();
     }
 
     /// Return the wrapped denoiser.
@@ -589,6 +696,63 @@ impl DmdDenoiser<crate::model::NativeWgpuBackend> for NativePaddedBlackboxDenois
             .map(|bias| bias.val().dtype())
     }
 
+    fn prepare_for_run(
+        &mut self,
+        input: &BooguDenoiserInput<crate::model::NativeWgpuBackend>,
+    ) -> Result<(), BooguError> {
+        if !self
+            .rope_geometry
+            .as_ref()
+            .is_some_and(|geometry| geometry.matches(input))
+        {
+            self.rope_geometry = Some(self.denoiser.prepare_rope_geometry(input)?);
+            self.rope_cache_misses += 1;
+        }
+        match self.attention_precision {
+            NativeDenoiserAttentionPrecisionPolicy::PreserveF16 => {
+                self.clear_prepared_conditioning();
+            }
+            NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge => {
+                let instruction_source_id = native_float_tensor_id(&input.instruction)?;
+                if self.prepared_instruction_source_id != Some(instruction_source_id)
+                    || self.prepared_instruction.is_none()
+                {
+                    self.prepared_instruction = Some(
+                        self.denoiser
+                            .prepare_native_q4_instruction_with_prepared_rope(
+                                input.instruction.clone(),
+                                self.rope_geometry
+                                    .as_ref()
+                                    .expect("native RoPE geometry was populated above"),
+                                self.num_planes,
+                                self.seq_kv_tiles,
+                                self.seq_q_tiles,
+                                self.rms_norm_policy,
+                            ),
+                    );
+                    self.prepared_instruction_source_id = Some(instruction_source_id);
+                }
+
+                let reference_source_id = input
+                    .reference
+                    .as_ref()
+                    .map(native_float_tensor_id)
+                    .transpose()?;
+                if self.prepared_reference_source_id != reference_source_id
+                    || (reference_source_id.is_some() && self.prepared_reference.is_none())
+                {
+                    self.prepared_reference = input
+                        .reference
+                        .clone()
+                        .map(|reference| self.denoiser.prepare_reference_embedding(reference))
+                        .transpose()?;
+                    self.prepared_reference_source_id = reference_source_id;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn predict(
         &mut self,
         input: BooguDenoiserInput<crate::model::NativeWgpuBackend>,
@@ -599,26 +763,59 @@ impl DmdDenoiser<crate::model::NativeWgpuBackend> for NativePaddedBlackboxDenois
             .is_some_and(|geometry| geometry.matches(&input))
         {
             self.rope_geometry = Some(self.denoiser.prepare_rope_geometry(&input)?);
+            self.prepared_instruction = None;
             self.rope_cache_misses += 1;
         }
         let geometry = self
             .rope_geometry
             .as_ref()
             .expect("native RoPE geometry was populated above");
-        self.denoiser
-            .forward_native_padded_blackbox_partitioned_with_prepared_rope_and_policies(
-                input,
-                geometry,
-                self.num_planes,
-                self.seq_kv_tiles,
-                self.seq_q_tiles,
-                self.rms_norm_policy,
-                self.fused_strict_qk_norm_rope,
-                self.fused_rope_gqa_padding,
-                self.balanced_strict_qk_norm_rope,
-                self.split_double_stream_shared_projection,
-            )
+        match self.attention_precision {
+            NativeDenoiserAttentionPrecisionPolicy::PreserveF16 => self
+                .denoiser
+                .forward_native_padded_blackbox_partitioned_with_prepared_rope_and_policies(
+                    input,
+                    geometry,
+                    self.num_planes,
+                    self.seq_kv_tiles,
+                    self.seq_q_tiles,
+                    self.rms_norm_policy,
+                    self.fused_strict_qk_norm_rope,
+                    self.fused_rope_gqa_padding,
+                    self.balanced_strict_qk_norm_rope,
+                    self.split_double_stream_shared_projection,
+                ),
+            NativeDenoiserAttentionPrecisionPolicy::F32ToF16Bridge => {
+                if let Some(instruction) = self.prepared_instruction.as_ref() {
+                    self.denoiser
+                        .forward_native_q4_padded_blackbox_with_prepared_instruction(
+                            input,
+                            geometry,
+                            self.num_planes,
+                            self.seq_kv_tiles,
+                            self.seq_q_tiles,
+                            self.rms_norm_policy,
+                            self.split_double_stream_shared_projection,
+                            instruction.clone(),
+                            self.prepared_reference.clone(),
+                        )
+                } else {
+                    self.denoiser
+                        .forward_native_q4_padded_blackbox_with_prepared_rope(
+                            input,
+                            geometry,
+                            self.num_planes,
+                            self.seq_kv_tiles,
+                            self.seq_q_tiles,
+                            self.rms_norm_policy,
+                            self.split_double_stream_shared_projection,
+                        )
+                }
+            }
+        }
     }
+
+    fn finish_run(&mut self) {}
 }
 
 /// Fully deterministic input to the DMD student loop.
@@ -1112,30 +1309,47 @@ where
 
     let device = input.initial_latents.device();
     let execution_dtype = input.execution_dtype;
-    let mut latents = input.initial_latents;
+    let mut latents = Some(input.initial_latents);
     let mut noises = input.renoise.into_iter();
-    for (index, &sigma) in sigmas.iter().enumerate() {
-        let timestep = Tensor::<B, 1>::from_data(TensorData::new(vec![sigma], [1]), &device)
-            .cast(execution_dtype);
-        let model_prediction = denoiser.predict(BooguDenoiserInput {
-            latent: latents.clone(),
-            timestep,
-            instruction: input.instruction.clone(),
-            reference: input.reference.clone(),
-        })?;
-        validate_tensor_dtype(
-            "denoiser prediction",
-            model_prediction.dtype(),
-            execution_dtype,
-        )?;
-        latents = dmd_prediction(latents, model_prediction, sigma);
-        if let Some(&next_sigma) = sigmas.get(index + 1) {
-            let noise = noises.next().expect("renoise count was validated");
-            latents = dmd_renoise(latents, noise, next_sigma);
+    let result = (|| {
+        for (index, &sigma) in sigmas.iter().enumerate() {
+            let timestep = Tensor::<B, 1>::from_data(TensorData::new(vec![sigma], [1]), &device)
+                .cast(execution_dtype);
+            let denoiser_input = BooguDenoiserInput {
+                latent: latents
+                    .as_ref()
+                    .expect("DMD latent is restored after every update")
+                    .clone(),
+                timestep,
+                instruction: input.instruction.clone(),
+                reference: input.reference.clone(),
+            };
+            if index == 0 {
+                denoiser.prepare_for_run(&denoiser_input)?;
+            }
+            let model_prediction = denoiser.predict(denoiser_input)?;
+            validate_tensor_dtype(
+                "denoiser prediction",
+                model_prediction.dtype(),
+                execution_dtype,
+            )?;
+            let current = latents
+                .take()
+                .expect("DMD latent is present before every update");
+            let mut updated = dmd_prediction(current, model_prediction, sigma);
+            if let Some(&next_sigma) = sigmas.get(index + 1) {
+                let noise = noises.next().expect("renoise count was validated");
+                updated = dmd_renoise(updated, noise, next_sigma);
+            }
+            latents = Some(updated);
+            after_step(index, sigma)?;
         }
-        after_step(index, sigma)?;
-    }
-    Ok(latents)
+        Ok(latents
+            .take()
+            .expect("the non-empty DMD schedule produced a final latent"))
+    })();
+    denoiser.finish_run();
+    result
 }
 
 fn validate_dmd_shapes<B: Backend>(input: &BooguDmdInput<B>) -> Result<(), BooguError> {
@@ -1919,6 +2133,53 @@ mod tests {
         fn predict(&mut self, _input: BooguDenoiserInput<B>) -> Result<Tensor<B, 4>, BooguError> {
             panic!("dtype validation must run before denoiser dispatch")
         }
+    }
+
+    #[derive(Default)]
+    struct RunLifecycleVelocity {
+        prepares: usize,
+        predictions: usize,
+        finishes: usize,
+    }
+
+    impl DmdDenoiser<B> for RunLifecycleVelocity {
+        fn prepare_for_run(&mut self, _input: &BooguDenoiserInput<B>) -> Result<(), BooguError> {
+            self.prepares += 1;
+            Ok(())
+        }
+
+        fn predict(&mut self, input: BooguDenoiserInput<B>) -> Result<Tensor<B, 4>, BooguError> {
+            self.predictions += 1;
+            Ok(input.latent)
+        }
+
+        fn finish_run(&mut self) {
+            self.finishes += 1;
+        }
+    }
+
+    #[test]
+    fn dmd_prepares_and_finishes_once_per_schedule_correctness() {
+        let device = Default::default();
+        let mut denoiser = RunLifecycleVelocity::default();
+        run_dmd(
+            &mut denoiser,
+            BooguDmdInput {
+                execution_dtype: DType::F32,
+                initial_latents: Tensor::ones([1, 16, 2, 2], &device),
+                instruction: Tensor::zeros([1, 2, 4096], &device),
+                reference: None,
+                renoise: (0..3)
+                    .map(|_| Tensor::zeros([1, 16, 2, 2], &device))
+                    .collect(),
+                schedule: DmdSchedule::upstream(BooguTask::Generate),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(denoiser.prepares, 1);
+        assert_eq!(denoiser.predictions, 4);
+        assert_eq!(denoiser.finishes, 1);
     }
 
     #[test]

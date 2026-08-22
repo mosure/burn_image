@@ -32,11 +32,11 @@ use cubek::matmul::{
 };
 use cubek::std::tile::Strided;
 
-// Two cooperative rows compile to 22,528 bytes of workgroup storage for the Qwen packed-Q4S
-// projections. WebGPU guarantees only 16 KiB. Selecting one row there preserves the cooperative
-// matrix path while reducing the compiled shared stage to the portable limit; adapters with the
-// larger effective limit keep the faster two-row launch.
-const QUANTIZED_CMMA_TWO_ROW_SHARED_MEMORY_BYTES: usize = 22_528;
+// One cooperative row requires 11,264 bytes of workgroup storage for the released packed-Q4S
+// projection geometries. WebGPU guarantees only 16 KiB, while native adapters commonly expose
+// enough space for two or four rows. Select the largest validated power-of-two row count that
+// fits the applied device limit instead of capping every native launch at two rows.
+const QUANTIZED_CMMA_ROW_SHARED_MEMORY_BYTES: usize = 11_264;
 const QUANTIZED_CMMA_TINY_SELECTION_ENABLED: bool = false;
 // WebGPU subgroup metadata is advisory unless the subgroup feature is enabled. Chrome can report
 // a minimum subgroup size of four while the ordinary portable device exposes no subgroup
@@ -50,10 +50,12 @@ const QUANTIZED_PORTABLE_UNIT_PLANE_DIM: u32 = 32;
 const QUANTIZED_PORTABLE_SHARED_ALIGNMENT_BYTES: usize = 128;
 
 const fn quantized_cmma_row_count(max_shared_memory_size: usize) -> u32 {
-    if max_shared_memory_size < QUANTIZED_CMMA_TWO_ROW_SHARED_MEMORY_BYTES {
-        1
-    } else {
+    if max_shared_memory_size >= QUANTIZED_CMMA_ROW_SHARED_MEMORY_BYTES * 4 {
+        4
+    } else if max_shared_memory_size >= QUANTIZED_CMMA_ROW_SHARED_MEMORY_BYTES * 2 {
         2
+    } else {
+        1
     }
 }
 
@@ -255,7 +257,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        QUANTIZED_CMMA_TINY_SELECTION_ENABLED, QUANTIZED_CMMA_TWO_ROW_SHARED_MEMORY_BYTES,
+        QUANTIZED_CMMA_ROW_SHARED_MEMORY_BYTES, QUANTIZED_CMMA_TINY_SELECTION_ENABLED,
         quantized_cmma_row_count, quantized_unit_tiling_shared_memory_bytes,
     };
     use cubek::matmul::definition::TilingScheme;
@@ -264,13 +266,14 @@ mod tests {
     fn quantized_portable_respects_webgpu_shared_memory_limit_correctness() {
         assert_eq!(quantized_cmma_row_count(16_384), 1);
         assert_eq!(
-            quantized_cmma_row_count(QUANTIZED_CMMA_TWO_ROW_SHARED_MEMORY_BYTES - 1),
+            quantized_cmma_row_count(QUANTIZED_CMMA_ROW_SHARED_MEMORY_BYTES * 2 - 1),
             1
         );
         assert_eq!(
-            quantized_cmma_row_count(QUANTIZED_CMMA_TWO_ROW_SHARED_MEMORY_BYTES),
+            quantized_cmma_row_count(QUANTIZED_CMMA_ROW_SHARED_MEMORY_BYTES * 2),
             2
         );
+        assert_eq!(quantized_cmma_row_count(49_152), 4);
         assert!(!QUANTIZED_CMMA_TINY_SELECTION_ENABLED);
     }
 

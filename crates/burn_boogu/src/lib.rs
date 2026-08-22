@@ -42,10 +42,11 @@ pub mod web_policy;
 pub mod wgpu_device;
 
 pub use config::{
-    BOOGU_1K_NATIVE_POLICY, BooguConfig, BooguTask, BooguVariant, EDIT_TURBO_1K5_NATIVE_POLICY,
-    NativeAutotunePolicy, NativeDenoiserAttentionPolicy, NativeDenoiserQkPreparationPolicy,
-    NativeDenoiserRmsNormPolicy, NativeHighVramPolicy, NativeQwenSynchronizationPolicy,
-    NativeVaeExecutionPolicy,
+    BOOGU_1K_NATIVE_POLICY, BOOGU_Q4_1K_NATIVE_POLICY, BooguConfig, BooguTask, BooguVariant,
+    EDIT_TURBO_1K5_NATIVE_POLICY, EDIT_TURBO_1K5_Q4_NATIVE_POLICY, NativeAutotunePolicy,
+    NativeDenoiserAttentionPolicy, NativeDenoiserAttentionPrecisionPolicy,
+    NativeDenoiserQkPreparationPolicy, NativeDenoiserRmsNormPolicy, NativeHighVramPolicy,
+    NativeQwenSynchronizationPolicy, NativeVaeExecutionPolicy,
 };
 pub use dmd::{DmdSchedule, dmd_prediction, dmd_renoise};
 pub use error::BooguError;

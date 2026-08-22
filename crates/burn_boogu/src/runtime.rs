@@ -10,9 +10,9 @@ use burn::{
     tensor::{DType, Tensor, TensorData},
 };
 use burn_image::{
-    GeneratedImage, ImageModel, ImageOutput, ImageRequest, InferenceContext, InputImage,
-    ModelDescriptor, ModelProvenance, NumericFormat, RuntimeError, Sha256Digest, StageTiming,
-    StageTimings,
+    Dimensions, GeneratedImage, ImageModel, ImageOutput, ImageRequest, InferenceContext,
+    InputImage, ModelDescriptor, ModelProvenance, NumericFormat, RuntimeError, Sha256Digest,
+    StageTiming, StageTimings,
 };
 use burn_qwen3_vl::{Qwen3VlImageProcessor, Qwen3VlProcessor, Qwen3VlTokenizer};
 use rand::SeedableRng;
@@ -160,6 +160,7 @@ pub struct BooguImageModel<B: Backend, T, E = ResidentBooguPipeline<B>> {
     device: B::Device,
     metadata: BooguRuntimeMetadata,
     conditioning_cache: Option<ConditioningCache<B>>,
+    reference_cache: Option<ReferenceCache<B>>,
     release_unused_memory_at_phase_boundaries: bool,
 }
 
@@ -173,6 +174,24 @@ struct ConditioningCacheKey {
 struct ConditioningCache<B: Backend> {
     key: ConditioningCacheKey,
     instruction: Tensor<B, 3>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReferenceCacheKey {
+    source: InputImage,
+    dimensions: Dimensions,
+    seed: u64,
+}
+
+struct ReferenceCache<B: Backend> {
+    key: ReferenceCacheKey,
+    latent: Tensor<B, 4>,
+}
+
+impl<B: Backend> ReferenceCache<B> {
+    fn latent_for(&self, key: &ReferenceCacheKey) -> Option<Tensor<B, 4>> {
+        (self.key == *key).then(|| self.latent.clone())
+    }
 }
 
 impl<B: Backend> ConditioningCache<B> {
@@ -205,6 +224,7 @@ where
             device,
             metadata,
             conditioning_cache: None,
+            reference_cache: None,
             release_unused_memory_at_phase_boundaries: false,
         })
     }
@@ -236,6 +256,7 @@ where
         // conditioning was produced by the previous pipeline state and must not survive that
         // mutation boundary.
         self.conditioning_cache = None;
+        self.reference_cache = None;
         &mut self.pipeline
     }
 
@@ -325,23 +346,43 @@ where
             self.release_unused_memory_at_phase_boundaries,
         )?;
 
-        let reference = if let Some(source) = source.as_ref() {
+        let reference = if let (Some(source), Some(source_identity)) =
+            (source.as_ref(), resolved.source.as_ref())
+        {
             context.check_cancelled().map_err(cancelled)?;
             context.stage_started("vae-encode", Some(1));
             let started = Instant::now();
-            let normalized = prepare_vae_reference::<B>(source, &self.device)?
-                .cast(self.metadata.execution_dtypes.vae);
-            let [_, _, height, width] = normalized.dims();
-            let epsilon = normal_tensor::<B, 4>(
-                [1, 16, height / 8, width / 8],
-                domain_seed(resolved.seed, 0x5641_452d_454e_434f),
-                self.metadata.execution_dtypes.vae,
-                &self.device,
-            );
-            let reference = self
-                .pipeline
-                .encode_reference(normalized, epsilon)?
-                .cast(self.metadata.execution_dtypes.denoiser);
+            let reference_key = ReferenceCacheKey {
+                source: source_identity.clone(),
+                dimensions: resolved.dimensions,
+                seed: resolved.seed,
+            };
+            let reference = if let Some(reference) = self
+                .reference_cache
+                .as_ref()
+                .and_then(|cached| cached.latent_for(&reference_key))
+            {
+                reference
+            } else {
+                let normalized = prepare_vae_reference::<B>(source, &self.device)?
+                    .cast(self.metadata.execution_dtypes.vae);
+                let [_, _, height, width] = normalized.dims();
+                let epsilon = normal_tensor::<B, 4>(
+                    [1, 16, height / 8, width / 8],
+                    domain_seed(resolved.seed, 0x5641_452d_454e_434f),
+                    self.metadata.execution_dtypes.vae,
+                    &self.device,
+                );
+                let reference = self
+                    .pipeline
+                    .encode_reference(normalized, epsilon)?
+                    .cast(self.metadata.execution_dtypes.denoiser);
+                self.reference_cache = Some(ReferenceCache {
+                    key: reference_key,
+                    latent: reference.clone(),
+                });
+                reference
+            };
             finish_stage::<B>(
                 &self.device,
                 context,
@@ -820,6 +861,38 @@ mod tests {
         let mut different_length = key;
         different_length.effective_length += 1;
         assert!(cache.instruction_for(&different_length).is_none());
+    }
+
+    #[test]
+    fn reference_cache_requires_exact_source_dimensions_and_seed_correctness() {
+        let device = Default::default();
+        let dimensions = Dimensions::new(8, 8).unwrap();
+        let source = InputImage::Pixels(
+            burn_image::PixelBuffer::new(
+                dimensions,
+                burn_image::PixelFormat::Rgb8,
+                burn_image::ColorSpace::Srgb,
+                vec![7; 8 * 8 * 3],
+            )
+            .unwrap(),
+        );
+        let key = ReferenceCacheKey {
+            source,
+            dimensions,
+            seed: 11,
+        };
+        let cache = ReferenceCache::<B> {
+            key: key.clone(),
+            latent: Tensor::ones([1, 16, 1, 1], &device),
+        };
+
+        assert!(cache.latent_for(&key).is_some());
+        let mut different_seed = key.clone();
+        different_seed.seed += 1;
+        assert!(cache.latent_for(&different_seed).is_none());
+        let mut different_dimensions = key;
+        different_dimensions.dimensions = Dimensions::new(16, 8).unwrap();
+        assert!(cache.latent_for(&different_dimensions).is_none());
     }
 
     #[cfg(feature = "burnpack")]

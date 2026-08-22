@@ -73,6 +73,24 @@ where
         if x.dtype == burn_backend::DType::F32 && requires_packed_f16_unpack(&weight) {
             return packed_f16_conv2d(x, weight, bias, options);
         }
+        // Native F16 VAE convolutions are substantially faster through the lower-memory CMMA
+        // implicit-GEMM path. Restrict the static choice to 2D groups=1 F16 inputs/weights and
+        // fall back when a particular geometry has no valid tile; 3D Qwen vision convolution and
+        // WebGPU retain the portable direct default.
+        #[cfg(not(target_arch = "wasm32"))]
+        if x.dtype == burn_backend::DType::F16
+            && weight.dtype == burn_backend::DType::F16
+            && options.groups == 1
+            && let Ok(output) = kernel::conv::conv_forward::<R, 2>(
+                x.clone(),
+                weight.clone(),
+                bias.clone(),
+                options.clone(),
+                kernel::conv::ConvStrategy::ImplicitGemm,
+            )
+        {
+            return output;
+        }
         kernel::conv::conv_forward::<R, 2>(x, weight, bias, options, Default::default()).unwrap()
     }
 

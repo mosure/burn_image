@@ -10534,6 +10534,198 @@ mod tests {
 
     #[cfg(all(feature = "burnpack", feature = "wgpu"))]
     #[test]
+    #[ignore = "opt-in representative native WGPU packed-Q4S denoiser matmul timing"]
+    fn packed_q4s_denoiser_geometry_wgpu_throughput_reference() {
+        use std::time::{Duration, Instant};
+
+        use burn::{
+            module::Param,
+            nn,
+            tensor::{Tensor, TensorData, backend::Backend as _},
+        };
+        use burn_cubecl::cubecl::Runtime;
+
+        type WgpuBackend = burn_wgpu::CubeBackend<burn_wgpu::WgpuRuntime, f32, i32, u32>;
+
+        const ROWS: usize = 9_261;
+        const INNER: usize = 3_360;
+        const OUTPUT: usize = 3_360;
+        const ATTEMPTS: usize = 3;
+
+        let device = crate::require_native_wgpu_device().expect("native hardware WGPU adapter");
+        let maximum_shared_memory = burn_wgpu::WgpuRuntime::client(&device)
+            .properties()
+            .hardware
+            .max_shared_memory_size;
+        let values = (0..INNER * OUTPUT)
+            .map(|index| {
+                let input = index / OUTPUT;
+                let output = index % OUTPUT;
+                (((input + output.wrapping_mul(3)) % 15) as f32 - 7.0) * (1.0 / 64.0)
+            })
+            .collect::<Vec<_>>();
+        let weight_data =
+            quantize_row_layout_q4s_block_up_to128_f32(TensorData::new(values, [INNER, OUTPUT]))
+                .expect("quantize representative denoiser projection");
+        let linear = nn::Linear {
+            weight: Param::from_tensor(Tensor::<WgpuBackend, 2>::from_data(weight_data, &device)),
+            bias: None,
+        };
+        let input = Tensor::<WgpuBackend, 2>::ones([ROWS, INNER], &device);
+        let warm = crate::model::linear::linear_forward(&linear, input.clone());
+        WgpuBackend::sync(&device).expect("warm representative Q4 projection");
+        drop(warm);
+
+        let mut fastest = Duration::MAX;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            let started = Instant::now();
+            let output = crate::model::linear::linear_forward(&linear, input.clone());
+            WgpuBackend::sync(&device).expect("time representative Q4 projection");
+            fastest = fastest.min(started.elapsed());
+            last = Some(output);
+        }
+        let operations = 2.0 * ROWS as f64 * INNER as f64 * OUTPUT as f64;
+        let throughput_tflops = operations / fastest.as_secs_f64() / 1.0e12;
+        eprintln!(
+            "packed-Q4S denoiser matmul {ROWS}x{INNER}x{OUTPUT}: {:.3} ms, {:.3} TFLOP/s, shared-memory={} bytes",
+            fastest.as_secs_f64() * 1_000.0,
+            throughput_tflops,
+            maximum_shared_memory,
+        );
+        assert!(throughput_tflops.is_finite() && throughput_tflops > 0.0);
+
+        let sample = last
+            .expect("at least one timing attempt")
+            .slice([0..1, 0..1])
+            .into_data()
+            .to_vec::<f32>()
+            .expect("representative Q4 output sample")[0];
+        assert!(sample.is_finite(), "unexpected sample {sample}");
+    }
+
+    #[cfg(all(feature = "burnpack", feature = "wgpu"))]
+    #[test]
+    #[ignore = "requires BURN_IMAGE_VAE_COMPONENT_ROOT and an explicitly selected native WGPU adapter"]
+    fn flux_vae_1k5_decoder_memory_policy_wgpu_throughput_reference() {
+        use std::{path::PathBuf, time::Instant};
+
+        use burn::tensor::{DType, Tensor, TensorData, backend::Backend as _};
+        use burn_flux_vae::{
+            AutoencoderKlConfig, DecoderGroupNormPolicy, FluxVaeArtifactFloatPolicy,
+            FluxVaeStageSource, VerifiedBurnpackFluxVaeStageSource,
+        };
+        use burn_image::DirectoryArtifactShardReader;
+
+        type WgpuBackend = crate::NativeWgpuBackend;
+
+        let root = PathBuf::from(
+            std::env::var_os("BURN_IMAGE_VAE_COMPONENT_ROOT")
+                .expect("set BURN_IMAGE_VAE_COMPONENT_ROOT to the sealed VAE component"),
+        );
+        let directory = burn_image::VerifiedArtifactDirectory::open(root.clone())
+            .expect("open sealed VAE component");
+        let config = AutoencoderKlConfig::from_diffusers_json(
+            &directory
+                .read_text("metadata/source/vae/config.json")
+                .expect("read sealed VAE configuration"),
+        )
+        .expect("parse sealed VAE configuration");
+        let device = crate::require_native_wgpu_device().expect("native hardware WGPU adapter");
+        let mut source = VerifiedBurnpackFluxVaeStageSource::<
+            WgpuBackend,
+            DirectoryArtifactShardReader,
+        >::from_directory(root, config, device.clone())
+        .expect("validate sealed VAE component")
+        .with_float_policy(FluxVaeArtifactFloatPolicy::Preserve);
+        let decoder = source.load_decoder().expect("load VAE decoder");
+        WgpuBackend::sync(&device).expect("finish VAE decoder upload");
+
+        let decoder_dtype: DType = decoder.decoder_float_dtype().into();
+        let input_shape = [1, 16, 192, 192];
+        let input_values = (0..input_shape.iter().product())
+            .map(|index| ((index * 29 % 257) as f32 - 128.0) / 128.0)
+            .collect::<Vec<_>>();
+        let make_input = || {
+            Tensor::<WgpuBackend, 4>::from_data(
+                TensorData::new(input_values.clone(), input_shape),
+                &device,
+            )
+            .cast(decoder_dtype)
+        };
+        let measure =
+            |label: &str,
+             decode: &mut dyn FnMut(Tensor<WgpuBackend, 4>) -> Tensor<WgpuBackend, 4>| {
+                WgpuBackend::memory_cleanup(&device);
+                WgpuBackend::sync(&device).expect("clean allocator before VAE timing");
+                let input = make_input();
+                WgpuBackend::sync(&device).expect("upload representative VAE input");
+                let started = Instant::now();
+                let output = decode(input);
+                WgpuBackend::sync(&device).expect("finish VAE timing");
+                let elapsed = started.elapsed();
+                assert_eq!(output.dims(), [1, 3, 1536, 1536]);
+                let sample = output
+                    .slice([0..1, 0..1, 0..1, 0..1])
+                    .into_data()
+                    .convert_dtype(DType::F32)
+                    .to_vec::<f32>()
+                    .expect("read VAE output sample")[0];
+                assert!(sample.is_finite(), "{label} produced {sample}");
+                eprintln!(
+                    "VAE 1536 decode {label}: {:.3} ms",
+                    elapsed.as_secs_f64() * 1_000.0
+                );
+            };
+
+        let mut exact_transient = |input| {
+            WgpuBackend::memory_persistent_allocations(&device, input, |input| {
+                decoder
+                    .decode_scaled_with_group_norm_policy_and_tail_barrier(
+                        input,
+                        DecoderGroupNormPolicy::F16StorageF32Accum,
+                        |device| {
+                            WgpuBackend::sync(device)
+                                .expect("finish VAE pre-tail exact-allocation work");
+                            WgpuBackend::memory_cleanup(device);
+                            WgpuBackend::sync(device)
+                                .expect("finish VAE pre-tail allocator cleanup");
+                            Ok::<(), core::convert::Infallible>(())
+                        },
+                    )
+                    .expect("exact transient VAE decode")
+            })
+        };
+        measure("exact-transient-tail-cleanup-cold", &mut exact_transient);
+        measure("exact-transient-tail-cleanup-warm", &mut exact_transient);
+        measure("backend-default", &mut |input| {
+            decoder.decode_scaled_with_group_norm_policy(
+                input,
+                DecoderGroupNormPolicy::F16StorageF32Accum,
+            )
+        });
+        measure("striped-per-stage-cleanup", &mut |input| {
+            WgpuBackend::memory_persistent_allocations(&device, input, |input| {
+                let input = decoder.unscale_latents(input);
+                let mut state = decoder.begin_decode_striped_tail_strict_f32(input, 768);
+                WgpuBackend::sync(&device).expect("finish striped VAE prefix");
+                WgpuBackend::memory_cleanup(&device);
+                let stage_count = decoder.decoder.striped_tail_stage_count();
+                let mut stages = 0_usize;
+                while !state.is_complete() {
+                    decoder.advance_decode_striped_tail_strict_f32(&mut state);
+                    WgpuBackend::sync(&device).expect("finish striped VAE stage");
+                    WgpuBackend::memory_cleanup(&device);
+                    stages += 1;
+                }
+                assert_eq!(stages, stage_count);
+                state.into_output()
+            })
+        });
+    }
+
+    #[cfg(all(feature = "burnpack", feature = "wgpu"))]
+    #[test]
     #[ignore = "requires BURN_BOOGU_HF_SNAPSHOT and an explicitly selected native WGPU adapter"]
     fn released_boogu_x_embedder_packed_q4s_wgpu_module_reference() {
         use std::{

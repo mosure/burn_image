@@ -17,8 +17,8 @@ use crate::{
         preferred_artifact_bundle_id, source_artifact_bundle_id,
     },
     config::{
-        BOOGU_1K_NATIVE_POLICY, EDIT_TURBO_1K5_NATIVE_POLICY, NativeAutotunePolicy,
-        NativeHighVramPolicy,
+        BOOGU_1K_NATIVE_POLICY, BOOGU_Q4_1K_NATIVE_POLICY, EDIT_TURBO_1K5_NATIVE_POLICY,
+        EDIT_TURBO_1K5_Q4_NATIVE_POLICY, NativeAutotunePolicy, NativeHighVramPolicy,
     },
     pipeline::VaeDecoderMemoryPolicy,
     processing::boogu_model_descriptor,
@@ -265,14 +265,19 @@ pub struct NativeResidentAllocationPolicy {
     pub phase_boundary_cleanup: bool,
 }
 
-/// Preserve resident model weights while bounding dead activation/workspace allocations.
+/// Preserve resident model weights while selecting the native high-residency allocation policy.
+///
+/// Packed Q4 uses exact transient VAE allocations with one safe pre-tail reclamation barrier. It
+/// deliberately retains the backend allocator cache between model phases so repeated interactive
+/// requests can reuse compatible GPU buffers instead of paying allocation and zeroing costs on
+/// every DMD/VAE boundary. Explicit low-VRAM execution owns its stricter cleanup policy separately.
 pub const fn native_resident_allocation_policy(
     profile: BooguStorageProfile,
 ) -> NativeResidentAllocationPolicy {
     if matches!(profile, BooguStorageProfile::Q4sBlockUpTo128F32) {
         NativeResidentAllocationPolicy {
-            vae_decoder: VaeDecoderMemoryPolicy::ExactStripedTailWithStageCleanup,
-            phase_boundary_cleanup: true,
+            vae_decoder: VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup,
+            phase_boundary_cleanup: false,
         }
     } else {
         NativeResidentAllocationPolicy {
@@ -299,6 +304,30 @@ pub const fn qualified_native_execution_policy(
         BooguVariant::Image01Turbo | BooguVariant::Image01EditTurbo => Some(BOOGU_1K_NATIVE_POLICY),
         BooguVariant::Image01EditTurbo1k5 => Some(EDIT_TURBO_1K5_NATIVE_POLICY),
     }
+}
+
+/// Resolve the production native execution controls for a released storage profile.
+///
+/// Mixed-F16 releases use their established exact policy. Packed-Q4S high-residency releases
+/// retain F32 residual arithmetic and select the explicit F32-to-F16 attention bridge; low-VRAM
+/// Q4S remains unsupported because its independent resource and numerical contract is absent.
+pub const fn native_execution_policy(
+    variant: BooguVariant,
+    residency: NativeBooguResidencyPolicy,
+    profile: BooguStorageProfile,
+) -> Option<NativeHighVramPolicy> {
+    if matches!(profile, BooguStorageProfile::Q4sBlockUpTo128F32) {
+        if !matches!(residency, NativeBooguResidencyPolicy::HighVram) {
+            return None;
+        }
+        return Some(match variant {
+            BooguVariant::Image01Turbo | BooguVariant::Image01EditTurbo => {
+                BOOGU_Q4_1K_NATIVE_POLICY
+            }
+            BooguVariant::Image01EditTurbo1k5 => EDIT_TURBO_1K5_Q4_NATIVE_POLICY,
+        });
+    }
+    qualified_native_execution_policy(variant, residency, profile)
 }
 
 /// Interactive 1K Edit query tile used by the explicitly unqualified balanced policy.
@@ -331,10 +360,10 @@ pub fn native_kernel_policy_label(
 ) -> String {
     let suffix = match variant {
         BooguVariant::Image01Turbo | BooguVariant::Image01EditTurbo => {
-            "1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum"
+            "1k-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-split-rows-q8192-rms-strict-f32-qk-balanced-strict-norm-rope/vae-q4096-f16-storage-f32-accum"
         }
         BooguVariant::Image01EditTurbo1k5 => {
-            "1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum"
+            "1k5-mixed-f16/qwen-q128/denoiser-padded-blackbox-p4-kv1-q1-split-rows-q16384-rms-strict-f32-qk-composed/vae-q4096-f16-storage-f32-accum"
         }
     };
     format!("{}/{suffix}", native_autotune_policy_label(autotune))
@@ -755,12 +784,28 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            native_execution_policy(
+                BooguVariant::Image01EditTurbo1k5,
+                NativeBooguResidencyPolicy::HighVram,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            Some(EDIT_TURBO_1K5_Q4_NATIVE_POLICY)
+        );
+        assert_eq!(
+            native_execution_policy(
+                BooguVariant::Image01EditTurbo1k5,
+                NativeBooguResidencyPolicy::LowVram,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            ),
+            None
+        );
         let allocation = native_resident_allocation_policy(BooguStorageProfile::Q4sBlockUpTo128F32);
         assert_eq!(
             allocation.vae_decoder,
-            VaeDecoderMemoryPolicy::ExactStripedTailWithStageCleanup
+            VaeDecoderMemoryPolicy::ExactTransientWithTailCleanup
         );
-        assert!(allocation.phase_boundary_cleanup);
+        assert!(!allocation.phase_boundary_cleanup);
     }
 
     #[test]

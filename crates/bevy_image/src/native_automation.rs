@@ -27,6 +27,8 @@ pub struct NativeAutomatedRun {
     pub report_path: PathBuf,
     pub timeout: Duration,
     pub show_window: bool,
+    /// Number of identical requests to execute against one retained runtime.
+    pub repeat: u16,
 }
 
 /// Submit a native request when the model becomes ready, save its PNG/report, and exit.
@@ -46,8 +48,10 @@ impl Plugin for NativeAutomatedRunPlugin {
             configuration: self.configuration.clone(),
             state: AutomatedRunState::WaitingForRuntime,
             progress: Vec::new(),
+            completed_runs: Vec::new(),
             started: Instant::now(),
             request_started: None,
+            runtime_ready_and_submit: None,
         })
         .add_systems(
             Update,
@@ -62,7 +66,7 @@ impl Plugin for NativeAutomatedRunPlugin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutomatedRunState {
     WaitingForRuntime,
-    Submitted(ImageJobId),
+    Submitted { id: ImageJobId, index: u16 },
     Finished,
 }
 
@@ -71,8 +75,10 @@ struct AutomatedRunHost {
     configuration: NativeAutomatedRun,
     state: AutomatedRunState,
     progress: Vec<ProgressEvent>,
+    completed_runs: Vec<serde_json::Value>,
     started: Instant,
     request_started: Option<Instant>,
+    runtime_ready_and_submit: Option<Duration>,
 }
 
 fn hide_automated_window(mut windows: Query<&mut Window, With<PrimaryWindow>>) {
@@ -105,10 +111,11 @@ fn drive_native_automated_run(
         );
         return;
     }
-    let active_id = match host.state {
-        AutomatedRunState::Submitted(id) => Some(id),
+    let active_submission = match host.state {
+        AutomatedRunState::Submitted { id, index } => Some((id, index)),
         AutomatedRunState::WaitingForRuntime | AutomatedRunState::Finished => None,
     };
+    let active_id = active_submission.map(|(id, _)| id);
     for update in progress.read() {
         if active_id == Some(update.id) {
             host.progress.push(update.event.clone());
@@ -149,12 +156,33 @@ fn drive_native_automated_run(
             );
             return;
         }
-        match finish_output(&host, completion.id, &completion.output) {
-            Ok(()) => {
-                host.state = AutomatedRunState::Finished;
-                exits.write(AppExit::Success);
+        if let Err(error) = validate_automated_output(&completion.output) {
+            finish_failure(&mut host, error, &mut exits);
+            return;
+        }
+        let (_, index) = active_submission.expect("completion belongs to active submission");
+        let run = automated_run_record(&host, index, completion.id, &completion.output);
+        if index + 1 < host.configuration.repeat {
+            host.completed_runs.push(run);
+            let id = jobs.reserve_id();
+            submit.write(SubmitImageJob {
+                id,
+                model: boogu_model_id(host.configuration.variant),
+                request: host.configuration.request.clone(),
+            });
+            host.request_started = Some(Instant::now());
+            host.state = AutomatedRunState::Submitted {
+                id,
+                index: index + 1,
+            };
+        } else {
+            match finish_output(&host, completion.id, &completion.output, run) {
+                Ok(()) => {
+                    host.state = AutomatedRunState::Finished;
+                    exits.write(AppExit::Success);
+                }
+                Err(error) => finish_failure(&mut host, error, &mut exits),
             }
-            Err(error) => finish_failure(&mut host, error, &mut exits),
         }
         return;
     }
@@ -184,7 +212,8 @@ fn drive_native_automated_run(
                 request: host.configuration.request.clone(),
             });
             host.request_started = Some(Instant::now());
-            host.state = AutomatedRunState::Submitted(id);
+            host.runtime_ready_and_submit = Some(host.started.elapsed());
+            host.state = AutomatedRunState::Submitted { id, index: 0 };
         }
         _ => {}
     }
@@ -194,13 +223,9 @@ fn finish_output(
     host: &AutomatedRunHost,
     job_id: ImageJobId,
     output: &burn_image::ImageOutput,
+    final_run: serde_json::Value,
 ) -> Result<(), String> {
-    output
-        .validate()
-        .map_err(|error| format!("automated output validation failed: {error}"))?;
-    if output.images.len() != 1 || output.images[0].index != 0 {
-        return Err("automated output must contain exactly image index zero".into());
-    }
+    validate_automated_output(output)?;
     let png = encode_host_image(&output.images[0].image, ImageEncoding::Png)
         .map_err(|error| format!("encode automated PNG: {error}"))?;
     write_atomic(&host.configuration.output_path, &png)?;
@@ -209,14 +234,22 @@ fn finish_output(
         .request_started
         .map(|started| started.elapsed().as_secs_f64() * 1_000.0);
     let startup_milliseconds = host
-        .request_started
-        .map(|started| started.duration_since(host.started).as_secs_f64() * 1_000.0);
+        .runtime_ready_and_submit
+        .map(|elapsed| elapsed.as_secs_f64() * 1_000.0);
+    let runs = host
+        .completed_runs
+        .iter()
+        .cloned()
+        .chain(std::iter::once(final_run))
+        .collect::<Vec<_>>();
     let report = serde_json::json!({
         "schema_version": 1,
         "test": "burn_image_native_automated_run",
         "ok": true,
         "job_id": job_id.0,
         "request": &host.configuration.request_identity,
+        "repeat": host.configuration.repeat,
+        "runs": runs,
         "output": {
             "path": output_path,
             "bytes": png.len(),
@@ -239,6 +272,34 @@ fn finish_output(
     Ok(())
 }
 
+fn validate_automated_output(output: &burn_image::ImageOutput) -> Result<(), String> {
+    output
+        .validate()
+        .map_err(|error| format!("automated output validation failed: {error}"))?;
+    if output.images.len() != 1 || output.images[0].index != 0 {
+        return Err("automated output must contain exactly image index zero".into());
+    }
+    Ok(())
+}
+
+fn automated_run_record(
+    host: &AutomatedRunHost,
+    index: u16,
+    job_id: ImageJobId,
+    output: &burn_image::ImageOutput,
+) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "residency": if index == 0 { "cold-kernels" } else { "warm-retained" },
+        "job_id": job_id.0,
+        "request_milliseconds": host.request_started.map(|started| {
+            started.elapsed().as_secs_f64() * 1_000.0
+        }),
+        "timings": &output.timings,
+        "seed": output.seed,
+    })
+}
+
 fn finish_failure(host: &mut AutomatedRunHost, error: String, exits: &mut MessageWriter<AppExit>) {
     if host.state == AutomatedRunState::Finished {
         return;
@@ -249,10 +310,12 @@ fn finish_failure(host: &mut AutomatedRunHost, error: String, exits: &mut Messag
         "ok": false,
         "failures": [&error],
         "request": &host.configuration.request_identity,
+        "repeat": host.configuration.repeat,
+        "completed_runs": &host.completed_runs,
         "progress_events": &host.progress,
         "host_timings": {
-            "runtime_ready_and_submit_milliseconds": host.request_started.map(|started| {
-                started.duration_since(host.started).as_secs_f64() * 1_000.0
+            "runtime_ready_and_submit_milliseconds": host.runtime_ready_and_submit.map(|elapsed| {
+                elapsed.as_secs_f64() * 1_000.0
             }),
             "request_milliseconds": host.request_started.map(|started| {
                 started.elapsed().as_secs_f64() * 1_000.0
