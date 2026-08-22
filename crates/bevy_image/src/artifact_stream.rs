@@ -1452,6 +1452,50 @@ impl BrowserArtifactTransferTracker {
         Ok(())
     }
 
+    /// Count exact logical objects whose verified device modules survived a model switch.
+    ///
+    /// Their physical parts were read and authenticated earlier in this same reader/cache
+    /// session. Seeding them into the new target denominator avoids presenting retained Qwen/VAE
+    /// modules as an unfinished download while the target loads only its missing stages.
+    fn mark_logical_objects_resident(
+        &mut self,
+        resident: &BTreeSet<ArtifactPath>,
+    ) -> Result<(), String> {
+        let known = self
+            .logical_objects
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let unknown = resident.difference(&known).cloned().collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "browser resident transfer handoff names unknown logical objects {unknown:?}"
+            ));
+        }
+        for logical in resident {
+            let parts = self.logical_parts.get(logical).ok_or_else(|| {
+                format!("browser resident logical object {logical} has no physical-part plan")
+            })?;
+            self.completed_logical_objects.insert(logical.clone());
+            for path in parts {
+                let part = self.physical_parts.get(path).ok_or_else(|| {
+                    format!("browser resident logical object {logical} names unknown part {path}")
+                })?;
+                if part.ranges != 1 {
+                    return Err(format!(
+                        "browser resident physical part {path} has {} ranges; expected one bounded complete-part read",
+                        part.ranges
+                    ));
+                }
+                self.completed_physical_parts.insert(path.clone());
+                if self.completed_ranges.insert((path.clone(), 0, part.size)) {
+                    self.loaded_bytes = self.loaded_bytes.saturating_add(part.size);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn object_started(&mut self, file: &ArtifactFile) {
         self.current_component = file.component.clone();
         if let Some(activity) = &mut self.request_activity {
@@ -1761,6 +1805,23 @@ impl BrowserArtifactControl {
             .snapshot()
     }
 
+    /// Begin a new selected-model transfer plan while preserving cache and traffic accounting.
+    ///
+    /// Model switching reuses shared Qwen/VAE readers and their cache session. The previous
+    /// model's progress denominator must not survive into the target closure, however, because
+    /// its unique denoiser objects are no longer live or relevant.
+    pub fn reset_transfer_plan(&self, phase: impl Into<String>) {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("browser artifact control mutex poisoned");
+        let mut transfer = BrowserArtifactTransferTracker::default();
+        transfer.set_phase(phase);
+        state.transfer = transfer;
+        state.events.clear();
+        state.active_loaded_bytes.clear();
+    }
+
     pub fn retain_transfer_logical_objects(
         &self,
         active: &BTreeSet<ArtifactPath>,
@@ -1770,6 +1831,18 @@ impl BrowserArtifactControl {
             .expect("browser artifact control mutex poisoned")
             .transfer
             .retain_logical_objects(active)
+            .map_err(BooguError::Artifact)
+    }
+
+    pub fn mark_transfer_logical_objects_resident(
+        &self,
+        resident: &BTreeSet<ArtifactPath>,
+    ) -> Result<(), BooguError> {
+        self.inner
+            .lock()
+            .expect("browser artifact control mutex poisoned")
+            .transfer
+            .mark_logical_objects_resident(resident)
             .map_err(BooguError::Artifact)
     }
 
@@ -3991,6 +4064,18 @@ mod tests {
         assert_eq!(active.physical_parts_total, 2);
         assert_eq!(active.bounded_ranges_total, 2);
         assert_eq!(active.total_bytes, 12);
+
+        // A model switch can transfer an already-authenticated shared component by device handle.
+        // Its target progress plan starts complete for that exact logical object/physical part;
+        // only the new pipeline object remains to load.
+        tracker
+            .mark_logical_objects_resident(&BTreeSet::from([active_qwen.clone()]))
+            .unwrap();
+        let retained = tracker.snapshot().unwrap();
+        assert_eq!(retained.logical_objects_completed, 1);
+        assert_eq!(retained.physical_parts_completed, 1);
+        assert_eq!(retained.bounded_ranges_completed, 1);
+        assert_eq!(retained.loaded_bytes, 4);
 
         for (bundle, layout, logical) in [
             (&pipeline.bundle, &pipeline_layout, active_pipeline),

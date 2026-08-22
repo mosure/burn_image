@@ -521,7 +521,16 @@ fn packed_f16_unpack_kernels_never_require_shader_f16_correctness() {
 }
 
 #[test]
-fn packed_f16_dispatch_covers_linear_embedding_and_convolution_correctness() {
+fn packed_f16_dispatch_covers_cast_linear_embedding_and_convolution_correctness() {
+    let cast = section(
+        BURN_CUBECL_TENSOR_OPS,
+        "    fn float_cast(",
+        "    fn float_unfold(",
+    );
+    assert!(cast.contains("dtype == FloatDType::F32"));
+    assert!(cast.contains("requires_packed_f16_unpack(&tensor)"));
+    assert!(cast.contains("return packed_f16_to_f32(tensor);"));
+
     let matmul = section(
         BURN_CUBECL_TENSOR_OPS,
         "    fn float_matmul(",

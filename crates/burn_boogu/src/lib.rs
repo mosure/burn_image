@@ -91,7 +91,8 @@ pub use pipeline::{
     AsyncBooguVaeStageSource, BooguDmdInput, BooguExecution, BooguPipelineOutput,
     BooguVaeStageSource, DmdDenoiser, ResidentBooguInput, ResidentBooguPipeline,
     RetainingAsyncBooguVaeStageSource, RetainingBooguVaeStageSource, StreamingBooguPipeline,
-    VaeDecoderMemoryPolicy, encode_instruction, encode_reference, run_dmd, run_dmd_with_observer,
+    VaeDecoderMemoryPolicy, encode_instruction, encode_reference,
+    encode_reference_with_activation_dtype, run_dmd, run_dmd_with_observer,
     trim_instruction_features,
 };
 #[cfg(feature = "burnpack")]

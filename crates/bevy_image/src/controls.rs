@@ -25,7 +25,6 @@ use crate::{
     REFERENCE_IMAGE_IO_ID,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::PrepareImageModel;
 
 #[cfg(any(target_arch = "wasm32", not(feature = "native-io")))]
@@ -83,22 +82,6 @@ pub struct ImageControlPanelState {
     size_index: usize,
     seed_valid: bool,
     model_switch_pending: bool,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-#[derive(Resource, Default)]
-struct BrowserModelSwitchState {
-    navigation: Option<crate::browser_boogu::BrowserModelSwitchTask>,
-    restore: BrowserEditContextRestoreState,
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-#[derive(Default)]
-enum BrowserEditContextRestoreState {
-    #[default]
-    Unchecked,
-    Loading(crate::browser_boogu::BrowserEditContextRestoreTask),
-    Complete,
 }
 
 #[derive(Resource, Default)]
@@ -348,12 +331,6 @@ impl Plugin for ImageControlPanelPlugin {
                 complete_browser_download,
                 dispatch_browser_ui_contract.after(update_action_availability),
             ),
-        );
-
-        #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-        app.init_resource::<BrowserModelSwitchState>().add_systems(
-            Update,
-            drive_browser_model_switch_handoff.before(update_action_availability),
         );
     }
 }
@@ -922,7 +899,26 @@ fn control_button_node() -> Node {
 fn dispatch_browser_ui_contract(
     runner: Res<ImageRunnerStatus>,
     editor: Res<ImageEditorState>,
+    model_dropdown: Res<ModelDropdownState>,
     input_focus: Res<InputFocus>,
+    model_buttons: Query<
+        (&ComputedNode, &UiGlobalTransform, Has<InteractionDisabled>),
+        (
+            With<ModelButton>,
+            Without<PromptInput>,
+            Without<SeedInput>,
+            Without<RunButton>,
+        ),
+    >,
+    model_options: Query<
+        (
+            &ModelOption,
+            &ComputedNode,
+            &UiGlobalTransform,
+            Has<InteractionDisabled>,
+        ),
+        (With<Button>, Without<ModelButton>),
+    >,
     prompts: Query<
         (
             Entity,
@@ -954,7 +950,7 @@ fn dispatch_browser_ui_contract(
             Without<RunButton>,
         ),
     >,
-    mut last_contract: Local<Option<(bool, bool, bool, bool, bool, bool, u32, u32)>>,
+    mut last_contract: Local<Option<(bool, bool, bool, bool, bool, bool, bool, bool, u32, u32)>>,
 ) {
     if !browser_model_smoke_requested() {
         return;
@@ -963,11 +959,13 @@ fn dispatch_browser_ui_contract(
         return;
     }
     let (
+        Ok((model_node, model_transform, model_disabled)),
         Ok((prompt_entity, prompt_node, prompt_transform, prompt_disabled)),
         Ok((seed_entity, seed_node, seed_transform, seed_disabled)),
         Ok((run_node, run_transform, run_disabled)),
         Ok((save_transform, save_disabled)),
     ) = (
+        model_buttons.single(),
         prompts.single(),
         seeds.single(),
         runs.single(),
@@ -979,13 +977,24 @@ fn dispatch_browser_ui_contract(
     // Save is deliberately hidden until an output exists. Initial Run automation must still
     // receive the prompt/seed/Run geometry; once an output is presented, the Save node becomes
     // non-empty and the changed contract emits its actionable geometry.
-    if prompt_node.is_empty() || seed_node.is_empty() || run_node.is_empty() {
+    if model_node.is_empty()
+        || prompt_node.is_empty()
+        || seed_node.is_empty()
+        || run_node.is_empty()
+    {
+        return;
+    }
+    // Opening the dropdown changes its child display state before Bevy computes their geometry.
+    // Wait one layout frame so automation never receives an unusable open contract and then
+    // suppresses the actionable coordinates as an apparent duplicate.
+    if model_dropdown.open && !model_options.iter().any(|(_, node, _, _)| !node.is_empty()) {
         return;
     }
     let (Some(model), Some(dimensions)) = (&editor.model, editor.options.dimensions) else {
         return;
     };
     let prompt_enabled = !prompt_disabled;
+    let model_enabled = !model_disabled;
     let seed_enabled = !seed_disabled;
     let prompt_focused = input_focus.get() == Some(prompt_entity);
     let seed_focused = input_focus.get() == Some(seed_entity);
@@ -998,12 +1007,15 @@ fn dispatch_browser_ui_contract(
         seed_focused,
         run_enabled,
         save_enabled,
+        model_enabled,
+        model_dropdown.open,
         dimensions.width(),
         dimensions.height(),
     );
     if last_contract.as_ref() == Some(&contract) {
         return;
     }
+    let model_center = model_transform.to_scale_angle_translation().2;
     let prompt_center = prompt_transform.to_scale_angle_translation().2;
     let seed_center = seed_transform.to_scale_angle_translation().2;
     let run_center = run_transform.to_scale_angle_translation().2;
@@ -1019,6 +1031,24 @@ fn dispatch_browser_ui_contract(
         set("model", model.as_str().into())?;
         set("width", dimensions.width().into())?;
         set("height", dimensions.height().into())?;
+        set("model_x", model_center.x.into())?;
+        set("model_y", model_center.y.into())?;
+        set("model_enabled", model_enabled.into())?;
+        set("model_dropdown_open", model_dropdown.open.into())?;
+        if model_dropdown.open {
+            for (option, node, transform, disabled) in &model_options {
+                if node.is_empty() {
+                    continue;
+                }
+                let center = transform.to_scale_angle_translation().2;
+                set(&format!("model_option_{}_x", option.index), center.x.into())?;
+                set(&format!("model_option_{}_y", option.index), center.y.into())?;
+                set(
+                    &format!("model_option_{}_enabled", option.index),
+                    (!disabled).into(),
+                )?;
+            }
+        }
         set("prompt_x", prompt_center.x.into())?;
         set("prompt_y", prompt_center.y.into())?;
         set("prompt_enabled", prompt_enabled.into())?;
@@ -1343,10 +1373,7 @@ fn handle_model_option(
     mut editor: ResMut<ImageEditorState>,
     mut panel: ResMut<ImageControlPanelState>,
     mut dropdown: ResMut<ModelDropdownState>,
-    #[cfg(not(target_arch = "wasm32"))] mut prepare: MessageWriter<PrepareImageModel>,
-    #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))] mut browser_switch: ResMut<
-        BrowserModelSwitchState,
-    >,
+    mut prepare: MessageWriter<PrepareImageModel>,
 ) {
     let Some(option) = interactions
         .iter()
@@ -1369,51 +1396,6 @@ fn handle_model_option(
     let target_mode = descriptor_mode(descriptor);
     let edit_context = model_switch_edit_context(&editor, &panel, target_mode);
 
-    #[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-    {
-        let edit_context_png = edit_context
-            .as_ref()
-            .map(|image| crate::encode_host_image(image, ImageEncoding::Png))
-            .transpose()
-            .map_err(|error| error.to_string());
-        let edit_context_png = match edit_context_png {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                panel.notice = format!(
-                    "Could not preserve the current output for the Edit model switch: {error}"
-                );
-                dropdown.open = false;
-                return;
-            }
-        };
-        match crate::browser_boogu::request_browser_model_release(&descriptor.id, edit_context_png)
-        {
-            Ok(Some(task)) => {
-                browser_switch.navigation = Some(task);
-                panel.model_switch_pending = true;
-                panel.notice = if edit_context.is_some() {
-                    format!(
-                        "Switching to {}; preserving the current image as its Edit reference while the previous model unloads",
-                        descriptor.display_name
-                    )
-                } else {
-                    format!(
-                        "Switching to {}; the previous browser model is unloading",
-                        descriptor.display_name
-                    )
-                };
-                dropdown.open = false;
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                panel.notice = error;
-                dropdown.open = false;
-                return;
-            }
-        }
-    }
-
     if let Some(image) = edit_context.as_ref() {
         replace_edit_reference(&mut editor, image);
     }
@@ -1422,35 +1404,21 @@ fn handle_model_option(
         editor.mode = mode;
     }
     apply_descriptor_size(descriptor, &mut editor, &mut panel);
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        prepare.write(PrepareImageModel {
-            model: descriptor.id.clone(),
-        });
-        panel.model_switch_pending = true;
-        panel.notice = if edit_context.is_some() && target_mode == Some(EditorMode::Edit) {
-            format!(
-                "Switching to {}; the current image remains in view as its Edit reference while the previous model unloads",
-                descriptor.display_name
-            )
-        } else {
-            format!(
-                "Switching to {}; unloading the previous model before loading the selected release",
-                descriptor.display_name
-            )
-        };
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        panel.notice = if edit_context.is_some() && target_mode == Some(EditorMode::Edit) {
-            format!(
-                "{} selected; the current image is its Edit reference and remains in view",
-                descriptor.display_name
-            )
-        } else {
-            format!("{} selected", descriptor.display_name)
-        };
-    }
+    prepare.write(PrepareImageModel {
+        model: descriptor.id.clone(),
+    });
+    panel.model_switch_pending = true;
+    panel.notice = if edit_context.is_some() && target_mode == Some(EditorMode::Edit) {
+        format!(
+            "Switching to {}; the current image remains in view as its Edit reference while compatible shared weights stay resident",
+            descriptor.display_name
+        )
+    } else {
+        format!(
+            "Switching to {}; releasing unique weights before loading the selected model",
+            descriptor.display_name
+        )
+    };
     dropdown.open = false;
 }
 
@@ -1510,58 +1478,6 @@ fn close_model_dropdown_on_outside_click(
         .any(|interaction| *interaction == Interaction::Pressed);
     if !clicked_selector {
         dropdown.open = false;
-    }
-}
-
-#[cfg(all(target_arch = "wasm32", feature = "boogu-web"))]
-fn drive_browser_model_switch_handoff(
-    mut state: ResMut<BrowserModelSwitchState>,
-    mut panel: ResMut<ImageControlPanelState>,
-    mut load: MessageWriter<LoadImageBytes>,
-) {
-    let navigation_failure = state
-        .navigation
-        .as_ref()
-        .and_then(crate::browser_boogu::BrowserModelSwitchTask::take_failure);
-    if let Some(error) = navigation_failure {
-        state.navigation = None;
-        panel.model_switch_pending = false;
-        panel.notice = error;
-    }
-
-    if matches!(state.restore, BrowserEditContextRestoreState::Unchecked) {
-        state.restore = match crate::browser_boogu::request_browser_edit_context_restore() {
-            Ok(Some(task)) => BrowserEditContextRestoreState::Loading(task),
-            Ok(None) => BrowserEditContextRestoreState::Complete,
-            Err(error) => {
-                panel.notice = error;
-                BrowserEditContextRestoreState::Complete
-            }
-        };
-    }
-
-    let restored = match &state.restore {
-        BrowserEditContextRestoreState::Loading(task) => task.try_take(),
-        BrowserEditContextRestoreState::Unchecked | BrowserEditContextRestoreState::Complete => {
-            None
-        }
-    };
-    let Some(restored) = restored else {
-        return;
-    };
-    state.restore = BrowserEditContextRestoreState::Complete;
-    match restored {
-        Ok(bytes) => {
-            load.write(LoadImageBytes {
-                id: REFERENCE_IMAGE_IO_ID,
-                bytes: bytes.into(),
-                encoding: Some(ImageEncoding::Png),
-            });
-            panel.notice = "Restoring the generated image as the Edit reference".into();
-        }
-        Err(error) => {
-            panel.notice = error;
-        }
     }
 }
 
@@ -3661,10 +3577,9 @@ mod tests {
             .0;
         let contract = include_str!("../tests/wasm_rendered_surface_contract.mjs");
         let harness = include_str!("../tests/wasm_rendered_surface_smoke.mjs");
-        assert!(
-            production_controls
-                .contains("prompt_node.is_empty() || seed_node.is_empty() || run_node.is_empty()")
-        );
+        for required_control in ["model_node", "prompt_node", "seed_node", "run_node"] {
+            assert!(production_controls.contains(&format!("{required_control}.is_empty()")));
+        }
         assert!(!production_controls.contains("|| save_node.is_empty()"));
         assert!(contract.contains(BROWSER_UI_CONTRACT_EVENT_NAME));
         assert!(harness.contains("UI_CONTRACT_EVENT_NAME"));

@@ -1,7 +1,8 @@
 use super::{expand, numeric, permute, unfold};
 use crate::CubeBackend;
 use crate::kernel::packed_f16::{
-    packed_f16_rhs_matmul, packed_f16_select_rows, requires_packed_f16_unpack,
+    packed_f16_rhs_matmul, packed_f16_select_rows, packed_f16_to_f32,
+    requires_packed_f16_unpack,
 };
 use crate::kernel::prng::{random_bernoulli, random_normal, random_uniform};
 use crate::kernel::unary_basic::BasicFloatUnaryKind;
@@ -694,6 +695,9 @@ where
     }
 
     fn float_cast(tensor: FloatTensor<Self>, dtype: FloatDType) -> FloatTensor<Self> {
+        if dtype == FloatDType::F32 && requires_packed_f16_unpack(&tensor) {
+            return packed_f16_to_f32(tensor);
+        }
         kernel::cast(tensor, dtype.into())
     }
 

@@ -275,6 +275,15 @@ impl FluxVaeComponentContract {
         &self.config
     }
 
+    /// Update exact attention partitioning for subsequently initialized halves.
+    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        assert!(
+            query_chunk_size > 0,
+            "attention query chunk must be non-zero"
+        );
+        self.config.attention_query_chunk_size = query_chunk_size;
+    }
+
     pub const fn max_shard_bytes(&self) -> u64 {
         self.max_shard_bytes
     }
@@ -465,6 +474,12 @@ impl<B: Backend, R: ArtifactShardReader> VerifiedBurnpackFluxVaeStageSource<B, R
         &mut self.reader
     }
 
+    /// Update exact attention partitioning for subsequently loaded halves.
+    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        self.contract
+            .set_attention_query_chunk_size(query_chunk_size);
+    }
+
     fn load_stage(&mut self, stage: &str) -> Result<AutoencoderKl<B>, FluxVaeArtifactError> {
         let files = self.contract.files(stage).to_vec();
         let expected = self.contract.expected(stage).clone();
@@ -557,6 +572,12 @@ impl<B: Backend, R: AsyncArtifactShardReader> VerifiedAsyncBurnpackFluxVaeStageS
 
     pub fn reader_mut(&mut self) -> &mut R {
         &mut self.reader
+    }
+
+    /// Update exact attention partitioning for subsequently loaded halves.
+    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        self.contract
+            .set_attention_query_chunk_size(query_chunk_size);
     }
 
     async fn load_stage(&mut self, stage: &str) -> Result<AutoencoderKl<B>, FluxVaeArtifactError> {

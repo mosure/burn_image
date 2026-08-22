@@ -44,8 +44,9 @@ use burn_boogu::{
         validate_canonical_release_artifact_digest,
     },
     boogu_model_descriptor, boogu_processor_config, decode_input_image,
-    decoder_output_data_to_host, dmd_prediction, dmd_renoise, encode_reference,
-    prepare_instruction, prepare_vae_reference, resolve_request, trim_instruction_features,
+    decoder_output_data_to_host, dmd_prediction, dmd_renoise,
+    encode_reference_with_activation_dtype, prepare_instruction, prepare_vae_reference,
+    resolve_request, trim_instruction_features,
     web_policy::{
         BrowserExecutionPolicy as BrowserExecutionPolicies,
         PACKED_F16_DMD_VAE_HANDOFF_POLICY as BROWSER_PACKED_F16_DMD_VAE_HANDOFF_POLICY,
@@ -91,9 +92,8 @@ use crate::{
     artifact_stream::{
         ArtifactStreamConfig, BrowserArtifactControl, BrowserArtifactEvent,
         BrowserArtifactTrafficSnapshot, BrowserPersistentCachePlan, BrowserStageShardReader,
-        MAX_BROWSER_MANIFEST_BYTES, artifact_progress_position, browser_cache_delete,
-        browser_cache_match, browser_cache_put, fetch_browser_bounded_file,
-        open_browser_artifact_cache, preflight_browser_persistent_cache, sibling_bundle_base_url,
+        MAX_BROWSER_MANIFEST_BYTES, artifact_progress_position, fetch_browser_bounded_file,
+        preflight_browser_persistent_cache, sibling_bundle_base_url,
     },
     browser_parity_fixture::{
         BrowserParityFixture, BrowserParityFixtureIdentity, BrowserParityVerificationSnapshot,
@@ -238,6 +238,21 @@ fn component_qwen_error(error: impl std::fmt::Display) -> BooguError {
 enum BrowserVerifiedVaeSource {
     Standalone(StandaloneBrowserVerifiedVaeSource),
     Component(ComponentBrowserVerifiedVaeSource),
+}
+
+impl BrowserVerifiedVaeSource {
+    fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        match self {
+            Self::Standalone(source) => {
+                source.set_attention_query_chunk_size(query_chunk_size);
+            }
+            Self::Component(source) => {
+                source
+                    .source_mut()
+                    .set_attention_query_chunk_size(query_chunk_size);
+            }
+        }
+    }
 }
 
 impl AsyncBooguVaeStageSource<BrowserBackend> for BrowserVerifiedVaeSource {
@@ -4978,6 +4993,8 @@ impl BrowserBooguFactory {
         let shared = Arc::new(Mutex::new(BrowserRuntimeShared {
             engine: None,
             active: Some((id, cancellation.clone())),
+            preparing: None,
+            preparation_events: VecDeque::new(),
             events: VecDeque::new(),
             diagnostic_console_progress: true,
             diagnostic_peak_wasm_linear_memory_bytes: wasm_linear_memory_bytes().unwrap_or(0),
@@ -5947,6 +5964,33 @@ struct BrowserBooguEngine {
     expected_weight_artifacts: BTreeMap<String, u64>,
     expected_vae_encoder_weight_artifacts: BTreeMap<String, u64>,
     verified_runtime_metadata: BTreeSet<String>,
+    qwen_component_bundle: String,
+    qwen_component_digest: Sha256Digest,
+    vae_component_bundle: String,
+    vae_component_digest: Sha256Digest,
+    inventory: BooguArtifactInventory,
+    settings: crate::BooguAdapterSettings,
+    allocation_device: Option<crate::backend::SharedWgpuAllocationDevice>,
+    reused_shared_components: bool,
+    reused_edit_components: bool,
+}
+
+/// Exact component residency transferred across one same-device browser model switch.
+///
+/// Qwen and VAE are shared component releases. The denoiser is intentionally absent so dropping
+/// the source engine retires all pipeline-unique buffers before the target denoiser preflight or
+/// load begins.
+struct BrowserSharedResidency {
+    qwen: Option<StreamingQwen3Vl<BrowserBackend, BrowserQwenSource>>,
+    vae: Option<BrowserVaeSource>,
+    qwen_component_bundle: String,
+    qwen_component_digest: Sha256Digest,
+    vae_component_bundle: String,
+    vae_component_digest: Sha256Digest,
+    retained_weight_bytes: u64,
+    retains_edit_stages: bool,
+    retained_logical_objects: BTreeSet<ArtifactPath>,
+    artifact_control: BrowserArtifactControl,
 }
 
 impl BrowserBooguEngine {
@@ -5959,7 +6003,35 @@ impl BrowserBooguEngine {
         allocation_device: Option<crate::backend::SharedWgpuAllocationDevice>,
         applied_buffer_limits: BrowserAppliedBufferLimits,
     ) -> Result<Self, RuntimeError> {
+        Self::build_with_shared_residency(
+            identity,
+            base_url,
+            settings,
+            policies,
+            device,
+            allocation_device,
+            applied_buffer_limits,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_with_shared_residency(
+        identity: BooguReleaseIdentity,
+        base_url: burn_image::RemoteBaseUrl,
+        settings: crate::BooguAdapterSettings,
+        policies: BrowserExecutionPolicies,
+        device: burn_wgpu::WgpuDevice,
+        allocation_device: Option<crate::backend::SharedWgpuAllocationDevice>,
+        applied_buffer_limits: BrowserAppliedBufferLimits,
+        mut shared: Option<BrowserSharedResidency>,
+    ) -> Result<Self, RuntimeError> {
         let variant = identity.variant;
+        let reused_shared_components = shared.is_some();
+        let reused_edit_components = shared
+            .as_ref()
+            .is_some_and(|shared| shared.retains_edit_stages);
         if !policies.packed_allocator_policy_is_exact() {
             return Err(execution_error(
                 variant,
@@ -6011,6 +6083,32 @@ impl BrowserBooguEngine {
         report_browser_manifest_verified(&manifest);
         let composition =
             BrowserArtifactComposition::resolve(variant, manifest, base_url, stream_config).await?;
+        let qwen_component_digest = composition.qwen_manifest.content_digest.ok_or_else(|| {
+            execution_error(
+                variant,
+                "sealed Qwen component manifest omits its content digest",
+            )
+        })?;
+        let vae_component_digest = composition.vae_manifest.content_digest.ok_or_else(|| {
+            execution_error(
+                variant,
+                "sealed VAE component manifest omits its content digest",
+            )
+        })?;
+        let qwen_component_bundle = composition.qwen_manifest.bundle.to_string();
+        let vae_component_bundle = composition.vae_manifest.bundle.to_string();
+        if let Some(shared) = shared.as_ref()
+            && (composition.standalone
+                || shared.qwen_component_bundle != qwen_component_bundle
+                || shared.qwen_component_digest != qwen_component_digest
+                || shared.vae_component_bundle != vae_component_bundle
+                || shared.vae_component_digest != vae_component_digest)
+        {
+            return Err(execution_error(
+                variant,
+                "browser model switch cannot retain Qwen/VAE buffers because the target component identities differ",
+            ));
+        }
         let expected_weight_artifacts = if composition.standalone {
             active_manifest_weight_artifacts(&composition.pipeline_manifest, false, variant)
         } else {
@@ -6062,7 +6160,14 @@ impl BrowserBooguEngine {
             ));
         }
 
-        let bootstrap_control = BrowserArtifactControl::default();
+        let bootstrap_control = shared
+            .as_ref()
+            .map_or_else(BrowserArtifactControl::default, |shared| {
+                shared.artifact_control.clone()
+            });
+        if shared.is_some() {
+            bootstrap_control.reset_transfer_plan("Switching selected model");
+        }
         bootstrap_control.set_transfer_phase("Model setup");
         let bootstrap_progress_control = bootstrap_control.clone();
         bootstrap_control.set_observer(Some(Arc::new(move |event| {
@@ -6124,6 +6229,16 @@ impl BrowserBooguEngine {
         bootstrap_control
             .retain_transfer_logical_objects(&active_transfer_objects)
             .map_err(|error| execution_error(variant, error))?;
+        if let Some(shared) = shared.as_ref() {
+            let retained = shared
+                .retained_logical_objects
+                .intersection(&active_transfer_objects)
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            bootstrap_control
+                .mark_transfer_logical_objects_resident(&retained)
+                .map_err(|error| execution_error(variant, error))?;
+        }
         if variant == BooguVariant::Image01Turbo
             && settings.storage_profile == BooguStorageProfile::F16QwenVisionF32
             && !composition.standalone
@@ -6261,6 +6376,7 @@ impl BrowserBooguEngine {
         if variant == BooguVariant::Image01EditTurbo1k5 {
             vae_config.attention_query_chunk_size = BROWSER_1K5_VAE_QUERY_CHUNK_SIZE;
         }
+        let vae_attention_query_chunk_size = vae_config.attention_query_chunk_size;
         let denoiser_config = BooguConfig::default();
         let inventory = BooguArtifactInventory::new(&qwen_config, &denoiser_config, &vae_config)
             .map_err(|error| execution_error(variant, error))?;
@@ -6359,10 +6475,22 @@ impl BrowserBooguEngine {
             });
         match (allocation_device.as_ref(), vram_preflight) {
             (Some(allocation_device), Some((policy, required_device_bytes))) => {
+                let additional_device_bytes = if let Some(shared) = shared.as_ref() {
+                    required_device_bytes
+                        .checked_sub(shared.retained_weight_bytes)
+                        .ok_or_else(|| {
+                            execution_error(
+                                variant,
+                                "retained shared-component bytes exceed the target resident resource plan",
+                            )
+                        })?
+                } else {
+                    required_device_bytes
+                };
                 run_browser_vram_preflight(
                     variant,
                     policy,
-                    required_device_bytes,
+                    additional_device_bytes,
                     applied_buffer_limits.max_buffer_size,
                     allocation_device,
                 )
@@ -6418,9 +6546,14 @@ impl BrowserBooguEngine {
                 "streaming Qwen allocator/embedding/synchronization provenance differs from the admitted browser policy",
             ));
         }
-        if variant == BooguVariant::Image01EditTurbo1k5 {
-            qwen.set_query_chunk_size(BROWSER_1K5_QWEN_QUERY_CHUNK_SIZE);
+        if let Some(retained) = shared.as_mut().and_then(|shared| shared.qwen.take()) {
+            qwen = retained;
         }
+        qwen.set_query_chunk_size(if variant == BooguVariant::Image01EditTurbo1k5 {
+            BROWSER_1K5_QWEN_QUERY_CHUNK_SIZE
+        } else {
+            128
+        });
         let verified_vae_source = if composition.standalone {
             BrowserVerifiedVaeSource::Standalone(
                 VerifiedAsyncBurnpackVaeStageSource::new(
@@ -6446,17 +6579,24 @@ impl BrowserBooguEngine {
             BrowserVerifiedVaeSource::Component(AsyncFluxVaeStageSourceAdapter::new(source))
         };
         let vae_source = BrowserAsyncStageSource::new(verified_vae_source, synchronizer.clone());
-        let vae = if policies.retain_vae_stages {
+        let mut vae = if policies.retain_vae_stages {
             RetainingAsyncBooguVaeStageSource::new(vae_source)
         } else {
             RetainingAsyncBooguVaeStageSource::passthrough(vae_source)
         };
+        if let Some(retained) = shared.as_mut().and_then(|shared| shared.vae.take()) {
+            vae = retained;
+        }
+        vae.set_cached_attention_query_chunk_size(vae_attention_query_chunk_size);
+        vae.source_mut()
+            .inner_mut()
+            .set_attention_query_chunk_size(vae_attention_query_chunk_size);
         let verified_denoiser_source = if policies.uses_packed_f16_denoiser_source() {
             BrowserVerifiedDenoiserSource::PackedF16(
                 VerifiedAsyncPackedF16DenoiserStageSource::new(
                     &identity,
                     composition.pipeline_manifest,
-                    inventory,
+                    inventory.clone(),
                     denoiser_config.clone(),
                     profile,
                     device.clone(),
@@ -6470,7 +6610,7 @@ impl BrowserBooguEngine {
                 VerifiedAsyncBurnpackDenoiserStageSource::new(
                     &identity,
                     composition.pipeline_manifest,
-                    inventory,
+                    inventory.clone(),
                     denoiser_config.clone(),
                     profile,
                     device.clone(),
@@ -6558,6 +6698,15 @@ impl BrowserBooguEngine {
             expected_weight_artifacts,
             expected_vae_encoder_weight_artifacts,
             verified_runtime_metadata,
+            qwen_component_bundle,
+            qwen_component_digest,
+            vae_component_bundle,
+            vae_component_digest,
+            inventory,
+            settings,
+            allocation_device,
+            reused_shared_components,
+            reused_edit_components,
         };
         if policies.eager_preload {
             engine.preload_resident_weights().await.map_err(|error| {
@@ -6579,6 +6728,155 @@ impl BrowserBooguEngine {
         engine.artifact_control.set_observer(None);
         engine.artifact_control.clear_events();
         Ok(engine)
+    }
+
+    /// Switch canonical Q4 releases on the same WebGPU device without duplicating shared models.
+    ///
+    /// The source denoiser is dropped before target preflight. Exact Qwen/VAE component identities
+    /// are retained by handle, and Edit-only visual/encoder stages are pruned when Generate is the
+    /// target. The target build then loads only its unique denoiser plus any missing shared stage.
+    async fn switch_to(mut self, target: BooguVariant) -> Result<Self, RuntimeError> {
+        let source = self.identity.variant;
+        if source == target {
+            return Ok(self);
+        }
+        if self.settings.storage_profile != BooguStorageProfile::Q4sBlockUpTo128F32
+            || !browser_release_switching_enabled()
+        {
+            return Err(execution_error(
+                target,
+                "same-page browser switching requires canonical resident Q4 releases",
+            ));
+        }
+        let expected_qwen_stages = self.expected_qwen_resident_stage_count();
+        if self.qwen.source.cached_stage_count() != expected_qwen_stages {
+            return Err(execution_error(
+                target,
+                format!(
+                    "source browser release has {} retained Qwen stages, expected {expected_qwen_stages}; refusing an incomplete shared-residency handoff",
+                    self.qwen.source.cached_stage_count()
+                ),
+            ));
+        }
+        let expected_vae_halves = if source.is_edit() { 2 } else { 1 };
+        if self.vae.cached_stage_count() != expected_vae_halves {
+            return Err(execution_error(
+                target,
+                format!(
+                    "source browser release has {} retained VAE halves, expected {expected_vae_halves}; refusing an incomplete shared-residency handoff",
+                    self.vae.cached_stage_count()
+                ),
+            ));
+        }
+
+        report_browser_runtime_preparing(format!(
+            "Switching model: synchronizing {source:?} before releasing unique weights"
+        ));
+        self.qwen
+            .source
+            .synchronize_pending()
+            .await
+            .map_err(|error| map_boogu(source, error))?;
+        self.denoiser
+            .source_mut()
+            .synchronize_pending()
+            .await
+            .map_err(|error| map_boogu(source, error))?;
+        self.vae
+            .synchronize()
+            .await
+            .map_err(|error| map_boogu(source, error))?;
+        BrowserAsyncSynchronizer::new(&self.device)
+            .synchronize("browser model-switch source retirement")
+            .await
+            .map_err(|error| map_boogu(source, error))?;
+
+        if !target.is_edit() {
+            self.qwen.source.clear_vision_stages();
+            self.vae.clear_encoder();
+        }
+        let shared_variant = browser_shared_residency_variant(source, target);
+        let retained_weight_bytes = self
+            .inventory
+            .packed_q4_shared_resident_footprint(
+                shared_variant,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            )
+            .map_err(|error| execution_error(target, error))?
+            .total_payload_bytes;
+        let qwen_prefix = format!("{}/", self.qwen_component_bundle);
+        let vae_prefix = format!("{}/", self.vae_component_bundle);
+        let retained_logical_objects = self
+            .expected_weight_artifacts
+            .keys()
+            .filter(|path| path.starts_with(&qwen_prefix) || path.starts_with(&vae_prefix))
+            .map(|path| {
+                ArtifactPath::new(path.clone()).map_err(|error| execution_error(target, error))
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+
+        let BrowserBooguEngine {
+            qwen,
+            vae,
+            denoiser,
+            artifact_control,
+            device,
+            applied_buffer_limits,
+            qwen_component_bundle,
+            qwen_component_digest,
+            vae_component_bundle,
+            vae_component_digest,
+            mut settings,
+            allocation_device,
+            ..
+        } = self;
+        drop(denoiser);
+        report_browser_runtime_preparing(format!(
+            "Switching model: released {source:?} unique denoiser weights; retaining compatible Qwen/VAE stages"
+        ));
+        release_browser_phase_allocator(
+            target,
+            &device,
+            "browser model-switch denoiser retirement",
+        )
+        .await?;
+
+        let target_url =
+            crate::boogu::boogu_cdn_base_url(target, BooguStorageProfile::Q4sBlockUpTo128F32)
+                .ok_or_else(|| {
+                    execution_error(target, "canonical Q4 CDN release is unavailable")
+                })?;
+        let base_url =
+            RemoteBaseUrl::new(&target_url).map_err(|error| execution_error(target, error))?;
+        settings.artifact_source = burn_image::ArtifactSource::Remote {
+            base_url: base_url.clone(),
+        };
+        let policies = BrowserExecutionPolicies::resident_packed_q4s(target, &settings)
+            .map_err(|error| execution_error(target, error))?
+            .for_ordinary_browser_factory(crate::boogu::browser_surface_inference_gate_requested());
+        let shared = BrowserSharedResidency {
+            qwen: Some(qwen),
+            vae: Some(vae),
+            qwen_component_bundle,
+            qwen_component_digest,
+            vae_component_bundle,
+            vae_component_digest,
+            retained_weight_bytes,
+            retains_edit_stages: source.is_edit() && target.is_edit(),
+            retained_logical_objects,
+            artifact_control,
+        };
+        Self::build_with_shared_residency(
+            BooguReleaseIdentity::canonical(target),
+            base_url,
+            settings,
+            policies,
+            device,
+            allocation_device,
+            applied_buffer_limits,
+            Some(shared),
+        )
+        .await
     }
 
     fn expected_qwen_resident_stage_count(&self) -> usize {
@@ -6713,7 +7011,7 @@ impl BrowserBooguEngine {
             .source_mut()
             .set_qwen_resident_preload(true);
 
-        if !self.policies.uses_host_routed_qwen_embedding() {
+        if !self.reused_shared_components && !self.policies.uses_host_routed_qwen_embedding() {
             for spec in self.qwen.plan.embedding_rows.chunks.clone() {
                 drop(
                     self.qwen
@@ -6725,7 +7023,7 @@ impl BrowserBooguEngine {
                 self.synchronize_preloaded_qwen_stage().await?;
             }
         }
-        if variant.is_edit() {
+        if variant.is_edit() && !self.reused_edit_components {
             drop(
                 self.qwen
                     .source
@@ -6768,31 +7066,33 @@ impl BrowserBooguEngine {
             );
             self.synchronize_preloaded_qwen_stage().await?;
         }
-        for index in 0..self.qwen_config.text_config.num_hidden_layers {
+        if !self.reused_shared_components {
+            for index in 0..self.qwen_config.text_config.num_hidden_layers {
+                drop(
+                    self.qwen
+                        .source
+                        .load_text_block(index)
+                        .await
+                        .map_err(|error| map_boogu(variant, error))?,
+                );
+                self.synchronize_preloaded_qwen_stage().await?;
+            }
             drop(
                 self.qwen
                     .source
-                    .load_text_block(index)
+                    .load_text_final_norm()
                     .await
                     .map_err(|error| map_boogu(variant, error))?,
             );
             self.synchronize_preloaded_qwen_stage().await?;
         }
-        drop(
-            self.qwen
-                .source
-                .load_text_final_norm()
-                .await
-                .map_err(|error| map_boogu(variant, error))?,
-        );
-        self.synchronize_preloaded_qwen_stage().await?;
         self.finish_preloaded_qwen_uploads().await?;
         self.qwen
             .source
             .source_mut()
             .set_qwen_resident_preload(false);
 
-        if variant.is_edit() {
+        if variant.is_edit() && !self.reused_edit_components {
             drop(
                 self.vae
                     .load_encoder()
@@ -6804,16 +7104,18 @@ impl BrowserBooguEngine {
                 .await
                 .map_err(|error| map_boogu(variant, error))?;
         }
-        drop(
+        if !self.reused_shared_components {
+            drop(
+                self.vae
+                    .load_decoder()
+                    .await
+                    .map_err(|error| map_boogu(variant, error))?,
+            );
             self.vae
-                .load_decoder()
+                .synchronize()
                 .await
-                .map_err(|error| map_boogu(variant, error))?,
-        );
-        self.vae
-            .synchronize()
-            .await
-            .map_err(|error| map_boogu(variant, error))?;
+                .map_err(|error| map_boogu(variant, error))?;
+        }
 
         drop(
             self.denoiser
@@ -9084,10 +9386,15 @@ impl BrowserBooguEngine {
                 job.variant,
                 "loaded VAE encoder",
                 loaded_dtype,
-                self.dtypes.vae,
+                self.policies.vae_parameter_dtype(),
             )?;
-            let reference = encode_reference(&encoder, normalized, epsilon)
-                .map_err(|error| map_boogu(job.variant, error))?;
+            let reference = encode_reference_with_activation_dtype(
+                &encoder,
+                normalized,
+                epsilon,
+                self.dtypes.vae,
+            )
+            .map_err(|error| map_boogu(job.variant, error))?;
             self.vae
                 .synchronize()
                 .await
@@ -10504,6 +10811,8 @@ struct BrowserBooguRuntime {
 struct BrowserRuntimeShared {
     engine: Option<BrowserBooguEngine>,
     active: Option<(ImageJobId, CancellationToken)>,
+    preparing: Option<BooguVariant>,
+    preparation_events: VecDeque<crate::boogu::BooguRuntimePreparationEvent>,
     events: VecDeque<ImageRunnerEvent>,
     diagnostic_console_progress: bool,
     diagnostic_peak_wasm_linear_memory_bytes: u64,
@@ -10517,6 +10826,8 @@ impl BrowserBooguRuntime {
             shared: Arc::new(Mutex::new(BrowserRuntimeShared {
                 engine: Some(engine),
                 active: None,
+                preparing: None,
+                preparation_events: VecDeque::new(),
                 events: VecDeque::new(),
                 diagnostic_console_progress: false,
                 diagnostic_peak_wasm_linear_memory_bytes: 0,
@@ -10532,254 +10843,15 @@ fn browser_release_switching_enabled() -> bool {
         .is_some_and(|params| !params.has("artifacts") && !params.has("headless"))
 }
 
-const BROWSER_EDIT_CONTEXT_QUERY: &str = "edit-context-sha256";
-const BROWSER_EDIT_CONTEXT_BYTES_QUERY: &str = "edit-context-bytes";
-const BROWSER_EDIT_CONTEXT_CACHE: &str = "burn-image-edit-context-v1";
-const BROWSER_EDIT_CONTEXT_MAX_BYTES: u64 = 64 * 1024 * 1024;
-
-/// Pending browser navigation after a generated image has been committed to a one-shot handoff.
-///
-/// Success unloads the page, so only a failure can become observable to the originating Bevy app.
-pub(crate) struct BrowserModelSwitchTask {
-    failure: Arc<Mutex<Option<String>>>,
-}
-
-impl BrowserModelSwitchTask {
-    pub(crate) fn take_failure(&self) -> Option<String> {
-        self.failure.lock().ok()?.take()
+const fn browser_shared_residency_variant(
+    source: BooguVariant,
+    target: BooguVariant,
+) -> BooguVariant {
+    if source.is_edit() && target.is_edit() {
+        target
+    } else {
+        BooguVariant::Image01Turbo
     }
-}
-
-/// One-shot generated-image restoration owned by the destination Edit page.
-type BrowserEditContextRestoreSlot = Arc<Mutex<Option<Result<Vec<u8>, String>>>>;
-type BrowserEditContextRestoreRequest = Result<Option<BrowserEditContextRestoreTask>, String>;
-
-pub(crate) struct BrowserEditContextRestoreTask {
-    result: BrowserEditContextRestoreSlot,
-}
-
-impl BrowserEditContextRestoreTask {
-    pub(crate) fn try_take(&self) -> Option<Result<Vec<u8>, String>> {
-        self.result.lock().ok()?.take()
-    }
-}
-
-fn browser_edit_context_cache_key(digest: Sha256Digest) -> String {
-    format!(
-        "https://burn-image.invalid/.well-known/edit-context/v1/{}.png",
-        digest.to_hex()
-    )
-}
-
-fn browser_model_switch_js_error(operation: &str, value: wasm_bindgen::JsValue) -> String {
-    let detail = value.as_string().unwrap_or_else(|| format!("{value:?}"));
-    format!("browser model switch {operation} failed: {detail}")
-}
-
-async fn store_browser_edit_context(bytes: &[u8], digest: Sha256Digest) -> Result<(), String> {
-    let byte_count = u64::try_from(bytes.len())
-        .map_err(|_| "browser Edit context byte length does not fit u64".to_owned())?;
-    if byte_count == 0 || byte_count > BROWSER_EDIT_CONTEXT_MAX_BYTES {
-        return Err(format!(
-            "browser Edit context must contain 1..={BROWSER_EDIT_CONTEXT_MAX_BYTES} PNG bytes, found {byte_count}"
-        ));
-    }
-    let cache = open_browser_artifact_cache(BROWSER_EDIT_CONTEXT_CACHE)
-        .await
-        .map_err(|error| format!("browser model switch handoff cache open failed: {error}"))?;
-    browser_cache_put(
-        &cache,
-        BROWSER_EDIT_CONTEXT_CACHE,
-        &browser_edit_context_cache_key(digest),
-        bytes,
-    )
-    .await
-    .map_err(|error| format!("browser model switch handoff cache write failed: {error}"))
-}
-
-async fn read_browser_edit_context(
-    digest: Sha256Digest,
-    expected_bytes: u64,
-) -> Result<Vec<u8>, String> {
-    if expected_bytes == 0 || expected_bytes > BROWSER_EDIT_CONTEXT_MAX_BYTES {
-        return Err(format!(
-            "browser Edit context length must be within 1..={BROWSER_EDIT_CONTEXT_MAX_BYTES}, found {expected_bytes}"
-        ));
-    }
-    let cache = open_browser_artifact_cache(BROWSER_EDIT_CONTEXT_CACHE)
-        .await
-        .map_err(|error| format!("browser model switch handoff cache open failed: {error}"))?;
-    let key = browser_edit_context_cache_key(digest);
-    let read = browser_cache_match(&cache, BROWSER_EDIT_CONTEXT_CACHE, &key, expected_bytes)
-        .await
-        .map_err(|error| format!("browser model switch handoff cache read failed: {error}"))?
-        .ok_or_else(|| {
-            "The generated image handoff is missing; select the Edit model again".to_owned()
-        })
-        .and_then(|bytes| {
-            if bytes.is_empty() {
-                return Err("browser Edit context has an invalid cached representation".into());
-            }
-            if Sha256Digest::calculate(&bytes) != digest {
-                return Err("browser Edit context failed its SHA-256 check".into());
-            }
-            Ok(bytes)
-        });
-
-    let deleted = browser_cache_delete(&cache, BROWSER_EDIT_CONTEXT_CACHE, &key)
-        .await
-        .map_err(|error| format!("browser model switch handoff cache cleanup failed: {error}"))?;
-    if !deleted && read.is_ok() {
-        return Err("browser Edit context could not be removed after its one-shot read".into());
-    }
-    read
-}
-
-fn remove_browser_edit_context_query(window: &web_sys::Window) -> Result<(), String> {
-    let href = window
-        .location()
-        .href()
-        .map_err(|error| browser_model_switch_js_error("handoff URL read", error))?;
-    let url = web_sys::Url::new(&href)
-        .map_err(|error| browser_model_switch_js_error("handoff URL parse", error))?;
-    url.search_params().delete(BROWSER_EDIT_CONTEXT_QUERY);
-    url.search_params().delete(BROWSER_EDIT_CONTEXT_BYTES_QUERY);
-    window
-        .history()
-        .map_err(|error| browser_model_switch_js_error("handoff history access", error))?
-        .replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url.href()))
-        .map_err(|error| browser_model_switch_js_error("handoff URL cleanup", error))
-}
-
-/// Begins a one-shot read of the generated image carried across a browser model-release reload.
-pub(crate) fn request_browser_edit_context_restore() -> BrowserEditContextRestoreRequest {
-    let window = web_sys::window().ok_or_else(|| "browser Window is unavailable".to_owned())?;
-    let search = window
-        .location()
-        .search()
-        .map_err(|error| browser_model_switch_js_error("handoff query read", error))?;
-    let params = web_sys::UrlSearchParams::new_with_str(&search)
-        .map_err(|error| browser_model_switch_js_error("handoff query parse", error))?;
-    let expected = match (
-        params.get(BROWSER_EDIT_CONTEXT_QUERY),
-        params.get(BROWSER_EDIT_CONTEXT_BYTES_QUERY),
-    ) {
-        (None, None) => return Ok(None),
-        (Some(digest), Some(bytes)) => (digest, bytes),
-        _ => return Err("browser Edit context query is incomplete".into()),
-    };
-    if !matches!(
-        params.get("variant").as_deref(),
-        Some("edit-turbo" | "edit-turbo-1k5")
-    ) {
-        return Err("browser Edit context is present on a non-Edit model release".into());
-    }
-    let digest = Sha256Digest::from_hex(&expected.0)
-        .map_err(|error| format!("browser Edit context digest is invalid: {error}"))?;
-    if digest.to_hex() != expected.0 {
-        return Err("browser Edit context digest must use canonical lowercase hexadecimal".into());
-    }
-    let expected_bytes = expected
-        .1
-        .parse::<u64>()
-        .map_err(|error| format!("browser Edit context byte length is invalid: {error}"))?;
-    if expected_bytes == 0 || expected_bytes > BROWSER_EDIT_CONTEXT_MAX_BYTES {
-        return Err(format!(
-            "browser Edit context length must be within 1..={BROWSER_EDIT_CONTEXT_MAX_BYTES}, found {expected_bytes}"
-        ));
-    }
-    let result = Arc::new(Mutex::new(None));
-    let task = BrowserEditContextRestoreTask {
-        result: Arc::clone(&result),
-    };
-    spawn_local(async move {
-        let read = read_browser_edit_context(digest, expected_bytes).await;
-        let query_cleanup = remove_browser_edit_context_query(&window);
-        let restored = match (read, query_cleanup) {
-            (Ok(bytes), Ok(())) => Ok(bytes),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(cleanup)) => {
-                Err(format!("{error}; URL cleanup also failed: {cleanup}"))
-            }
-        };
-        if let Ok(mut slot) = result.lock() {
-            *slot = Some(restored);
-        }
-    });
-    Ok(Some(task))
-}
-
-/// Reload the canonical browser release selected by the Bevy model dropdown.
-///
-/// A navigation is the browser's model-switch boundary: it drops the old runtime/device tensors
-/// before the target release begins its VRAM preflight and verified artifact load. Custom artifact
-/// mirrors and no-surface diagnostics remain pinned to their one exact release.
-pub(crate) fn request_browser_model_release(
-    model: &burn_image::ModelId,
-    edit_context_png: Option<Vec<u8>>,
-) -> Result<Option<BrowserModelSwitchTask>, String> {
-    let Some(variant) = crate::boogu::variant_for_model(model) else {
-        return Err(format!(
-            "browser model switch received unknown model {model}"
-        ));
-    };
-    if !browser_release_switching_enabled() {
-        return Ok(None);
-    }
-    let window = web_sys::window().ok_or_else(|| "browser Window is unavailable".to_owned())?;
-    let href = window
-        .location()
-        .href()
-        .map_err(|error| format!("browser model switch could not read the page URL: {error:?}"))?;
-    let url = web_sys::Url::new(&href)
-        .map_err(|error| format!("browser model switch could not parse the page URL: {error:?}"))?;
-    let params = url.search_params();
-    if params.get("variant").as_deref() == Some(variant_slug(variant)) {
-        return Ok(None);
-    }
-    params.set("variant", variant_slug(variant));
-    if params
-        .get("residency")
-        .is_some_and(|value| value != "resident" && value != "low-vram")
-    {
-        params.set("residency", "low-vram");
-    }
-    let context = edit_context_png.map(|bytes| {
-        let digest = Sha256Digest::calculate(&bytes);
-        let byte_count = bytes.len() as u64;
-        params.set(BROWSER_EDIT_CONTEXT_QUERY, &digest.to_hex());
-        params.set(BROWSER_EDIT_CONTEXT_BYTES_QUERY, &byte_count.to_string());
-        (bytes, digest)
-    });
-    if context.is_none() {
-        params.delete(BROWSER_EDIT_CONTEXT_QUERY);
-        params.delete(BROWSER_EDIT_CONTEXT_BYTES_QUERY);
-    }
-    let target = url.href();
-    let failure = Arc::new(Mutex::new(None));
-    let task = BrowserModelSwitchTask {
-        failure: Arc::clone(&failure),
-    };
-    spawn_local(async move {
-        let result = async {
-            if let Some((bytes, digest)) = context {
-                store_browser_edit_context(&bytes, digest).await?;
-            }
-            window
-                .location()
-                .assign(&target)
-                .map_err(|error| browser_model_switch_js_error("navigation", error))?;
-            Ok::<(), String>(())
-        }
-        .await;
-        if let Err(error) = result
-            && let Ok(mut slot) = failure.lock()
-        {
-            *slot = Some(error);
-        }
-    });
-    Ok(Some(task))
 }
 
 impl BooguRuntime for BrowserBooguRuntime {
@@ -10806,24 +10878,116 @@ impl BooguRuntime for BrowserBooguRuntime {
         }
     }
 
-    fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError> {
-        if job.variant != self.variant {
-            return Err(execution_error(
-                self.variant,
-                "browser runtime received a different Boogu release",
-            ));
+    fn prepare_variant(
+        &mut self,
+        variant: BooguVariant,
+    ) -> Result<crate::boogu::BooguRuntimePreparation, RuntimeError> {
+        if !self.variants().contains(&variant) {
+            return Err(RuntimeError::UnknownModel(crate::boogu::boogu_model_id(
+                variant,
+            )));
         }
-        let cancellation = CancellationToken::default();
         let mut state = self.shared.lock().expect("browser runtime mutex poisoned");
         if state.active.is_some() {
             return Err(execution_error(
-                self.variant,
-                "browser runtime executes one request at a time",
+                variant,
+                "cannot switch browser models while an inference request is active",
             ));
         }
-        let mut engine = state.engine.take().ok_or_else(|| {
-            execution_error(self.variant, "browser runtime engine is unavailable")
-        })?;
+        if let Some(preparing) = state.preparing {
+            return Err(execution_error(
+                variant,
+                format!("browser model preparation for {preparing:?} is already active"),
+            ));
+        }
+        if state
+            .engine
+            .as_ref()
+            .is_some_and(|engine| engine.identity.variant == variant)
+        {
+            return Ok(crate::boogu::BooguRuntimePreparation::Ready);
+        }
+        let engine = state
+            .engine
+            .take()
+            .ok_or_else(|| execution_error(variant, "browser runtime engine is unavailable"))?;
+        state.preparing = Some(variant);
+        drop(state);
+        let _ = take_browser_factory_progress();
+
+        let shared = Arc::clone(&self.shared);
+        spawn_local(async move {
+            let result = engine.switch_to(variant).await;
+            let mut state = shared.lock().expect("browser runtime mutex poisoned");
+            state.preparing = None;
+            match result {
+                Ok(engine) => {
+                    report_browser_runtime_ready(
+                        engine.identity.variant,
+                        engine.policies.eager_preload,
+                        engine.artifact_control.transfer_progress(),
+                        engine.policies.qwen_text_layer_allocation_policy(),
+                        engine
+                            .policies
+                            .qwen_text_block_load_synchronization_policy(),
+                        engine.policies.qwen_text_layer_submission_policy(),
+                    );
+                    state.engine = Some(engine);
+                    state
+                        .preparation_events
+                        .push_back(crate::boogu::BooguRuntimePreparationEvent::Ready { variant });
+                }
+                Err(error) => {
+                    report_browser_runtime_failure(error.to_string());
+                    state.preparation_events.push_back(
+                        crate::boogu::BooguRuntimePreparationEvent::Failed { variant, error },
+                    );
+                }
+            }
+        });
+        Ok(crate::boogu::BooguRuntimePreparation::Started)
+    }
+
+    fn poll_preparation(
+        &mut self,
+        emit: &mut dyn FnMut(crate::boogu::BooguRuntimePreparationEvent),
+    ) {
+        let mut state = self.shared.lock().expect("browser runtime mutex poisoned");
+        if let Some(variant) = state.preparing
+            && let Some(message) = take_browser_factory_progress()
+        {
+            emit(crate::boogu::BooguRuntimePreparationEvent::Progress { variant, message });
+        }
+        for _ in 0..MAX_EVENTS_PER_POLL {
+            let Some(event) = state.preparation_events.pop_front() else {
+                break;
+            };
+            emit(event);
+        }
+    }
+
+    fn submit(&mut self, job: BooguRuntimeJob) -> Result<CancellationToken, RuntimeError> {
+        let cancellation = CancellationToken::default();
+        let mut state = self.shared.lock().expect("browser runtime mutex poisoned");
+        if state.active.is_some() || state.preparing.is_some() {
+            return Err(execution_error(
+                job.variant,
+                "browser runtime is already executing or preparing a model",
+            ));
+        }
+        let resident = state.engine.as_ref().map(|engine| engine.identity.variant);
+        if resident != Some(job.variant) {
+            return Err(execution_error(
+                job.variant,
+                format!(
+                    "browser runtime resident release {resident:?} differs from the requested release"
+                ),
+            ));
+        }
+        let mut engine = state
+            .engine
+            .take()
+            .ok_or_else(|| execution_error(job.variant, "browser runtime engine is unavailable"))?;
         state.active = Some((job.id, cancellation.clone()));
         drop(state);
 

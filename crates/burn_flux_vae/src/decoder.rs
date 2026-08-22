@@ -176,6 +176,12 @@ impl<B: Backend> Decoder<B> {
         self.forward_with_group_norm_policy(input, DecoderGroupNormPolicy::StrictF32)
     }
 
+    /// Update exact attention partitioning without reallocating model parameters.
+    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        self.mid_block
+            .set_attention_query_chunk_size(query_chunk_size);
+    }
+
     /// Decode with an explicit mixed-precision GroupNorm execution policy.
     ///
     /// The ordinary [`Self::forward`] API remains strict F32 for F16/BF16 activations.

@@ -1085,16 +1085,30 @@ mod web_shell_tests {
         for required in [
             "fn browser_release_switching_enabled()",
             "!params.has(\"artifacts\") && !params.has(\"headless\")",
-            "pub(crate) fn request_browser_model_release(",
-            ".assign(&target)",
-            "store_browser_edit_context(&bytes, digest).await?",
-            "request_browser_edit_context_restore",
-            "Sha256Digest::calculate(&bytes) != digest",
-            "the current image as its Edit reference",
+            "async fn switch_to(mut self, target: BooguVariant)",
+            "drop(denoiser);",
+            "packed_q4_shared_resident_footprint",
+            "shared.qwen_component_digest != qwen_component_digest",
+            "shared.vae_component_digest != vae_component_digest",
+            "self.qwen.source.clear_vision_stages();",
+            "self.vae.clear_encoder();",
+            "reset_transfer_plan(\"Switching selected model\")",
+            "prepare.write(PrepareImageModel",
+            "the current image remains in view as its Edit reference",
         ] {
             assert!(
                 runtime.contains(required) || controls.contains(required),
                 "Bevy-owned browser model switching omits {required}"
+            );
+        }
+        for forbidden in [
+            ".location().assign(",
+            "request_browser_model_release",
+            "request_browser_edit_context_restore",
+        ] {
+            assert!(
+                !runtime.contains(forbidden) && !controls.contains(forbidden),
+                "same-page browser model switching retains obsolete navigation path {forbidden}"
             );
         }
         assert!(

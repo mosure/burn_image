@@ -56,6 +56,14 @@ impl<B: Backend> AutoencoderKl<B> {
         Self::try_new(device, config).expect("valid AutoencoderKL configuration")
     }
 
+    /// Update exact attention partitioning for both independently loadable halves.
+    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        self.encoder
+            .set_attention_query_chunk_size(query_chunk_size);
+        self.decoder
+            .set_attention_query_chunk_size(query_chunk_size);
+    }
+
     /// Encode images into raw concatenated mean/log-variance moments.
     pub fn encode_moments(&self, images: Tensor<B, 4>) -> Tensor<B, 4> {
         assert_eq!(

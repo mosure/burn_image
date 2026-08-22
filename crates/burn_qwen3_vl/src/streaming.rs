@@ -1506,15 +1506,20 @@ impl<B: Backend, S> RetainingQwen3VlStageSource<B, S> {
             + self.lm_head_rows.len()
     }
 
+    /// Drop only Edit-only visual stages while preserving shared text and embedding residency.
+    pub fn clear_vision_stages(&mut self) {
+        self.vision_prelude = None;
+        self.vision_blocks.clear();
+        self.vision_deepstack_mergers.clear();
+        self.vision_final_merger = None;
+    }
+
     /// Drop every retained module and row tensor while preserving the wrapped source.
     ///
     /// This does not implicitly flush deferred work.
     pub fn clear(&mut self) {
         self.embedding_rows.clear();
-        self.vision_prelude = None;
-        self.vision_blocks.clear();
-        self.vision_deepstack_mergers.clear();
-        self.vision_final_merger = None;
+        self.clear_vision_stages();
         self.text_blocks.clear();
         self.text_final_norm = None;
         self.lm_head_rows.clear();
@@ -1822,15 +1827,20 @@ impl<B: Backend, S> RetainingAsyncQwen3VlStageSource<B, S> {
             + self.lm_head_rows.len()
     }
 
+    /// Drop only Edit-only visual stages while preserving shared text and embedding residency.
+    pub fn clear_vision_stages(&mut self) {
+        self.vision_prelude = None;
+        self.vision_blocks.clear();
+        self.vision_deepstack_mergers.clear();
+        self.vision_final_merger = None;
+    }
+
     /// Drop every retained device handle while preserving the wrapped verified source.
     ///
     /// Callers must await the final submitted synchronization before clearing a live GPU cache.
     pub fn clear(&mut self) {
         self.embedding_rows.clear();
-        self.vision_prelude = None;
-        self.vision_blocks.clear();
-        self.vision_deepstack_mergers.clear();
-        self.vision_final_merger = None;
+        self.clear_vision_stages();
         self.text_blocks.clear();
         self.text_final_norm = None;
         self.lm_head_rows.clear();

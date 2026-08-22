@@ -121,4 +121,10 @@ impl<B: Backend> Encoder<B> {
         self.conv_out
             .forward(silu(group_norm_f32(&self.conv_norm_out, hidden)))
     }
+
+    /// Update exact attention partitioning without reallocating model parameters.
+    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        self.mid_block
+            .set_attention_query_chunk_size(query_chunk_size);
+    }
 }

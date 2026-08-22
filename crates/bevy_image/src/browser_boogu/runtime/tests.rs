@@ -289,6 +289,27 @@ fn browser_public_variants_resident_q4_keep_all_modules_warm_correctness() {
 }
 
 #[test]
+fn browser_model_switch_retains_only_the_component_intersection_correctness() {
+    use BooguVariant::{Image01EditTurbo, Image01EditTurbo1k5, Image01Turbo};
+
+    assert_eq!(
+        browser_shared_residency_variant(Image01Turbo, Image01EditTurbo1k5),
+        Image01Turbo,
+        "Generate to Edit may retain only text Qwen plus the VAE decoder"
+    );
+    assert_eq!(
+        browser_shared_residency_variant(Image01EditTurbo1k5, Image01Turbo),
+        Image01Turbo,
+        "Edit to Generate must prune Qwen vision and the VAE encoder"
+    );
+    assert_eq!(
+        browser_shared_residency_variant(Image01EditTurbo, Image01EditTurbo1k5),
+        Image01EditTurbo1k5,
+        "Edit releases share both Qwen halves and both VAE halves"
+    );
+}
+
+#[test]
 fn browser_turbo_low_vram_preloads_packed_f16_for_dense_f32_stages_correctness() {
     let policy = BrowserExecutionPolicies::low_vram_preloaded_packed_f16_denoiser(
         BooguVariant::Image01Turbo,

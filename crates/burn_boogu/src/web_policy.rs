@@ -558,6 +558,10 @@ impl BrowserExecutionPolicy {
             BooguFloatLoadPolicy::PackedF16WeightsF32Auxiliaries
                 | BooguFloatLoadPolicy::PackedQ4sWeightsF32Auxiliaries
         ) {
+            // WebGPU without `shader-f16` executes the mixed packed-F16 kernels with F32
+            // activations while retaining the authenticated convolution/linear parameters in
+            // F16 storage. This activation boundary is intentionally distinct from
+            // `vae_parameter_dtype`.
             dtypes.vae = DType::F32;
         }
         dtypes
@@ -652,6 +656,11 @@ mod tests {
             assert!(policy.retain_qwen_stages && policy.retain_vae_stages);
             assert!(policy.retain_denoiser_stages);
             assert!(policy.weight_traffic_contract().contains("no-model-unload"));
+            let dtypes = policy.execution_dtypes(BooguStorageProfile::Q4sBlockUpTo128F32);
+            assert_eq!(dtypes.qwen_visual, DType::F32);
+            assert_eq!(dtypes.vae, DType::F32);
+            assert_eq!(policy.vae_parameter_dtype(), DType::F16);
+            assert_eq!(dtypes.denoiser, DType::F32);
         }
     }
 }

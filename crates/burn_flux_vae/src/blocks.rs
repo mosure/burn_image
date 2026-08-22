@@ -165,6 +165,15 @@ impl<B: Backend> AttentionBlock<B> {
         self.forward_with_group_norm_policy(input, DecoderGroupNormPolicy::StrictF32)
     }
 
+    /// Update the exact-query attention partition without changing model parameters.
+    pub fn set_query_chunk_size(&mut self, query_chunk_size: usize) {
+        assert!(
+            query_chunk_size > 0,
+            "attention query chunk must be non-zero"
+        );
+        self.query_chunk_size = query_chunk_size;
+    }
+
     pub(crate) fn forward_with_group_norm_policy(
         &self,
         input: Tensor<B, 4>,
@@ -242,6 +251,13 @@ impl<B: Backend> MidBlock2d<B> {
 
     pub fn forward(&self, input: Tensor<B, 4>) -> Tensor<B, 4> {
         self.forward_with_group_norm_policy(input, DecoderGroupNormPolicy::StrictF32)
+    }
+
+    /// Update attention partitioning for every middle-block attention module.
+    pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        for attention in &mut self.attentions {
+            attention.set_query_chunk_size(query_chunk_size);
+        }
     }
 
     pub(crate) fn forward_with_group_norm_policy(
@@ -468,7 +484,7 @@ mod tests {
             .to_data()
             .to_vec::<f32>()
             .expect("chunked values");
-        attention.query_chunk_size = 64;
+        attention.set_query_chunk_size(64);
         let unchunked = attention
             .forward(input)
             .to_data()

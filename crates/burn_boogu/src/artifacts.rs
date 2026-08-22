@@ -1372,6 +1372,29 @@ mod loading {
             variant: BooguVariant,
             profile: BooguStorageProfile,
         ) -> Result<super::BooguPackedQ4ResidentFootprint, BooguError> {
+            self.packed_q4_resident_footprint_for(variant, profile, false)
+        }
+
+        /// Derive the exact variant-active Qwen/VAE payload that can survive a model switch.
+        ///
+        /// Pipeline-specific Boogu denoiser tensors are deliberately excluded. Callers may retain
+        /// only the intersection selected by the source and target variants; switching to Generate
+        /// therefore drops Edit-only Qwen vision and VAE encoder stages before the new denoiser is
+        /// admitted.
+        pub fn packed_q4_shared_resident_footprint(
+            &self,
+            variant: BooguVariant,
+            profile: BooguStorageProfile,
+        ) -> Result<super::BooguPackedQ4ResidentFootprint, BooguError> {
+            self.packed_q4_resident_footprint_for(variant, profile, true)
+        }
+
+        fn packed_q4_resident_footprint_for(
+            &self,
+            variant: BooguVariant,
+            profile: BooguStorageProfile,
+            shared_components_only: bool,
+        ) -> Result<super::BooguPackedQ4ResidentFootprint, BooguError> {
             if !matches!(profile, BooguStorageProfile::Q4sBlockUpTo128F32) {
                 return Err(BooguError::Artifact(
                     "resident Q4S requires the canonical Q4 artifact profile".into(),
@@ -1379,7 +1402,8 @@ mod loading {
             }
             let mut footprint = super::BooguPackedQ4ResidentFootprint::default();
             for spec in self.tensors().iter().filter(|spec| {
-                spec.target_name != "lm_head.weight"
+                (!shared_components_only || spec.owner != TensorOwner::BooguDenoiser)
+                    && spec.target_name != "lm_head.weight"
                     && (variant.is_edit()
                         || (!spec.stage.starts_with("qwen-vision-")
                             && spec.stage != "flux-vae-encoder"
@@ -1460,7 +1484,9 @@ mod loading {
                 .ok_or_else(|| {
                     BooguError::Artifact("packed-Q4 total byte count overflowed".into())
                 })?;
-            if footprint.packed_q4_tensor_count == 0 || footprint.total_payload_bytes == 0 {
+            if (!shared_components_only && footprint.packed_q4_tensor_count == 0)
+                || footprint.total_payload_bytes == 0
+            {
                 return Err(BooguError::Artifact(
                     "packed-Q4 resident footprint contains no packed weights".into(),
                 ));
@@ -3416,6 +3442,15 @@ mod loading {
         /// Maximum response size passed to and enforced around every read.
         pub const fn max_shard_bytes(&self) -> u64 {
             self.max_bytes
+        }
+
+        /// Update exact attention partitioning for subsequently loaded VAE halves.
+        pub fn set_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+            assert!(
+                query_chunk_size > 0,
+                "attention query chunk must be non-zero"
+            );
+            self.config.attention_query_chunk_size = query_chunk_size;
         }
 
         async fn load_stage(&mut self, stage: &str) -> Result<AutoencoderKl<B>, BooguError> {
@@ -8173,6 +8208,18 @@ mod tests {
                 BooguStorageProfile::Q4sBlockUpTo128F32,
             )
             .unwrap();
+        let turbo_shared = inventory
+            .packed_q4_shared_resident_footprint(
+                BooguVariant::Image01Turbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            )
+            .unwrap();
+        let edit_shared = inventory
+            .packed_q4_shared_resident_footprint(
+                BooguVariant::Image01EditTurbo,
+                BooguStorageProfile::Q4sBlockUpTo128F32,
+            )
+            .unwrap();
 
         assert!(q4.packed_q4_tensor_count > 0);
         assert!(q4.packed_q4_elements.is_multiple_of(2));
@@ -8189,6 +8236,9 @@ mod tests {
         );
         assert!(q4.total_payload_bytes < f16.total_payload_bytes);
         assert!(edit_q4.total_payload_bytes > q4.total_payload_bytes);
+        assert!(turbo_shared.total_payload_bytes < q4.total_payload_bytes);
+        assert!(edit_shared.total_payload_bytes < edit_q4.total_payload_bytes);
+        assert!(edit_shared.total_payload_bytes > turbo_shared.total_payload_bytes);
 
         let released = BooguArtifactInventory::new(
             &released_qwen_config(),

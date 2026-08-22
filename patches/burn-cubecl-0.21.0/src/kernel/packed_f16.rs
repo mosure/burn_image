@@ -85,6 +85,52 @@ fn load_packed_f16(packed: &Tensor<u32>, logical_index: usize) -> f32 {
 }
 
 #[cube(launch_unchecked, address_type = "dynamic")]
+fn packed_f16_to_f32_kernel(packed: &Tensor<u32>, output: &mut Tensor<f32>) {
+    if ABSOLUTE_POS < output.len() {
+        // `packed` may be a sliced/permuted F16 activation. Reconstruct its physical F16 offset
+        // from the contiguous output coordinate before interpreting the storage as u32 words.
+        let mut source_index = 0;
+        for axis in 0..packed.rank() {
+            source_index += output.coordinate(ABSOLUTE_POS, axis) * packed.stride(axis);
+        }
+        output[ABSOLUTE_POS] = load_packed_f16(packed, source_index);
+    }
+}
+
+/// Widen an arbitrary F16 tensor to F32 without requiring typed F16 shader support.
+///
+/// This is the no-`shader-f16` implementation of an ordinary F16-to-F32 tensor cast. It is also
+/// used for small activation boundaries; unlike model-weight materialization it never creates a
+/// second model-sized parameter allocation.
+pub fn packed_f16_to_f32<R: CubeRuntime>(input: CubeTensor<R>) -> CubeTensor<R> {
+    assert_eq!(
+        input.dtype,
+        DType::F16,
+        "packed-F16 widening requires F16 input"
+    );
+    let output = empty_device_contiguous_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        input.shape(),
+        DType::F32,
+    );
+    let work_items = output.meta.num_elements();
+    let cube_dim = CubeDim::new(&output.client, work_items);
+    let cube_count = calculate_cube_count_elemwise(&output.client, work_items, cube_dim);
+    unsafe {
+        packed_f16_to_f32_kernel::launch_unchecked(
+            &output.client,
+            cube_count,
+            cube_dim,
+            address_type!(input, output),
+            input.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+        )
+    };
+    output
+}
+
+#[cube(launch_unchecked, address_type = "dynamic")]
 fn packed_f16_rhs_matmul_kernel(
     lhs: &Tensor<f32>,
     packed_rhs: &Tensor<u32>,

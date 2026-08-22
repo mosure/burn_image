@@ -988,6 +988,21 @@ impl<B: Backend, S> RetainingBooguVaeStageSource<B, S> {
         self.decoder = None;
     }
 
+    /// Drop the Edit-only encoder while preserving the decoder shared by Generate and Edit.
+    pub fn clear_encoder(&mut self) {
+        self.encoder = None;
+    }
+
+    /// Update exact attention partitioning on any already-retained halves.
+    pub fn set_cached_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        if let Some(encoder) = &mut self.encoder {
+            encoder.set_attention_query_chunk_size(query_chunk_size);
+        }
+        if let Some(decoder) = &mut self.decoder {
+            decoder.set_attention_query_chunk_size(query_chunk_size);
+        }
+    }
+
     /// Borrow the verified source wrapped by this cache.
     pub const fn source(&self) -> &S {
         &self.source
@@ -1161,6 +1176,21 @@ impl<B: Backend, S> RetainingAsyncBooguVaeStageSource<B, S> {
         self.decoder = None;
     }
 
+    /// Drop the Edit-only encoder while preserving the decoder shared by Generate and Edit.
+    pub fn clear_encoder(&mut self) {
+        self.encoder = None;
+    }
+
+    /// Update exact attention partitioning on any already-retained halves.
+    pub fn set_cached_attention_query_chunk_size(&mut self, query_chunk_size: usize) {
+        if let Some(encoder) = &mut self.encoder {
+            encoder.set_attention_query_chunk_size(query_chunk_size);
+        }
+        if let Some(decoder) = &mut self.decoder {
+            decoder.set_attention_query_chunk_size(query_chunk_size);
+        }
+    }
+
     /// Borrow the wrapped verified source.
     pub const fn source(&self) -> &S {
         &self.source
@@ -1251,12 +1281,40 @@ pub fn encode_reference<B: Backend>(
     normalized_image: Tensor<B, 4>,
     posterior_epsilon: Tensor<B, 4>,
 ) -> Result<Tensor<B, 4>, BooguError> {
-    let vae_dtype: DType = vae.encoder_float_dtype().into();
-    validate_tensor_dtype("normalized VAE image", normalized_image.dtype(), vae_dtype)?;
+    encode_reference_with_activation_dtype(
+        vae,
+        normalized_image,
+        posterior_epsilon,
+        vae.encoder_float_dtype().into(),
+    )
+}
+
+/// Sample and scale one edit reference using an explicit activation dtype.
+///
+/// Mixed packed-F16 backends retain the encoder's large parameters in F16 storage while their
+/// measured kernels consume and return F32 activations. Callers selecting that backend policy
+/// must therefore validate the activation boundary independently from the parameter dtype.
+pub fn encode_reference_with_activation_dtype<B: Backend>(
+    vae: &AutoencoderKl<B>,
+    normalized_image: Tensor<B, 4>,
+    posterior_epsilon: Tensor<B, 4>,
+    activation_dtype: DType,
+) -> Result<Tensor<B, 4>, BooguError> {
+    if !activation_dtype.is_float() {
+        return Err(BooguError::InvalidConfig(format!(
+            "VAE activation dtype must be floating point, got {}",
+            activation_dtype.name()
+        )));
+    }
+    validate_tensor_dtype(
+        "normalized VAE image",
+        normalized_image.dtype(),
+        activation_dtype,
+    )?;
     validate_tensor_dtype(
         "VAE posterior epsilon",
         posterior_epsilon.dtype(),
-        vae_dtype,
+        activation_dtype,
     )?;
     let [batch, channels, height, width] = normalized_image.dims();
     if batch != 1 || channels != 3 || height == 0 || width == 0 {
@@ -2001,6 +2059,13 @@ mod tests {
         assert_eq!(retaining.source().encoder_loads, 1);
         assert_eq!(retaining.source().decoder_loads, 1);
 
+        retaining.clear_encoder();
+        assert_eq!(retaining.cached_stage_count(), 1);
+        drop(retaining.load_decoder().unwrap());
+        assert_eq!(retaining.source().decoder_loads, 1);
+        drop(retaining.load_encoder().unwrap());
+        assert_eq!(retaining.source().encoder_loads, 2);
+
         retaining.clear();
         assert_eq!(retaining.cached_stage_count(), 0);
         drop(retaining.load_decoder().unwrap());
@@ -2024,6 +2089,12 @@ mod tests {
         assert_eq!(retaining.cached_stage_count(), 2);
         assert_eq!(retaining.source().encoder_loads, 1);
         assert_eq!(retaining.source().decoder_loads, 1);
+        retaining.clear_encoder();
+        assert_eq!(retaining.cached_stage_count(), 1);
+        block_on_immediate(retaining.load_decoder()).unwrap();
+        assert_eq!(retaining.source().decoder_loads, 1);
+        block_on_immediate(retaining.load_encoder()).unwrap();
+        assert_eq!(retaining.source().encoder_loads, 2);
         retaining.clear();
         assert_eq!(retaining.cached_stage_count(), 0);
         block_on_immediate(retaining.load_decoder()).unwrap();
